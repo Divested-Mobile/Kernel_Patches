@@ -1,0 +1,196 @@
+diff --git a/Makefile b/Makefile
+index 02a30af3aad0..3979e65d516e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 64
++SUBLEVEL = 65
+ EXTRAVERSION =
+ NAME = Diseased Newt
+ 
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 99b703e45c59..22ad4e433b3a 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2436,7 +2436,7 @@ static inline bool skb_needs_check(struct sk_buff *skb, bool tx_path)
+ {
+ 	if (tx_path)
+ 		return skb->ip_summed != CHECKSUM_PARTIAL &&
+-		       skb->ip_summed != CHECKSUM_NONE;
++		       skb->ip_summed != CHECKSUM_UNNECESSARY;
+ 
+ 	return skb->ip_summed == CHECKSUM_NONE;
+ }
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index ba7f71169132..5ed8740017d0 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -888,10 +888,12 @@ static int __ip_append_data(struct sock *sk,
+ 		csummode = CHECKSUM_PARTIAL;
+ 
+ 	cork->length += length;
+-	if ((((length + fragheaderlen) > mtu) || (skb && skb_is_gso(skb))) &&
++	if ((skb && skb_is_gso(skb)) ||
++	    (((length + fragheaderlen) > mtu) &&
++	    (skb_queue_len(queue) <= 1) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO) && !rt->dst.header_len &&
+-	    (sk->sk_type == SOCK_DGRAM)) {
++	    (sk->sk_type == SOCK_DGRAM))) {
+ 		err = ip_ufo_append_data(sk, queue, getfrag, from, length,
+ 					 hh_len, fragheaderlen, transhdrlen,
+ 					 maxfraglen, flags);
+@@ -1207,6 +1209,7 @@ ssize_t	ip_append_page(struct sock *sk, struct flowi4 *fl4, struct page *page,
+ 
+ 	cork->length += size;
+ 	if ((size + skb->len > mtu) &&
++	    (skb_queue_len(&sk->sk_write_queue) == 1) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO)) {
+ 		skb_shinfo(skb)->gso_size = mtu - fragheaderlen;
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index c0e026ae388e..c16688d39ca4 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -2535,8 +2535,8 @@ static inline void tcp_end_cwnd_reduction(struct sock *sk)
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 
+ 	/* Reset cwnd to ssthresh in CWR or Recovery (unless it's undone) */
+-	if (inet_csk(sk)->icsk_ca_state == TCP_CA_CWR ||
+-	    (tp->undo_marker && tp->snd_ssthresh < TCP_INFINITE_SSTHRESH)) {
++	if (tp->snd_ssthresh < TCP_INFINITE_SSTHRESH &&
++	    (inet_csk(sk)->icsk_ca_state == TCP_CA_CWR || tp->undo_marker)) {
+ 		tp->snd_cwnd = tp->snd_ssthresh;
+ 		tp->snd_cwnd_stamp = tcp_time_stamp;
+ 	}
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 5853c5a2264e..2adfa23285be 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -3122,6 +3122,9 @@ int tcp_connect(struct sock *sk)
+ 	struct sk_buff *buff;
+ 	int err;
+ 
++	if (inet_csk(sk)->icsk_af_ops->rebuild_header(sk))
++		return -EHOSTUNREACH; /* Routing failure or similar. */
++
+ 	tcp_connect_init(sk);
+ 
+ 	if (unlikely(tp->repair)) {
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index baec68553e90..f146c10ca11d 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -596,7 +596,8 @@ static void tcp_keepalive_timer (unsigned long data)
+ 		goto death;
+ 	}
+ 
+-	if (!sock_flag(sk, SOCK_KEEPOPEN) || sk->sk_state == TCP_CLOSE)
++	if (!sock_flag(sk, SOCK_KEEPOPEN) ||
++	    ((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_SYN_SENT)))
+ 		goto out;
+ 
+ 	elapsed = keepalive_time_when(tp);
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index ee26711a952a..085fd0d357e2 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -804,7 +804,7 @@ static int udp_send_skb(struct sk_buff *skb, struct flowi4 *fl4)
+ 	if (is_udplite)  				 /*     UDP-Lite      */
+ 		csum = udplite_csum(skb);
+ 
+-	else if (sk->sk_no_check_tx) {   /* UDP csum disabled */
++	else if (sk->sk_no_check_tx && !skb_is_gso(skb)) {   /* UDP csum off */
+ 
+ 		skb->ip_summed = CHECKSUM_NONE;
+ 		goto send;
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index e6d05ae1f22e..7a98b8d968c9 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -198,7 +198,7 @@ static struct sk_buff *udp4_ufo_fragment(struct sk_buff *skb,
+ 	if (uh->check == 0)
+ 		uh->check = CSUM_MANGLED_0;
+ 
+-	skb->ip_summed = CHECKSUM_NONE;
++	skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+ 	/* Fragment the skb. IP headers of the fragments are updated in
+ 	 * inet_gso_segment()
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 650e7c53c3c8..f71de459139f 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1305,11 +1305,12 @@ emsgsize:
+ 
+ 	skb = skb_peek_tail(&sk->sk_write_queue);
+ 	cork->length += length;
+-	if ((((length + fragheaderlen) > mtu) ||
+-	     (skb && skb_is_gso(skb))) &&
++	if ((skb && skb_is_gso(skb)) ||
++	    (((length + fragheaderlen) > mtu) &&
++	    (skb_queue_len(&sk->sk_write_queue) <= 1) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO) &&
+-	    (sk->sk_type == SOCK_DGRAM)) {
++	    (sk->sk_type == SOCK_DGRAM))) {
+ 		err = ip6_ufo_append_data(sk, getfrag, from, length,
+ 					  hh_len, fragheaderlen,
+ 					  transhdrlen, mtu, flags, rt);
+diff --git a/net/ipv6/udp_offload.c b/net/ipv6/udp_offload.c
+index 050d556a7997..3e2a55307b3d 100644
+--- a/net/ipv6/udp_offload.c
++++ b/net/ipv6/udp_offload.c
+@@ -82,7 +82,7 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
+ 		if (uh->check == 0)
+ 			uh->check = CSUM_MANGLED_0;
+ 
+-		skb->ip_summed = CHECKSUM_NONE;
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+ 		/* Check if there is enough headroom to insert fragment header. */
+ 		tnl_hlen = skb_tnl_header_len(skb);
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index eafac12b39a1..1c03d83edd7e 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -3310,14 +3310,19 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
+ 
+ 		if (optlen != sizeof(val))
+ 			return -EINVAL;
+-		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec)
+-			return -EBUSY;
+ 		if (copy_from_user(&val, optval, sizeof(val)))
+ 			return -EFAULT;
+ 		if (val > INT_MAX)
+ 			return -EINVAL;
+-		po->tp_reserve = val;
+-		return 0;
++		lock_sock(sk);
++		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec) {
++			ret = -EBUSY;
++		} else {
++			po->tp_reserve = val;
++			ret = 0;
++		}
++		release_sock(sk);
++		return ret;
+ 	}
+ 	case PACKET_LOSS:
+ 	{
+diff --git a/net/sched/act_ipt.c b/net/sched/act_ipt.c
+index 8a64a0734aee..1faa24b3203e 100644
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@ -42,8 +42,8 @@ static int ipt_init_target(struct xt_entry_target *t, char *table, unsigned int
+ 		return PTR_ERR(target);
+ 
+ 	t->u.kernel.target = target;
++	memset(&par, 0, sizeof(par));
+ 	par.table     = table;
+-	par.entryinfo = NULL;
+ 	par.target    = target;
+ 	par.targinfo  = t->data;
+ 	par.hook_mask = hook;

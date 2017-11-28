@@ -1,0 +1,693 @@
+diff --git a/Makefile b/Makefile
+index e44d3f45b72a..0c3f5de9c2fe 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 58
++SUBLEVEL = 59
+ EXTRAVERSION =
+ NAME = Diseased Newt
+ 
+diff --git a/arch/powerpc/kernel/kprobes.c b/arch/powerpc/kernel/kprobes.c
+index 2f72af82513c..4dc454172ab3 100644
+--- a/arch/powerpc/kernel/kprobes.c
++++ b/arch/powerpc/kernel/kprobes.c
+@@ -514,6 +514,15 @@ int __kprobes setjmp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+ #endif
+ #endif
+ 
++	/*
++	 * jprobes use jprobe_return() which skips the normal return
++	 * path of the function, and this messes up the accounting of the
++	 * function graph tracer.
++	 *
++	 * Pause function graph tracing while performing the jprobe function.
++	 */
++	pause_graph_tracing();
++
+ 	return 1;
+ }
+ 
+@@ -536,6 +545,8 @@ int __kprobes longjmp_break_handler(struct kprobe *p, struct pt_regs *regs)
+ 	 * saved regs...
+ 	 */
+ 	memcpy(regs, &kcb->jprobe_saved_regs, sizeof(struct pt_regs));
++	/* It's OK to start function graph tracing again */
++	unpause_graph_tracing();
+ 	preempt_enable_no_resched();
+ 	return 1;
+ }
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index ed86c263a103..ed671bd0690d 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -1956,6 +1956,27 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Don't allow entry with a suspended transaction, because
++	 * the guest entry/exit code will lose it.
++	 * If the guest has TM enabled, save away their TM-related SPRs
++	 * (they will get restored by the TM unavailable interrupt).
++	 */
++#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++	if (cpu_has_feature(CPU_FTR_TM) && current->thread.regs &&
++	    (current->thread.regs->msr & MSR_TM)) {
++		if (MSR_TM_ACTIVE(current->thread.regs->msr)) {
++			run->exit_reason = KVM_EXIT_FAIL_ENTRY;
++			run->fail_entry.hardware_entry_failure_reason = 0;
++			return -EINVAL;
++		}
++		current->thread.tm_tfhar = mfspr(SPRN_TFHAR);
++		current->thread.tm_tfiar = mfspr(SPRN_TFIAR);
++		current->thread.tm_texasr = mfspr(SPRN_TEXASR);
++		current->thread.regs->msr &= ~MSR_TM;
++	}
++#endif
++
+ 	kvmppc_core_prepare_to_enter(vcpu);
+ 
+ 	/* No need to go into the guest when all we'll do is come back out */
+diff --git a/arch/powerpc/mm/slb_low.S b/arch/powerpc/mm/slb_low.S
+index 4c48b487698c..0b48ce40d351 100644
+--- a/arch/powerpc/mm/slb_low.S
++++ b/arch/powerpc/mm/slb_low.S
+@@ -179,6 +179,16 @@ END_MMU_FTR_SECTION_IFSET(MMU_FTR_1T_SEGMENT)
+ 	b	slb_finish_load
+ 
+ 8:	/* invalid EA */
++	/*
++	 * It's possible the bad EA is too large to fit in the SLB cache, which
++	 * would mean we'd fail to invalidate it on context switch. So mark the
++	 * SLB cache as full so we force a full flush. We also set cr7+eq to
++	 * mark the address as a kernel address, so slb_finish_load() skips
++	 * trying to insert it into the SLB cache.
++	 */
++	li	r9,SLB_CACHE_ENTRIES + 1
++	sth	r9,PACASLBCACHEPTR(r13)
++	crset	4*cr7+eq
+ 	li	r10,0			/* BAD_VSID */
+ 	li	r9,0			/* BAD_VSID */
+ 	li	r11,SLB_VSID_USER	/* flags don't much matter */
+diff --git a/drivers/input/serio/i8042-x86ia64io.h b/drivers/input/serio/i8042-x86ia64io.h
+index 3b9947bc2b02..160b705869f3 100644
+--- a/drivers/input/serio/i8042-x86ia64io.h
++++ b/drivers/input/serio/i8042-x86ia64io.h
+@@ -688,6 +688,13 @@ static const struct dmi_system_id __initconst i8042_dmi_notimeout_table[] = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK U574"),
+ 		},
+ 	},
++	{
++		/* Fujitsu UH554 laptop */
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK UH544"),
++		},
++	},
+ 	{ }
+ };
+ 
+diff --git a/drivers/mtd/spi-nor/spi-nor.c b/drivers/mtd/spi-nor/spi-nor.c
+index c51ee52386a7..f17cee64e862 100644
+--- a/drivers/mtd/spi-nor/spi-nor.c
++++ b/drivers/mtd/spi-nor/spi-nor.c
+@@ -864,6 +864,13 @@ static int spansion_quad_enable(struct spi_nor *nor)
+ 		return -EINVAL;
+ 	}
+ 
++	ret = spi_nor_wait_till_ready(nor);
++	if (ret) {
++		dev_err(nor->dev,
++			"timeout while writing configuration register\n");
++		return ret;
++	}
++
+ 	/* read back and check it */
+ 	ret = read_cr(nor);
+ 	if (!(ret > 0 && (ret & CR_QUAD_EN_SPAN))) {
+diff --git a/drivers/net/phy/marvell.c b/drivers/net/phy/marvell.c
+index 225c033b08f3..b6cad1731cbe 100644
+--- a/drivers/net/phy/marvell.c
++++ b/drivers/net/phy/marvell.c
+@@ -737,8 +737,6 @@ static int marvell_read_status(struct phy_device *phydev)
+ 		if (adv < 0)
+ 			return adv;
+ 
+-		lpa &= adv;
+-
+ 		if (status & MII_M1011_PHY_STATUS_FULLDUPLEX)
+ 			phydev->duplex = DUPLEX_FULL;
+ 		else
+diff --git a/drivers/of/fdt.c b/drivers/of/fdt.c
+index 74c7aba476f6..63a6e1e6abdc 100644
+--- a/drivers/of/fdt.c
++++ b/drivers/of/fdt.c
+@@ -585,9 +585,12 @@ int __init of_scan_flat_dt(int (*it)(unsigned long node,
+ 	const char *pathp;
+ 	int offset, rc = 0, depth = -1;
+ 
+-        for (offset = fdt_next_node(blob, -1, &depth);
+-             offset >= 0 && depth >= 0 && !rc;
+-             offset = fdt_next_node(blob, offset, &depth)) {
++	if (!blob)
++		return 0;
++
++	for (offset = fdt_next_node(blob, -1, &depth);
++	     offset >= 0 && depth >= 0 && !rc;
++	     offset = fdt_next_node(blob, offset, &depth)) {
+ 
+ 		pathp = fdt_get_name(blob, offset, NULL);
+ 		if (*pathp == '/')
+diff --git a/drivers/target/target_core_internal.h b/drivers/target/target_core_internal.h
+index e31f42f369ff..5018126b3f76 100644
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@ -92,7 +92,7 @@ int	init_se_kmem_caches(void);
+ void	release_se_kmem_caches(void);
+ u32	scsi_get_new_index(scsi_index_t);
+ void	transport_subsystem_check_init(void);
+-void	transport_cmd_finish_abort(struct se_cmd *, int);
++int	transport_cmd_finish_abort(struct se_cmd *, int);
+ unsigned char *transport_dump_cmd_direction(struct se_cmd *);
+ void	transport_dump_dev_state(struct se_device *, char *, int *);
+ void	transport_dump_dev_info(struct se_device *, struct se_lun *,
+diff --git a/drivers/target/target_core_tmr.c b/drivers/target/target_core_tmr.c
+index 05c0a90e11a9..9b1a4000d0f9 100644
+--- a/drivers/target/target_core_tmr.c
++++ b/drivers/target/target_core_tmr.c
+@@ -78,7 +78,7 @@ void core_tmr_release_req(struct se_tmr_req *tmr)
+ 	kfree(tmr);
+ }
+ 
+-static void core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
++static int core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
+ {
+ 	unsigned long flags;
+ 	bool remove = true, send_tas;
+@@ -94,7 +94,7 @@ static void core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
+ 		transport_send_task_abort(cmd);
+ 	}
+ 
+-	transport_cmd_finish_abort(cmd, remove);
++	return transport_cmd_finish_abort(cmd, remove);
+ }
+ 
+ static int target_check_cdb_and_preempt(struct list_head *list,
+@@ -190,8 +190,8 @@ void core_tmr_abort_task(
+ 		cancel_work_sync(&se_cmd->work);
+ 		transport_wait_for_tasks(se_cmd);
+ 
+-		transport_cmd_finish_abort(se_cmd, true);
+-		target_put_sess_cmd(se_cmd);
++		if (!transport_cmd_finish_abort(se_cmd, true))
++			target_put_sess_cmd(se_cmd);
+ 
+ 		printk("ABORT_TASK: Sending TMR_FUNCTION_COMPLETE for"
+ 				" ref_tag: %d\n", ref_tag);
+@@ -291,8 +291,8 @@ static void core_tmr_drain_tmr_list(
+ 		cancel_work_sync(&cmd->work);
+ 		transport_wait_for_tasks(cmd);
+ 
+-		transport_cmd_finish_abort(cmd, 1);
+-		target_put_sess_cmd(cmd);
++		if (!transport_cmd_finish_abort(cmd, 1))
++			target_put_sess_cmd(cmd);
+ 	}
+ }
+ 
+@@ -390,8 +390,8 @@ static void core_tmr_drain_state_list(
+ 		cancel_work_sync(&cmd->work);
+ 		transport_wait_for_tasks(cmd);
+ 
+-		core_tmr_handle_tas_abort(cmd, tas);
+-		target_put_sess_cmd(cmd);
++		if (!core_tmr_handle_tas_abort(cmd, tas))
++			target_put_sess_cmd(cmd);
+ 	}
+ }
+ 
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 837d464fa6da..d206274e6676 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -604,9 +604,10 @@ static void transport_lun_remove_cmd(struct se_cmd *cmd)
+ 		percpu_ref_put(&lun->lun_ref);
+ }
+ 
+-void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
++int transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
+ {
+ 	bool ack_kref = (cmd->se_cmd_flags & SCF_ACK_KREF);
++	int ret = 0;
+ 
+ 	if (cmd->se_cmd_flags & SCF_SE_LUN_CMD)
+ 		transport_lun_remove_cmd(cmd);
+@@ -618,9 +619,11 @@ void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
+ 		cmd->se_tfo->aborted_task(cmd);
+ 
+ 	if (transport_cmd_check_stop_to_fabric(cmd))
+-		return;
++		return 1;
+ 	if (remove && ack_kref)
+-		transport_put_cmd(cmd);
++		ret = transport_put_cmd(cmd);
++
++	return ret;
+ }
+ 
+ static void target_complete_failure_work(struct work_struct *work)
+diff --git a/drivers/usb/gadget/function/f_fs.c b/drivers/usb/gadget/function/f_fs.c
+index 58888b8bd389..42bee631b6be 100644
+--- a/drivers/usb/gadget/function/f_fs.c
++++ b/drivers/usb/gadget/function/f_fs.c
+@@ -1674,12 +1674,12 @@ static int ffs_func_eps_enable(struct ffs_function *func)
+ 		ep->ep->driver_data = ep;
+ 		ep->ep->desc = ds;
+ 
+-		comp_desc = (struct usb_ss_ep_comp_descriptor *)(ds +
+-				USB_DT_ENDPOINT_SIZE);
+-		ep->ep->maxburst = comp_desc->bMaxBurst + 1;
+-
+-		if (needs_comp_desc)
++		if (needs_comp_desc) {
++			comp_desc = (struct usb_ss_ep_comp_descriptor *)(ds +
++					USB_DT_ENDPOINT_SIZE);
++			ep->ep->maxburst = comp_desc->bMaxBurst + 1;
+ 			ep->ep->comp_desc = comp_desc;
++		}
+ 
+ 		ret = usb_ep_enable(ep->ep);
+ 		if (likely(!ret)) {
+diff --git a/fs/autofs4/dev-ioctl.c b/fs/autofs4/dev-ioctl.c
+index ac7d921ed984..257425511d10 100644
+--- a/fs/autofs4/dev-ioctl.c
++++ b/fs/autofs4/dev-ioctl.c
+@@ -331,7 +331,7 @@ static int autofs_dev_ioctl_fail(struct file *fp,
+ 	int status;
+ 
+ 	token = (autofs_wqt_t) param->fail.token;
+-	status = param->fail.status ? param->fail.status : -ENOENT;
++	status = param->fail.status < 0 ? param->fail.status : -ENOENT;
+ 	return autofs4_wait_release(sbi, token, status);
+ }
+ 
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index edaabb8dee7b..b0f973b2b189 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -849,8 +849,13 @@ cifs_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
+ 		     struct cifs_fid *fid, __u16 search_flags,
+ 		     struct cifs_search_info *srch_inf)
+ {
+-	return CIFSFindFirst(xid, tcon, path, cifs_sb,
+-			     &fid->netfid, search_flags, srch_inf, true);
++	int rc;
++
++	rc = CIFSFindFirst(xid, tcon, path, cifs_sb,
++			   &fid->netfid, search_flags, srch_inf, true);
++	if (rc)
++		cifs_dbg(FYI, "find first failed=%d\n", rc);
++	return rc;
+ }
+ 
+ static int
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 56dba5249d5f..a74f433a93b6 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -842,7 +842,7 @@ smb2_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
+ 	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL);
+ 	kfree(utf16_path);
+ 	if (rc) {
+-		cifs_dbg(VFS, "open dir failed\n");
++		cifs_dbg(FYI, "open dir failed rc=%d\n", rc);
+ 		return rc;
+ 	}
+ 
+@@ -852,7 +852,7 @@ smb2_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
+ 	rc = SMB2_query_directory(xid, tcon, fid->persistent_fid,
+ 				  fid->volatile_fid, 0, srch_inf);
+ 	if (rc) {
+-		cifs_dbg(VFS, "query directory failed\n");
++		cifs_dbg(FYI, "query directory failed rc=%d\n", rc);
+ 		SMB2_close(xid, tcon, fid->persistent_fid, fid->volatile_fid);
+ 	}
+ 	return rc;
+diff --git a/fs/exec.c b/fs/exec.c
+index fe9ec45685a5..6fa04b3170ee 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -199,8 +199,26 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
+ 
+ 	if (write) {
+ 		unsigned long size = bprm->vma->vm_end - bprm->vma->vm_start;
++		unsigned long ptr_size;
+ 		struct rlimit *rlim;
+ 
++		/*
++		 * Since the stack will hold pointers to the strings, we
++		 * must account for them as well.
++		 *
++		 * The size calculation is the entire vma while each arg page is
++		 * built, so each time we get here it's calculating how far it
++		 * is currently (rather than each call being just the newly
++		 * added size from the arg page).  As a result, we need to
++		 * always add the entire size of the pointers, so that on the
++		 * last call to get_arg_page() we'll actually have the entire
++		 * correct size.
++		 */
++		ptr_size = (bprm->argc + bprm->envc) * sizeof(void *);
++		if (ptr_size > ULONG_MAX - size)
++			goto fail;
++		size += ptr_size;
++
+ 		acct_arg_size(bprm, size / PAGE_SIZE);
+ 
+ 		/*
+@@ -218,13 +236,15 @@ static struct page *get_arg_page(struct linux_binprm *bprm, unsigned long pos,
+ 		 *    to work from.
+ 		 */
+ 		rlim = current->signal->rlim;
+-		if (size > ACCESS_ONCE(rlim[RLIMIT_STACK].rlim_cur) / 4) {
+-			put_page(page);
+-			return NULL;
+-		}
++		if (size > READ_ONCE(rlim[RLIMIT_STACK].rlim_cur) / 4)
++			goto fail;
+ 	}
+ 
+ 	return page;
++
++fail:
++	put_page(page);
++	return NULL;
+ }
+ 
+ static void put_arg_page(struct page *page)
+diff --git a/kernel/signal.c b/kernel/signal.c
+index 74083306403f..046c7f77cdcb 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -543,7 +543,8 @@ unblock_all_signals(void)
+ 	spin_unlock_irqrestore(&current->sighand->siglock, flags);
+ }
+ 
+-static void collect_signal(int sig, struct sigpending *list, siginfo_t *info)
++static void collect_signal(int sig, struct sigpending *list, siginfo_t *info,
++			   bool *resched_timer)
+ {
+ 	struct sigqueue *q, *first = NULL;
+ 
+@@ -565,6 +566,12 @@ static void collect_signal(int sig, struct sigpending *list, siginfo_t *info)
+ still_pending:
+ 		list_del_init(&first->list);
+ 		copy_siginfo(info, &first->info);
++
++		*resched_timer =
++			(first->flags & SIGQUEUE_PREALLOC) &&
++			(info->si_code == SI_TIMER) &&
++			(info->si_sys_private);
++
+ 		__sigqueue_free(first);
+ 	} else {
+ 		/*
+@@ -581,7 +588,7 @@ still_pending:
+ }
+ 
+ static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
+-			siginfo_t *info)
++			siginfo_t *info, bool *resched_timer)
+ {
+ 	int sig = next_signal(pending, mask);
+ 
+@@ -595,7 +602,7 @@ static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
+ 			}
+ 		}
+ 
+-		collect_signal(sig, pending, info);
++		collect_signal(sig, pending, info, resched_timer);
+ 	}
+ 
+ 	return sig;
+@@ -609,15 +616,16 @@ static int __dequeue_signal(struct sigpending *pending, sigset_t *mask,
+  */
+ int dequeue_signal(struct task_struct *tsk, sigset_t *mask, siginfo_t *info)
+ {
++	bool resched_timer = false;
+ 	int signr;
+ 
+ 	/* We only dequeue private signals from ourselves, we don't let
+ 	 * signalfd steal them
+ 	 */
+-	signr = __dequeue_signal(&tsk->pending, mask, info);
++	signr = __dequeue_signal(&tsk->pending, mask, info, &resched_timer);
+ 	if (!signr) {
+ 		signr = __dequeue_signal(&tsk->signal->shared_pending,
+-					 mask, info);
++					 mask, info, &resched_timer);
+ 		/*
+ 		 * itimer signal ?
+ 		 *
+@@ -662,7 +670,7 @@ int dequeue_signal(struct task_struct *tsk, sigset_t *mask, siginfo_t *info)
+ 		 */
+ 		current->jobctl |= JOBCTL_STOP_DEQUEUED;
+ 	}
+-	if ((info->si_code & __SI_MASK) == __SI_TIMER && info->si_sys_private) {
++	if (resched_timer) {
+ 		/*
+ 		 * Release the siglock to ensure proper locking order
+ 		 * of timer locks outside of siglocks.  Note, we leave
+diff --git a/lib/cmdline.c b/lib/cmdline.c
+index 8f13cf73c2ec..79069d7938ea 100644
+--- a/lib/cmdline.c
++++ b/lib/cmdline.c
+@@ -22,14 +22,14 @@
+  *	the values[M, M+1, ..., N] into the ints array in get_options.
+  */
+ 
+-static int get_range(char **str, int *pint)
++static int get_range(char **str, int *pint, int n)
+ {
+ 	int x, inc_counter, upper_range;
+ 
+ 	(*str)++;
+ 	upper_range = simple_strtol((*str), NULL, 0);
+ 	inc_counter = upper_range - *pint;
+-	for (x = *pint; x < upper_range; x++)
++	for (x = *pint; n && x < upper_range; x++, n--)
+ 		*pint++ = x;
+ 	return inc_counter;
+ }
+@@ -96,7 +96,7 @@ char *get_options(const char *str, int nints, int *ints)
+ 			break;
+ 		if (res == 3) {
+ 			int range_nums;
+-			range_nums = get_range((char **)&str, ints + i);
++			range_nums = get_range((char **)&str, ints + i, nints - i);
+ 			if (range_nums < 0)
+ 				break;
+ 			/*
+diff --git a/net/mac80211/wpa.c b/net/mac80211/wpa.c
+index 983527a4c1ab..bf87de469c03 100644
+--- a/net/mac80211/wpa.c
++++ b/net/mac80211/wpa.c
+@@ -16,6 +16,7 @@
+ #include <asm/unaligned.h>
+ #include <net/mac80211.h>
+ #include <crypto/aes.h>
++#include <crypto/algapi.h>
+ 
+ #include "ieee80211_i.h"
+ #include "michael.h"
+@@ -150,7 +151,7 @@ ieee80211_rx_h_michael_mic_verify(struct ieee80211_rx_data *rx)
+ 	data_len = skb->len - hdrlen - MICHAEL_MIC_LEN;
+ 	key = &rx->key->conf.key[NL80211_TKIP_DATA_OFFSET_RX_MIC_KEY];
+ 	michael_mic(key, hdr, data, data_len, mic);
+-	if (memcmp(mic, data + data_len, MICHAEL_MIC_LEN) != 0)
++	if (crypto_memneq(mic, data + data_len, MICHAEL_MIC_LEN))
+ 		goto mic_fail;
+ 
+ 	/* remove Michael MIC from payload */
+@@ -771,7 +772,7 @@ ieee80211_crypto_aes_cmac_decrypt(struct ieee80211_rx_data *rx)
+ 		bip_aad(skb, aad);
+ 		ieee80211_aes_cmac(key->u.aes_cmac.tfm, aad,
+ 				   skb->data + 24, skb->len - 24, mic);
+-		if (memcmp(mic, mmie->mic, sizeof(mmie->mic)) != 0) {
++		if (crypto_memneq(mic, mmie->mic, sizeof(mmie->mic))) {
+ 			key->u.aes_cmac.icverrors++;
+ 			return RX_DROP_UNUSABLE;
+ 		}
+diff --git a/net/rxrpc/ar-key.c b/net/rxrpc/ar-key.c
+index db0f39f5ef96..6851a6d98fce 100644
+--- a/net/rxrpc/ar-key.c
++++ b/net/rxrpc/ar-key.c
+@@ -215,7 +215,7 @@ static int rxrpc_krb5_decode_principal(struct krb5_principal *princ,
+ 				       unsigned int *_toklen)
+ {
+ 	const __be32 *xdr = *_xdr;
+-	unsigned int toklen = *_toklen, n_parts, loop, tmp;
++	unsigned int toklen = *_toklen, n_parts, loop, tmp, paddedlen;
+ 
+ 	/* there must be at least one name, and at least #names+1 length
+ 	 * words */
+@@ -245,16 +245,16 @@ static int rxrpc_krb5_decode_principal(struct krb5_principal *princ,
+ 		toklen -= 4;
+ 		if (tmp <= 0 || tmp > AFSTOKEN_STRING_MAX)
+ 			return -EINVAL;
+-		if (tmp > toklen)
++		paddedlen = (tmp + 3) & ~3;
++		if (paddedlen > toklen)
+ 			return -EINVAL;
+ 		princ->name_parts[loop] = kmalloc(tmp + 1, GFP_KERNEL);
+ 		if (!princ->name_parts[loop])
+ 			return -ENOMEM;
+ 		memcpy(princ->name_parts[loop], xdr, tmp);
+ 		princ->name_parts[loop][tmp] = 0;
+-		tmp = (tmp + 3) & ~3;
+-		toklen -= tmp;
+-		xdr += tmp >> 2;
++		toklen -= paddedlen;
++		xdr += paddedlen >> 2;
+ 	}
+ 
+ 	if (toklen < 4)
+@@ -263,16 +263,16 @@ static int rxrpc_krb5_decode_principal(struct krb5_principal *princ,
+ 	toklen -= 4;
+ 	if (tmp <= 0 || tmp > AFSTOKEN_K5_REALM_MAX)
+ 		return -EINVAL;
+-	if (tmp > toklen)
++	paddedlen = (tmp + 3) & ~3;
++	if (paddedlen > toklen)
+ 		return -EINVAL;
+ 	princ->realm = kmalloc(tmp + 1, GFP_KERNEL);
+ 	if (!princ->realm)
+ 		return -ENOMEM;
+ 	memcpy(princ->realm, xdr, tmp);
+ 	princ->realm[tmp] = 0;
+-	tmp = (tmp + 3) & ~3;
+-	toklen -= tmp;
+-	xdr += tmp >> 2;
++	toklen -= paddedlen;
++	xdr += paddedlen >> 2;
+ 
+ 	_debug("%s/...@%s", princ->name_parts[0], princ->realm);
+ 
+@@ -291,7 +291,7 @@ static int rxrpc_krb5_decode_tagged_data(struct krb5_tagged_data *td,
+ 					 unsigned int *_toklen)
+ {
+ 	const __be32 *xdr = *_xdr;
+-	unsigned int toklen = *_toklen, len;
++	unsigned int toklen = *_toklen, len, paddedlen;
+ 
+ 	/* there must be at least one tag and one length word */
+ 	if (toklen <= 8)
+@@ -305,15 +305,17 @@ static int rxrpc_krb5_decode_tagged_data(struct krb5_tagged_data *td,
+ 	toklen -= 8;
+ 	if (len > max_data_size)
+ 		return -EINVAL;
++	paddedlen = (len + 3) & ~3;
++	if (paddedlen > toklen)
++		return -EINVAL;
+ 	td->data_len = len;
+ 
+ 	if (len > 0) {
+ 		td->data = kmemdup(xdr, len, GFP_KERNEL);
+ 		if (!td->data)
+ 			return -ENOMEM;
+-		len = (len + 3) & ~3;
+-		toklen -= len;
+-		xdr += len >> 2;
++		toklen -= paddedlen;
++		xdr += paddedlen >> 2;
+ 	}
+ 
+ 	_debug("tag %x len %x", td->tag, td->data_len);
+@@ -385,7 +387,7 @@ static int rxrpc_krb5_decode_ticket(u8 **_ticket, u16 *_tktlen,
+ 				    const __be32 **_xdr, unsigned int *_toklen)
+ {
+ 	const __be32 *xdr = *_xdr;
+-	unsigned int toklen = *_toklen, len;
++	unsigned int toklen = *_toklen, len, paddedlen;
+ 
+ 	/* there must be at least one length word */
+ 	if (toklen <= 4)
+@@ -397,6 +399,9 @@ static int rxrpc_krb5_decode_ticket(u8 **_ticket, u16 *_tktlen,
+ 	toklen -= 4;
+ 	if (len > AFSTOKEN_K5_TIX_MAX)
+ 		return -EINVAL;
++	paddedlen = (len + 3) & ~3;
++	if (paddedlen > toklen)
++		return -EINVAL;
+ 	*_tktlen = len;
+ 
+ 	_debug("ticket len %u", len);
+@@ -405,9 +410,8 @@ static int rxrpc_krb5_decode_ticket(u8 **_ticket, u16 *_tktlen,
+ 		*_ticket = kmemdup(xdr, len, GFP_KERNEL);
+ 		if (!*_ticket)
+ 			return -ENOMEM;
+-		len = (len + 3) & ~3;
+-		toklen -= len;
+-		xdr += len >> 2;
++		toklen -= paddedlen;
++		xdr += paddedlen >> 2;
+ 	}
+ 
+ 	*_xdr = xdr;
+@@ -550,7 +554,7 @@ static int rxrpc_preparse_xdr(struct key_preparsed_payload *prep)
+ {
+ 	const __be32 *xdr = prep->data, *token;
+ 	const char *cp;
+-	unsigned int len, tmp, loop, ntoken, toklen, sec_ix;
++	unsigned int len, paddedlen, loop, ntoken, toklen, sec_ix;
+ 	size_t datalen = prep->datalen;
+ 	int ret;
+ 
+@@ -576,22 +580,21 @@ static int rxrpc_preparse_xdr(struct key_preparsed_payload *prep)
+ 	if (len < 1 || len > AFSTOKEN_CELL_MAX)
+ 		goto not_xdr;
+ 	datalen -= 4;
+-	tmp = (len + 3) & ~3;
+-	if (tmp > datalen)
++	paddedlen = (len + 3) & ~3;
++	if (paddedlen > datalen)
+ 		goto not_xdr;
+ 
+ 	cp = (const char *) xdr;
+ 	for (loop = 0; loop < len; loop++)
+ 		if (!isprint(cp[loop]))
+ 			goto not_xdr;
+-	if (len < tmp)
+-		for (; loop < tmp; loop++)
+-			if (cp[loop])
+-				goto not_xdr;
++	for (; loop < paddedlen; loop++)
++		if (cp[loop])
++			goto not_xdr;
+ 	_debug("cellname: [%u/%u] '%*.*s'",
+-	       len, tmp, len, len, (const char *) xdr);
+-	datalen -= tmp;
+-	xdr += tmp >> 2;
++	       len, paddedlen, len, len, (const char *) xdr);
++	datalen -= paddedlen;
++	xdr += paddedlen >> 2;
+ 
+ 	/* get the token count */
+ 	if (datalen < 12)
+@@ -612,10 +615,11 @@ static int rxrpc_preparse_xdr(struct key_preparsed_payload *prep)
+ 		sec_ix = ntohl(*xdr);
+ 		datalen -= 4;
+ 		_debug("token: [%x/%zx] %x", toklen, datalen, sec_ix);
+-		if (toklen < 20 || toklen > datalen)
++		paddedlen = (toklen + 3) & ~3;
++		if (toklen < 20 || toklen > datalen || paddedlen > datalen)
+ 			goto not_xdr;
+-		datalen -= (toklen + 3) & ~3;
+-		xdr += (toklen + 3) >> 2;
++		datalen -= paddedlen;
++		xdr += paddedlen >> 2;
+ 
+ 	} while (--loop > 0);
+ 

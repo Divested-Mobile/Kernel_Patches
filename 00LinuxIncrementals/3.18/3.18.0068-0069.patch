@@ -1,0 +1,833 @@
+diff --git a/Makefile b/Makefile
+index 0d7f1e91e910..49237a0442cd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 68
++SUBLEVEL = 69
+ EXTRAVERSION =
+ NAME = Diseased Newt
+ 
+diff --git a/arch/arm64/kernel/fpsimd.c b/arch/arm64/kernel/fpsimd.c
+index 3dca15634e69..7b4e9ea0b1a4 100644
+--- a/arch/arm64/kernel/fpsimd.c
++++ b/arch/arm64/kernel/fpsimd.c
+@@ -156,8 +156,11 @@ void fpsimd_thread_switch(struct task_struct *next)
+ 
+ void fpsimd_flush_thread(void)
+ {
++	preempt_disable();
+ 	memset(&current->thread.fpsimd_state, 0, sizeof(struct fpsimd_state));
++	fpsimd_flush_task_state(current);
+ 	set_thread_flag(TIF_FOREIGN_FPSTATE);
++	preempt_enable();
+ }
+ 
+ /*
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 6094c64b3380..df0f5347029f 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -253,8 +253,11 @@ retry:
+ 	 * signal first. We do not need to release the mmap_sem because it
+ 	 * would already be released in __lock_page_or_retry in mm/filemap.c.
+ 	 */
+-	if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current))
++	if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current)) {
++		if (!user_mode(regs))
++			goto no_context;
+ 		return 0;
++	}
+ 
+ 	/*
+ 	 * Major/minor page fault accounting is only done on the initial
+diff --git a/arch/x86/boot/compressed/misc.c b/arch/x86/boot/compressed/misc.c
+index 0c33a7c67ea5..a950864a64da 100644
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@ -260,7 +260,7 @@ static void handle_relocations(void *output, unsigned long output_len)
+ 
+ 	/*
+ 	 * Process relocations: 32 bit relocations first then 64 bit after.
+-	 * Two sets of binary relocations are added to the end of the kernel
++	 * Three sets of binary relocations are added to the end of the kernel
+ 	 * before compression. Each relocation table entry is the kernel
+ 	 * address of the location which needs to be updated stored as a
+ 	 * 32-bit value which is sign extended to 64 bits.
+@@ -270,6 +270,8 @@ static void handle_relocations(void *output, unsigned long output_len)
+ 	 * kernel bits...
+ 	 * 0 - zero terminator for 64 bit relocations
+ 	 * 64 bit relocation repeated
++	 * 0 - zero terminator for inverse 32 bit relocations
++	 * 32 bit inverse relocation repeated
+ 	 * 0 - zero terminator for 32 bit relocations
+ 	 * 32 bit relocation repeated
+ 	 *
+@@ -286,6 +288,16 @@ static void handle_relocations(void *output, unsigned long output_len)
+ 		*(uint32_t *)ptr += delta;
+ 	}
+ #ifdef CONFIG_X86_64
++	while (*--reloc) {
++		long extended = *reloc;
++		extended += map;
++
++		ptr = (unsigned long)extended;
++		if (ptr < min_addr || ptr > max_addr)
++			error("inverse 32-bit relocation outside of kernel!\n");
++
++		*(int32_t *)ptr -= delta;
++	}
+ 	for (reloc--; *reloc; reloc--) {
+ 		long extended = *reloc;
+ 		extended += map;
+diff --git a/arch/x86/include/asm/io.h b/arch/x86/include/asm/io.h
+index b8237d8a1e0c..a882087d34f2 100644
+--- a/arch/x86/include/asm/io.h
++++ b/arch/x86/include/asm/io.h
+@@ -297,13 +297,13 @@ static inline unsigned type in##bwl##_p(int port)			\
+ static inline void outs##bwl(int port, const void *addr, unsigned long count) \
+ {									\
+ 	asm volatile("rep; outs" #bwl					\
+-		     : "+S"(addr), "+c"(count) : "d"(port));		\
++		     : "+S"(addr), "+c"(count) : "d"(port) : "memory");	\
+ }									\
+ 									\
+ static inline void ins##bwl(int port, void *addr, unsigned long count)	\
+ {									\
+ 	asm volatile("rep; ins" #bwl					\
+-		     : "+D"(addr), "+c"(count) : "d"(port));		\
++		     : "+D"(addr), "+c"(count) : "d"(port) : "memory");	\
+ }
+ 
+ BUILDIO(b, b, char)
+diff --git a/arch/x86/tools/relocs.c b/arch/x86/tools/relocs.c
+index a5efb21d5228..73eb7fd4aec4 100644
+--- a/arch/x86/tools/relocs.c
++++ b/arch/x86/tools/relocs.c
+@@ -20,7 +20,10 @@ struct relocs {
+ 
+ static struct relocs relocs16;
+ static struct relocs relocs32;
++#if ELF_BITS == 64
++static struct relocs relocs32neg;
+ static struct relocs relocs64;
++#endif
+ 
+ struct section {
+ 	Elf_Shdr       shdr;
+@@ -762,11 +765,16 @@ static int do_reloc64(struct section *sec, Elf_Rel *rel, ElfW(Sym) *sym,
+ 
+ 	switch (r_type) {
+ 	case R_X86_64_NONE:
++		/* NONE can be ignored. */
++		break;
++
+ 	case R_X86_64_PC32:
+ 		/*
+-		 * NONE can be ignored and PC relative relocations don't
+-		 * need to be adjusted.
++		 * PC relative relocations don't need to be adjusted unless
++		 * referencing a percpu symbol.
+ 		 */
++		if (is_percpu_sym(sym, symname))
++			add_reloc(&relocs32neg, offset);
+ 		break;
+ 
+ 	case R_X86_64_32:
+@@ -984,9 +992,13 @@ static void emit_relocs(int as_text, int use_real_mode)
+ 		die("Segment relocations found but --realmode not specified\n");
+ 
+ 	/* Order the relocations for more efficient processing */
+-	sort_relocs(&relocs16);
+ 	sort_relocs(&relocs32);
++#if ELF_BITS == 64
++	sort_relocs(&relocs32neg);
+ 	sort_relocs(&relocs64);
++#else
++	sort_relocs(&relocs16);
++#endif
+ 
+ 	/* Print the relocations */
+ 	if (as_text) {
+@@ -1007,14 +1019,21 @@ static void emit_relocs(int as_text, int use_real_mode)
+ 		for (i = 0; i < relocs32.count; i++)
+ 			write_reloc(relocs32.offset[i], stdout);
+ 	} else {
+-		if (ELF_BITS == 64) {
+-			/* Print a stop */
+-			write_reloc(0, stdout);
++#if ELF_BITS == 64
++		/* Print a stop */
++		write_reloc(0, stdout);
+ 
+-			/* Now print each relocation */
+-			for (i = 0; i < relocs64.count; i++)
+-				write_reloc(relocs64.offset[i], stdout);
+-		}
++		/* Now print each relocation */
++		for (i = 0; i < relocs64.count; i++)
++			write_reloc(relocs64.offset[i], stdout);
++
++		/* Print a stop */
++		write_reloc(0, stdout);
++
++		/* Now print each inverse 32-bit relocation */
++		for (i = 0; i < relocs32neg.count; i++)
++			write_reloc(relocs32neg.offset[i], stdout);
++#endif
+ 
+ 		/* Print a stop */
+ 		write_reloc(0, stdout);
+diff --git a/drivers/base/dma-contiguous.c b/drivers/base/dma-contiguous.c
+index 950fff9ce453..a12ff9863d7e 100644
+--- a/drivers/base/dma-contiguous.c
++++ b/drivers/base/dma-contiguous.c
+@@ -187,7 +187,7 @@ int __init dma_contiguous_reserve_area(phys_addr_t size, phys_addr_t base,
+  * global one. Requires architecture specific dev_get_cma_area() helper
+  * function.
+  */
+-struct page *dma_alloc_from_contiguous(struct device *dev, int count,
++struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
+ 				       unsigned int align)
+ {
+ 	if (align > CONFIG_CMA_ALIGNMENT)
+diff --git a/drivers/clk/clk-si5351.c b/drivers/clk/clk-si5351.c
+index 3b2a66f78755..44ea107cfc67 100644
+--- a/drivers/clk/clk-si5351.c
++++ b/drivers/clk/clk-si5351.c
+@@ -68,16 +68,16 @@ struct si5351_driver_data {
+ 	struct si5351_hw_data	*clkout;
+ };
+ 
+-static const char const *si5351_input_names[] = {
++static const char * const si5351_input_names[] = {
+ 	"xtal", "clkin"
+ };
+-static const char const *si5351_pll_names[] = {
++static const char * const si5351_pll_names[] = {
+ 	"plla", "pllb", "vxco"
+ };
+-static const char const *si5351_msynth_names[] = {
++static const char * const si5351_msynth_names[] = {
+ 	"ms0", "ms1", "ms2", "ms3", "ms4", "ms5", "ms6", "ms7"
+ };
+-static const char const *si5351_clkout_names[] = {
++static const char * const si5351_clkout_names[] = {
+ 	"clk0", "clk1", "clk2", "clk3", "clk4", "clk5", "clk6", "clk7"
+ };
+ 
+@@ -207,7 +207,7 @@ static bool si5351_regmap_is_writeable(struct device *dev, unsigned int reg)
+ 	return true;
+ }
+ 
+-static struct regmap_config si5351_regmap_config = {
++static const struct regmap_config si5351_regmap_config = {
+ 	.reg_bits = 8,
+ 	.val_bits = 8,
+ 	.cache_type = REGCACHE_RBTREE,
+diff --git a/drivers/net/wireless/p54/fwio.c b/drivers/net/wireless/p54/fwio.c
+index bc065e8e348b..811a8c25a237 100644
+--- a/drivers/net/wireless/p54/fwio.c
++++ b/drivers/net/wireless/p54/fwio.c
+@@ -486,7 +486,7 @@ int p54_scan(struct p54_common *priv, u16 mode, u16 dwell)
+ 
+ 			entry += sizeof(__le16);
+ 			chan->pa_points_per_curve = 8;
+-			memset(chan->curve_data, 0, sizeof(*chan->curve_data));
++			memset(chan->curve_data, 0, sizeof(chan->curve_data));
+ 			memcpy(chan->curve_data, entry,
+ 			       sizeof(struct p54_pa_curve_data_sample) *
+ 			       min((u8)8, curve_data->points_per_channel));
+diff --git a/drivers/scsi/isci/remote_node_context.c b/drivers/scsi/isci/remote_node_context.c
+index 1910100638a2..00602abec0ea 100644
+--- a/drivers/scsi/isci/remote_node_context.c
++++ b/drivers/scsi/isci/remote_node_context.c
+@@ -66,6 +66,9 @@ const char *rnc_state_name(enum scis_sds_remote_node_context_states state)
+ {
+ 	static const char * const strings[] = RNC_STATES;
+ 
++	if (state >= ARRAY_SIZE(strings))
++		return "UNKNOWN";
++
+ 	return strings[state];
+ }
+ #undef C
+diff --git a/drivers/scsi/sg.c b/drivers/scsi/sg.c
+index 71b30e18f2f0..e99945b790ba 100644
+--- a/drivers/scsi/sg.c
++++ b/drivers/scsi/sg.c
+@@ -153,6 +153,7 @@ typedef struct sg_fd {		/* holds the state of a file descriptor */
+ 	struct sg_device *parentdp;	/* owning device */
+ 	wait_queue_head_t read_wait;	/* queue read until command done */
+ 	rwlock_t rq_list_lock;	/* protect access to list in req_arr */
++	struct mutex f_mutex;	/* protect against changes in this fd */
+ 	int timeout;		/* defaults to SG_DEFAULT_TIMEOUT      */
+ 	int timeout_user;	/* defaults to SG_DEFAULT_TIMEOUT_USER */
+ 	Sg_scatter_hold reserve;	/* buffer held for this file descriptor */
+@@ -166,6 +167,7 @@ typedef struct sg_fd {		/* holds the state of a file descriptor */
+ 	unsigned char next_cmd_len; /* 0: automatic, >0: use on next write() */
+ 	char keep_orphan;	/* 0 -> drop orphan (def), 1 -> keep for read() */
+ 	char mmap_called;	/* 0 -> mmap() never called on this fd */
++	char res_in_use;	/* 1 -> 'reserve' array in use */
+ 	struct kref f_ref;
+ 	struct execute_work ew;
+ } Sg_fd;
+@@ -209,7 +211,6 @@ static void sg_remove_sfp(struct kref *);
+ static Sg_request *sg_get_rq_mark(Sg_fd * sfp, int pack_id);
+ static Sg_request *sg_add_request(Sg_fd * sfp);
+ static int sg_remove_request(Sg_fd * sfp, Sg_request * srp);
+-static int sg_res_in_use(Sg_fd * sfp);
+ static Sg_device *sg_get_dev(int dev);
+ static void sg_device_destroy(struct kref *kref);
+ 
+@@ -625,6 +626,7 @@ sg_write(struct file *filp, const char __user *buf, size_t count, loff_t * ppos)
+ 	}
+ 	buf += SZ_SG_HEADER;
+ 	__get_user(opcode, buf);
++	mutex_lock(&sfp->f_mutex);
+ 	if (sfp->next_cmd_len > 0) {
+ 		cmd_size = sfp->next_cmd_len;
+ 		sfp->next_cmd_len = 0;	/* reset so only this write() effected */
+@@ -633,6 +635,7 @@ sg_write(struct file *filp, const char __user *buf, size_t count, loff_t * ppos)
+ 		if ((opcode >= 0xc0) && old_hdr.twelve_byte)
+ 			cmd_size = 12;
+ 	}
++	mutex_unlock(&sfp->f_mutex);
+ 	SCSI_LOG_TIMEOUT(4, sg_printk(KERN_INFO, sdp,
+ 		"sg_write:   scsi opcode=0x%02x, cmd_size=%d\n", (int) opcode, cmd_size));
+ /* Determine buffer size.  */
+@@ -732,7 +735,7 @@ sg_new_write(Sg_fd *sfp, struct file *file, const char __user *buf,
+ 			sg_remove_request(sfp, srp);
+ 			return -EINVAL;	/* either MMAP_IO or DIRECT_IO (not both) */
+ 		}
+-		if (sg_res_in_use(sfp)) {
++		if (sfp->res_in_use) {
+ 			sg_remove_request(sfp, srp);
+ 			return -EBUSY;	/* reserve buffer already being used */
+ 		}
+@@ -917,7 +920,7 @@ sg_ioctl(struct file *filp, unsigned int cmd_in, unsigned long arg)
+ 			return result;
+ 		if (val) {
+ 			sfp->low_dma = 1;
+-			if ((0 == sfp->low_dma) && (0 == sg_res_in_use(sfp))) {
++			if ((0 == sfp->low_dma) && !sfp->res_in_use) {
+ 				val = (int) sfp->reserve.bufflen;
+ 				sg_remove_scat(sfp, &sfp->reserve);
+ 				sg_build_reserve(sfp, val);
+@@ -992,12 +995,18 @@ sg_ioctl(struct file *filp, unsigned int cmd_in, unsigned long arg)
+                         return -EINVAL;
+ 		val = min_t(int, val,
+ 			    max_sectors_bytes(sdp->device->request_queue));
++		mutex_lock(&sfp->f_mutex);
+ 		if (val != sfp->reserve.bufflen) {
+-			if (sg_res_in_use(sfp) || sfp->mmap_called)
++			if (sfp->mmap_called ||
++			    sfp->res_in_use) {
++				mutex_unlock(&sfp->f_mutex);
+ 				return -EBUSY;
++			}
++
+ 			sg_remove_scat(sfp, &sfp->reserve);
+ 			sg_build_reserve(sfp, val);
+ 		}
++		mutex_unlock(&sfp->f_mutex);
+ 		return 0;
+ 	case SG_GET_RESERVED_SIZE:
+ 		val = min_t(int, sfp->reserve.bufflen,
+@@ -1778,13 +1787,22 @@ sg_start_req(Sg_request *srp, unsigned char *cmd)
+ 		md = &map_data;
+ 
+ 	if (md) {
+-		if (!sg_res_in_use(sfp) && dxfer_len <= rsv_schp->bufflen)
++		mutex_lock(&sfp->f_mutex);
++		if (dxfer_len <= rsv_schp->bufflen &&
++		    !sfp->res_in_use) {
++			sfp->res_in_use = 1;
+ 			sg_link_reserve(sfp, srp, dxfer_len);
+-		else {
++		} else if ((hp->flags & SG_FLAG_MMAP_IO) && sfp->res_in_use) {
++			mutex_unlock(&sfp->f_mutex);
++			return -EBUSY;
++		} else {
+ 			res = sg_build_indirect(req_schp, sfp, dxfer_len);
+-			if (res)
++			if (res) {
++				mutex_unlock(&sfp->f_mutex);
+ 				return res;
++			}
+ 		}
++		mutex_unlock(&sfp->f_mutex);
+ 
+ 		md->pages = req_schp->pages;
+ 		md->page_order = req_schp->page_order;
+@@ -2080,6 +2098,8 @@ sg_unlink_reserve(Sg_fd * sfp, Sg_request * srp)
+ 	req_schp->sglist_len = 0;
+ 	sfp->save_scat_len = 0;
+ 	srp->res_used = 0;
++	/* Called without mutex lock to avoid deadlock */
++	sfp->res_in_use = 0;
+ }
+ 
+ static Sg_request *
+@@ -2191,6 +2211,7 @@ sg_add_sfp(Sg_device * sdp)
+ 	rwlock_init(&sfp->rq_list_lock);
+ 
+ 	kref_init(&sfp->f_ref);
++	mutex_init(&sfp->f_mutex);
+ 	sfp->timeout = SG_DEFAULT_TIMEOUT;
+ 	sfp->timeout_user = SG_DEFAULT_TIMEOUT_USER;
+ 	sfp->force_packid = SG_DEF_FORCE_PACK_ID;
+@@ -2266,20 +2287,6 @@ sg_remove_sfp(struct kref *kref)
+ 	schedule_work(&sfp->ew.work);
+ }
+ 
+-static int
+-sg_res_in_use(Sg_fd * sfp)
+-{
+-	const Sg_request *srp;
+-	unsigned long iflags;
+-
+-	read_lock_irqsave(&sfp->rq_list_lock, iflags);
+-	for (srp = sfp->headrp; srp; srp = srp->nextrp)
+-		if (srp->res_used)
+-			break;
+-	read_unlock_irqrestore(&sfp->rq_list_lock, iflags);
+-	return srp ? 1 : 0;
+-}
+-
+ #ifdef CONFIG_SCSI_PROC_FS
+ static int
+ sg_idr_max_id(int id, void *p, void *data)
+diff --git a/include/linux/bitmap.h b/include/linux/bitmap.h
+index e1c8d080c427..34e020c23644 100644
+--- a/include/linux/bitmap.h
++++ b/include/linux/bitmap.h
+@@ -45,6 +45,7 @@
+  * bitmap_set(dst, pos, nbits)			Set specified bit area
+  * bitmap_clear(dst, pos, nbits)		Clear specified bit area
+  * bitmap_find_next_zero_area(buf, len, pos, n, mask)	Find bit free area
++ * bitmap_find_next_zero_area_off(buf, len, pos, n, mask)	as above
+  * bitmap_shift_right(dst, src, n, nbits)	*dst = *src >> n
+  * bitmap_shift_left(dst, src, n, nbits)	*dst = *src << n
+  * bitmap_remap(dst, src, old, new, nbits)	*dst = map(old, new)(src)
+@@ -114,11 +115,36 @@ extern int __bitmap_weight(const unsigned long *bitmap, unsigned int nbits);
+ 
+ extern void bitmap_set(unsigned long *map, unsigned int start, int len);
+ extern void bitmap_clear(unsigned long *map, unsigned int start, int len);
+-extern unsigned long bitmap_find_next_zero_area(unsigned long *map,
+-					 unsigned long size,
+-					 unsigned long start,
+-					 unsigned int nr,
+-					 unsigned long align_mask);
++
++extern unsigned long bitmap_find_next_zero_area_off(unsigned long *map,
++						    unsigned long size,
++						    unsigned long start,
++						    unsigned int nr,
++						    unsigned long align_mask,
++						    unsigned long align_offset);
++
++/**
++ * bitmap_find_next_zero_area - find a contiguous aligned zero area
++ * @map: The address to base the search on
++ * @size: The bitmap size in bits
++ * @start: The bitnumber to start searching at
++ * @nr: The number of zeroed bits we're looking for
++ * @align_mask: Alignment mask for zero area
++ *
++ * The @align_mask should be one less than a power of 2; the effect is that
++ * the bit offset of all zero areas this function finds is multiples of that
++ * power of 2. A @align_mask of 0 means no alignment is required.
++ */
++static inline unsigned long
++bitmap_find_next_zero_area(unsigned long *map,
++			   unsigned long size,
++			   unsigned long start,
++			   unsigned int nr,
++			   unsigned long align_mask)
++{
++	return bitmap_find_next_zero_area_off(map, size, start, nr,
++					      align_mask, 0);
++}
+ 
+ extern int bitmap_scnprintf(char *buf, unsigned int len,
+ 			const unsigned long *src, int nbits);
+diff --git a/include/linux/cma.h b/include/linux/cma.h
+index a93438beb33c..29f9e774ab76 100644
+--- a/include/linux/cma.h
++++ b/include/linux/cma.h
+@@ -15,16 +15,17 @@
+ 
+ struct cma;
+ 
+-extern phys_addr_t cma_get_base(struct cma *cma);
+-extern unsigned long cma_get_size(struct cma *cma);
++extern unsigned long totalcma_pages;
++extern phys_addr_t cma_get_base(const struct cma *cma);
++extern unsigned long cma_get_size(const struct cma *cma);
+ 
+ extern int __init cma_declare_contiguous(phys_addr_t base,
+ 			phys_addr_t size, phys_addr_t limit,
+ 			phys_addr_t alignment, unsigned int order_per_bit,
+ 			bool fixed, struct cma **res_cma);
+-extern int cma_init_reserved_mem(phys_addr_t base,
+-					phys_addr_t size, int order_per_bit,
++extern int cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
++					unsigned int order_per_bit,
+ 					struct cma **res_cma);
+-extern struct page *cma_alloc(struct cma *cma, int count, unsigned int align);
+-extern bool cma_release(struct cma *cma, struct page *pages, int count);
++extern struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align);
++extern bool cma_release(struct cma *cma, const struct page *pages, unsigned int count);
+ #endif
+diff --git a/include/linux/dma-contiguous.h b/include/linux/dma-contiguous.h
+index 569bbd039896..fec734df1524 100644
+--- a/include/linux/dma-contiguous.h
++++ b/include/linux/dma-contiguous.h
+@@ -111,7 +111,7 @@ static inline int dma_declare_contiguous(struct device *dev, phys_addr_t size,
+ 	return ret;
+ }
+ 
+-struct page *dma_alloc_from_contiguous(struct device *dev, int count,
++struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
+ 				       unsigned int order);
+ bool dma_release_from_contiguous(struct device *dev, struct page *pages,
+ 				 int count);
+@@ -144,7 +144,7 @@ int dma_declare_contiguous(struct device *dev, phys_addr_t size,
+ }
+ 
+ static inline
+-struct page *dma_alloc_from_contiguous(struct device *dev, int count,
++struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
+ 				       unsigned int order)
+ {
+ 	return NULL;
+diff --git a/kernel/gcov/base.c b/kernel/gcov/base.c
+index b358a802fd18..47aeb0536409 100644
+--- a/kernel/gcov/base.c
++++ b/kernel/gcov/base.c
+@@ -91,6 +91,18 @@ void __gcov_merge_time_profile(gcov_type *counters, unsigned int n_counters)
+ }
+ EXPORT_SYMBOL(__gcov_merge_time_profile);
+ 
++void __gcov_merge_icall_topn(gcov_type *counters, unsigned int n_counters)
++{
++	/* Unused. */
++}
++EXPORT_SYMBOL(__gcov_merge_icall_topn);
++
++void __gcov_exit(void)
++{
++	/* Unused. */
++}
++EXPORT_SYMBOL(__gcov_exit);
++
+ /**
+  * gcov_enable_events - enable event reporting through gcov_event()
+  *
+diff --git a/kernel/gcov/gcc_4_7.c b/kernel/gcov/gcc_4_7.c
+index 826ba9fb5e32..46a18e72bce6 100644
+--- a/kernel/gcov/gcc_4_7.c
++++ b/kernel/gcov/gcc_4_7.c
+@@ -18,7 +18,11 @@
+ #include <linux/vmalloc.h>
+ #include "gcov.h"
+ 
+-#if __GNUC__ == 4 && __GNUC_MINOR__ >= 9
++#if (__GNUC__ >= 7)
++#define GCOV_COUNTERS			9
++#elif (__GNUC__ > 5) || (__GNUC__ == 5 && __GNUC_MINOR__ >= 1)
++#define GCOV_COUNTERS			10
++#elif __GNUC__ == 4 && __GNUC_MINOR__ >= 9
+ #define GCOV_COUNTERS			9
+ #else
+ #define GCOV_COUNTERS			8
+diff --git a/lib/bitmap.c b/lib/bitmap.c
+index 2ed91904e806..b7ffeaa965fe 100644
+--- a/lib/bitmap.c
++++ b/lib/bitmap.c
+@@ -326,30 +326,32 @@ void bitmap_clear(unsigned long *map, unsigned int start, int len)
+ }
+ EXPORT_SYMBOL(bitmap_clear);
+ 
+-/*
+- * bitmap_find_next_zero_area - find a contiguous aligned zero area
++/**
++ * bitmap_find_next_zero_area_off - find a contiguous aligned zero area
+  * @map: The address to base the search on
+  * @size: The bitmap size in bits
+  * @start: The bitnumber to start searching at
+  * @nr: The number of zeroed bits we're looking for
+  * @align_mask: Alignment mask for zero area
++ * @align_offset: Alignment offset for zero area.
+  *
+  * The @align_mask should be one less than a power of 2; the effect is that
+- * the bit offset of all zero areas this function finds is multiples of that
+- * power of 2. A @align_mask of 0 means no alignment is required.
++ * the bit offset of all zero areas this function finds plus @align_offset
++ * is multiple of that power of 2.
+  */
+-unsigned long bitmap_find_next_zero_area(unsigned long *map,
+-					 unsigned long size,
+-					 unsigned long start,
+-					 unsigned int nr,
+-					 unsigned long align_mask)
++unsigned long bitmap_find_next_zero_area_off(unsigned long *map,
++					     unsigned long size,
++					     unsigned long start,
++					     unsigned int nr,
++					     unsigned long align_mask,
++					     unsigned long align_offset)
+ {
+ 	unsigned long index, end, i;
+ again:
+ 	index = find_next_zero_bit(map, size, start);
+ 
+ 	/* Align allocation */
+-	index = __ALIGN_MASK(index, align_mask);
++	index = __ALIGN_MASK(index + align_offset, align_mask) - align_offset;
+ 
+ 	end = index + nr;
+ 	if (end > size)
+@@ -361,7 +363,7 @@ again:
+ 	}
+ 	return index;
+ }
+-EXPORT_SYMBOL(bitmap_find_next_zero_area);
++EXPORT_SYMBOL(bitmap_find_next_zero_area_off);
+ 
+ /*
+  * Bitmap printing & parsing functions: first version by Nadia Yvette Chambers,
+diff --git a/mm/cma.c b/mm/cma.c
+index 0f4549cf796f..26506cc277bd 100644
+--- a/mm/cma.c
++++ b/mm/cma.c
+@@ -33,6 +33,7 @@
+ #include <linux/log2.h>
+ #include <linux/cma.h>
+ #include <linux/highmem.h>
++#include <linux/io.h>
+ 
+ struct cma {
+ 	unsigned long	base_pfn;
+@@ -46,35 +47,51 @@ static struct cma cma_areas[MAX_CMA_AREAS];
+ static unsigned cma_area_count;
+ static DEFINE_MUTEX(cma_mutex);
+ 
+-phys_addr_t cma_get_base(struct cma *cma)
++phys_addr_t cma_get_base(const struct cma *cma)
+ {
+ 	return PFN_PHYS(cma->base_pfn);
+ }
+ 
+-unsigned long cma_get_size(struct cma *cma)
++unsigned long cma_get_size(const struct cma *cma)
+ {
+ 	return cma->count << PAGE_SHIFT;
+ }
+ 
+-static unsigned long cma_bitmap_aligned_mask(struct cma *cma, int align_order)
++static unsigned long cma_bitmap_aligned_mask(const struct cma *cma,
++					     int align_order)
+ {
+ 	if (align_order <= cma->order_per_bit)
+ 		return 0;
+ 	return (1UL << (align_order - cma->order_per_bit)) - 1;
+ }
+ 
++/*
++ * Find a PFN aligned to the specified order and return an offset represented in
++ * order_per_bits.
++ */
++static unsigned long cma_bitmap_aligned_offset(const struct cma *cma,
++					       int align_order)
++{
++	if (align_order <= cma->order_per_bit)
++		return 0;
++
++	return (ALIGN(cma->base_pfn, (1UL << align_order))
++		- cma->base_pfn) >> cma->order_per_bit;
++}
++
+ static unsigned long cma_bitmap_maxno(struct cma *cma)
+ {
+ 	return cma->count >> cma->order_per_bit;
+ }
+ 
+-static unsigned long cma_bitmap_pages_to_bits(struct cma *cma,
+-						unsigned long pages)
++static unsigned long cma_bitmap_pages_to_bits(const struct cma *cma,
++					      unsigned long pages)
+ {
+ 	return ALIGN(pages, 1UL << cma->order_per_bit) >> cma->order_per_bit;
+ }
+ 
+-static void cma_clear_bitmap(struct cma *cma, unsigned long pfn, int count)
++static void cma_clear_bitmap(struct cma *cma, unsigned long pfn,
++			     unsigned int count)
+ {
+ 	unsigned long bitmap_no, bitmap_count;
+ 
+@@ -153,7 +170,8 @@ core_initcall(cma_init_reserved_areas);
+  * This function creates custom contiguous area from already reserved memory.
+  */
+ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
+-				 int order_per_bit, struct cma **res_cma)
++				 unsigned int order_per_bit,
++				 struct cma **res_cma)
+ {
+ 	struct cma *cma;
+ 	phys_addr_t alignment;
+@@ -188,6 +206,7 @@ int __init cma_init_reserved_mem(phys_addr_t base, phys_addr_t size,
+ 	cma->order_per_bit = order_per_bit;
+ 	*res_cma = cma;
+ 	cma_area_count++;
++	totalcma_pages += (size / PAGE_SIZE);
+ 
+ 	return 0;
+ }
+@@ -314,6 +333,11 @@ int __init cma_declare_contiguous(phys_addr_t base,
+ 			}
+ 		}
+ 
++		/*
++		 * kmemleak scans/reads tracked objects for pointers to other
++		 * objects but this address isn't mapped and accessible
++		 */
++		kmemleak_ignore(phys_to_virt(addr));
+ 		base = addr;
+ 	}
+ 
+@@ -339,9 +363,9 @@ err:
+  * This function allocates part of contiguous memory on specific
+  * contiguous memory area.
+  */
+-struct page *cma_alloc(struct cma *cma, int count, unsigned int align)
++struct page *cma_alloc(struct cma *cma, size_t count, unsigned int align)
+ {
+-	unsigned long mask, pfn, start = 0;
++	unsigned long mask, offset, pfn, start = 0;
+ 	unsigned long bitmap_maxno, bitmap_no, bitmap_count;
+ 	struct page *page = NULL;
+ 	int ret;
+@@ -349,20 +373,22 @@ struct page *cma_alloc(struct cma *cma, int count, unsigned int align)
+ 	if (!cma || !cma->count)
+ 		return NULL;
+ 
+-	pr_debug("%s(cma %p, count %d, align %d)\n", __func__, (void *)cma,
++	pr_debug("%s(cma %p, count %zu, align %d)\n", __func__, (void *)cma,
+ 		 count, align);
+ 
+ 	if (!count)
+ 		return NULL;
+ 
+ 	mask = cma_bitmap_aligned_mask(cma, align);
++	offset = cma_bitmap_aligned_offset(cma, align);
+ 	bitmap_maxno = cma_bitmap_maxno(cma);
+ 	bitmap_count = cma_bitmap_pages_to_bits(cma, count);
+ 
+ 	for (;;) {
+ 		mutex_lock(&cma->lock);
+-		bitmap_no = bitmap_find_next_zero_area(cma->bitmap,
+-				bitmap_maxno, start, bitmap_count, mask);
++		bitmap_no = bitmap_find_next_zero_area_off(cma->bitmap,
++				bitmap_maxno, start, bitmap_count, mask,
++				offset);
+ 		if (bitmap_no >= bitmap_maxno) {
+ 			mutex_unlock(&cma->lock);
+ 			break;
+@@ -408,7 +434,7 @@ struct page *cma_alloc(struct cma *cma, int count, unsigned int align)
+  * It returns false when provided pages do not belong to contiguous area and
+  * true otherwise.
+  */
+-bool cma_release(struct cma *cma, struct page *pages, int count)
++bool cma_release(struct cma *cma, const struct page *pages, unsigned int count)
+ {
+ 	unsigned long pfn;
+ 
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 47ede9d8ddc2..fcd8a8ce5cc0 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -110,6 +110,7 @@ static DEFINE_SPINLOCK(managed_page_count_lock);
+ 
+ unsigned long totalram_pages __read_mostly;
+ unsigned long totalreserve_pages __read_mostly;
++unsigned long totalcma_pages __read_mostly;
+ /*
+  * When calculating the number of globally allowed dirty pages, there
+  * is a certain number of per-zone reserves that should not be
+@@ -5522,7 +5523,7 @@ void __init mem_init_print_info(const char *str)
+ 
+ 	printk("Memory: %luK/%luK available "
+ 	       "(%luK kernel code, %luK rwdata, %luK rodata, "
+-	       "%luK init, %luK bss, %luK reserved"
++	       "%luK init, %luK bss, %luK reserved, %luK cma-reserved"
+ #ifdef	CONFIG_HIGHMEM
+ 	       ", %luK highmem"
+ #endif
+@@ -5530,7 +5531,8 @@ void __init mem_init_print_info(const char *str)
+ 	       nr_free_pages() << (PAGE_SHIFT-10), physpages << (PAGE_SHIFT-10),
+ 	       codesize >> 10, datasize >> 10, rosize >> 10,
+ 	       (init_data_size + init_code_size) >> 10, bss_size >> 10,
+-	       (physpages - totalram_pages) << (PAGE_SHIFT-10),
++	       (physpages - totalram_pages - totalcma_pages) << (PAGE_SHIFT-10),
++	       totalcma_pages << (PAGE_SHIFT-10),
+ #ifdef	CONFIG_HIGHMEM
+ 	       totalhigh_pages << (PAGE_SHIFT-10),
+ #endif
+diff --git a/sound/pci/au88x0/au88x0_core.c b/sound/pci/au88x0/au88x0_core.c
+index 8eae95acc09c..72002382a0db 100644
+--- a/sound/pci/au88x0/au88x0_core.c
++++ b/sound/pci/au88x0/au88x0_core.c
+@@ -2146,8 +2146,7 @@ vortex_adb_allocroute(vortex_t *vortex, int dma, int nr_ch, int dir,
+ 							   stream->resources, en,
+ 							   VORTEX_RESOURCE_SRC)) < 0) {
+ 					memset(stream->resources, 0,
+-					       sizeof(unsigned char) *
+-					       VORTEX_RESOURCE_LAST);
++					       sizeof(stream->resources));
+ 					return -EBUSY;
+ 				}
+ 				if (stream->type != VORTEX_PCM_A3D) {
+@@ -2157,7 +2156,7 @@ vortex_adb_allocroute(vortex_t *vortex, int dma, int nr_ch, int dir,
+ 								   VORTEX_RESOURCE_MIXIN)) < 0) {
+ 						memset(stream->resources,
+ 						       0,
+-						       sizeof(unsigned char) * VORTEX_RESOURCE_LAST);
++						       sizeof(stream->resources));
+ 						return -EBUSY;
+ 					}
+ 				}
+@@ -2170,8 +2169,7 @@ vortex_adb_allocroute(vortex_t *vortex, int dma, int nr_ch, int dir,
+ 						   stream->resources, en,
+ 						   VORTEX_RESOURCE_A3D)) < 0) {
+ 				memset(stream->resources, 0,
+-				       sizeof(unsigned char) *
+-				       VORTEX_RESOURCE_LAST);
++				       sizeof(stream->resources));
+ 				pr_err( "vortex: out of A3D sources. Sorry\n");
+ 				return -EBUSY;
+ 			}
+@@ -2283,8 +2281,7 @@ vortex_adb_allocroute(vortex_t *vortex, int dma, int nr_ch, int dir,
+ 						   VORTEX_RESOURCE_MIXOUT))
+ 			    < 0) {
+ 				memset(stream->resources, 0,
+-				       sizeof(unsigned char) *
+-				       VORTEX_RESOURCE_LAST);
++				       sizeof(stream->resources));
+ 				return -EBUSY;
+ 			}
+ 			if ((src[i] =
+@@ -2292,8 +2289,7 @@ vortex_adb_allocroute(vortex_t *vortex, int dma, int nr_ch, int dir,
+ 						   stream->resources, en,
+ 						   VORTEX_RESOURCE_SRC)) < 0) {
+ 				memset(stream->resources, 0,
+-				       sizeof(unsigned char) *
+-				       VORTEX_RESOURCE_LAST);
++				       sizeof(stream->resources));
+ 				return -EBUSY;
+ 			}
+ 		}

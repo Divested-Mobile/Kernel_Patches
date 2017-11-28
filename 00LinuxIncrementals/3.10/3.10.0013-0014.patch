@@ -1,0 +1,2751 @@
+diff --git a/Makefile b/Makefile
+index 25d38b7..129c49f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 10
+-SUBLEVEL = 13
++SUBLEVEL = 14
+ EXTRAVERSION =
+ NAME = TOSSUG Baby Fish
+ 
+diff --git a/block/cfq-iosched.c b/block/cfq-iosched.c
+index d5bbdcf..c410752 100644
+--- a/block/cfq-iosched.c
++++ b/block/cfq-iosched.c
+@@ -1803,7 +1803,7 @@ static u64 cfqg_prfill_avg_queue_size(struct seq_file *sf,
+ 
+ 	if (samples) {
+ 		v = blkg_stat_read(&cfqg->stats.avg_queue_size_sum);
+-		do_div(v, samples);
++		v = div64_u64(v, samples);
+ 	}
+ 	__blkg_prfill_u64(sf, pd, v);
+ 	return 0;
+diff --git a/drivers/gpu/drm/ast/ast_drv.h b/drivers/gpu/drm/ast/ast_drv.h
+index 02e52d5..b6b7d70 100644
+--- a/drivers/gpu/drm/ast/ast_drv.h
++++ b/drivers/gpu/drm/ast/ast_drv.h
+@@ -177,7 +177,7 @@ uint8_t ast_get_index_reg_mask(struct ast_private *ast,
+ 
+ static inline void ast_open_key(struct ast_private *ast)
+ {
+-	ast_set_index_reg_mask(ast, AST_IO_CRTC_PORT, 0xA1, 0xFF, 0x04);
++	ast_set_index_reg(ast, AST_IO_CRTC_PORT, 0x80, 0xA8);
+ }
+ 
+ #define AST_VIDMEM_SIZE_8M    0x00800000
+diff --git a/drivers/gpu/drm/drm_crtc.c b/drivers/gpu/drm/drm_crtc.c
+index e7e9242..8759d69 100644
+--- a/drivers/gpu/drm/drm_crtc.c
++++ b/drivers/gpu/drm/drm_crtc.c
+@@ -2501,10 +2501,22 @@ int drm_mode_getfb(struct drm_device *dev,
+ 	r->depth = fb->depth;
+ 	r->bpp = fb->bits_per_pixel;
+ 	r->pitch = fb->pitches[0];
+-	if (fb->funcs->create_handle)
+-		ret = fb->funcs->create_handle(fb, file_priv, &r->handle);
+-	else
++	if (fb->funcs->create_handle) {
++		if (file_priv->is_master || capable(CAP_SYS_ADMIN)) {
++			ret = fb->funcs->create_handle(fb, file_priv,
++						       &r->handle);
++		} else {
++			/* GET_FB() is an unprivileged ioctl so we must not
++			 * return a buffer-handle to non-master processes! For
++			 * backwards-compatibility reasons, we cannot make
++			 * GET_FB() privileged, so just return an invalid handle
++			 * for non-masters. */
++			r->handle = 0;
++			ret = 0;
++		}
++	} else {
+ 		ret = -ENODEV;
++	}
+ 
+ 	drm_framebuffer_unreference(fb);
+ 
+diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
+index e5e32869..c8d16a6 100644
+--- a/drivers/gpu/drm/i915/i915_irq.c
++++ b/drivers/gpu/drm/i915/i915_irq.c
+@@ -1009,6 +1009,34 @@ done:
+ 	return ret;
+ }
+ 
++static void i915_error_wake_up(struct drm_i915_private *dev_priv,
++			       bool reset_completed)
++{
++	struct intel_ring_buffer *ring;
++	int i;
++
++	/*
++	 * Notify all waiters for GPU completion events that reset state has
++	 * been changed, and that they need to restart their wait after
++	 * checking for potential errors (and bail out to drop locks if there is
++	 * a gpu reset pending so that i915_error_work_func can acquire them).
++	 */
++
++	/* Wake up __wait_seqno, potentially holding dev->struct_mutex. */
++	for_each_ring(ring, dev_priv, i)
++		wake_up_all(&ring->irq_queue);
++
++	/* Wake up intel_crtc_wait_for_pending_flips, holding crtc->mutex. */
++	wake_up_all(&dev_priv->pending_flip_queue);
++
++	/*
++	 * Signal tasks blocked in i915_gem_wait_for_error that the pending
++	 * reset state is cleared.
++	 */
++	if (reset_completed)
++		wake_up_all(&dev_priv->gpu_error.reset_queue);
++}
++
+ /**
+  * i915_error_work_func - do process context error handling work
+  * @work: work struct
+@@ -1023,11 +1051,10 @@ static void i915_error_work_func(struct work_struct *work)
+ 	drm_i915_private_t *dev_priv = container_of(error, drm_i915_private_t,
+ 						    gpu_error);
+ 	struct drm_device *dev = dev_priv->dev;
+-	struct intel_ring_buffer *ring;
+ 	char *error_event[] = { "ERROR=1", NULL };
+ 	char *reset_event[] = { "RESET=1", NULL };
+ 	char *reset_done_event[] = { "ERROR=0", NULL };
+-	int i, ret;
++	int ret;
+ 
+ 	kobject_uevent_env(&dev->primary->kdev.kobj, KOBJ_CHANGE, error_event);
+ 
+@@ -1046,8 +1073,16 @@ static void i915_error_work_func(struct work_struct *work)
+ 		kobject_uevent_env(&dev->primary->kdev.kobj, KOBJ_CHANGE,
+ 				   reset_event);
+ 
++		/*
++		 * All state reset _must_ be completed before we update the
++		 * reset counter, for otherwise waiters might miss the reset
++		 * pending state and not properly drop locks, resulting in
++		 * deadlocks with the reset work.
++		 */
+ 		ret = i915_reset(dev);
+ 
++		intel_display_handle_reset(dev);
++
+ 		if (ret == 0) {
+ 			/*
+ 			 * After all the gem state is reset, increment the reset
+@@ -1068,12 +1103,11 @@ static void i915_error_work_func(struct work_struct *work)
+ 			atomic_set(&error->reset_counter, I915_WEDGED);
+ 		}
+ 
+-		for_each_ring(ring, dev_priv, i)
+-			wake_up_all(&ring->irq_queue);
+-
+-		intel_display_handle_reset(dev);
+-
+-		wake_up_all(&dev_priv->gpu_error.reset_queue);
++		/*
++		 * Note: The wake_up also serves as a memory barrier so that
++		 * waiters see the update value of the reset counter atomic_t.
++		 */
++		i915_error_wake_up(dev_priv, true);
+ 	}
+ }
+ 
+@@ -1709,8 +1743,6 @@ static void i915_report_and_clear_eir(struct drm_device *dev)
+ void i915_handle_error(struct drm_device *dev, bool wedged)
+ {
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+-	struct intel_ring_buffer *ring;
+-	int i;
+ 
+ 	i915_capture_error_state(dev);
+ 	i915_report_and_clear_eir(dev);
+@@ -1720,14 +1752,28 @@ void i915_handle_error(struct drm_device *dev, bool wedged)
+ 				&dev_priv->gpu_error.reset_counter);
+ 
+ 		/*
+-		 * Wakeup waiting processes so that the reset work item
+-		 * doesn't deadlock trying to grab various locks.
++		 * Wakeup waiting processes so that the reset work function
++		 * i915_error_work_func doesn't deadlock trying to grab various
++		 * locks. By bumping the reset counter first, the woken
++		 * processes will see a reset in progress and back off,
++		 * releasing their locks and then wait for the reset completion.
++		 * We must do this for _all_ gpu waiters that might hold locks
++		 * that the reset work needs to acquire.
++		 *
++		 * Note: The wake_up serves as the required memory barrier to
++		 * ensure that the waiters see the updated value of the reset
++		 * counter atomic_t.
+ 		 */
+-		for_each_ring(ring, dev_priv, i)
+-			wake_up_all(&ring->irq_queue);
++		i915_error_wake_up(dev_priv, false);
+ 	}
+ 
+-	queue_work(dev_priv->wq, &dev_priv->gpu_error.work);
++	/*
++	 * Our reset work can grab modeset locks (since it needs to reset the
++	 * state of outstanding pagelips). Hence it must not be run on our own
++	 * dev-priv->wq work queue for otherwise the flush_work in the pageflip
++	 * code will deadlock.
++	 */
++	schedule_work(&dev_priv->gpu_error.work);
+ }
+ 
+ static void __always_unused i915_pageflip_stall_check(struct drm_device *dev, int pipe)
+diff --git a/drivers/gpu/drm/nouveau/core/engine/disp/dacnv50.c b/drivers/gpu/drm/nouveau/core/engine/disp/dacnv50.c
+index f02fd9f..a66b27c 100644
+--- a/drivers/gpu/drm/nouveau/core/engine/disp/dacnv50.c
++++ b/drivers/gpu/drm/nouveau/core/engine/disp/dacnv50.c
+@@ -49,18 +49,23 @@ int
+ nv50_dac_sense(struct nv50_disp_priv *priv, int or, u32 loadval)
+ {
+ 	const u32 doff = (or * 0x800);
+-	int load = -EINVAL;
++
+ 	nv_mask(priv, 0x61a004 + doff, 0x807f0000, 0x80150000);
+ 	nv_wait(priv, 0x61a004 + doff, 0x80000000, 0x00000000);
++
+ 	nv_wr32(priv, 0x61a00c + doff, 0x00100000 | loadval);
+ 	mdelay(9);
+ 	udelay(500);
+-	nv_wr32(priv, 0x61a00c + doff, 0x80000000);
+-	load = (nv_rd32(priv, 0x61a00c + doff) & 0x38000000) >> 27;
+-	nv_wr32(priv, 0x61a00c + doff, 0x00000000);
++	loadval = nv_mask(priv, 0x61a00c + doff, 0xffffffff, 0x00000000);
++
+ 	nv_mask(priv, 0x61a004 + doff, 0x807f0000, 0x80550000);
+ 	nv_wait(priv, 0x61a004 + doff, 0x80000000, 0x00000000);
+-	return load;
++
++	nv_debug(priv, "DAC%d sense: 0x%08x\n", or, loadval);
++	if (!(loadval & 0x80000000))
++		return -ETIMEDOUT;
++
++	return (loadval & 0x38000000) >> 27;
+ }
+ 
+ int
+diff --git a/drivers/gpu/drm/radeon/atombios_dp.c b/drivers/gpu/drm/radeon/atombios_dp.c
+index 32501f6..1602398 100644
+--- a/drivers/gpu/drm/radeon/atombios_dp.c
++++ b/drivers/gpu/drm/radeon/atombios_dp.c
+@@ -50,7 +50,7 @@ static char *pre_emph_names[] = {
+  * or from atom. Note that atom operates on
+  * dw units.
+  */
+-static void radeon_copy_swap(u8 *dst, u8 *src, u8 num_bytes, bool to_le)
++void radeon_atom_copy_swap(u8 *dst, u8 *src, u8 num_bytes, bool to_le)
+ {
+ #ifdef __BIG_ENDIAN
+ 	u8 src_tmp[20], dst_tmp[20]; /* used for byteswapping */
+@@ -100,7 +100,7 @@ static int radeon_process_aux_ch(struct radeon_i2c_chan *chan,
+ 
+ 	base = (unsigned char *)(rdev->mode_info.atom_context->scratch + 1);
+ 
+-	radeon_copy_swap(base, send, send_bytes, true);
++	radeon_atom_copy_swap(base, send, send_bytes, true);
+ 
+ 	args.v1.lpAuxRequest = cpu_to_le16((u16)(0 + 4));
+ 	args.v1.lpDataOut = cpu_to_le16((u16)(16 + 4));
+@@ -137,7 +137,7 @@ static int radeon_process_aux_ch(struct radeon_i2c_chan *chan,
+ 		recv_bytes = recv_size;
+ 
+ 	if (recv && recv_size)
+-		radeon_copy_swap(recv, base + 16, recv_bytes, false);
++		radeon_atom_copy_swap(recv, base + 16, recv_bytes, false);
+ 
+ 	return recv_bytes;
+ }
+diff --git a/drivers/gpu/drm/radeon/atombios_encoders.c b/drivers/gpu/drm/radeon/atombios_encoders.c
+index 4120d35..c272d88 100644
+--- a/drivers/gpu/drm/radeon/atombios_encoders.c
++++ b/drivers/gpu/drm/radeon/atombios_encoders.c
+@@ -1636,8 +1636,12 @@ radeon_atom_encoder_dpms_dig(struct drm_encoder *encoder, int mode)
+ 			atombios_dig_encoder_setup(encoder, ATOM_ENABLE, 0);
+ 			atombios_dig_transmitter_setup(encoder, ATOM_TRANSMITTER_ACTION_SETUP, 0, 0);
+ 			atombios_dig_transmitter_setup(encoder, ATOM_TRANSMITTER_ACTION_ENABLE, 0, 0);
+-			/* some early dce3.2 boards have a bug in their transmitter control table */
+-			if ((rdev->family != CHIP_RV710) && (rdev->family != CHIP_RV730))
++			/* some dce3.x boards have a bug in their transmitter control table.
++			 * ACTION_ENABLE_OUTPUT can probably be dropped since ACTION_ENABLE
++			 * does the same thing and more.
++			 */
++			if ((rdev->family != CHIP_RV710) && (rdev->family != CHIP_RV730) &&
++			    (rdev->family != CHIP_RS880))
+ 				atombios_dig_transmitter_setup(encoder, ATOM_TRANSMITTER_ACTION_ENABLE_OUTPUT, 0, 0);
+ 		}
+ 		if (ENCODER_MODE_IS_DP(atombios_get_encoder_mode(encoder)) && connector) {
+diff --git a/drivers/gpu/drm/radeon/atombios_i2c.c b/drivers/gpu/drm/radeon/atombios_i2c.c
+index 082338d..2ca389d 100644
+--- a/drivers/gpu/drm/radeon/atombios_i2c.c
++++ b/drivers/gpu/drm/radeon/atombios_i2c.c
+@@ -27,6 +27,8 @@
+ #include "radeon.h"
+ #include "atom.h"
+ 
++extern void radeon_atom_copy_swap(u8 *dst, u8 *src, u8 num_bytes, bool to_le);
++
+ #define TARGET_HW_I2C_CLOCK 50
+ 
+ /* these are a limitation of ProcessI2cChannelTransaction not the hw */
+@@ -77,7 +79,7 @@ static int radeon_process_i2c_ch(struct radeon_i2c_chan *chan,
+ 	}
+ 
+ 	if (!(flags & HW_I2C_WRITE))
+-		memcpy(buf, base, num);
++		radeon_atom_copy_swap(buf, base, num, false);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/gpu/drm/radeon/evergreen.c b/drivers/gpu/drm/radeon/evergreen.c
+index 687b421..2068df1 100644
+--- a/drivers/gpu/drm/radeon/evergreen.c
++++ b/drivers/gpu/drm/radeon/evergreen.c
+@@ -1718,7 +1718,8 @@ static u32 evergreen_line_buffer_adjust(struct radeon_device *rdev,
+ 					struct drm_display_mode *mode,
+ 					struct drm_display_mode *other_mode)
+ {
+-	u32 tmp;
++	u32 tmp, buffer_alloc, i;
++	u32 pipe_offset = radeon_crtc->crtc_id * 0x20;
+ 	/*
+ 	 * Line Buffer Setup
+ 	 * There are 3 line buffers, each one shared by 2 display controllers.
+@@ -1741,18 +1742,34 @@ static u32 evergreen_line_buffer_adjust(struct radeon_device *rdev,
+ 	 * non-linked crtcs for maximum line buffer allocation.
+ 	 */
+ 	if (radeon_crtc->base.enabled && mode) {
+-		if (other_mode)
++		if (other_mode) {
+ 			tmp = 0; /* 1/2 */
+-		else
++			buffer_alloc = 1;
++		} else {
+ 			tmp = 2; /* whole */
+-	} else
++			buffer_alloc = 2;
++		}
++	} else {
+ 		tmp = 0;
++		buffer_alloc = 0;
++	}
+ 
+ 	/* second controller of the pair uses second half of the lb */
+ 	if (radeon_crtc->crtc_id % 2)
+ 		tmp += 4;
+ 	WREG32(DC_LB_MEMORY_SPLIT + radeon_crtc->crtc_offset, tmp);
+ 
++	if (ASIC_IS_DCE41(rdev) || ASIC_IS_DCE5(rdev)) {
++		WREG32(PIPE0_DMIF_BUFFER_CONTROL + pipe_offset,
++		       DMIF_BUFFERS_ALLOCATED(buffer_alloc));
++		for (i = 0; i < rdev->usec_timeout; i++) {
++			if (RREG32(PIPE0_DMIF_BUFFER_CONTROL + pipe_offset) &
++			    DMIF_BUFFERS_ALLOCATED_COMPLETED)
++				break;
++			udelay(1);
++		}
++	}
++
+ 	if (radeon_crtc->base.enabled && mode) {
+ 		switch (tmp) {
+ 		case 0:
+diff --git a/drivers/gpu/drm/radeon/evergreend.h b/drivers/gpu/drm/radeon/evergreend.h
+index 75c0563..9490972 100644
+--- a/drivers/gpu/drm/radeon/evergreend.h
++++ b/drivers/gpu/drm/radeon/evergreend.h
+@@ -810,6 +810,10 @@
+ #       define LATENCY_LOW_WATERMARK(x)                   ((x) << 0)
+ #       define LATENCY_HIGH_WATERMARK(x)                  ((x) << 16)
+ 
++#define	PIPE0_DMIF_BUFFER_CONTROL			  0x0ca0
++#       define DMIF_BUFFERS_ALLOCATED(x)                  ((x) << 0)
++#       define DMIF_BUFFERS_ALLOCATED_COMPLETED           (1 << 4)
++
+ #define IH_RB_CNTL                                        0x3e00
+ #       define IH_RB_ENABLE                               (1 << 0)
+ #       define IH_IB_SIZE(x)                              ((x) << 1) /* log2 */
+diff --git a/drivers/gpu/drm/radeon/radeon_atombios.c b/drivers/gpu/drm/radeon/radeon_atombios.c
+index dea6f63c..239a407 100644
+--- a/drivers/gpu/drm/radeon/radeon_atombios.c
++++ b/drivers/gpu/drm/radeon/radeon_atombios.c
+@@ -715,13 +715,16 @@ bool radeon_get_atom_connector_info_from_object_table(struct drm_device *dev)
+ 								(ATOM_SRC_DST_TABLE_FOR_ONE_OBJECT *)
+ 								(ctx->bios + data_offset +
+ 								 le16_to_cpu(router_obj->asObjects[k].usSrcDstTableOffset));
++							u8 *num_dst_objs = (u8 *)
++								((u8 *)router_src_dst_table + 1 +
++								 (router_src_dst_table->ucNumberOfSrc * 2));
++							u16 *dst_objs = (u16 *)(num_dst_objs + 1);
+ 							int enum_id;
+ 
+ 							router.router_id = router_obj_id;
+-							for (enum_id = 0; enum_id < router_src_dst_table->ucNumberOfDst;
+-							     enum_id++) {
++							for (enum_id = 0; enum_id < (*num_dst_objs); enum_id++) {
+ 								if (le16_to_cpu(path->usConnObjectId) ==
+-								    le16_to_cpu(router_src_dst_table->usDstObjectID[enum_id]))
++								    le16_to_cpu(dst_objs[enum_id]))
+ 									break;
+ 							}
+ 
+@@ -1651,7 +1654,9 @@ struct radeon_encoder_atom_dig *radeon_atombios_get_lvds_info(struct
+ 								kfree(edid);
+ 						}
+ 					}
+-					record += sizeof(ATOM_FAKE_EDID_PATCH_RECORD);
++					record += fake_edid_record->ucFakeEDIDLength ?
++						fake_edid_record->ucFakeEDIDLength + 2 :
++						sizeof(ATOM_FAKE_EDID_PATCH_RECORD);
+ 					break;
+ 				case LCD_PANEL_RESOLUTION_RECORD_TYPE:
+ 					panel_res_record = (ATOM_PANEL_RESOLUTION_PATCH_RECORD *)record;
+diff --git a/drivers/gpu/drm/radeon/radeon_connectors.c b/drivers/gpu/drm/radeon/radeon_connectors.c
+index 2399f25..5a87c9f 100644
+--- a/drivers/gpu/drm/radeon/radeon_connectors.c
++++ b/drivers/gpu/drm/radeon/radeon_connectors.c
+@@ -1489,6 +1489,24 @@ static const struct drm_connector_funcs radeon_dp_connector_funcs = {
+ 	.force = radeon_dvi_force,
+ };
+ 
++static const struct drm_connector_funcs radeon_edp_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
++	.detect = radeon_dp_detect,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.set_property = radeon_lvds_set_property,
++	.destroy = radeon_dp_connector_destroy,
++	.force = radeon_dvi_force,
++};
++
++static const struct drm_connector_funcs radeon_lvds_bridge_connector_funcs = {
++	.dpms = drm_helper_connector_dpms,
++	.detect = radeon_dp_detect,
++	.fill_modes = drm_helper_probe_single_connector_modes,
++	.set_property = radeon_lvds_set_property,
++	.destroy = radeon_dp_connector_destroy,
++	.force = radeon_dvi_force,
++};
++
+ void
+ radeon_add_atom_connector(struct drm_device *dev,
+ 			  uint32_t connector_id,
+@@ -1580,8 +1598,6 @@ radeon_add_atom_connector(struct drm_device *dev,
+ 			goto failed;
+ 		radeon_dig_connector->igp_lane_info = igp_lane_info;
+ 		radeon_connector->con_priv = radeon_dig_connector;
+-		drm_connector_init(dev, &radeon_connector->base, &radeon_dp_connector_funcs, connector_type);
+-		drm_connector_helper_add(&radeon_connector->base, &radeon_dp_connector_helper_funcs);
+ 		if (i2c_bus->valid) {
+ 			/* add DP i2c bus */
+ 			if (connector_type == DRM_MODE_CONNECTOR_eDP)
+@@ -1598,6 +1614,10 @@ radeon_add_atom_connector(struct drm_device *dev,
+ 		case DRM_MODE_CONNECTOR_VGA:
+ 		case DRM_MODE_CONNECTOR_DVIA:
+ 		default:
++			drm_connector_init(dev, &radeon_connector->base,
++					   &radeon_dp_connector_funcs, connector_type);
++			drm_connector_helper_add(&radeon_connector->base,
++						 &radeon_dp_connector_helper_funcs);
+ 			connector->interlace_allowed = true;
+ 			connector->doublescan_allowed = true;
+ 			radeon_connector->dac_load_detect = true;
+@@ -1610,6 +1630,10 @@ radeon_add_atom_connector(struct drm_device *dev,
+ 		case DRM_MODE_CONNECTOR_HDMIA:
+ 		case DRM_MODE_CONNECTOR_HDMIB:
+ 		case DRM_MODE_CONNECTOR_DisplayPort:
++			drm_connector_init(dev, &radeon_connector->base,
++					   &radeon_dp_connector_funcs, connector_type);
++			drm_connector_helper_add(&radeon_connector->base,
++						 &radeon_dp_connector_helper_funcs);
+ 			drm_object_attach_property(&radeon_connector->base.base,
+ 						      rdev->mode_info.underscan_property,
+ 						      UNDERSCAN_OFF);
+@@ -1634,6 +1658,10 @@ radeon_add_atom_connector(struct drm_device *dev,
+ 			break;
+ 		case DRM_MODE_CONNECTOR_LVDS:
+ 		case DRM_MODE_CONNECTOR_eDP:
++			drm_connector_init(dev, &radeon_connector->base,
++					   &radeon_lvds_bridge_connector_funcs, connector_type);
++			drm_connector_helper_add(&radeon_connector->base,
++						 &radeon_dp_connector_helper_funcs);
+ 			drm_object_attach_property(&radeon_connector->base.base,
+ 						      dev->mode_config.scaling_mode_property,
+ 						      DRM_MODE_SCALE_FULLSCREEN);
+@@ -1797,7 +1825,7 @@ radeon_add_atom_connector(struct drm_device *dev,
+ 				goto failed;
+ 			radeon_dig_connector->igp_lane_info = igp_lane_info;
+ 			radeon_connector->con_priv = radeon_dig_connector;
+-			drm_connector_init(dev, &radeon_connector->base, &radeon_dp_connector_funcs, connector_type);
++			drm_connector_init(dev, &radeon_connector->base, &radeon_edp_connector_funcs, connector_type);
+ 			drm_connector_helper_add(&radeon_connector->base, &radeon_dp_connector_helper_funcs);
+ 			if (i2c_bus->valid) {
+ 				/* add DP i2c bus */
+diff --git a/drivers/gpu/drm/radeon/radeon_cs.c b/drivers/gpu/drm/radeon/radeon_cs.c
+index 7e265a5..6337f67 100644
+--- a/drivers/gpu/drm/radeon/radeon_cs.c
++++ b/drivers/gpu/drm/radeon/radeon_cs.c
+@@ -80,9 +80,11 @@ static int radeon_cs_parser_relocs(struct radeon_cs_parser *p)
+ 		p->relocs[i].lobj.bo = p->relocs[i].robj;
+ 		p->relocs[i].lobj.written = !!r->write_domain;
+ 
+-		/* the first reloc of an UVD job is the
+-		   msg and that must be in VRAM */
+-		if (p->ring == R600_RING_TYPE_UVD_INDEX && i == 0) {
++		/* the first reloc of an UVD job is the msg and that must be in
++		   VRAM, also but everything into VRAM on AGP cards to avoid
++		   image corruptions */
++		if (p->ring == R600_RING_TYPE_UVD_INDEX &&
++		    (i == 0 || p->rdev->flags & RADEON_IS_AGP)) {
+ 			/* TODO: is this still needed for NI+ ? */
+ 			p->relocs[i].lobj.domain =
+ 				RADEON_GEM_DOMAIN_VRAM;
+diff --git a/drivers/gpu/drm/radeon/radeon_kms.c b/drivers/gpu/drm/radeon/radeon_kms.c
+index 4f2d4f4..7e292d8 100644
+--- a/drivers/gpu/drm/radeon/radeon_kms.c
++++ b/drivers/gpu/drm/radeon/radeon_kms.c
+@@ -414,6 +414,9 @@ int radeon_info_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		value = rdev->config.si.tile_mode_array;
+ 		value_size = sizeof(uint32_t)*32;
+ 		break;
++	case RADEON_INFO_SI_CP_DMA_COMPUTE:
++		*value = 1;
++		break;
+ 	default:
+ 		DRM_DEBUG_KMS("Invalid request %d\n", info->request);
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/radeon/rs400.c b/drivers/gpu/drm/radeon/rs400.c
+index 233a9b9..b8074a8 100644
+--- a/drivers/gpu/drm/radeon/rs400.c
++++ b/drivers/gpu/drm/radeon/rs400.c
+@@ -174,10 +174,13 @@ int rs400_gart_enable(struct radeon_device *rdev)
+ 	/* FIXME: according to doc we should set HIDE_MMCFG_BAR=0,
+ 	 * AGPMODE30=0 & AGP30ENHANCED=0 in NB_CNTL */
+ 	if ((rdev->family == CHIP_RS690) || (rdev->family == CHIP_RS740)) {
+-		WREG32_MC(RS480_MC_MISC_CNTL,
+-			  (RS480_GART_INDEX_REG_EN | RS690_BLOCK_GFX_D3_EN));
++		tmp = RREG32_MC(RS480_MC_MISC_CNTL);
++		tmp |= RS480_GART_INDEX_REG_EN | RS690_BLOCK_GFX_D3_EN;
++		WREG32_MC(RS480_MC_MISC_CNTL, tmp);
+ 	} else {
+-		WREG32_MC(RS480_MC_MISC_CNTL, RS480_GART_INDEX_REG_EN);
++		tmp = RREG32_MC(RS480_MC_MISC_CNTL);
++		tmp |= RS480_GART_INDEX_REG_EN;
++		WREG32_MC(RS480_MC_MISC_CNTL, tmp);
+ 	}
+ 	/* Enable gart */
+ 	WREG32_MC(RS480_AGP_ADDRESS_SPACE_SIZE, (RS480_GART_EN | size_reg));
+diff --git a/drivers/gpu/drm/radeon/si.c b/drivers/gpu/drm/radeon/si.c
+index 1a96a16..f054a3b 100644
+--- a/drivers/gpu/drm/radeon/si.c
++++ b/drivers/gpu/drm/radeon/si.c
+@@ -1467,7 +1467,8 @@ static u32 dce6_line_buffer_adjust(struct radeon_device *rdev,
+ 				   struct drm_display_mode *mode,
+ 				   struct drm_display_mode *other_mode)
+ {
+-	u32 tmp;
++	u32 tmp, buffer_alloc, i;
++	u32 pipe_offset = radeon_crtc->crtc_id * 0x20;
+ 	/*
+ 	 * Line Buffer Setup
+ 	 * There are 3 line buffers, each one shared by 2 display controllers.
+@@ -1482,16 +1483,30 @@ static u32 dce6_line_buffer_adjust(struct radeon_device *rdev,
+ 	 * non-linked crtcs for maximum line buffer allocation.
+ 	 */
+ 	if (radeon_crtc->base.enabled && mode) {
+-		if (other_mode)
++		if (other_mode) {
+ 			tmp = 0; /* 1/2 */
+-		else
++			buffer_alloc = 1;
++		} else {
+ 			tmp = 2; /* whole */
+-	} else
++			buffer_alloc = 2;
++		}
++	} else {
+ 		tmp = 0;
++		buffer_alloc = 0;
++	}
+ 
+ 	WREG32(DC_LB_MEMORY_SPLIT + radeon_crtc->crtc_offset,
+ 	       DC_LB_MEMORY_CONFIG(tmp));
+ 
++	WREG32(PIPE0_DMIF_BUFFER_CONTROL + pipe_offset,
++	       DMIF_BUFFERS_ALLOCATED(buffer_alloc));
++	for (i = 0; i < rdev->usec_timeout; i++) {
++		if (RREG32(PIPE0_DMIF_BUFFER_CONTROL + pipe_offset) &
++		    DMIF_BUFFERS_ALLOCATED_COMPLETED)
++			break;
++		udelay(1);
++	}
++
+ 	if (radeon_crtc->base.enabled && mode) {
+ 		switch (tmp) {
+ 		case 0:
+@@ -3796,13 +3811,64 @@ static int si_vm_packet3_ce_check(struct radeon_device *rdev,
+ 	return 0;
+ }
+ 
++static int si_vm_packet3_cp_dma_check(u32 *ib, u32 idx)
++{
++	u32 start_reg, reg, i;
++	u32 command = ib[idx + 4];
++	u32 info = ib[idx + 1];
++	u32 idx_value = ib[idx];
++	if (command & PACKET3_CP_DMA_CMD_SAS) {
++		/* src address space is register */
++		if (((info & 0x60000000) >> 29) == 0) {
++			start_reg = idx_value << 2;
++			if (command & PACKET3_CP_DMA_CMD_SAIC) {
++				reg = start_reg;
++				if (!si_vm_reg_valid(reg)) {
++					DRM_ERROR("CP DMA Bad SRC register\n");
++					return -EINVAL;
++				}
++			} else {
++				for (i = 0; i < (command & 0x1fffff); i++) {
++					reg = start_reg + (4 * i);
++					if (!si_vm_reg_valid(reg)) {
++						DRM_ERROR("CP DMA Bad SRC register\n");
++						return -EINVAL;
++					}
++				}
++			}
++		}
++	}
++	if (command & PACKET3_CP_DMA_CMD_DAS) {
++		/* dst address space is register */
++		if (((info & 0x00300000) >> 20) == 0) {
++			start_reg = ib[idx + 2];
++			if (command & PACKET3_CP_DMA_CMD_DAIC) {
++				reg = start_reg;
++				if (!si_vm_reg_valid(reg)) {
++					DRM_ERROR("CP DMA Bad DST register\n");
++					return -EINVAL;
++				}
++			} else {
++				for (i = 0; i < (command & 0x1fffff); i++) {
++					reg = start_reg + (4 * i);
++				if (!si_vm_reg_valid(reg)) {
++						DRM_ERROR("CP DMA Bad DST register\n");
++						return -EINVAL;
++					}
++				}
++			}
++		}
++	}
++	return 0;
++}
++
+ static int si_vm_packet3_gfx_check(struct radeon_device *rdev,
+ 				   u32 *ib, struct radeon_cs_packet *pkt)
+ {
++	int r;
+ 	u32 idx = pkt->idx + 1;
+ 	u32 idx_value = ib[idx];
+ 	u32 start_reg, end_reg, reg, i;
+-	u32 command, info;
+ 
+ 	switch (pkt->opcode) {
+ 	case PACKET3_NOP:
+@@ -3903,50 +3969,9 @@ static int si_vm_packet3_gfx_check(struct radeon_device *rdev,
+ 		}
+ 		break;
+ 	case PACKET3_CP_DMA:
+-		command = ib[idx + 4];
+-		info = ib[idx + 1];
+-		if (command & PACKET3_CP_DMA_CMD_SAS) {
+-			/* src address space is register */
+-			if (((info & 0x60000000) >> 29) == 0) {
+-				start_reg = idx_value << 2;
+-				if (command & PACKET3_CP_DMA_CMD_SAIC) {
+-					reg = start_reg;
+-					if (!si_vm_reg_valid(reg)) {
+-						DRM_ERROR("CP DMA Bad SRC register\n");
+-						return -EINVAL;
+-					}
+-				} else {
+-					for (i = 0; i < (command & 0x1fffff); i++) {
+-						reg = start_reg + (4 * i);
+-						if (!si_vm_reg_valid(reg)) {
+-							DRM_ERROR("CP DMA Bad SRC register\n");
+-							return -EINVAL;
+-						}
+-					}
+-				}
+-			}
+-		}
+-		if (command & PACKET3_CP_DMA_CMD_DAS) {
+-			/* dst address space is register */
+-			if (((info & 0x00300000) >> 20) == 0) {
+-				start_reg = ib[idx + 2];
+-				if (command & PACKET3_CP_DMA_CMD_DAIC) {
+-					reg = start_reg;
+-					if (!si_vm_reg_valid(reg)) {
+-						DRM_ERROR("CP DMA Bad DST register\n");
+-						return -EINVAL;
+-					}
+-				} else {
+-					for (i = 0; i < (command & 0x1fffff); i++) {
+-						reg = start_reg + (4 * i);
+-						if (!si_vm_reg_valid(reg)) {
+-							DRM_ERROR("CP DMA Bad DST register\n");
+-							return -EINVAL;
+-						}
+-					}
+-				}
+-			}
+-		}
++		r = si_vm_packet3_cp_dma_check(ib, idx);
++		if (r)
++			return r;
+ 		break;
+ 	default:
+ 		DRM_ERROR("Invalid GFX packet3: 0x%x\n", pkt->opcode);
+@@ -3958,6 +3983,7 @@ static int si_vm_packet3_gfx_check(struct radeon_device *rdev,
+ static int si_vm_packet3_compute_check(struct radeon_device *rdev,
+ 				       u32 *ib, struct radeon_cs_packet *pkt)
+ {
++	int r;
+ 	u32 idx = pkt->idx + 1;
+ 	u32 idx_value = ib[idx];
+ 	u32 start_reg, reg, i;
+@@ -4030,6 +4056,11 @@ static int si_vm_packet3_compute_check(struct radeon_device *rdev,
+ 				return -EINVAL;
+ 		}
+ 		break;
++	case PACKET3_CP_DMA:
++		r = si_vm_packet3_cp_dma_check(ib, idx);
++		if (r)
++			return r;
++		break;
+ 	default:
+ 		DRM_ERROR("Invalid Compute packet3: 0x%x\n", pkt->opcode);
+ 		return -EINVAL;
+diff --git a/drivers/gpu/drm/radeon/sid.h b/drivers/gpu/drm/radeon/sid.h
+index 8f2d7d4..8c68e67 100644
+--- a/drivers/gpu/drm/radeon/sid.h
++++ b/drivers/gpu/drm/radeon/sid.h
+@@ -97,6 +97,10 @@
+ 
+ #define DMIF_ADDR_CALC  				0xC00
+ 
++#define	PIPE0_DMIF_BUFFER_CONTROL			  0x0ca0
++#       define DMIF_BUFFERS_ALLOCATED(x)                  ((x) << 0)
++#       define DMIF_BUFFERS_ALLOCATED_COMPLETED           (1 << 4)
++
+ #define	SRBM_STATUS				        0xE50
+ #define		GRBM_RQ_PENDING 			(1 << 5)
+ #define		VMC_BUSY 				(1 << 8)
+diff --git a/drivers/gpu/drm/ttm/ttm_tt.c b/drivers/gpu/drm/ttm/ttm_tt.c
+index 5e93a52..210d503 100644
+--- a/drivers/gpu/drm/ttm/ttm_tt.c
++++ b/drivers/gpu/drm/ttm/ttm_tt.c
+@@ -170,7 +170,7 @@ void ttm_tt_destroy(struct ttm_tt *ttm)
+ 		ttm_tt_unbind(ttm);
+ 	}
+ 
+-	if (likely(ttm->pages != NULL)) {
++	if (ttm->state == tt_unbound) {
+ 		ttm->bdev->driver->ttm_tt_unpopulate(ttm);
+ 	}
+ 
+diff --git a/drivers/hid/hid-core.c b/drivers/hid/hid-core.c
+index ed626e0..ca959cf 100644
+--- a/drivers/hid/hid-core.c
++++ b/drivers/hid/hid-core.c
+@@ -94,7 +94,6 @@ EXPORT_SYMBOL_GPL(hid_register_report);
+ static struct hid_field *hid_register_field(struct hid_report *report, unsigned usages, unsigned values)
+ {
+ 	struct hid_field *field;
+-	int i;
+ 
+ 	if (report->maxfield == HID_MAX_FIELDS) {
+ 		hid_err(report->device, "too many fields in report\n");
+@@ -113,9 +112,6 @@ static struct hid_field *hid_register_field(struct hid_report *report, unsigned
+ 	field->value = (s32 *)(field->usage + usages);
+ 	field->report = report;
+ 
+-	for (i = 0; i < usages; i++)
+-		field->usage[i].usage_index = i;
+-
+ 	return field;
+ }
+ 
+@@ -226,9 +222,9 @@ static int hid_add_field(struct hid_parser *parser, unsigned report_type, unsign
+ {
+ 	struct hid_report *report;
+ 	struct hid_field *field;
+-	int usages;
++	unsigned usages;
+ 	unsigned offset;
+-	int i;
++	unsigned i;
+ 
+ 	report = hid_register_report(parser->device, report_type, parser->global.report_id);
+ 	if (!report) {
+@@ -255,7 +251,8 @@ static int hid_add_field(struct hid_parser *parser, unsigned report_type, unsign
+ 	if (!parser->local.usage_index) /* Ignore padding fields */
+ 		return 0;
+ 
+-	usages = max_t(int, parser->local.usage_index, parser->global.report_count);
++	usages = max_t(unsigned, parser->local.usage_index,
++				 parser->global.report_count);
+ 
+ 	field = hid_register_field(report, usages, parser->global.report_count);
+ 	if (!field)
+@@ -266,13 +263,14 @@ static int hid_add_field(struct hid_parser *parser, unsigned report_type, unsign
+ 	field->application = hid_lookup_collection(parser, HID_COLLECTION_APPLICATION);
+ 
+ 	for (i = 0; i < usages; i++) {
+-		int j = i;
++		unsigned j = i;
+ 		/* Duplicate the last usage we parsed if we have excess values */
+ 		if (i >= parser->local.usage_index)
+ 			j = parser->local.usage_index - 1;
+ 		field->usage[i].hid = parser->local.usage[j];
+ 		field->usage[i].collection_index =
+ 			parser->local.collection_index[j];
++		field->usage[i].usage_index = i;
+ 	}
+ 
+ 	field->maxusage = usages;
+@@ -759,6 +757,64 @@ int hid_parse_report(struct hid_device *hid, __u8 *start, unsigned size)
+ }
+ EXPORT_SYMBOL_GPL(hid_parse_report);
+ 
++static const char * const hid_report_names[] = {
++	"HID_INPUT_REPORT",
++	"HID_OUTPUT_REPORT",
++	"HID_FEATURE_REPORT",
++};
++/**
++ * hid_validate_values - validate existing device report's value indexes
++ *
++ * @device: hid device
++ * @type: which report type to examine
++ * @id: which report ID to examine (0 for first)
++ * @field_index: which report field to examine
++ * @report_counts: expected number of values
++ *
++ * Validate the number of values in a given field of a given report, after
++ * parsing.
++ */
++struct hid_report *hid_validate_values(struct hid_device *hid,
++				       unsigned int type, unsigned int id,
++				       unsigned int field_index,
++				       unsigned int report_counts)
++{
++	struct hid_report *report;
++
++	if (type > HID_FEATURE_REPORT) {
++		hid_err(hid, "invalid HID report type %u\n", type);
++		return NULL;
++	}
++
++	if (id >= HID_MAX_IDS) {
++		hid_err(hid, "invalid HID report id %u\n", id);
++		return NULL;
++	}
++
++	/*
++	 * Explicitly not using hid_get_report() here since it depends on
++	 * ->numbered being checked, which may not always be the case when
++	 * drivers go to access report values.
++	 */
++	report = hid->report_enum[type].report_id_hash[id];
++	if (!report) {
++		hid_err(hid, "missing %s %u\n", hid_report_names[type], id);
++		return NULL;
++	}
++	if (report->maxfield <= field_index) {
++		hid_err(hid, "not enough fields in %s %u\n",
++			hid_report_names[type], id);
++		return NULL;
++	}
++	if (report->field[field_index]->report_count < report_counts) {
++		hid_err(hid, "not enough values in %s %u field %u\n",
++			hid_report_names[type], id, field_index);
++		return NULL;
++	}
++	return report;
++}
++EXPORT_SYMBOL_GPL(hid_validate_values);
++
+ /**
+  * hid_open_report - open a driver-specific device report
+  *
+@@ -1237,7 +1293,7 @@ int hid_report_raw_event(struct hid_device *hid, int type, u8 *data, int size,
+ 			goto out;
+ 	}
+ 
+-	if (hid->claimed != HID_CLAIMED_HIDRAW) {
++	if (hid->claimed != HID_CLAIMED_HIDRAW && report->maxfield) {
+ 		for (a = 0; a < report->maxfield; a++)
+ 			hid_input_field(hid, report->field[a], cdata, interrupt);
+ 		hdrv = hid->driver;
+diff --git a/drivers/hid/hid-input.c b/drivers/hid/hid-input.c
+index ac5e935..012880a 100644
+--- a/drivers/hid/hid-input.c
++++ b/drivers/hid/hid-input.c
+@@ -485,6 +485,10 @@ static void hidinput_configure_usage(struct hid_input *hidinput, struct hid_fiel
+ 	if (field->flags & HID_MAIN_ITEM_CONSTANT)
+ 		goto ignore;
+ 
++	/* Ignore if report count is out of bounds. */
++	if (field->report_count < 1)
++		goto ignore;
++
+ 	/* only LED usages are supported in output fields */
+ 	if (field->report_type == HID_OUTPUT_REPORT &&
+ 			(usage->hid & HID_USAGE_PAGE) != HID_UP_LED) {
+@@ -1163,7 +1167,11 @@ static void report_features(struct hid_device *hid)
+ 
+ 	rep_enum = &hid->report_enum[HID_FEATURE_REPORT];
+ 	list_for_each_entry(rep, &rep_enum->report_list, list)
+-		for (i = 0; i < rep->maxfield; i++)
++		for (i = 0; i < rep->maxfield; i++) {
++			/* Ignore if report count is out of bounds. */
++			if (rep->field[i]->report_count < 1)
++				continue;
++
+ 			for (j = 0; j < rep->field[i]->maxusage; j++) {
+ 				/* Verify if Battery Strength feature is available */
+ 				hidinput_setup_battery(hid, HID_FEATURE_REPORT, rep->field[i]);
+@@ -1172,6 +1180,7 @@ static void report_features(struct hid_device *hid)
+ 					drv->feature_mapping(hid, rep->field[i],
+ 							     rep->field[i]->usage + j);
+ 			}
++		}
+ }
+ 
+ static struct hid_input *hidinput_allocate(struct hid_device *hid)
+diff --git a/drivers/hid/hid-lenovo-tpkbd.c b/drivers/hid/hid-lenovo-tpkbd.c
+index 07837f5..31cf29a 100644
+--- a/drivers/hid/hid-lenovo-tpkbd.c
++++ b/drivers/hid/hid-lenovo-tpkbd.c
+@@ -339,7 +339,15 @@ static int tpkbd_probe_tp(struct hid_device *hdev)
+ 	struct tpkbd_data_pointer *data_pointer;
+ 	size_t name_sz = strlen(dev_name(dev)) + 16;
+ 	char *name_mute, *name_micmute;
+-	int ret;
++	int i, ret;
++
++	/* Validate required reports. */
++	for (i = 0; i < 4; i++) {
++		if (!hid_validate_values(hdev, HID_FEATURE_REPORT, 4, i, 1))
++			return -ENODEV;
++	}
++	if (!hid_validate_values(hdev, HID_OUTPUT_REPORT, 3, 0, 2))
++		return -ENODEV;
+ 
+ 	if (sysfs_create_group(&hdev->dev.kobj,
+ 				&tpkbd_attr_group_pointer)) {
+@@ -406,22 +414,27 @@ static int tpkbd_probe(struct hid_device *hdev,
+ 	ret = hid_parse(hdev);
+ 	if (ret) {
+ 		hid_err(hdev, "hid_parse failed\n");
+-		goto err_free;
++		goto err;
+ 	}
+ 
+ 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+ 	if (ret) {
+ 		hid_err(hdev, "hid_hw_start failed\n");
+-		goto err_free;
++		goto err;
+ 	}
+ 
+ 	uhdev = (struct usbhid_device *) hdev->driver_data;
+ 
+-	if (uhdev->ifnum == 1)
+-		return tpkbd_probe_tp(hdev);
++	if (uhdev->ifnum == 1) {
++		ret = tpkbd_probe_tp(hdev);
++		if (ret)
++			goto err_hid;
++	}
+ 
+ 	return 0;
+-err_free:
++err_hid:
++	hid_hw_stop(hdev);
++err:
+ 	return ret;
+ }
+ 
+diff --git a/drivers/hid/hid-lg2ff.c b/drivers/hid/hid-lg2ff.c
+index b3cd150..1a42eaa 100644
+--- a/drivers/hid/hid-lg2ff.c
++++ b/drivers/hid/hid-lg2ff.c
+@@ -64,26 +64,13 @@ int lg2ff_init(struct hid_device *hid)
+ 	struct hid_report *report;
+ 	struct hid_input *hidinput = list_entry(hid->inputs.next,
+ 						struct hid_input, list);
+-	struct list_head *report_list =
+-			&hid->report_enum[HID_OUTPUT_REPORT].report_list;
+ 	struct input_dev *dev = hidinput->input;
+ 	int error;
+ 
+-	if (list_empty(report_list)) {
+-		hid_err(hid, "no output report found\n");
++	/* Check that the report looks ok */
++	report = hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 7);
++	if (!report)
+ 		return -ENODEV;
+-	}
+-
+-	report = list_entry(report_list->next, struct hid_report, list);
+-
+-	if (report->maxfield < 1) {
+-		hid_err(hid, "output report is empty\n");
+-		return -ENODEV;
+-	}
+-	if (report->field[0]->report_count < 7) {
+-		hid_err(hid, "not enough values in the field\n");
+-		return -ENODEV;
+-	}
+ 
+ 	lg2ff = kmalloc(sizeof(struct lg2ff_device), GFP_KERNEL);
+ 	if (!lg2ff)
+diff --git a/drivers/hid/hid-lg3ff.c b/drivers/hid/hid-lg3ff.c
+index e52f181..8c2da18 100644
+--- a/drivers/hid/hid-lg3ff.c
++++ b/drivers/hid/hid-lg3ff.c
+@@ -66,10 +66,11 @@ static int hid_lg3ff_play(struct input_dev *dev, void *data,
+ 	int x, y;
+ 
+ /*
+- * Maxusage should always be 63 (maximum fields)
+- * likely a better way to ensure this data is clean
++ * Available values in the field should always be 63, but we only use up to
++ * 35. Instead, clear the entire area, however big it is.
+  */
+-	memset(report->field[0]->value, 0, sizeof(__s32)*report->field[0]->maxusage);
++	memset(report->field[0]->value, 0,
++	       sizeof(__s32) * report->field[0]->report_count);
+ 
+ 	switch (effect->type) {
+ 	case FF_CONSTANT:
+@@ -129,32 +130,14 @@ static const signed short ff3_joystick_ac[] = {
+ int lg3ff_init(struct hid_device *hid)
+ {
+ 	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+-	struct list_head *report_list = &hid->report_enum[HID_OUTPUT_REPORT].report_list;
+ 	struct input_dev *dev = hidinput->input;
+-	struct hid_report *report;
+-	struct hid_field *field;
+ 	const signed short *ff_bits = ff3_joystick_ac;
+ 	int error;
+ 	int i;
+ 
+-	/* Find the report to use */
+-	if (list_empty(report_list)) {
+-		hid_err(hid, "No output report found\n");
+-		return -1;
+-	}
+-
+ 	/* Check that the report looks ok */
+-	report = list_entry(report_list->next, struct hid_report, list);
+-	if (!report) {
+-		hid_err(hid, "NULL output report\n");
+-		return -1;
+-	}
+-
+-	field = report->field[0];
+-	if (!field) {
+-		hid_err(hid, "NULL field\n");
+-		return -1;
+-	}
++	if (!hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 35))
++		return -ENODEV;
+ 
+ 	/* Assume single fixed device G940 */
+ 	for (i = 0; ff_bits[i] >= 0; i++)
+diff --git a/drivers/hid/hid-lg4ff.c b/drivers/hid/hid-lg4ff.c
+index 0ddae2a..8782fe1 100644
+--- a/drivers/hid/hid-lg4ff.c
++++ b/drivers/hid/hid-lg4ff.c
+@@ -484,34 +484,16 @@ static enum led_brightness lg4ff_led_get_brightness(struct led_classdev *led_cde
+ int lg4ff_init(struct hid_device *hid)
+ {
+ 	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+-	struct list_head *report_list = &hid->report_enum[HID_OUTPUT_REPORT].report_list;
+ 	struct input_dev *dev = hidinput->input;
+-	struct hid_report *report;
+-	struct hid_field *field;
+ 	struct lg4ff_device_entry *entry;
+ 	struct lg_drv_data *drv_data;
+ 	struct usb_device_descriptor *udesc;
+ 	int error, i, j;
+ 	__u16 bcdDevice, rev_maj, rev_min;
+ 
+-	/* Find the report to use */
+-	if (list_empty(report_list)) {
+-		hid_err(hid, "No output report found\n");
+-		return -1;
+-	}
+-
+ 	/* Check that the report looks ok */
+-	report = list_entry(report_list->next, struct hid_report, list);
+-	if (!report) {
+-		hid_err(hid, "NULL output report\n");
++	if (!hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 7))
+ 		return -1;
+-	}
+-
+-	field = report->field[0];
+-	if (!field) {
+-		hid_err(hid, "NULL field\n");
+-		return -1;
+-	}
+ 
+ 	/* Check what wheel has been connected */
+ 	for (i = 0; i < ARRAY_SIZE(lg4ff_devices); i++) {
+diff --git a/drivers/hid/hid-lgff.c b/drivers/hid/hid-lgff.c
+index d7ea8c8..e1394af 100644
+--- a/drivers/hid/hid-lgff.c
++++ b/drivers/hid/hid-lgff.c
+@@ -128,27 +128,14 @@ static void hid_lgff_set_autocenter(struct input_dev *dev, u16 magnitude)
+ int lgff_init(struct hid_device* hid)
+ {
+ 	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+-	struct list_head *report_list = &hid->report_enum[HID_OUTPUT_REPORT].report_list;
+ 	struct input_dev *dev = hidinput->input;
+-	struct hid_report *report;
+-	struct hid_field *field;
+ 	const signed short *ff_bits = ff_joystick;
+ 	int error;
+ 	int i;
+ 
+-	/* Find the report to use */
+-	if (list_empty(report_list)) {
+-		hid_err(hid, "No output report found\n");
+-		return -1;
+-	}
+-
+ 	/* Check that the report looks ok */
+-	report = list_entry(report_list->next, struct hid_report, list);
+-	field = report->field[0];
+-	if (!field) {
+-		hid_err(hid, "NULL field\n");
+-		return -1;
+-	}
++	if (!hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 7))
++		return -ENODEV;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(devices); i++) {
+ 		if (dev->id.vendor == devices[i].idVendor &&
+diff --git a/drivers/hid/hid-logitech-dj.c b/drivers/hid/hid-logitech-dj.c
+index 5207591a..0522b80 100644
+--- a/drivers/hid/hid-logitech-dj.c
++++ b/drivers/hid/hid-logitech-dj.c
+@@ -421,7 +421,7 @@ static int logi_dj_recv_send_report(struct dj_receiver_dev *djrcv_dev,
+ 	struct hid_report *report;
+ 	struct hid_report_enum *output_report_enum;
+ 	u8 *data = (u8 *)(&dj_report->device_index);
+-	int i;
++	unsigned int i;
+ 
+ 	output_report_enum = &hdev->report_enum[HID_OUTPUT_REPORT];
+ 	report = output_report_enum->report_id_hash[REPORT_ID_DJ_SHORT];
+@@ -431,7 +431,7 @@ static int logi_dj_recv_send_report(struct dj_receiver_dev *djrcv_dev,
+ 		return -ENODEV;
+ 	}
+ 
+-	for (i = 0; i < report->field[0]->report_count; i++)
++	for (i = 0; i < DJREPORT_SHORT_LENGTH - 1; i++)
+ 		report->field[0]->value[i] = data[i];
+ 
+ 	hid_hw_request(hdev, report, HID_REQ_SET_REPORT);
+@@ -738,6 +738,12 @@ static int logi_dj_probe(struct hid_device *hdev,
+ 		goto hid_parse_fail;
+ 	}
+ 
++	if (!hid_validate_values(hdev, HID_OUTPUT_REPORT, REPORT_ID_DJ_SHORT,
++				 0, DJREPORT_SHORT_LENGTH - 1)) {
++		retval = -ENODEV;
++		goto hid_parse_fail;
++	}
++
+ 	/* Starts the usb device and connects to upper interfaces hiddev and
+ 	 * hidraw */
+ 	retval = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+diff --git a/drivers/hid/hid-multitouch.c b/drivers/hid/hid-multitouch.c
+index d39a5ce..b6701ce 100644
+--- a/drivers/hid/hid-multitouch.c
++++ b/drivers/hid/hid-multitouch.c
+@@ -101,9 +101,9 @@ struct mt_device {
+ 	unsigned last_slot_field;	/* the last field of a slot */
+ 	unsigned mt_report_id;	/* the report ID of the multitouch device */
+ 	unsigned pen_report_id;	/* the report ID of the pen device */
+-	__s8 inputmode;		/* InputMode HID feature, -1 if non-existent */
+-	__s8 inputmode_index;	/* InputMode HID feature index in the report */
+-	__s8 maxcontact_report_id;	/* Maximum Contact Number HID feature,
++	__s16 inputmode;	/* InputMode HID feature, -1 if non-existent */
++	__s16 inputmode_index;	/* InputMode HID feature index in the report */
++	__s16 maxcontact_report_id;	/* Maximum Contact Number HID feature,
+ 				   -1 if non-existent */
+ 	__u8 num_received;	/* how many contacts we received */
+ 	__u8 num_expected;	/* expected last contact index */
+@@ -317,20 +317,18 @@ static void mt_feature_mapping(struct hid_device *hdev,
+ 		struct hid_field *field, struct hid_usage *usage)
+ {
+ 	struct mt_device *td = hid_get_drvdata(hdev);
+-	int i;
+ 
+ 	switch (usage->hid) {
+ 	case HID_DG_INPUTMODE:
+-		td->inputmode = field->report->id;
+-		td->inputmode_index = 0; /* has to be updated below */
+-
+-		for (i=0; i < field->maxusage; i++) {
+-			if (field->usage[i].hid == usage->hid) {
+-				td->inputmode_index = i;
+-				break;
+-			}
++		/* Ignore if value index is out of bounds. */
++		if (usage->usage_index >= field->report_count) {
++			dev_err(&hdev->dev, "HID_DG_INPUTMODE out of range\n");
++			break;
+ 		}
+ 
++		td->inputmode = field->report->id;
++		td->inputmode_index = usage->usage_index;
++
+ 		break;
+ 	case HID_DG_CONTACTMAX:
+ 		td->maxcontact_report_id = field->report->id;
+@@ -536,6 +534,10 @@ static int mt_touch_input_mapping(struct hid_device *hdev, struct hid_input *hi,
+ 			mt_store_field(usage, td, hi);
+ 			return 1;
+ 		case HID_DG_CONTACTCOUNT:
++			/* Ignore if indexes are out of bounds. */
++			if (field->index >= field->report->maxfield ||
++			    usage->usage_index >= field->report_count)
++				return 1;
+ 			td->cc_index = field->index;
+ 			td->cc_value_index = usage->usage_index;
+ 			return 1;
+diff --git a/drivers/hid/hid-steelseries.c b/drivers/hid/hid-steelseries.c
+index d164911..29f328f 100644
+--- a/drivers/hid/hid-steelseries.c
++++ b/drivers/hid/hid-steelseries.c
+@@ -249,6 +249,11 @@ static int steelseries_srws1_probe(struct hid_device *hdev,
+ 		goto err_free;
+ 	}
+ 
++	if (!hid_validate_values(hdev, HID_OUTPUT_REPORT, 0, 0, 16)) {
++		ret = -ENODEV;
++		goto err_free;
++	}
++
+ 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
+ 	if (ret) {
+ 		hid_err(hdev, "hw start failed\n");
+diff --git a/drivers/hid/hid-zpff.c b/drivers/hid/hid-zpff.c
+index 6ec28a3..a29756c 100644
+--- a/drivers/hid/hid-zpff.c
++++ b/drivers/hid/hid-zpff.c
+@@ -68,21 +68,13 @@ static int zpff_init(struct hid_device *hid)
+ 	struct hid_report *report;
+ 	struct hid_input *hidinput = list_entry(hid->inputs.next,
+ 						struct hid_input, list);
+-	struct list_head *report_list =
+-			&hid->report_enum[HID_OUTPUT_REPORT].report_list;
+ 	struct input_dev *dev = hidinput->input;
+-	int error;
++	int i, error;
+ 
+-	if (list_empty(report_list)) {
+-		hid_err(hid, "no output report found\n");
+-		return -ENODEV;
+-	}
+-
+-	report = list_entry(report_list->next, struct hid_report, list);
+-
+-	if (report->maxfield < 4) {
+-		hid_err(hid, "not enough fields in report\n");
+-		return -ENODEV;
++	for (i = 0; i < 4; i++) {
++		report = hid_validate_values(hid, HID_OUTPUT_REPORT, 0, i, 1);
++		if (!report)
++			return -ENODEV;
+ 	}
+ 
+ 	zpff = kzalloc(sizeof(struct zpff_device), GFP_KERNEL);
+diff --git a/drivers/media/pci/Kconfig b/drivers/media/pci/Kconfig
+index d4e2ed3..53196f1 100644
+--- a/drivers/media/pci/Kconfig
++++ b/drivers/media/pci/Kconfig
+@@ -1,6 +1,7 @@
++if PCI && MEDIA_SUPPORT
++
+ menuconfig MEDIA_PCI_SUPPORT
+ 	bool "Media PCI Adapters"
+-	depends on PCI && MEDIA_SUPPORT
+ 	help
+ 	  Enable media drivers for PCI/PCIe bus.
+ 	  If you have such devices, say Y.
+@@ -45,3 +46,4 @@ source "drivers/media/pci/ddbridge/Kconfig"
+ endif
+ 
+ endif #MEDIA_PCI_SUPPORT
++endif #PCI
+diff --git a/drivers/media/usb/Kconfig b/drivers/media/usb/Kconfig
+index 0a7d520..7cac453 100644
+--- a/drivers/media/usb/Kconfig
++++ b/drivers/media/usb/Kconfig
+@@ -1,6 +1,7 @@
++if USB && MEDIA_SUPPORT
++
+ menuconfig MEDIA_USB_SUPPORT
+ 	bool "Media USB Adapters"
+-	depends on USB && MEDIA_SUPPORT
+ 	help
+ 	  Enable media drivers for USB bus.
+ 	  If you have such devices, say Y.
+@@ -52,3 +53,4 @@ source "drivers/media/usb/em28xx/Kconfig"
+ endif
+ 
+ endif #MEDIA_USB_SUPPORT
++endif #USB
+diff --git a/drivers/net/ethernet/broadcom/bgmac.c b/drivers/net/ethernet/broadcom/bgmac.c
+index eec0af4..1c6bc96 100644
+--- a/drivers/net/ethernet/broadcom/bgmac.c
++++ b/drivers/net/ethernet/broadcom/bgmac.c
+@@ -908,7 +908,7 @@ static void bgmac_chip_reset(struct bgmac *bgmac)
+ 		struct bcma_drv_cc *cc = &bgmac->core->bus->drv_cc;
+ 		u8 et_swtype = 0;
+ 		u8 sw_type = BGMAC_CHIPCTL_1_SW_TYPE_EPHY |
+-			     BGMAC_CHIPCTL_1_IF_TYPE_RMII;
++			     BGMAC_CHIPCTL_1_IF_TYPE_MII;
+ 		char buf[2];
+ 
+ 		if (bcm47xx_nvram_getenv("et_swtype", buf, 1) > 0) {
+diff --git a/drivers/net/ethernet/broadcom/bgmac.h b/drivers/net/ethernet/broadcom/bgmac.h
+index 98d4b5f..12a35cf 100644
+--- a/drivers/net/ethernet/broadcom/bgmac.h
++++ b/drivers/net/ethernet/broadcom/bgmac.h
+@@ -333,7 +333,7 @@
+ 
+ #define BGMAC_CHIPCTL_1_IF_TYPE_MASK		0x00000030
+ #define BGMAC_CHIPCTL_1_IF_TYPE_RMII		0x00000000
+-#define BGMAC_CHIPCTL_1_IF_TYPE_MI		0x00000010
++#define BGMAC_CHIPCTL_1_IF_TYPE_MII		0x00000010
+ #define BGMAC_CHIPCTL_1_IF_TYPE_RGMII		0x00000020
+ #define BGMAC_CHIPCTL_1_SW_TYPE_MASK		0x000000C0
+ #define BGMAC_CHIPCTL_1_SW_TYPE_EPHY		0x00000000
+diff --git a/drivers/net/usb/cdc_ether.c b/drivers/net/usb/cdc_ether.c
+index 04ee044..b1897c7 100644
+--- a/drivers/net/usb/cdc_ether.c
++++ b/drivers/net/usb/cdc_ether.c
+@@ -709,6 +709,11 @@ static const struct usb_device_id	products [] = {
+ 	.bInterfaceProtocol	= USB_CDC_PROTO_NONE,
+ 	.driver_info = (unsigned long)&wwan_info,
+ }, {
++	/* Telit modules */
++	USB_VENDOR_AND_INTERFACE_INFO(0x1bc7, USB_CLASS_COMM,
++			USB_CDC_SUBCLASS_ETHERNET, USB_CDC_PROTO_NONE),
++	.driver_info = (kernel_ulong_t) &wwan_info,
++}, {
+ 	USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_ETHERNET,
+ 			USB_CDC_PROTO_NONE),
+ 	.driver_info = (unsigned long) &cdc_info,
+diff --git a/drivers/net/wireless/rt2x00/rt2800lib.c b/drivers/net/wireless/rt2x00/rt2800lib.c
+index 7e66a90..f281971 100644
+--- a/drivers/net/wireless/rt2x00/rt2800lib.c
++++ b/drivers/net/wireless/rt2x00/rt2800lib.c
+@@ -2767,6 +2767,13 @@ static int rt2800_get_gain_calibration_delta(struct rt2x00_dev *rt2x00dev)
+ 	int i;
+ 
+ 	/*
++	 * First check if temperature compensation is supported.
++	 */
++	rt2x00_eeprom_read(rt2x00dev, EEPROM_NIC_CONF1, &eeprom);
++	if (!rt2x00_get_field16(eeprom, EEPROM_NIC_CONF1_EXTERNAL_TX_ALC))
++		return 0;
++
++	/*
+ 	 * Read TSSI boundaries for temperature compensation from
+ 	 * the EEPROM.
+ 	 *
+@@ -4041,10 +4048,6 @@ static int rt2800_init_bbp(struct rt2x00_dev *rt2x00dev)
+ 	u8 reg_id;
+ 	u8 value;
+ 
+-	if (unlikely(rt2800_wait_bbp_rf_ready(rt2x00dev) ||
+-		     rt2800_wait_bbp_ready(rt2x00dev)))
+-		return -EACCES;
+-
+ 	if (rt2x00_rt(rt2x00dev, RT5592)) {
+ 		rt2800_init_bbp_5592(rt2x00dev);
+ 		return 0;
+@@ -5185,20 +5188,23 @@ int rt2800_enable_radio(struct rt2x00_dev *rt2x00dev)
+ 		     rt2800_init_registers(rt2x00dev)))
+ 		return -EIO;
+ 
++	if (unlikely(rt2800_wait_bbp_rf_ready(rt2x00dev)))
++		return -EIO;
++
+ 	/*
+ 	 * Send signal to firmware during boot time.
+ 	 */
+ 	rt2800_register_write(rt2x00dev, H2M_BBP_AGENT, 0);
+ 	rt2800_register_write(rt2x00dev, H2M_MAILBOX_CSR, 0);
+-	if (rt2x00_is_usb(rt2x00dev)) {
++	if (rt2x00_is_usb(rt2x00dev))
+ 		rt2800_register_write(rt2x00dev, H2M_INT_SRC, 0);
+-		rt2800_mcu_request(rt2x00dev, MCU_BOOT_SIGNAL, 0, 0, 0);
+-	}
++	rt2800_mcu_request(rt2x00dev, MCU_BOOT_SIGNAL, 0, 0, 0);
+ 	msleep(1);
+ 
+-	if (unlikely(rt2800_init_bbp(rt2x00dev)))
++	if (unlikely(rt2800_wait_bbp_ready(rt2x00dev)))
+ 		return -EIO;
+ 
++	rt2800_init_bbp(rt2x00dev);
+ 	rt2800_init_rfcsr(rt2x00dev);
+ 
+ 	if (rt2x00_is_usb(rt2x00dev) &&
+diff --git a/drivers/pci/pci-acpi.c b/drivers/pci/pci-acpi.c
+index 336b3f9..0eab3a3 100644
+--- a/drivers/pci/pci-acpi.c
++++ b/drivers/pci/pci-acpi.c
+@@ -47,6 +47,9 @@ static void pci_acpi_wake_dev(acpi_handle handle, u32 event, void *context)
+ 	if (event != ACPI_NOTIFY_DEVICE_WAKE || !pci_dev)
+ 		return;
+ 
++	if (pci_dev->pme_poll)
++		pci_dev->pme_poll = false;
++
+ 	if (pci_dev->current_state == PCI_D3cold) {
+ 		pci_wakeup_event(pci_dev);
+ 		pm_runtime_resume(&pci_dev->dev);
+@@ -57,9 +60,6 @@ static void pci_acpi_wake_dev(acpi_handle handle, u32 event, void *context)
+ 	if (pci_dev->pme_support)
+ 		pci_check_pme_status(pci_dev);
+ 
+-	if (pci_dev->pme_poll)
+-		pci_dev->pme_poll = false;
+-
+ 	pci_wakeup_event(pci_dev);
+ 	pm_runtime_resume(&pci_dev->dev);
+ 
+diff --git a/drivers/usb/gadget/dummy_hcd.c b/drivers/usb/gadget/dummy_hcd.c
+index c588e8e..ac0e79e 100644
+--- a/drivers/usb/gadget/dummy_hcd.c
++++ b/drivers/usb/gadget/dummy_hcd.c
+@@ -923,8 +923,9 @@ static int dummy_udc_stop(struct usb_gadget *g,
+ 	struct dummy_hcd	*dum_hcd = gadget_to_dummy_hcd(g);
+ 	struct dummy		*dum = dum_hcd->dum;
+ 
+-	dev_dbg(udc_dev(dum), "unregister gadget driver '%s'\n",
+-			driver->driver.name);
++	if (driver)
++		dev_dbg(udc_dev(dum), "unregister gadget driver '%s'\n",
++				driver->driver.name);
+ 
+ 	dum->driver = NULL;
+ 
+@@ -1000,8 +1001,8 @@ static int dummy_udc_remove(struct platform_device *pdev)
+ {
+ 	struct dummy	*dum = platform_get_drvdata(pdev);
+ 
+-	usb_del_gadget_udc(&dum->gadget);
+ 	device_remove_file(&dum->gadget.dev, &dev_attr_function);
++	usb_del_gadget_udc(&dum->gadget);
+ 	return 0;
+ }
+ 
+diff --git a/fs/bio-integrity.c b/fs/bio-integrity.c
+index 8fb4291..45e944f 100644
+--- a/fs/bio-integrity.c
++++ b/fs/bio-integrity.c
+@@ -734,7 +734,7 @@ void bioset_integrity_free(struct bio_set *bs)
+ 		mempool_destroy(bs->bio_integrity_pool);
+ 
+ 	if (bs->bvec_integrity_pool)
+-		mempool_destroy(bs->bio_integrity_pool);
++		mempool_destroy(bs->bvec_integrity_pool);
+ }
+ EXPORT_SYMBOL(bioset_integrity_free);
+ 
+diff --git a/fs/cifs/dir.c b/fs/cifs/dir.c
+index 5699b50..0c2425b 100644
+--- a/fs/cifs/dir.c
++++ b/fs/cifs/dir.c
+@@ -491,6 +491,7 @@ cifs_atomic_open(struct inode *inode, struct dentry *direntry,
+ 		if (server->ops->close)
+ 			server->ops->close(xid, tcon, &fid);
+ 		cifs_del_pending_open(&open);
++		fput(file);
+ 		rc = -ENOMEM;
+ 	}
+ 
+diff --git a/fs/udf/super.c b/fs/udf/super.c
+index 9ac4057..839a2ba 100644
+--- a/fs/udf/super.c
++++ b/fs/udf/super.c
+@@ -630,6 +630,12 @@ static int udf_remount_fs(struct super_block *sb, int *flags, char *options)
+ 	struct udf_sb_info *sbi = UDF_SB(sb);
+ 	int error = 0;
+ 
++	if (sbi->s_lvid_bh) {
++		int write_rev = le16_to_cpu(udf_sb_lvidiu(sbi)->minUDFWriteRev);
++		if (write_rev > UDF_MAX_WRITE_VERSION && !(*flags & MS_RDONLY))
++			return -EACCES;
++	}
++
+ 	uopt.flags = sbi->s_flags;
+ 	uopt.uid   = sbi->s_uid;
+ 	uopt.gid   = sbi->s_gid;
+@@ -649,12 +655,6 @@ static int udf_remount_fs(struct super_block *sb, int *flags, char *options)
+ 	sbi->s_dmode = uopt.dmode;
+ 	write_unlock(&sbi->s_cred_lock);
+ 
+-	if (sbi->s_lvid_bh) {
+-		int write_rev = le16_to_cpu(udf_sb_lvidiu(sbi)->minUDFWriteRev);
+-		if (write_rev > UDF_MAX_WRITE_VERSION)
+-			*flags |= MS_RDONLY;
+-	}
+-
+ 	if ((*flags & MS_RDONLY) == (sb->s_flags & MS_RDONLY))
+ 		goto out_unlock;
+ 
+@@ -843,27 +843,38 @@ static int udf_find_fileset(struct super_block *sb,
+ 	return 1;
+ }
+ 
++/*
++ * Load primary Volume Descriptor Sequence
++ *
++ * Return <0 on error, 0 on success. -EAGAIN is special meaning next sequence
++ * should be tried.
++ */
+ static int udf_load_pvoldesc(struct super_block *sb, sector_t block)
+ {
+ 	struct primaryVolDesc *pvoldesc;
+ 	struct ustr *instr, *outstr;
+ 	struct buffer_head *bh;
+ 	uint16_t ident;
+-	int ret = 1;
++	int ret = -ENOMEM;
+ 
+ 	instr = kmalloc(sizeof(struct ustr), GFP_NOFS);
+ 	if (!instr)
+-		return 1;
++		return -ENOMEM;
+ 
+ 	outstr = kmalloc(sizeof(struct ustr), GFP_NOFS);
+ 	if (!outstr)
+ 		goto out1;
+ 
+ 	bh = udf_read_tagged(sb, block, block, &ident);
+-	if (!bh)
++	if (!bh) {
++		ret = -EAGAIN;
+ 		goto out2;
++	}
+ 
+-	BUG_ON(ident != TAG_IDENT_PVD);
++	if (ident != TAG_IDENT_PVD) {
++		ret = -EIO;
++		goto out_bh;
++	}
+ 
+ 	pvoldesc = (struct primaryVolDesc *)bh->b_data;
+ 
+@@ -889,8 +900,9 @@ static int udf_load_pvoldesc(struct super_block *sb, sector_t block)
+ 		if (udf_CS0toUTF8(outstr, instr))
+ 			udf_debug("volSetIdent[] = '%s'\n", outstr->u_name);
+ 
+-	brelse(bh);
+ 	ret = 0;
++out_bh:
++	brelse(bh);
+ out2:
+ 	kfree(outstr);
+ out1:
+@@ -947,7 +959,7 @@ static int udf_load_metadata_files(struct super_block *sb, int partition)
+ 
+ 		if (mdata->s_mirror_fe == NULL) {
+ 			udf_err(sb, "Both metadata and mirror metadata inode efe can not found\n");
+-			goto error_exit;
++			return -EIO;
+ 		}
+ 	}
+ 
+@@ -964,23 +976,18 @@ static int udf_load_metadata_files(struct super_block *sb, int partition)
+ 			  addr.logicalBlockNum, addr.partitionReferenceNum);
+ 
+ 		mdata->s_bitmap_fe = udf_iget(sb, &addr);
+-
+ 		if (mdata->s_bitmap_fe == NULL) {
+ 			if (sb->s_flags & MS_RDONLY)
+ 				udf_warn(sb, "bitmap inode efe not found but it's ok since the disc is mounted read-only\n");
+ 			else {
+ 				udf_err(sb, "bitmap inode efe not found and attempted read-write mount\n");
+-				goto error_exit;
++				return -EIO;
+ 			}
+ 		}
+ 	}
+ 
+ 	udf_debug("udf_load_metadata_files Ok\n");
+-
+ 	return 0;
+-
+-error_exit:
+-	return 1;
+ }
+ 
+ static void udf_load_fileset(struct super_block *sb, struct buffer_head *bh,
+@@ -1069,7 +1076,7 @@ static int udf_fill_partdesc_info(struct super_block *sb,
+ 		if (!map->s_uspace.s_table) {
+ 			udf_debug("cannot load unallocSpaceTable (part %d)\n",
+ 				  p_index);
+-			return 1;
++			return -EIO;
+ 		}
+ 		map->s_partition_flags |= UDF_PART_FLAG_UNALLOC_TABLE;
+ 		udf_debug("unallocSpaceTable (part %d) @ %ld\n",
+@@ -1079,7 +1086,7 @@ static int udf_fill_partdesc_info(struct super_block *sb,
+ 	if (phd->unallocSpaceBitmap.extLength) {
+ 		struct udf_bitmap *bitmap = udf_sb_alloc_bitmap(sb, p_index);
+ 		if (!bitmap)
+-			return 1;
++			return -ENOMEM;
+ 		map->s_uspace.s_bitmap = bitmap;
+ 		bitmap->s_extPosition = le32_to_cpu(
+ 				phd->unallocSpaceBitmap.extPosition);
+@@ -1102,7 +1109,7 @@ static int udf_fill_partdesc_info(struct super_block *sb,
+ 		if (!map->s_fspace.s_table) {
+ 			udf_debug("cannot load freedSpaceTable (part %d)\n",
+ 				  p_index);
+-			return 1;
++			return -EIO;
+ 		}
+ 
+ 		map->s_partition_flags |= UDF_PART_FLAG_FREED_TABLE;
+@@ -1113,7 +1120,7 @@ static int udf_fill_partdesc_info(struct super_block *sb,
+ 	if (phd->freedSpaceBitmap.extLength) {
+ 		struct udf_bitmap *bitmap = udf_sb_alloc_bitmap(sb, p_index);
+ 		if (!bitmap)
+-			return 1;
++			return -ENOMEM;
+ 		map->s_fspace.s_bitmap = bitmap;
+ 		bitmap->s_extPosition = le32_to_cpu(
+ 				phd->freedSpaceBitmap.extPosition);
+@@ -1165,7 +1172,7 @@ static int udf_load_vat(struct super_block *sb, int p_index, int type1_index)
+ 		udf_find_vat_block(sb, p_index, type1_index, blocks - 1);
+ 	}
+ 	if (!sbi->s_vat_inode)
+-		return 1;
++		return -EIO;
+ 
+ 	if (map->s_partition_type == UDF_VIRTUAL_MAP15) {
+ 		map->s_type_specific.s_virtual.s_start_offset = 0;
+@@ -1177,7 +1184,7 @@ static int udf_load_vat(struct super_block *sb, int p_index, int type1_index)
+ 			pos = udf_block_map(sbi->s_vat_inode, 0);
+ 			bh = sb_bread(sb, pos);
+ 			if (!bh)
+-				return 1;
++				return -EIO;
+ 			vat20 = (struct virtualAllocationTable20 *)bh->b_data;
+ 		} else {
+ 			vat20 = (struct virtualAllocationTable20 *)
+@@ -1195,6 +1202,12 @@ static int udf_load_vat(struct super_block *sb, int p_index, int type1_index)
+ 	return 0;
+ }
+ 
++/*
++ * Load partition descriptor block
++ *
++ * Returns <0 on error, 0 on success, -EAGAIN is special - try next descriptor
++ * sequence.
++ */
+ static int udf_load_partdesc(struct super_block *sb, sector_t block)
+ {
+ 	struct buffer_head *bh;
+@@ -1204,13 +1217,15 @@ static int udf_load_partdesc(struct super_block *sb, sector_t block)
+ 	int i, type1_idx;
+ 	uint16_t partitionNumber;
+ 	uint16_t ident;
+-	int ret = 0;
++	int ret;
+ 
+ 	bh = udf_read_tagged(sb, block, block, &ident);
+ 	if (!bh)
+-		return 1;
+-	if (ident != TAG_IDENT_PD)
++		return -EAGAIN;
++	if (ident != TAG_IDENT_PD) {
++		ret = 0;
+ 		goto out_bh;
++	}
+ 
+ 	p = (struct partitionDesc *)bh->b_data;
+ 	partitionNumber = le16_to_cpu(p->partitionNumber);
+@@ -1229,10 +1244,13 @@ static int udf_load_partdesc(struct super_block *sb, sector_t block)
+ 	if (i >= sbi->s_partitions) {
+ 		udf_debug("Partition (%d) not found in partition map\n",
+ 			  partitionNumber);
++		ret = 0;
+ 		goto out_bh;
+ 	}
+ 
+ 	ret = udf_fill_partdesc_info(sb, p, i);
++	if (ret < 0)
++		goto out_bh;
+ 
+ 	/*
+ 	 * Now rescan for VIRTUAL or METADATA partitions when SPARABLE and
+@@ -1249,32 +1267,37 @@ static int udf_load_partdesc(struct super_block *sb, sector_t block)
+ 			break;
+ 	}
+ 
+-	if (i >= sbi->s_partitions)
++	if (i >= sbi->s_partitions) {
++		ret = 0;
+ 		goto out_bh;
++	}
+ 
+ 	ret = udf_fill_partdesc_info(sb, p, i);
+-	if (ret)
++	if (ret < 0)
+ 		goto out_bh;
+ 
+ 	if (map->s_partition_type == UDF_METADATA_MAP25) {
+ 		ret = udf_load_metadata_files(sb, i);
+-		if (ret) {
++		if (ret < 0) {
+ 			udf_err(sb, "error loading MetaData partition map %d\n",
+ 				i);
+ 			goto out_bh;
+ 		}
+ 	} else {
+-		ret = udf_load_vat(sb, i, type1_idx);
+-		if (ret)
+-			goto out_bh;
+ 		/*
+-		 * Mark filesystem read-only if we have a partition with
+-		 * virtual map since we don't handle writing to it (we
+-		 * overwrite blocks instead of relocating them).
++		 * If we have a partition with virtual map, we don't handle
++		 * writing to it (we overwrite blocks instead of relocating
++		 * them).
+ 		 */
+-		sb->s_flags |= MS_RDONLY;
+-		pr_notice("Filesystem marked read-only because writing to pseudooverwrite partition is not implemented\n");
++		if (!(sb->s_flags & MS_RDONLY)) {
++			ret = -EACCES;
++			goto out_bh;
++		}
++		ret = udf_load_vat(sb, i, type1_idx);
++		if (ret < 0)
++			goto out_bh;
+ 	}
++	ret = 0;
+ out_bh:
+ 	/* In case loading failed, we handle cleanup in udf_fill_super */
+ 	brelse(bh);
+@@ -1340,11 +1363,11 @@ static int udf_load_logicalvol(struct super_block *sb, sector_t block,
+ 	uint16_t ident;
+ 	struct buffer_head *bh;
+ 	unsigned int table_len;
+-	int ret = 0;
++	int ret;
+ 
+ 	bh = udf_read_tagged(sb, block, block, &ident);
+ 	if (!bh)
+-		return 1;
++		return -EAGAIN;
+ 	BUG_ON(ident != TAG_IDENT_LVD);
+ 	lvd = (struct logicalVolDesc *)bh->b_data;
+ 	table_len = le32_to_cpu(lvd->mapTableLength);
+@@ -1352,7 +1375,7 @@ static int udf_load_logicalvol(struct super_block *sb, sector_t block,
+ 		udf_err(sb, "error loading logical volume descriptor: "
+ 			"Partition table too long (%u > %lu)\n", table_len,
+ 			sb->s_blocksize - sizeof(*lvd));
+-		ret = 1;
++		ret = -EIO;
+ 		goto out_bh;
+ 	}
+ 
+@@ -1396,11 +1419,10 @@ static int udf_load_logicalvol(struct super_block *sb, sector_t block,
+ 			} else if (!strncmp(upm2->partIdent.ident,
+ 						UDF_ID_SPARABLE,
+ 						strlen(UDF_ID_SPARABLE))) {
+-				if (udf_load_sparable_map(sb, map,
+-				    (struct sparablePartitionMap *)gpm) < 0) {
+-					ret = 1;
++				ret = udf_load_sparable_map(sb, map,
++					(struct sparablePartitionMap *)gpm);
++				if (ret < 0)
+ 					goto out_bh;
+-				}
+ 			} else if (!strncmp(upm2->partIdent.ident,
+ 						UDF_ID_METADATA,
+ 						strlen(UDF_ID_METADATA))) {
+@@ -1465,7 +1487,7 @@ static int udf_load_logicalvol(struct super_block *sb, sector_t block,
+ 	}
+ 	if (lvd->integritySeqExt.extLength)
+ 		udf_load_logicalvolint(sb, leea_to_cpu(lvd->integritySeqExt));
+-
++	ret = 0;
+ out_bh:
+ 	brelse(bh);
+ 	return ret;
+@@ -1503,22 +1525,18 @@ static void udf_load_logicalvolint(struct super_block *sb, struct kernel_extent_
+ }
+ 
+ /*
+- * udf_process_sequence
+- *
+- * PURPOSE
+- *	Process a main/reserve volume descriptor sequence.
+- *
+- * PRE-CONDITIONS
+- *	sb			Pointer to _locked_ superblock.
+- *	block			First block of first extent of the sequence.
+- *	lastblock		Lastblock of first extent of the sequence.
++ * Process a main/reserve volume descriptor sequence.
++ *   @block		First block of first extent of the sequence.
++ *   @lastblock		Lastblock of first extent of the sequence.
++ *   @fileset		There we store extent containing root fileset
+  *
+- * HISTORY
+- *	July 1, 1997 - Andrew E. Mileski
+- *	Written, tested, and released.
++ * Returns <0 on error, 0 on success. -EAGAIN is special - try next descriptor
++ * sequence
+  */
+-static noinline int udf_process_sequence(struct super_block *sb, long block,
+-				long lastblock, struct kernel_lb_addr *fileset)
++static noinline int udf_process_sequence(
++		struct super_block *sb,
++		sector_t block, sector_t lastblock,
++		struct kernel_lb_addr *fileset)
+ {
+ 	struct buffer_head *bh = NULL;
+ 	struct udf_vds_record vds[VDS_POS_LENGTH];
+@@ -1529,6 +1547,7 @@ static noinline int udf_process_sequence(struct super_block *sb, long block,
+ 	uint32_t vdsn;
+ 	uint16_t ident;
+ 	long next_s = 0, next_e = 0;
++	int ret;
+ 
+ 	memset(vds, 0, sizeof(struct udf_vds_record) * VDS_POS_LENGTH);
+ 
+@@ -1543,7 +1562,7 @@ static noinline int udf_process_sequence(struct super_block *sb, long block,
+ 			udf_err(sb,
+ 				"Block %llu of volume descriptor sequence is corrupted or we could not read it\n",
+ 				(unsigned long long)block);
+-			return 1;
++			return -EAGAIN;
+ 		}
+ 
+ 		/* Process each descriptor (ISO 13346 3/8.3-8.4) */
+@@ -1616,14 +1635,19 @@ static noinline int udf_process_sequence(struct super_block *sb, long block,
+ 	 */
+ 	if (!vds[VDS_POS_PRIMARY_VOL_DESC].block) {
+ 		udf_err(sb, "Primary Volume Descriptor not found!\n");
+-		return 1;
++		return -EAGAIN;
++	}
++	ret = udf_load_pvoldesc(sb, vds[VDS_POS_PRIMARY_VOL_DESC].block);
++	if (ret < 0)
++		return ret;
++
++	if (vds[VDS_POS_LOGICAL_VOL_DESC].block) {
++		ret = udf_load_logicalvol(sb,
++					  vds[VDS_POS_LOGICAL_VOL_DESC].block,
++					  fileset);
++		if (ret < 0)
++			return ret;
+ 	}
+-	if (udf_load_pvoldesc(sb, vds[VDS_POS_PRIMARY_VOL_DESC].block))
+-		return 1;
+-
+-	if (vds[VDS_POS_LOGICAL_VOL_DESC].block && udf_load_logicalvol(sb,
+-	    vds[VDS_POS_LOGICAL_VOL_DESC].block, fileset))
+-		return 1;
+ 
+ 	if (vds[VDS_POS_PARTITION_DESC].block) {
+ 		/*
+@@ -1632,19 +1656,27 @@ static noinline int udf_process_sequence(struct super_block *sb, long block,
+ 		 */
+ 		for (block = vds[VDS_POS_PARTITION_DESC].block;
+ 		     block < vds[VDS_POS_TERMINATING_DESC].block;
+-		     block++)
+-			if (udf_load_partdesc(sb, block))
+-				return 1;
++		     block++) {
++			ret = udf_load_partdesc(sb, block);
++			if (ret < 0)
++				return ret;
++		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
++/*
++ * Load Volume Descriptor Sequence described by anchor in bh
++ *
++ * Returns <0 on error, 0 on success
++ */
+ static int udf_load_sequence(struct super_block *sb, struct buffer_head *bh,
+ 			     struct kernel_lb_addr *fileset)
+ {
+ 	struct anchorVolDescPtr *anchor;
+-	long main_s, main_e, reserve_s, reserve_e;
++	sector_t main_s, main_e, reserve_s, reserve_e;
++	int ret;
+ 
+ 	anchor = (struct anchorVolDescPtr *)bh->b_data;
+ 
+@@ -1662,18 +1694,26 @@ static int udf_load_sequence(struct super_block *sb, struct buffer_head *bh,
+ 
+ 	/* Process the main & reserve sequences */
+ 	/* responsible for finding the PartitionDesc(s) */
+-	if (!udf_process_sequence(sb, main_s, main_e, fileset))
+-		return 1;
+-	udf_sb_free_partitions(sb);
+-	if (!udf_process_sequence(sb, reserve_s, reserve_e, fileset))
+-		return 1;
++	ret = udf_process_sequence(sb, main_s, main_e, fileset);
++	if (ret != -EAGAIN)
++		return ret;
+ 	udf_sb_free_partitions(sb);
+-	return 0;
++	ret = udf_process_sequence(sb, reserve_s, reserve_e, fileset);
++	if (ret < 0) {
++		udf_sb_free_partitions(sb);
++		/* No sequence was OK, return -EIO */
++		if (ret == -EAGAIN)
++			ret = -EIO;
++	}
++	return ret;
+ }
+ 
+ /*
+  * Check whether there is an anchor block in the given block and
+  * load Volume Descriptor Sequence if so.
++ *
++ * Returns <0 on error, 0 on success, -EAGAIN is special - try next anchor
++ * block
+  */
+ static int udf_check_anchor_block(struct super_block *sb, sector_t block,
+ 				  struct kernel_lb_addr *fileset)
+@@ -1685,33 +1725,40 @@ static int udf_check_anchor_block(struct super_block *sb, sector_t block,
+ 	if (UDF_QUERY_FLAG(sb, UDF_FLAG_VARCONV) &&
+ 	    udf_fixed_to_variable(block) >=
+ 	    sb->s_bdev->bd_inode->i_size >> sb->s_blocksize_bits)
+-		return 0;
++		return -EAGAIN;
+ 
+ 	bh = udf_read_tagged(sb, block, block, &ident);
+ 	if (!bh)
+-		return 0;
++		return -EAGAIN;
+ 	if (ident != TAG_IDENT_AVDP) {
+ 		brelse(bh);
+-		return 0;
++		return -EAGAIN;
+ 	}
+ 	ret = udf_load_sequence(sb, bh, fileset);
+ 	brelse(bh);
+ 	return ret;
+ }
+ 
+-/* Search for an anchor volume descriptor pointer */
+-static sector_t udf_scan_anchors(struct super_block *sb, sector_t lastblock,
+-				 struct kernel_lb_addr *fileset)
++/*
++ * Search for an anchor volume descriptor pointer.
++ *
++ * Returns < 0 on error, 0 on success. -EAGAIN is special - try next set
++ * of anchors.
++ */
++static int udf_scan_anchors(struct super_block *sb, sector_t *lastblock,
++			    struct kernel_lb_addr *fileset)
+ {
+ 	sector_t last[6];
+ 	int i;
+ 	struct udf_sb_info *sbi = UDF_SB(sb);
+ 	int last_count = 0;
++	int ret;
+ 
+ 	/* First try user provided anchor */
+ 	if (sbi->s_anchor) {
+-		if (udf_check_anchor_block(sb, sbi->s_anchor, fileset))
+-			return lastblock;
++		ret = udf_check_anchor_block(sb, sbi->s_anchor, fileset);
++		if (ret != -EAGAIN)
++			return ret;
+ 	}
+ 	/*
+ 	 * according to spec, anchor is in either:
+@@ -1720,39 +1767,46 @@ static sector_t udf_scan_anchors(struct super_block *sb, sector_t lastblock,
+ 	 *     lastblock
+ 	 *  however, if the disc isn't closed, it could be 512.
+ 	 */
+-	if (udf_check_anchor_block(sb, sbi->s_session + 256, fileset))
+-		return lastblock;
++	ret = udf_check_anchor_block(sb, sbi->s_session + 256, fileset);
++	if (ret != -EAGAIN)
++		return ret;
+ 	/*
+ 	 * The trouble is which block is the last one. Drives often misreport
+ 	 * this so we try various possibilities.
+ 	 */
+-	last[last_count++] = lastblock;
+-	if (lastblock >= 1)
+-		last[last_count++] = lastblock - 1;
+-	last[last_count++] = lastblock + 1;
+-	if (lastblock >= 2)
+-		last[last_count++] = lastblock - 2;
+-	if (lastblock >= 150)
+-		last[last_count++] = lastblock - 150;
+-	if (lastblock >= 152)
+-		last[last_count++] = lastblock - 152;
++	last[last_count++] = *lastblock;
++	if (*lastblock >= 1)
++		last[last_count++] = *lastblock - 1;
++	last[last_count++] = *lastblock + 1;
++	if (*lastblock >= 2)
++		last[last_count++] = *lastblock - 2;
++	if (*lastblock >= 150)
++		last[last_count++] = *lastblock - 150;
++	if (*lastblock >= 152)
++		last[last_count++] = *lastblock - 152;
+ 
+ 	for (i = 0; i < last_count; i++) {
+ 		if (last[i] >= sb->s_bdev->bd_inode->i_size >>
+ 				sb->s_blocksize_bits)
+ 			continue;
+-		if (udf_check_anchor_block(sb, last[i], fileset))
+-			return last[i];
++		ret = udf_check_anchor_block(sb, last[i], fileset);
++		if (ret != -EAGAIN) {
++			if (!ret)
++				*lastblock = last[i];
++			return ret;
++		}
+ 		if (last[i] < 256)
+ 			continue;
+-		if (udf_check_anchor_block(sb, last[i] - 256, fileset))
+-			return last[i];
++		ret = udf_check_anchor_block(sb, last[i] - 256, fileset);
++		if (ret != -EAGAIN) {
++			if (!ret)
++				*lastblock = last[i];
++			return ret;
++		}
+ 	}
+ 
+ 	/* Finally try block 512 in case media is open */
+-	if (udf_check_anchor_block(sb, sbi->s_session + 512, fileset))
+-		return last[0];
+-	return 0;
++	return udf_check_anchor_block(sb, sbi->s_session + 512, fileset);
+ }
+ 
+ /*
+@@ -1760,54 +1814,59 @@ static sector_t udf_scan_anchors(struct super_block *sb, sector_t lastblock,
+  * area specified by it. The function expects sbi->s_lastblock to be the last
+  * block on the media.
+  *
+- * Return 1 if ok, 0 if not found.
+- *
++ * Return <0 on error, 0 if anchor found. -EAGAIN is special meaning anchor
++ * was not found.
+  */
+ static int udf_find_anchor(struct super_block *sb,
+ 			   struct kernel_lb_addr *fileset)
+ {
+-	sector_t lastblock;
+ 	struct udf_sb_info *sbi = UDF_SB(sb);
++	sector_t lastblock = sbi->s_last_block;
++	int ret;
+ 
+-	lastblock = udf_scan_anchors(sb, sbi->s_last_block, fileset);
+-	if (lastblock)
++	ret = udf_scan_anchors(sb, &lastblock, fileset);
++	if (ret != -EAGAIN)
+ 		goto out;
+ 
+ 	/* No anchor found? Try VARCONV conversion of block numbers */
+ 	UDF_SET_FLAG(sb, UDF_FLAG_VARCONV);
++	lastblock = udf_variable_to_fixed(sbi->s_last_block);
+ 	/* Firstly, we try to not convert number of the last block */
+-	lastblock = udf_scan_anchors(sb,
+-				udf_variable_to_fixed(sbi->s_last_block),
+-				fileset);
+-	if (lastblock)
++	ret = udf_scan_anchors(sb, &lastblock, fileset);
++	if (ret != -EAGAIN)
+ 		goto out;
+ 
++	lastblock = sbi->s_last_block;
+ 	/* Secondly, we try with converted number of the last block */
+-	lastblock = udf_scan_anchors(sb, sbi->s_last_block, fileset);
+-	if (!lastblock) {
++	ret = udf_scan_anchors(sb, &lastblock, fileset);
++	if (ret < 0) {
+ 		/* VARCONV didn't help. Clear it. */
+ 		UDF_CLEAR_FLAG(sb, UDF_FLAG_VARCONV);
+-		return 0;
+ 	}
+ out:
+-	sbi->s_last_block = lastblock;
+-	return 1;
++	if (ret == 0)
++		sbi->s_last_block = lastblock;
++	return ret;
+ }
+ 
+ /*
+  * Check Volume Structure Descriptor, find Anchor block and load Volume
+- * Descriptor Sequence
++ * Descriptor Sequence.
++ *
++ * Returns < 0 on error, 0 on success. -EAGAIN is special meaning anchor
++ * block was not found.
+  */
+ static int udf_load_vrs(struct super_block *sb, struct udf_options *uopt,
+ 			int silent, struct kernel_lb_addr *fileset)
+ {
+ 	struct udf_sb_info *sbi = UDF_SB(sb);
+ 	loff_t nsr_off;
++	int ret;
+ 
+ 	if (!sb_set_blocksize(sb, uopt->blocksize)) {
+ 		if (!silent)
+ 			udf_warn(sb, "Bad block size\n");
+-		return 0;
++		return -EINVAL;
+ 	}
+ 	sbi->s_last_block = uopt->lastblock;
+ 	if (!uopt->novrs) {
+@@ -1828,12 +1887,13 @@ static int udf_load_vrs(struct super_block *sb, struct udf_options *uopt,
+ 
+ 	/* Look for anchor block and load Volume Descriptor Sequence */
+ 	sbi->s_anchor = uopt->anchor;
+-	if (!udf_find_anchor(sb, fileset)) {
+-		if (!silent)
++	ret = udf_find_anchor(sb, fileset);
++	if (ret < 0) {
++		if (!silent && ret == -EAGAIN)
+ 			udf_warn(sb, "No anchor found\n");
+-		return 0;
++		return ret;
+ 	}
+-	return 1;
++	return 0;
+ }
+ 
+ static void udf_open_lvid(struct super_block *sb)
+@@ -1939,7 +1999,7 @@ u64 lvid_get_unique_id(struct super_block *sb)
+ 
+ static int udf_fill_super(struct super_block *sb, void *options, int silent)
+ {
+-	int ret;
++	int ret = -EINVAL;
+ 	struct inode *inode = NULL;
+ 	struct udf_options uopt;
+ 	struct kernel_lb_addr rootdir, fileset;
+@@ -2011,7 +2071,7 @@ static int udf_fill_super(struct super_block *sb, void *options, int silent)
+ 	} else {
+ 		uopt.blocksize = bdev_logical_block_size(sb->s_bdev);
+ 		ret = udf_load_vrs(sb, &uopt, silent, &fileset);
+-		if (!ret && uopt.blocksize != UDF_DEFAULT_BLOCKSIZE) {
++		if (ret == -EAGAIN && uopt.blocksize != UDF_DEFAULT_BLOCKSIZE) {
+ 			if (!silent)
+ 				pr_notice("Rescanning with blocksize %d\n",
+ 					  UDF_DEFAULT_BLOCKSIZE);
+@@ -2021,8 +2081,11 @@ static int udf_fill_super(struct super_block *sb, void *options, int silent)
+ 			ret = udf_load_vrs(sb, &uopt, silent, &fileset);
+ 		}
+ 	}
+-	if (!ret) {
+-		udf_warn(sb, "No partition found (1)\n");
++	if (ret < 0) {
++		if (ret == -EAGAIN) {
++			udf_warn(sb, "No partition found (1)\n");
++			ret = -EINVAL;
++		}
+ 		goto error_out;
+ 	}
+ 
+@@ -2040,9 +2103,13 @@ static int udf_fill_super(struct super_block *sb, void *options, int silent)
+ 			udf_err(sb, "minUDFReadRev=%x (max is %x)\n",
+ 				le16_to_cpu(lvidiu->minUDFReadRev),
+ 				UDF_MAX_READ_VERSION);
++			ret = -EINVAL;
++			goto error_out;
++		} else if (minUDFWriteRev > UDF_MAX_WRITE_VERSION &&
++			   !(sb->s_flags & MS_RDONLY)) {
++			ret = -EACCES;
+ 			goto error_out;
+-		} else if (minUDFWriteRev > UDF_MAX_WRITE_VERSION)
+-			sb->s_flags |= MS_RDONLY;
++		}
+ 
+ 		sbi->s_udfrev = minUDFWriteRev;
+ 
+@@ -2054,17 +2121,20 @@ static int udf_fill_super(struct super_block *sb, void *options, int silent)
+ 
+ 	if (!sbi->s_partitions) {
+ 		udf_warn(sb, "No partition found (2)\n");
++		ret = -EINVAL;
+ 		goto error_out;
+ 	}
+ 
+ 	if (sbi->s_partmaps[sbi->s_partition].s_partition_flags &
+-			UDF_PART_FLAG_READ_ONLY) {
+-		pr_notice("Partition marked readonly; forcing readonly mount\n");
+-		sb->s_flags |= MS_RDONLY;
++			UDF_PART_FLAG_READ_ONLY &&
++	    !(sb->s_flags & MS_RDONLY)) {
++		ret = -EACCES;
++		goto error_out;
+ 	}
+ 
+ 	if (udf_find_fileset(sb, &fileset, &rootdir)) {
+ 		udf_warn(sb, "No fileset found\n");
++		ret = -EINVAL;
+ 		goto error_out;
+ 	}
+ 
+@@ -2086,6 +2156,7 @@ static int udf_fill_super(struct super_block *sb, void *options, int silent)
+ 	if (!inode) {
+ 		udf_err(sb, "Error in udf_iget, block=%d, partition=%d\n",
+ 		       rootdir.logicalBlockNum, rootdir.partitionReferenceNum);
++		ret = -EIO;
+ 		goto error_out;
+ 	}
+ 
+@@ -2093,6 +2164,7 @@ static int udf_fill_super(struct super_block *sb, void *options, int silent)
+ 	sb->s_root = d_make_root(inode);
+ 	if (!sb->s_root) {
+ 		udf_err(sb, "Couldn't allocate root dentry\n");
++		ret = -ENOMEM;
+ 		goto error_out;
+ 	}
+ 	sb->s_maxbytes = MAX_LFS_FILESIZE;
+@@ -2113,7 +2185,7 @@ error_out:
+ 	kfree(sbi);
+ 	sb->s_fs_info = NULL;
+ 
+-	return -EINVAL;
++	return ret;
+ }
+ 
+ void _udf_err(struct super_block *sb, const char *function,
+diff --git a/include/linux/hid.h b/include/linux/hid.h
+index ff545cc..6e18550 100644
+--- a/include/linux/hid.h
++++ b/include/linux/hid.h
+@@ -749,6 +749,10 @@ void hid_output_report(struct hid_report *report, __u8 *data);
+ struct hid_device *hid_allocate_device(void);
+ struct hid_report *hid_register_report(struct hid_device *device, unsigned type, unsigned id);
+ int hid_parse_report(struct hid_device *hid, __u8 *start, unsigned size);
++struct hid_report *hid_validate_values(struct hid_device *hid,
++				       unsigned int type, unsigned int id,
++				       unsigned int field_index,
++				       unsigned int report_counts);
+ int hid_open_report(struct hid_device *device);
+ int hid_check_keys_pressed(struct hid_device *hid);
+ int hid_connect(struct hid_device *hid, unsigned int connect_mask);
+diff --git a/include/linux/timex.h b/include/linux/timex.h
+index b3726e6..dd3edd7 100644
+--- a/include/linux/timex.h
++++ b/include/linux/timex.h
+@@ -141,6 +141,7 @@ extern int do_adjtimex(struct timex *);
+ extern void hardpps(const struct timespec *, const struct timespec *);
+ 
+ int read_current_timer(unsigned long *timer_val);
++void ntp_notify_cmos_timer(void);
+ 
+ /* The clock frequency of the i8253/i8254 PIT */
+ #define PIT_TICK_RATE 1193182ul
+diff --git a/include/uapi/drm/radeon_drm.h b/include/uapi/drm/radeon_drm.h
+index 321d4ac..fa8b3ad 100644
+--- a/include/uapi/drm/radeon_drm.h
++++ b/include/uapi/drm/radeon_drm.h
+@@ -979,6 +979,8 @@ struct drm_radeon_cs {
+ #define RADEON_INFO_RING_WORKING	0x15
+ /* SI tile mode array */
+ #define RADEON_INFO_SI_TILE_MODE_ARRAY	0x16
++/* query if CP DMA is supported on the compute ring */
++#define RADEON_INFO_SI_CP_DMA_COMPUTE	0x17
+ 
+ 
+ struct drm_radeon_info {
+diff --git a/kernel/audit.c b/kernel/audit.c
+index 91e53d0..7b0e23a 100644
+--- a/kernel/audit.c
++++ b/kernel/audit.c
+@@ -1117,9 +1117,10 @@ struct audit_buffer *audit_log_start(struct audit_context *ctx, gfp_t gfp_mask,
+ 
+ 			sleep_time = timeout_start + audit_backlog_wait_time -
+ 					jiffies;
+-			if ((long)sleep_time > 0)
++			if ((long)sleep_time > 0) {
+ 				wait_for_auditd(sleep_time);
+-			continue;
++				continue;
++			}
+ 		}
+ 		if (audit_rate_check() && printk_ratelimit())
+ 			printk(KERN_WARNING
+diff --git a/kernel/sched/cputime.c b/kernel/sched/cputime.c
+index b5ccba2..1101d92 100644
+--- a/kernel/sched/cputime.c
++++ b/kernel/sched/cputime.c
+@@ -558,7 +558,7 @@ static void cputime_adjust(struct task_cputime *curr,
+ 			   struct cputime *prev,
+ 			   cputime_t *ut, cputime_t *st)
+ {
+-	cputime_t rtime, stime, utime, total;
++	cputime_t rtime, stime, utime;
+ 
+ 	if (vtime_accounting_enabled()) {
+ 		*ut = curr->utime;
+@@ -566,9 +566,6 @@ static void cputime_adjust(struct task_cputime *curr,
+ 		return;
+ 	}
+ 
+-	stime = curr->stime;
+-	total = stime + curr->utime;
+-
+ 	/*
+ 	 * Tick based cputime accounting depend on random scheduling
+ 	 * timeslices of a task to be interrupted or not by the timer.
+@@ -589,13 +586,19 @@ static void cputime_adjust(struct task_cputime *curr,
+ 	if (prev->stime + prev->utime >= rtime)
+ 		goto out;
+ 
+-	if (total) {
++	stime = curr->stime;
++	utime = curr->utime;
++
++	if (utime == 0) {
++		stime = rtime;
++	} else if (stime == 0) {
++		utime = rtime;
++	} else {
++		cputime_t total = stime + utime;
++
+ 		stime = scale_stime((__force u64)stime,
+ 				    (__force u64)rtime, (__force u64)total);
+ 		utime = rtime - stime;
+-	} else {
+-		stime = rtime;
+-		utime = 0;
+ 	}
+ 
+ 	/*
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 03b73be..009a62b 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -5778,11 +5778,15 @@ static void task_fork_fair(struct task_struct *p)
+ 	cfs_rq = task_cfs_rq(current);
+ 	curr = cfs_rq->curr;
+ 
+-	if (unlikely(task_cpu(p) != this_cpu)) {
+-		rcu_read_lock();
+-		__set_task_cpu(p, this_cpu);
+-		rcu_read_unlock();
+-	}
++	/*
++	 * Not only the cpu but also the task_group of the parent might have
++	 * been changed after parent->se.parent,cfs_rq were copied to
++	 * child->se.parent,cfs_rq. So call __set_task_cpu() to make those
++	 * of child point to valid ones.
++	 */
++	rcu_read_lock();
++	__set_task_cpu(p, this_cpu);
++	rcu_read_unlock();
+ 
+ 	update_curr(cfs_rq);
+ 
+diff --git a/kernel/time/ntp.c b/kernel/time/ntp.c
+index 8f5b3b9..bb22151 100644
+--- a/kernel/time/ntp.c
++++ b/kernel/time/ntp.c
+@@ -516,13 +516,13 @@ static void sync_cmos_clock(struct work_struct *work)
+ 	schedule_delayed_work(&sync_cmos_work, timespec_to_jiffies(&next));
+ }
+ 
+-static void notify_cmos_timer(void)
++void ntp_notify_cmos_timer(void)
+ {
+ 	schedule_delayed_work(&sync_cmos_work, 0);
+ }
+ 
+ #else
+-static inline void notify_cmos_timer(void) { }
++void ntp_notify_cmos_timer(void) { }
+ #endif
+ 
+ 
+@@ -687,8 +687,6 @@ int __do_adjtimex(struct timex *txc, struct timespec *ts, s32 *time_tai)
+ 	if (!(time_status & STA_NANO))
+ 		txc->time.tv_usec /= NSEC_PER_USEC;
+ 
+-	notify_cmos_timer();
+-
+ 	return result;
+ }
+ 
+diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
+index baeeb5c..fcc261c 100644
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -1682,6 +1682,8 @@ int do_adjtimex(struct timex *txc)
+ 	write_seqcount_end(&timekeeper_seq);
+ 	raw_spin_unlock_irqrestore(&timekeeper_lock, flags);
+ 
++	ntp_notify_cmos_timer();
++
+ 	return ret;
+ }
+ 
+diff --git a/mm/swap.c b/mm/swap.c
+index dfd7d71..9f2225f 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -31,6 +31,7 @@
+ #include <linux/memcontrol.h>
+ #include <linux/gfp.h>
+ #include <linux/uio.h>
++#include <linux/hugetlb.h>
+ 
+ #include "internal.h"
+ 
+@@ -78,6 +79,19 @@ static void __put_compound_page(struct page *page)
+ 
+ static void put_compound_page(struct page *page)
+ {
++	/*
++	 * hugetlbfs pages cannot be split from under us.  If this is a
++	 * hugetlbfs page, check refcount on head page and release the page if
++	 * the refcount becomes zero.
++	 */
++	if (PageHuge(page)) {
++		page = compound_head(page);
++		if (put_page_testzero(page))
++			__put_compound_page(page);
++
++		return;
++	}
++
+ 	if (unlikely(PageTail(page))) {
+ 		/* __split_huge_page_refcount can run under us */
+ 		struct page *page_head = compound_trans_head(page);
+@@ -181,38 +195,51 @@ bool __get_page_tail(struct page *page)
+ 	 * proper PT lock that already serializes against
+ 	 * split_huge_page().
+ 	 */
+-	unsigned long flags;
+ 	bool got = false;
+-	struct page *page_head = compound_trans_head(page);
++	struct page *page_head;
+ 
+-	if (likely(page != page_head && get_page_unless_zero(page_head))) {
++	/*
++	 * If this is a hugetlbfs page it cannot be split under us.  Simply
++	 * increment refcount for the head page.
++	 */
++	if (PageHuge(page)) {
++		page_head = compound_head(page);
++		atomic_inc(&page_head->_count);
++		got = true;
++	} else {
++		unsigned long flags;
++
++		page_head = compound_trans_head(page);
++		if (likely(page != page_head &&
++					get_page_unless_zero(page_head))) {
++
++			/* Ref to put_compound_page() comment. */
++			if (PageSlab(page_head)) {
++				if (likely(PageTail(page))) {
++					__get_page_tail_foll(page, false);
++					return true;
++				} else {
++					put_page(page_head);
++					return false;
++				}
++			}
+ 
+-		/* Ref to put_compound_page() comment. */
+-		if (PageSlab(page_head)) {
++			/*
++			 * page_head wasn't a dangling pointer but it
++			 * may not be a head page anymore by the time
++			 * we obtain the lock. That is ok as long as it
++			 * can't be freed from under us.
++			 */
++			flags = compound_lock_irqsave(page_head);
++			/* here __split_huge_page_refcount won't run anymore */
+ 			if (likely(PageTail(page))) {
+ 				__get_page_tail_foll(page, false);
+-				return true;
+-			} else {
+-				put_page(page_head);
+-				return false;
++				got = true;
+ 			}
++			compound_unlock_irqrestore(page_head, flags);
++			if (unlikely(!got))
++				put_page(page_head);
+ 		}
+-
+-		/*
+-		 * page_head wasn't a dangling pointer but it
+-		 * may not be a head page anymore by the time
+-		 * we obtain the lock. That is ok as long as it
+-		 * can't be freed from under us.
+-		 */
+-		flags = compound_lock_irqsave(page_head);
+-		/* here __split_huge_page_refcount won't run anymore */
+-		if (likely(PageTail(page))) {
+-			__get_page_tail_foll(page, false);
+-			got = true;
+-		}
+-		compound_unlock_irqrestore(page_head, flags);
+-		if (unlikely(!got))
+-			put_page(page_head);
+ 	}
+ 	return got;
+ }
+diff --git a/net/netfilter/ipset/ip_set_hash_gen.h b/net/netfilter/ipset/ip_set_hash_gen.h
+index 57beb17..707bc52 100644
+--- a/net/netfilter/ipset/ip_set_hash_gen.h
++++ b/net/netfilter/ipset/ip_set_hash_gen.h
+@@ -325,18 +325,22 @@ mtype_add_cidr(struct htype *h, u8 cidr, u8 nets_length)
+ static void
+ mtype_del_cidr(struct htype *h, u8 cidr, u8 nets_length)
+ {
+-	u8 i, j;
+-
+-	for (i = 0; i < nets_length - 1 && h->nets[i].cidr != cidr; i++)
+-		;
+-	h->nets[i].nets--;
+-
+-	if (h->nets[i].nets != 0)
+-		return;
+-
+-	for (j = i; j < nets_length - 1 && h->nets[j].nets; j++) {
+-		h->nets[j].cidr = h->nets[j + 1].cidr;
+-		h->nets[j].nets = h->nets[j + 1].nets;
++	u8 i, j, net_end = nets_length - 1;
++
++	for (i = 0; i < nets_length; i++) {
++	        if (h->nets[i].cidr != cidr)
++	                continue;
++                if (h->nets[i].nets > 1 || i == net_end ||
++                    h->nets[i + 1].nets == 0) {
++                        h->nets[i].nets--;
++                        return;
++                }
++                for (j = i; j < net_end && h->nets[j].nets; j++) {
++		        h->nets[j].cidr = h->nets[j + 1].cidr;
++		        h->nets[j].nets = h->nets[j + 1].nets;
++                }
++                h->nets[j].nets = 0;
++                return;
+ 	}
+ }
+ #endif
+diff --git a/net/sunrpc/auth_gss/gss_rpc_upcall.c b/net/sunrpc/auth_gss/gss_rpc_upcall.c
+index af7ffd4..f1eb0d1 100644
+--- a/net/sunrpc/auth_gss/gss_rpc_upcall.c
++++ b/net/sunrpc/auth_gss/gss_rpc_upcall.c
+@@ -213,6 +213,26 @@ static int gssp_call(struct net *net, struct rpc_message *msg)
+ 	return status;
+ }
+ 
++static void gssp_free_receive_pages(struct gssx_arg_accept_sec_context *arg)
++{
++	int i;
++
++	for (i = 0; i < arg->npages && arg->pages[i]; i++)
++		__free_page(arg->pages[i]);
++}
++
++static int gssp_alloc_receive_pages(struct gssx_arg_accept_sec_context *arg)
++{
++	arg->npages = DIV_ROUND_UP(NGROUPS_MAX * 4, PAGE_SIZE);
++	arg->pages = kzalloc(arg->npages * sizeof(struct page *), GFP_KERNEL);
++	/*
++	 * XXX: actual pages are allocated by xdr layer in
++	 * xdr_partial_copy_from_skb.
++	 */
++	if (!arg->pages)
++		return -ENOMEM;
++	return 0;
++}
+ 
+ /*
+  * Public functions
+@@ -261,10 +281,16 @@ int gssp_accept_sec_context_upcall(struct net *net,
+ 		arg.context_handle = &ctxh;
+ 	res.output_token->len = GSSX_max_output_token_sz;
+ 
++	ret = gssp_alloc_receive_pages(&arg);
++	if (ret)
++		return ret;
++
+ 	/* use nfs/ for targ_name ? */
+ 
+ 	ret = gssp_call(net, &msg);
+ 
++	gssp_free_receive_pages(&arg);
++
+ 	/* we need to fetch all data even in case of error so
+ 	 * that we can free special strctures is they have been allocated */
+ 	data->major_status = res.status.major_status;
+diff --git a/net/sunrpc/auth_gss/gss_rpc_xdr.c b/net/sunrpc/auth_gss/gss_rpc_xdr.c
+index 3c85d1c..f0f78c5 100644
+--- a/net/sunrpc/auth_gss/gss_rpc_xdr.c
++++ b/net/sunrpc/auth_gss/gss_rpc_xdr.c
+@@ -166,14 +166,15 @@ static int dummy_dec_opt_array(struct xdr_stream *xdr,
+ 	return 0;
+ }
+ 
+-static int get_s32(void **p, void *max, s32 *res)
++static int get_host_u32(struct xdr_stream *xdr, u32 *res)
+ {
+-	void *base = *p;
+-	void *next = (void *)((char *)base + sizeof(s32));
+-	if (unlikely(next > max || next < base))
++	__be32 *p;
++
++	p = xdr_inline_decode(xdr, 4);
++	if (!p)
+ 		return -EINVAL;
+-	memcpy(res, base, sizeof(s32));
+-	*p = next;
++	/* Contents of linux creds are all host-endian: */
++	memcpy(res, p, sizeof(u32));
+ 	return 0;
+ }
+ 
+@@ -182,9 +183,9 @@ static int gssx_dec_linux_creds(struct xdr_stream *xdr,
+ {
+ 	u32 length;
+ 	__be32 *p;
+-	void *q, *end;
+-	s32 tmp;
+-	int N, i, err;
++	u32 tmp;
++	u32 N;
++	int i, err;
+ 
+ 	p = xdr_inline_decode(xdr, 4);
+ 	if (unlikely(p == NULL))
+@@ -192,33 +193,28 @@ static int gssx_dec_linux_creds(struct xdr_stream *xdr,
+ 
+ 	length = be32_to_cpup(p);
+ 
+-	/* FIXME: we do not want to use the scratch buffer for this one
+-	 * may need to use functions that allows us to access an io vector
+-	 * directly */
+-	p = xdr_inline_decode(xdr, length);
+-	if (unlikely(p == NULL))
++	if (length > (3 + NGROUPS_MAX) * sizeof(u32))
+ 		return -ENOSPC;
+ 
+-	q = p;
+-	end = q + length;
+-
+ 	/* uid */
+-	err = get_s32(&q, end, &tmp);
++	err = get_host_u32(xdr, &tmp);
+ 	if (err)
+ 		return err;
+ 	creds->cr_uid = make_kuid(&init_user_ns, tmp);
+ 
+ 	/* gid */
+-	err = get_s32(&q, end, &tmp);
++	err = get_host_u32(xdr, &tmp);
+ 	if (err)
+ 		return err;
+ 	creds->cr_gid = make_kgid(&init_user_ns, tmp);
+ 
+ 	/* number of additional gid's */
+-	err = get_s32(&q, end, &tmp);
++	err = get_host_u32(xdr, &tmp);
+ 	if (err)
+ 		return err;
+ 	N = tmp;
++	if ((3 + N) * sizeof(u32) != length)
++		return -EINVAL;
+ 	creds->cr_group_info = groups_alloc(N);
+ 	if (creds->cr_group_info == NULL)
+ 		return -ENOMEM;
+@@ -226,7 +222,7 @@ static int gssx_dec_linux_creds(struct xdr_stream *xdr,
+ 	/* gid's */
+ 	for (i = 0; i < N; i++) {
+ 		kgid_t kgid;
+-		err = get_s32(&q, end, &tmp);
++		err = get_host_u32(xdr, &tmp);
+ 		if (err)
+ 			goto out_free_groups;
+ 		err = -EINVAL;
+@@ -784,6 +780,9 @@ void gssx_enc_accept_sec_context(struct rpc_rqst *req,
+ 	/* arg->options */
+ 	err = dummy_enc_opt_array(xdr, &arg->options);
+ 
++	xdr_inline_pages(&req->rq_rcv_buf,
++		PAGE_SIZE/2 /* pretty arbitrary */,
++		arg->pages, 0 /* page base */, arg->npages * PAGE_SIZE);
+ done:
+ 	if (err)
+ 		dprintk("RPC:       gssx_enc_accept_sec_context: %d\n", err);
+diff --git a/net/sunrpc/auth_gss/gss_rpc_xdr.h b/net/sunrpc/auth_gss/gss_rpc_xdr.h
+index 1c98b27..685a688 100644
+--- a/net/sunrpc/auth_gss/gss_rpc_xdr.h
++++ b/net/sunrpc/auth_gss/gss_rpc_xdr.h
+@@ -147,6 +147,8 @@ struct gssx_arg_accept_sec_context {
+ 	struct gssx_cb *input_cb;
+ 	u32 ret_deleg_cred;
+ 	struct gssx_option_array options;
++	struct page **pages;
++	unsigned int npages;
+ };
+ 
+ struct gssx_res_accept_sec_context {
+@@ -240,7 +242,8 @@ int gssx_dec_accept_sec_context(struct rpc_rqst *rqstp,
+ 			     2 * GSSX_max_princ_sz + \
+ 			     8 + 8 + 4 + 4 + 4)
+ #define GSSX_max_output_token_sz 1024
+-#define GSSX_max_creds_sz (4 + 4 + 4 + NGROUPS_MAX * 4)
++/* grouplist not included; we allocate separate pages for that: */
++#define GSSX_max_creds_sz (4 + 4 + 4 /* + NGROUPS_MAX*4 */)
+ #define GSSX_RES_accept_sec_context_sz (GSSX_default_status_sz + \
+ 					GSSX_default_ctx_sz + \
+ 					GSSX_max_output_token_sz + \
+diff --git a/tools/perf/util/map.c b/tools/perf/util/map.c
+index 6fcb9de..8bcdf9e 100644
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@ -21,6 +21,7 @@ const char *map_type__name[MAP__NR_TYPES] = {
+ static inline int is_anon_memory(const char *filename)
+ {
+ 	return !strcmp(filename, "//anon") ||
++	       !strcmp(filename, "/dev/zero (deleted)") ||
+ 	       !strcmp(filename, "/anon_hugepage (deleted)");
+ }
+ 

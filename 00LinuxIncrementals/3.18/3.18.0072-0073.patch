@@ -1,0 +1,678 @@
+diff --git a/Makefile b/Makefile
+index 9b82f279ef1d..f5e683464cd4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 72
++SUBLEVEL = 73
+ EXTRAVERSION =
+ NAME = Diseased Newt
+ 
+diff --git a/arch/arm/xen/mm.c b/arch/arm/xen/mm.c
+index f8a576b1d9bb..5409d70ffe6f 100644
+--- a/arch/arm/xen/mm.c
++++ b/arch/arm/xen/mm.c
+@@ -59,6 +59,7 @@ static struct dma_map_ops xen_swiotlb_dma_ops = {
+ 	.unmap_page = xen_swiotlb_unmap_page,
+ 	.dma_supported = xen_swiotlb_dma_supported,
+ 	.set_dma_mask = xen_swiotlb_set_dma_mask,
++	.mmap = xen_swiotlb_dma_mmap,
+ };
+ 
+ int __init xen_mm_init(void)
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 2877dd818977..5c4b8d6e8ba0 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -264,6 +264,7 @@ ENDPROC(stext)
+  * booted in EL1 or EL2 respectively.
+  */
+ ENTRY(el2_setup)
++	msr	SPsel, #1			// We want to use SP_EL{1,2}
+ 	mrs	x0, CurrentEL
+ 	cmp	x0, #CurrentEL_EL2
+ 	b.ne	1f
+diff --git a/arch/powerpc/kvm/book3s_64_vio.c b/arch/powerpc/kvm/book3s_64_vio.c
+index 54cf9bc94dad..3a095670b0c4 100644
+--- a/arch/powerpc/kvm/book3s_64_vio.c
++++ b/arch/powerpc/kvm/book3s_64_vio.c
+@@ -101,22 +101,17 @@ long kvm_vm_ioctl_create_spapr_tce(struct kvm *kvm,
+ 				   struct kvm_create_spapr_tce *args)
+ {
+ 	struct kvmppc_spapr_tce_table *stt = NULL;
++	struct kvmppc_spapr_tce_table *siter;
+ 	long npages;
+ 	int ret = -ENOMEM;
+ 	int i;
+ 
+-	/* Check this LIOBN hasn't been previously allocated */
+-	list_for_each_entry(stt, &kvm->arch.spapr_tce_tables, list) {
+-		if (stt->liobn == args->liobn)
+-			return -EBUSY;
+-	}
+-
+ 	npages = kvmppc_stt_npages(args->window_size);
+ 
+ 	stt = kzalloc(sizeof(*stt) + npages * sizeof(struct page *),
+ 		      GFP_KERNEL);
+ 	if (!stt)
+-		goto fail;
++		return ret;
+ 
+ 	stt->liobn = args->liobn;
+ 	stt->window_size = args->window_size;
+@@ -128,23 +123,36 @@ long kvm_vm_ioctl_create_spapr_tce(struct kvm *kvm,
+ 			goto fail;
+ 	}
+ 
+-	kvm_get_kvm(kvm);
+-
+ 	mutex_lock(&kvm->lock);
+-	list_add(&stt->list, &kvm->arch.spapr_tce_tables);
++
++	/* Check this LIOBN hasn't been previously allocated */
++	ret = 0;
++	list_for_each_entry(siter, &kvm->arch.spapr_tce_tables, list) {
++		if (siter->liobn == args->liobn) {
++			ret = -EBUSY;
++			break;
++		}
++	}
++
++	if (!ret)
++		ret = anon_inode_getfd("kvm-spapr-tce", &kvm_spapr_tce_fops,
++				       stt, O_RDWR | O_CLOEXEC);
++
++	if (ret >= 0) {
++		list_add(&stt->list, &kvm->arch.spapr_tce_tables);
++		kvm_get_kvm(kvm);
++	}
+ 
+ 	mutex_unlock(&kvm->lock);
+ 
+-	return anon_inode_getfd("kvm-spapr-tce", &kvm_spapr_tce_fops,
+-				stt, O_RDWR | O_CLOEXEC);
++	if (ret >= 0)
++		return ret;
+ 
+-fail:
+-	if (stt) {
+-		for (i = 0; i < npages; i++)
+-			if (stt->pages[i])
+-				__free_page(stt->pages[i]);
++ fail:
++	for (i = 0; i < npages; i++)
++		if (stt->pages[i])
++			__free_page(stt->pages[i]);
+ 
+-		kfree(stt);
+-	}
++	kfree(stt);
+ 	return ret;
+ }
+diff --git a/arch/powerpc/platforms/pseries/mobility.c b/arch/powerpc/platforms/pseries/mobility.c
+index f8c9ff7886e1..b86408e91e8b 100644
+--- a/arch/powerpc/platforms/pseries/mobility.c
++++ b/arch/powerpc/platforms/pseries/mobility.c
+@@ -225,8 +225,10 @@ static int add_dt_node(__be32 parent_phandle, __be32 drc_index)
+ 		return -ENOENT;
+ 
+ 	dn = dlpar_configure_connector(drc_index, parent_dn);
+-	if (!dn)
++	if (!dn) {
++		of_node_put(parent_dn);
+ 		return -ENOENT;
++	}
+ 
+ 	rc = dlpar_attach_node(dn);
+ 	if (rc)
+diff --git a/arch/x86/kernel/i387.c b/arch/x86/kernel/i387.c
+index 8d6e954db2a7..9c9f4c0b0106 100644
+--- a/arch/x86/kernel/i387.c
++++ b/arch/x86/kernel/i387.c
+@@ -388,11 +388,22 @@ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+ 	xsave_hdr = &target->thread.fpu.state->xsave.xsave_hdr;
+ 
+ 	xsave_hdr->xstate_bv &= pcntxt_mask;
++
++	/* xcomp_bv must be 0 when using uncompacted format */
++	if (!ret && xsave_hdr->xcomp_bv)
++		ret = -EINVAL;
++
+ 	/*
+ 	 * These bits must be zero.
+ 	 */
+ 	memset(xsave_hdr->reserved, 0, 48);
+ 
++	/*
++	 * In case of failure, mark all states as init:
++	 */
++	if (ret)
++		fpu_finit(&target->thread.fpu);
++
+ 	return ret;
+ }
+ 
+diff --git a/arch/x86/kernel/xsave.c b/arch/x86/kernel/xsave.c
+index cdc6cf903078..460e72155f51 100644
+--- a/arch/x86/kernel/xsave.c
++++ b/arch/x86/kernel/xsave.c
+@@ -394,7 +394,9 @@ int __restore_xstate_sig(void __user *buf, void __user *buf_fx, int size)
+ 		drop_fpu(tsk);
+ 
+ 		if (__copy_from_user(&fpu->state->xsave, buf_fx, state_size) ||
+-		    __copy_from_user(&env, buf, sizeof(env))) {
++		    __copy_from_user(&env, buf, sizeof(env)) ||
++		    (state_size > offsetof(struct xsave_struct, xsave_hdr) &&
++		     fpu->state->xsave.xsave_hdr.xcomp_bv)) {
+ 			fpu_finit(fpu);
+ 			err = -1;
+ 		} else {
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 99c004ddefd8..dd3ca375bfdf 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -8275,6 +8275,11 @@ static void prepare_vmcs02(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+ 		vmcs_write64(VIRTUAL_APIC_PAGE_ADDR,
+ 				page_to_phys(vmx->nested.virtual_apic_page));
+ 		vmcs_write32(TPR_THRESHOLD, vmcs12->tpr_threshold);
++	} else {
++#ifdef CONFIG_X86_64
++		exec_control |= CPU_BASED_CR8_LOAD_EXITING |
++				CPU_BASED_CR8_STORE_EXITING;
++#endif
+ 	}
+ 
+ 	/*
+diff --git a/block/bsg-lib.c b/block/bsg-lib.c
+index 650f427d915b..341b8d858e67 100644
+--- a/block/bsg-lib.c
++++ b/block/bsg-lib.c
+@@ -147,7 +147,6 @@ static int bsg_create_job(struct device *dev, struct request *req)
+ failjob_rls_rqst_payload:
+ 	kfree(job->request_payload.sg_list);
+ failjob_rls_job:
+-	kfree(job);
+ 	return -ENOMEM;
+ }
+ 
+diff --git a/drivers/crypto/talitos.c b/drivers/crypto/talitos.c
+index 00410b319b26..9fa17913941c 100644
+--- a/drivers/crypto/talitos.c
++++ b/drivers/crypto/talitos.c
+@@ -1581,9 +1581,9 @@ static int common_nonsnoop_hash(struct talitos_edesc *edesc,
+ 		req_ctx->swinit = 0;
+ 	} else {
+ 		desc->ptr[1] = zero_entry;
+-		/* Indicate next op is not the first. */
+-		req_ctx->first = 0;
+ 	}
++	/* Indicate next op is not the first. */
++	req_ctx->first = 0;
+ 
+ 	/* HMAC key */
+ 	if (ctx->keylen)
+diff --git a/drivers/pci/pci-sysfs.c b/drivers/pci/pci-sysfs.c
+index 66ba1ee09a6c..318707870cb2 100644
+--- a/drivers/pci/pci-sysfs.c
++++ b/drivers/pci/pci-sysfs.c
+@@ -513,7 +513,7 @@ static ssize_t driver_override_store(struct device *dev,
+ 				     const char *buf, size_t count)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+-	char *driver_override, *old = pdev->driver_override, *cp;
++	char *driver_override, *old, *cp;
+ 
+ 	/* We need to keep extra room for a newline */
+ 	if (count >= (PAGE_SIZE - 1))
+@@ -527,12 +527,15 @@ static ssize_t driver_override_store(struct device *dev,
+ 	if (cp)
+ 		*cp = '\0';
+ 
++	device_lock(dev);
++	old = pdev->driver_override;
+ 	if (strlen(driver_override)) {
+ 		pdev->driver_override = driver_override;
+ 	} else {
+ 		kfree(driver_override);
+ 		pdev->driver_override = NULL;
+ 	}
++	device_unlock(dev);
+ 
+ 	kfree(old);
+ 
+@@ -543,8 +546,12 @@ static ssize_t driver_override_show(struct device *dev,
+ 				    struct device_attribute *attr, char *buf)
+ {
+ 	struct pci_dev *pdev = to_pci_dev(dev);
++	ssize_t len;
+ 
+-	return snprintf(buf, PAGE_SIZE, "%s\n", pdev->driver_override);
++	device_lock(dev);
++	len = snprintf(buf, PAGE_SIZE, "%s\n", pdev->driver_override);
++	device_unlock(dev);
++	return len;
+ }
+ static DEVICE_ATTR_RW(driver_override);
+ 
+diff --git a/drivers/scsi/scsi_transport_iscsi.c b/drivers/scsi/scsi_transport_iscsi.c
+index 67d43e35693d..b5a653aed5a4 100644
+--- a/drivers/scsi/scsi_transport_iscsi.c
++++ b/drivers/scsi/scsi_transport_iscsi.c
+@@ -3693,7 +3693,7 @@ iscsi_if_rx(struct sk_buff *skb)
+ 		uint32_t group;
+ 
+ 		nlh = nlmsg_hdr(skb);
+-		if (nlh->nlmsg_len < sizeof(*nlh) ||
++		if (nlh->nlmsg_len < sizeof(*nlh) + sizeof(*ev) ||
+ 		    skb->len < nlh->nlmsg_len) {
+ 			break;
+ 		}
+diff --git a/drivers/video/fbdev/aty/atyfb_base.c b/drivers/video/fbdev/aty/atyfb_base.c
+index 37ec09b3fffd..fd38ee820da6 100644
+--- a/drivers/video/fbdev/aty/atyfb_base.c
++++ b/drivers/video/fbdev/aty/atyfb_base.c
+@@ -1852,7 +1852,7 @@ static int atyfb_ioctl(struct fb_info *info, u_int cmd, u_long arg)
+ #if defined(DEBUG) && defined(CONFIG_FB_ATY_CT)
+ 	case ATYIO_CLKR:
+ 		if (M64_HAS(INTEGRATED)) {
+-			struct atyclk clk;
++			struct atyclk clk = { 0 };
+ 			union aty_pll *pll = &par->pll;
+ 			u32 dsp_config = pll->ct.dsp_config;
+ 			u32 dsp_on_off = pll->ct.dsp_on_off;
+diff --git a/drivers/xen/swiotlb-xen.c b/drivers/xen/swiotlb-xen.c
+index c9d0d5a0e662..c6d47e558488 100644
+--- a/drivers/xen/swiotlb-xen.c
++++ b/drivers/xen/swiotlb-xen.c
+@@ -684,3 +684,22 @@ xen_swiotlb_set_dma_mask(struct device *dev, u64 dma_mask)
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(xen_swiotlb_set_dma_mask);
++
++/*
++ * Create userspace mapping for the DMA-coherent memory.
++ * This function should be called with the pages from the current domain only,
++ * passing pages mapped from other domains would lead to memory corruption.
++ */
++int
++xen_swiotlb_dma_mmap(struct device *dev, struct vm_area_struct *vma,
++		     void *cpu_addr, dma_addr_t dma_addr, size_t size,
++		     struct dma_attrs *attrs)
++{
++#if defined(CONFIG_ARM) || defined(CONFIG_ARM64)
++	if (__generic_dma_ops(dev)->mmap)
++		return __generic_dma_ops(dev)->mmap(dev, vma, cpu_addr,
++						    dma_addr, size, attrs);
++#endif
++	return dma_common_mmap(dev, vma, cpu_addr, dma_addr, size);
++}
++EXPORT_SYMBOL_GPL(xen_swiotlb_dma_mmap);
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index dd8526a659f8..a877e6279b10 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -3963,6 +3963,10 @@ static long btrfs_ioctl_default_subvol(struct file *file, void __user *argp)
+ 		ret = PTR_ERR(new_root);
+ 		goto out;
+ 	}
++	if (!is_fstree(new_root->objectid)) {
++		ret = -ENOENT;
++		goto out;
++	}
+ 
+ 	path = btrfs_alloc_path();
+ 	if (!path) {
+diff --git a/fs/cifs/cifsfs.c b/fs/cifs/cifsfs.c
+index 103e8b6604b1..b8158006e0ff 100644
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@ -1311,7 +1311,7 @@ exit_cifs(void)
+ 	exit_cifs_idmap();
+ #endif
+ #ifdef CONFIG_CIFS_UPCALL
+-	unregister_key_type(&cifs_spnego_key_type);
++	exit_cifs_spnego();
+ #endif
+ 	cifs_destroy_request_bufs();
+ 	cifs_destroy_mids();
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 32c46a5c489e..43df8c3e026c 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -3958,6 +3958,14 @@ cifs_setup_session(const unsigned int xid, struct cifs_ses *ses,
+ 	cifs_dbg(FYI, "Security Mode: 0x%x Capabilities: 0x%x TimeAdjust: %d\n",
+ 		 server->sec_mode, server->capabilities, server->timeAdj);
+ 
++	if (ses->auth_key.response) {
++		cifs_dbg(VFS, "Free previous auth_key.response = %p\n",
++			 ses->auth_key.response);
++		kfree(ses->auth_key.response);
++		ses->auth_key.response = NULL;
++		ses->auth_key.len = 0;
++	}
++
+ 	if (server->ops->sess_setup)
+ 		rc = server->ops->sess_setup(xid, ses, nls_info);
+ 
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index a3badede1b32..237c201d6d3e 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -225,6 +225,13 @@ cifs_nt_open(char *full_path, struct inode *inode, struct cifs_sb_info *cifs_sb,
+ 	if (backup_cred(cifs_sb))
+ 		create_options |= CREATE_OPEN_BACKUP_INTENT;
+ 
++	/* O_SYNC also has bit for O_DSYNC so following check picks up either */
++	if (f_flags & O_SYNC)
++		create_options |= CREATE_WRITE_THROUGH;
++
++	if (f_flags & O_DIRECT)
++		create_options |= CREATE_NO_BUFFER;
++
+ 	oparms.tcon = tcon;
+ 	oparms.cifs_sb = cifs_sb;
+ 	oparms.desired_access = desired_access;
+diff --git a/fs/cifs/smb2pdu.c b/fs/cifs/smb2pdu.c
+index 2c3047636d4e..fc5809d494ed 100644
+--- a/fs/cifs/smb2pdu.c
++++ b/fs/cifs/smb2pdu.c
+@@ -453,15 +453,22 @@ int smb3_validate_negotiate(const unsigned int xid, struct cifs_tcon *tcon)
+ 
+ 	/*
+ 	 * validation ioctl must be signed, so no point sending this if we
+-	 * can not sign it.  We could eventually change this to selectively
++	 * can not sign it (ie are not known user).  Even if signing is not
++	 * required (enabled but not negotiated), in those cases we selectively
+ 	 * sign just this, the first and only signed request on a connection.
+-	 * This is good enough for now since a user who wants better security
+-	 * would also enable signing on the mount. Having validation of
+-	 * negotiate info for signed connections helps reduce attack vectors
++	 * Having validation of negotiate info  helps reduce attack vectors.
+ 	 */
+-	if (tcon->ses->server->sign == false)
++	if (tcon->ses->session_flags & SMB2_SESSION_FLAG_IS_GUEST)
+ 		return 0; /* validation requires signing */
+ 
++	if (tcon->ses->user_name == NULL) {
++		cifs_dbg(FYI, "Can't validate negotiate: null user mount\n");
++		return 0; /* validation requires signing */
++	}
++
++	if (tcon->ses->session_flags & SMB2_SESSION_FLAG_IS_NULL)
++		cifs_dbg(VFS, "Unexpected null user (anonymous) auth flag sent by server\n");
++
+ 	vneg_inbuf.Capabilities =
+ 			cpu_to_le32(tcon->ses->server->vals->req_capabilities);
+ 	memcpy(vneg_inbuf.Guid, tcon->ses->server->client_guid,
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 7d9318c3d43c..1afb99c33c63 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -116,7 +116,7 @@ generic_file_llseek_size(struct file *file, loff_t offset, int whence,
+ 		 * In the generic case the entire file is data, so as long as
+ 		 * offset isn't at the end of the file then the offset is data.
+ 		 */
+-		if (offset >= eof)
++		if ((unsigned long long)offset >= eof)
+ 			return -ENXIO;
+ 		break;
+ 	case SEEK_HOLE:
+@@ -124,7 +124,7 @@ generic_file_llseek_size(struct file *file, loff_t offset, int whence,
+ 		 * There is a virtual hole at the end of the file, so as long as
+ 		 * offset isn't i_size or larger, return i_size.
+ 		 */
+-		if (offset >= eof)
++		if ((unsigned long long)offset >= eof)
+ 			return -ENXIO;
+ 		offset = eof;
+ 		break;
+diff --git a/include/linux/key.h b/include/linux/key.h
+index e1d4715f3222..dcc00a7a5b8d 100644
+--- a/include/linux/key.h
++++ b/include/linux/key.h
+@@ -172,6 +172,7 @@ struct key {
+ #define KEY_FLAG_TRUSTED_ONLY	9	/* set if keyring only accepts links to trusted keys */
+ #define KEY_FLAG_BUILTIN	10	/* set if key is builtin */
+ #define KEY_FLAG_ROOT_CAN_INVAL	11	/* set if key can be invalidated by root without permission */
++#define KEY_FLAG_UID_KEYRING	12	/* set if key is a user or user session keyring */
+ 
+ 	/* the key type and key description string
+ 	 * - the desc is used to match a key against search criteria
+@@ -223,6 +224,7 @@ extern struct key *key_alloc(struct key_type *type,
+ #define KEY_ALLOC_QUOTA_OVERRUN	0x0001	/* add to quota, permit even if overrun */
+ #define KEY_ALLOC_NOT_IN_QUOTA	0x0002	/* not in quota */
+ #define KEY_ALLOC_TRUSTED	0x0004	/* Key should be flagged as trusted */
++#define KEY_ALLOC_UID_KEYRING	0x0010	/* allocating a user or user session keyring */
+ 
+ extern void key_revoke(struct key *key);
+ extern void key_invalidate(struct key *key);
+diff --git a/include/xen/swiotlb-xen.h b/include/xen/swiotlb-xen.h
+index 8b2eb93ae8ba..4d7fdbf20eff 100644
+--- a/include/xen/swiotlb-xen.h
++++ b/include/xen/swiotlb-xen.h
+@@ -58,4 +58,9 @@ xen_swiotlb_dma_supported(struct device *hwdev, u64 mask);
+ 
+ extern int
+ xen_swiotlb_set_dma_mask(struct device *dev, u64 dma_mask);
++
++extern int
++xen_swiotlb_dma_mmap(struct device *dev, struct vm_area_struct *vma,
++		     void *cpu_addr, dma_addr_t dma_addr, size_t size,
++		     struct dma_attrs *attrs);
+ #endif /* __LINUX_SWIOTLB_XEN_H */
+diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
+index 941b21f7c8a4..e61b862309af 100644
+--- a/kernel/trace/trace.c
++++ b/kernel/trace/trace.c
+@@ -3168,11 +3168,17 @@ static int tracing_open(struct inode *inode, struct file *file)
+ 	/* If this file was open for write, then erase contents */
+ 	if ((file->f_mode & FMODE_WRITE) && (file->f_flags & O_TRUNC)) {
+ 		int cpu = tracing_get_cpu(inode);
++		struct trace_buffer *trace_buf = &tr->trace_buffer;
++
++#ifdef CONFIG_TRACER_MAX_TRACE
++		if (tr->current_trace->print_max)
++			trace_buf = &tr->max_buffer;
++#endif
+ 
+ 		if (cpu == RING_BUFFER_ALL_CPUS)
+-			tracing_reset_online_cpus(&tr->trace_buffer);
++			tracing_reset_online_cpus(trace_buf);
+ 		else
+-			tracing_reset(&tr->trace_buffer, cpu);
++			tracing_reset(trace_buf, cpu);
+ 	}
+ 
+ 	if (file->f_mode & FMODE_READ) {
+@@ -4430,7 +4436,7 @@ static int tracing_wait_pipe(struct file *filp)
+ 		 *
+ 		 * iter->pos will be 0 if we haven't read anything.
+ 		 */
+-		if (!tracing_is_on() && iter->pos)
++		if (!tracer_tracing_is_on(iter->tr) && iter->pos)
+ 			break;
+ 
+ 		mutex_unlock(&iter->mutex);
+diff --git a/net/mac80211/offchannel.c b/net/mac80211/offchannel.c
+index ff20b2ebdb30..a914eaa7ff06 100644
+--- a/net/mac80211/offchannel.c
++++ b/net/mac80211/offchannel.c
+@@ -469,6 +469,8 @@ void ieee80211_roc_purge(struct ieee80211_local *local,
+ 	struct ieee80211_roc_work *roc, *tmp;
+ 	LIST_HEAD(tmp_list);
+ 
++	flush_work(&local->hw_roc_start);
++
+ 	mutex_lock(&local->mtx);
+ 	list_for_each_entry_safe(roc, tmp, &local->roc_list, list) {
+ 		if (sdata && roc->sdata != sdata)
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 9fb1dd399788..f843f704c17c 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -9006,6 +9006,9 @@ static int nl80211_set_rekey_data(struct sk_buff *skb, struct genl_info *info)
+ 	if (err)
+ 		return err;
+ 
++	if (!tb[NL80211_REKEY_DATA_REPLAY_CTR] || !tb[NL80211_REKEY_DATA_KEK] ||
++	    !tb[NL80211_REKEY_DATA_KCK])
++		return -EINVAL;
+ 	if (nla_len(tb[NL80211_REKEY_DATA_REPLAY_CTR]) != NL80211_REPLAY_CTR_LEN)
+ 		return -ERANGE;
+ 	if (nla_len(tb[NL80211_REKEY_DATA_KEK]) != NL80211_KEK_LEN)
+diff --git a/security/keys/internal.h b/security/keys/internal.h
+index 200e37867336..b87c92ffae68 100644
+--- a/security/keys/internal.h
++++ b/security/keys/internal.h
+@@ -136,7 +136,7 @@ extern key_ref_t keyring_search_aux(key_ref_t keyring_ref,
+ extern key_ref_t search_my_process_keyrings(struct keyring_search_context *ctx);
+ extern key_ref_t search_process_keyrings(struct keyring_search_context *ctx);
+ 
+-extern struct key *find_keyring_by_name(const char *name, bool skip_perm_check);
++extern struct key *find_keyring_by_name(const char *name, bool uid_keyring);
+ 
+ extern int install_user_keyrings(void);
+ extern int install_thread_keyring_to_cred(struct cred *);
+diff --git a/security/keys/key.c b/security/keys/key.c
+index 37c268fb5c81..8f67cd3bb999 100644
+--- a/security/keys/key.c
++++ b/security/keys/key.c
+@@ -298,6 +298,8 @@ struct key *key_alloc(struct key_type *type, const char *desc,
+ 		key->flags |= 1 << KEY_FLAG_IN_QUOTA;
+ 	if (flags & KEY_ALLOC_TRUSTED)
+ 		key->flags |= 1 << KEY_FLAG_TRUSTED;
++	if (flags & KEY_ALLOC_UID_KEYRING)
++		key->flags |= 1 << KEY_FLAG_UID_KEYRING;
+ 
+ #ifdef KEY_DEBUGGING
+ 	key->magic = KEY_DEBUG_MAGIC;
+diff --git a/security/keys/keyctl.c b/security/keys/keyctl.c
+index 98c5ebc6dad6..9fc289ec0159 100644
+--- a/security/keys/keyctl.c
++++ b/security/keys/keyctl.c
+@@ -744,6 +744,11 @@ long keyctl_read_key(key_serial_t keyid, char __user *buffer, size_t buflen)
+ 
+ 	key = key_ref_to_ptr(key_ref);
+ 
++	if (test_bit(KEY_FLAG_NEGATIVE, &key->flags)) {
++		ret = -ENOKEY;
++		goto error2;
++	}
++
+ 	/* see if we can read it directly */
+ 	ret = key_permission(key_ref, KEY_NEED_READ);
+ 	if (ret == 0)
+diff --git a/security/keys/keyring.c b/security/keys/keyring.c
+index d33437007ad2..6d913f40b6f0 100644
+--- a/security/keys/keyring.c
++++ b/security/keys/keyring.c
+@@ -416,7 +416,7 @@ static void keyring_describe(const struct key *keyring, struct seq_file *m)
+ }
+ 
+ struct keyring_read_iterator_context {
+-	size_t			qty;
++	size_t			buflen;
+ 	size_t			count;
+ 	key_serial_t __user	*buffer;
+ };
+@@ -428,9 +428,9 @@ static int keyring_read_iterator(const void *object, void *data)
+ 	int ret;
+ 
+ 	kenter("{%s,%d},,{%zu/%zu}",
+-	       key->type->name, key->serial, ctx->count, ctx->qty);
++	       key->type->name, key->serial, ctx->count, ctx->buflen);
+ 
+-	if (ctx->count >= ctx->qty)
++	if (ctx->count >= ctx->buflen)
+ 		return 1;
+ 
+ 	ret = put_user(key->serial, ctx->buffer);
+@@ -465,16 +465,12 @@ static long keyring_read(const struct key *keyring,
+ 		return 0;
+ 
+ 	/* Calculate how much data we could return */
+-	ctx.qty = nr_keys * sizeof(key_serial_t);
+-
+ 	if (!buffer || !buflen)
+-		return ctx.qty;
+-
+-	if (buflen > ctx.qty)
+-		ctx.qty = buflen;
++		return nr_keys * sizeof(key_serial_t);
+ 
+ 	/* Copy the IDs of the subscribed keys into the buffer */
+ 	ctx.buffer = (key_serial_t __user *)buffer;
++	ctx.buflen = buflen;
+ 	ctx.count = 0;
+ 	ret = assoc_array_iterate(&keyring->keys, keyring_read_iterator, &ctx);
+ 	if (ret < 0) {
+@@ -965,15 +961,15 @@ found:
+ /*
+  * Find a keyring with the specified name.
+  *
+- * All named keyrings in the current user namespace are searched, provided they
+- * grant Search permission directly to the caller (unless this check is
+- * skipped).  Keyrings whose usage points have reached zero or who have been
+- * revoked are skipped.
++ * Only keyrings that have nonzero refcount, are not revoked, and are owned by a
++ * user in the current user namespace are considered.  If @uid_keyring is %true,
++ * the keyring additionally must have been allocated as a user or user session
++ * keyring; otherwise, it must grant Search permission directly to the caller.
+  *
+  * Returns a pointer to the keyring with the keyring's refcount having being
+  * incremented on success.  -ENOKEY is returned if a key could not be found.
+  */
+-struct key *find_keyring_by_name(const char *name, bool skip_perm_check)
++struct key *find_keyring_by_name(const char *name, bool uid_keyring)
+ {
+ 	struct key *keyring;
+ 	int bucket;
+@@ -1001,10 +997,15 @@ struct key *find_keyring_by_name(const char *name, bool skip_perm_check)
+ 			if (strcmp(keyring->description, name) != 0)
+ 				continue;
+ 
+-			if (!skip_perm_check &&
+-			    key_permission(make_key_ref(keyring, 0),
+-					   KEY_NEED_SEARCH) < 0)
+-				continue;
++			if (uid_keyring) {
++				if (!test_bit(KEY_FLAG_UID_KEYRING,
++					      &keyring->flags))
++					continue;
++			} else {
++				if (key_permission(make_key_ref(keyring, 0),
++						   KEY_NEED_SEARCH) < 0)
++					continue;
++			}
+ 
+ 			/* we've got a match but we might end up racing with
+ 			 * key_cleanup() if the keyring is currently 'dead'
+diff --git a/security/keys/process_keys.c b/security/keys/process_keys.c
+index 162077db5f81..85b61a3ac981 100644
+--- a/security/keys/process_keys.c
++++ b/security/keys/process_keys.c
+@@ -76,7 +76,9 @@ int install_user_keyrings(void)
+ 		if (IS_ERR(uid_keyring)) {
+ 			uid_keyring = keyring_alloc(buf, user->uid, INVALID_GID,
+ 						    cred, user_keyring_perm,
+-						    KEY_ALLOC_IN_QUOTA, NULL);
++						    KEY_ALLOC_UID_KEYRING |
++							KEY_ALLOC_IN_QUOTA,
++						    NULL);
+ 			if (IS_ERR(uid_keyring)) {
+ 				ret = PTR_ERR(uid_keyring);
+ 				goto error;
+@@ -92,7 +94,9 @@ int install_user_keyrings(void)
+ 			session_keyring =
+ 				keyring_alloc(buf, user->uid, INVALID_GID,
+ 					      cred, user_keyring_perm,
+-					      KEY_ALLOC_IN_QUOTA, NULL);
++					      KEY_ALLOC_UID_KEYRING |
++						  KEY_ALLOC_IN_QUOTA,
++					      NULL);
+ 			if (IS_ERR(session_keyring)) {
+ 				ret = PTR_ERR(session_keyring);
+ 				goto error_release;

@@ -1,0 +1,174 @@
+diff --git a/Makefile b/Makefile
+index 28912c341bd8..05b64e6d1456 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 43
++SUBLEVEL = 44
+ EXTRAVERSION =
+ NAME = Diseased Newt
+ 
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index 88635b301694..69608a4f554b 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -291,10 +291,9 @@ __setup("nosmap", setup_disable_smap);
+ 
+ static __always_inline void setup_smap(struct cpuinfo_x86 *c)
+ {
+-	unsigned long eflags;
++	unsigned long eflags = native_save_fl();
+ 
+ 	/* This should have been cleared long ago */
+-	raw_local_save_flags(eflags);
+ 	BUG_ON(eflags & X86_EFLAGS_AC);
+ 
+ 	if (cpu_has(c, X86_FEATURE_SMAP)) {
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index dfe835d21b15..0fa8fd9adeba 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -619,8 +619,30 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd,
+ 		if ((raw_port_status & PORT_RESET) ||
+ 				!(raw_port_status & PORT_PE))
+ 			return 0xffffffff;
+-		if (time_after_eq(jiffies,
+-					bus_state->resume_done[wIndex])) {
++		/* did port event handler already start resume timing? */
++		if (!bus_state->resume_done[wIndex]) {
++			/* If not, maybe we are in a host initated resume? */
++			if (test_bit(wIndex, &bus_state->resuming_ports)) {
++				/* Host initated resume doesn't time the resume
++				 * signalling using resume_done[].
++				 * It manually sets RESUME state, sleeps 20ms
++				 * and sets U0 state. This should probably be
++				 * changed, but not right now.
++				 */
++			} else {
++				/* port resume was discovered now and here,
++				 * start resume timing
++				 */
++				unsigned long timeout = jiffies +
++					msecs_to_jiffies(USB_RESUME_TIMEOUT);
++
++				set_bit(wIndex, &bus_state->resuming_ports);
++				bus_state->resume_done[wIndex] = timeout;
++				mod_timer(&hcd->rh_timer, timeout);
++			}
++		/* Has resume been signalled for USB_RESUME_TIME yet? */
++		} else if (time_after_eq(jiffies,
++					 bus_state->resume_done[wIndex])) {
+ 			int time_left;
+ 
+ 			xhci_dbg(xhci, "Resume USB2 port %d\n",
+@@ -661,13 +683,24 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd,
+ 		} else {
+ 			/*
+ 			 * The resume has been signaling for less than
+-			 * 20ms. Report the port status as SUSPEND,
+-			 * let the usbcore check port status again
+-			 * and clear resume signaling later.
++			 * USB_RESUME_TIME. Report the port status as SUSPEND,
++			 * let the usbcore check port status again and clear
++			 * resume signaling later.
+ 			 */
+ 			status |= USB_PORT_STAT_SUSPEND;
+ 		}
+ 	}
++	/*
++	 * Clear stale usb2 resume signalling variables in case port changed
++	 * state during resume signalling. For example on error
++	 */
++	if ((bus_state->resume_done[wIndex] ||
++	     test_bit(wIndex, &bus_state->resuming_ports)) &&
++	    (raw_port_status & PORT_PLS_MASK) != XDEV_U3 &&
++	    (raw_port_status & PORT_PLS_MASK) != XDEV_RESUME) {
++		bus_state->resume_done[wIndex] = 0;
++		clear_bit(wIndex, &bus_state->resuming_ports);
++	}
+ 	if ((raw_port_status & PORT_PLS_MASK) == XDEV_U0
+ 			&& (raw_port_status & PORT_POWER)
+ 			&& (bus_state->suspended_ports & (1 << wIndex))) {
+@@ -998,6 +1031,7 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 				if ((temp & PORT_PE) == 0)
+ 					goto error;
+ 
++				set_bit(wIndex, &bus_state->resuming_ports);
+ 				xhci_set_link_state(xhci, port_array, wIndex,
+ 							XDEV_RESUME);
+ 				spin_unlock_irqrestore(&xhci->lock, flags);
+@@ -1005,6 +1039,7 @@ int xhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+ 				spin_lock_irqsave(&xhci->lock, flags);
+ 				xhci_set_link_state(xhci, port_array, wIndex,
+ 							XDEV_U0);
++				clear_bit(wIndex, &bus_state->resuming_ports);
+ 			}
+ 			bus_state->port_c_suspend |= 1 << wIndex;
+ 
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index c15dbffe660b..cd88034c7a83 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1595,7 +1595,8 @@ static void handle_port_status(struct xhci_hcd *xhci,
+ 			 */
+ 			bogus_port_status = true;
+ 			goto cleanup;
+-		} else {
++		} else if (!test_bit(faked_port_index,
++				     &bus_state->resuming_ports)) {
+ 			xhci_dbg(xhci, "resume HS port %d\n", port_id);
+ 			bus_state->resume_done[faked_port_index] = jiffies +
+ 				msecs_to_jiffies(USB_RESUME_TIMEOUT);
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 9eef3a1f2291..db853dee1ec5 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2029,6 +2029,7 @@ static inline struct page *follow_page(struct vm_area_struct *vma,
+ #define FOLL_NUMA	0x200	/* force NUMA hinting page fault */
+ #define FOLL_MIGRATION	0x400	/* wait for page to replace migration entry */
+ #define FOLL_TRIED	0x800	/* a retry, previous pass started an IO */
++#define FOLL_COW	0x4000	/* internal GUP flag */
+ 
+ typedef int (*pte_fn_t)(pte_t *pte, pgtable_t token, unsigned long addr,
+ 			void *data);
+diff --git a/mm/gup.c b/mm/gup.c
+index 377a5a796242..3cec4df06e6b 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -32,6 +32,16 @@ static struct page *no_page_table(struct vm_area_struct *vma,
+ 	return NULL;
+ }
+ 
++/*
++ * FOLL_FORCE can write to even unwritable pte's, but only
++ * after we've gone through a COW cycle and they are dirty.
++ */
++static inline bool can_follow_write_pte(pte_t pte, unsigned int flags)
++{
++	return pte_write(pte) ||
++		((flags & FOLL_FORCE) && (flags & FOLL_COW) && pte_dirty(pte));
++}
++
+ static struct page *follow_page_pte(struct vm_area_struct *vma,
+ 		unsigned long address, pmd_t *pmd, unsigned int flags)
+ {
+@@ -66,7 +76,7 @@ retry:
+ 	}
+ 	if ((flags & FOLL_NUMA) && pte_numa(pte))
+ 		goto no_page;
+-	if ((flags & FOLL_WRITE) && !pte_write(pte)) {
++	if ((flags & FOLL_WRITE) && !can_follow_write_pte(pte, flags)) {
+ 		pte_unmap_unlock(ptep, ptl);
+ 		return NULL;
+ 	}
+@@ -315,7 +325,7 @@ static int faultin_page(struct task_struct *tsk, struct vm_area_struct *vma,
+ 	 * reCOWed by userspace write).
+ 	 */
+ 	if ((ret & VM_FAULT_WRITE) && !(vma->vm_flags & VM_WRITE))
+-		*flags &= ~FOLL_WRITE;
++	        *flags |= FOLL_COW;
+ 	return 0;
+ }
+ 

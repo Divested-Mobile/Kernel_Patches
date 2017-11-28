@@ -1,0 +1,947 @@
+diff --git a/Makefile b/Makefile
+index 2d84a1d..f139ce7 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 4
+-SUBLEVEL = 26
++SUBLEVEL = 27
+ EXTRAVERSION =
+ NAME = Saber-toothed Squirrel
+ 
+diff --git a/arch/s390/include/asm/timex.h b/arch/s390/include/asm/timex.h
+index c447a27..945b7cd 100644
+--- a/arch/s390/include/asm/timex.h
++++ b/arch/s390/include/asm/timex.h
+@@ -137,4 +137,32 @@ static inline unsigned long long get_clock_monotonic(void)
+ 	return get_clock_xt() - sched_clock_base_cc;
+ }
+ 
++/**
++ * tod_to_ns - convert a TOD format value to nanoseconds
++ * @todval: to be converted TOD format value
++ * Returns: number of nanoseconds that correspond to the TOD format value
++ *
++ * Converting a 64 Bit TOD format value to nanoseconds means that the value
++ * must be divided by 4.096. In order to achieve that we multiply with 125
++ * and divide by 512:
++ *
++ *    ns = (todval * 125) >> 9;
++ *
++ * In order to avoid an overflow with the multiplication we can rewrite this.
++ * With a split todval == 2^32 * th + tl (th upper 32 bits, tl lower 32 bits)
++ * we end up with
++ *
++ *    ns = ((2^32 * th + tl) * 125 ) >> 9;
++ * -> ns = (2^23 * th * 125) + ((tl * 125) >> 9);
++ *
++ */
++static inline unsigned long long tod_to_ns(unsigned long long todval)
++{
++	unsigned long long ns;
++
++	ns = ((todval >> 32) << 23) * 125;
++	ns += ((todval & 0xffffffff) * 125) >> 9;
++	return ns;
++}
++
+ #endif
+diff --git a/arch/s390/kernel/time.c b/arch/s390/kernel/time.c
+index d4e1cb1..c5531db 100644
+--- a/arch/s390/kernel/time.c
++++ b/arch/s390/kernel/time.c
+@@ -64,7 +64,7 @@ static DEFINE_PER_CPU(struct clock_event_device, comparators);
+  */
+ unsigned long long notrace __kprobes sched_clock(void)
+ {
+-	return (get_clock_monotonic() * 125) >> 9;
++	return tod_to_ns(get_clock_monotonic());
+ }
+ 
+ /*
+diff --git a/arch/s390/kvm/interrupt.c b/arch/s390/kvm/interrupt.c
+index 2d9f9a7..10e13b3 100644
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@ -390,7 +390,7 @@ int kvm_s390_handle_wait(struct kvm_vcpu *vcpu)
+ 		return 0;
+ 	}
+ 
+-	sltime = ((vcpu->arch.sie_block->ckc - now)*125)>>9;
++	sltime = tod_to_ns(vcpu->arch.sie_block->ckc - now);
+ 
+ 	hrtimer_start(&vcpu->arch.ckc_timer, ktime_set (0, sltime) , HRTIMER_MODE_REL);
+ 	VCPU_EVENT(vcpu, 5, "enabled wait via clock comparator: %llx ns", sltime);
+diff --git a/arch/sh/include/asm/elf.h b/arch/sh/include/asm/elf.h
+index f38112b..978b7fd 100644
+--- a/arch/sh/include/asm/elf.h
++++ b/arch/sh/include/asm/elf.h
+@@ -202,9 +202,9 @@ extern void __kernel_vsyscall;
+ 	if (vdso_enabled)					\
+ 		NEW_AUX_ENT(AT_SYSINFO_EHDR, VDSO_BASE);	\
+ 	else							\
+-		NEW_AUX_ENT(AT_IGNORE, 0);
++		NEW_AUX_ENT(AT_IGNORE, 0)
+ #else
+-#define VSYSCALL_AUX_ENT
++#define VSYSCALL_AUX_ENT	NEW_AUX_ENT(AT_IGNORE, 0)
+ #endif /* CONFIG_VSYSCALL */
+ 
+ #ifdef CONFIG_SH_FPU
+diff --git a/arch/x86/kernel/entry_32.S b/arch/x86/kernel/entry_32.S
+index 6d4f7ba..2af4ccd 100644
+--- a/arch/x86/kernel/entry_32.S
++++ b/arch/x86/kernel/entry_32.S
+@@ -1074,7 +1074,6 @@ ENTRY(xen_failsafe_callback)
+ 	lea 16(%esp),%esp
+ 	CFI_ADJUST_CFA_OFFSET -16
+ 	jz 5f
+-	addl $16,%esp
+ 	jmp iret_exc
+ 5:	pushl_cfi $-1 /* orig_ax = -1 => not a system call */
+ 	SAVE_ALL
+diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
+index ae98dbb..d289ee7 100644
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@ -620,6 +620,81 @@ static __init void reserve_ibft_region(void)
+ 
+ static unsigned reserve_low = CONFIG_X86_RESERVE_LOW << 10;
+ 
++static bool __init snb_gfx_workaround_needed(void)
++{
++	int i;
++	u16 vendor, devid;
++	static const u16 snb_ids[] = {
++		0x0102,
++		0x0112,
++		0x0122,
++		0x0106,
++		0x0116,
++		0x0126,
++		0x010a,
++	};
++
++	/* Assume no if something weird is going on with PCI */
++	if (!early_pci_allowed())
++		return false;
++
++	vendor = read_pci_config_16(0, 2, 0, PCI_VENDOR_ID);
++	if (vendor != 0x8086)
++		return false;
++
++	devid = read_pci_config_16(0, 2, 0, PCI_DEVICE_ID);
++	for (i = 0; i < ARRAY_SIZE(snb_ids); i++)
++		if (devid == snb_ids[i])
++			return true;
++
++	return false;
++}
++
++/*
++ * Sandy Bridge graphics has trouble with certain ranges, exclude
++ * them from allocation.
++ */
++static void __init trim_snb_memory(void)
++{
++	static const unsigned long bad_pages[] = {
++		0x20050000,
++		0x20110000,
++		0x20130000,
++		0x20138000,
++		0x40004000,
++	};
++	int i;
++
++	if (!snb_gfx_workaround_needed())
++		return;
++
++	printk(KERN_DEBUG "reserving inaccessible SNB gfx pages\n");
++
++	/*
++	 * Reserve all memory below the 1 MB mark that has not
++	 * already been reserved.
++	 */
++	memblock_reserve(0, 1<<20);
++
++	for (i = 0; i < ARRAY_SIZE(bad_pages); i++) {
++		if (memblock_reserve(bad_pages[i], PAGE_SIZE))
++			printk(KERN_WARNING "failed to reserve 0x%08lx\n",
++			       bad_pages[i]);
++	}
++}
++
++/*
++ * Here we put platform-specific memory range workarounds, i.e.
++ * memory known to be corrupt or otherwise in need to be reserved on
++ * specific platforms.
++ *
++ * If this gets used more widely it could use a real dispatch mechanism.
++ */
++static void __init trim_platform_memory_ranges(void)
++{
++	trim_snb_memory();
++}
++
+ static void __init trim_bios_range(void)
+ {
+ 	/*
+@@ -640,6 +715,7 @@ static void __init trim_bios_range(void)
+ 	 * take them out.
+ 	 */
+ 	e820_remove_range(BIOS_BEGIN, BIOS_END - BIOS_BEGIN, E820_RAM, 1);
++
+ 	sanitize_e820_map(e820.map, ARRAY_SIZE(e820.map), &e820.nr_map);
+ }
+ 
+@@ -919,6 +995,8 @@ void __init setup_arch(char **cmdline_p)
+ 
+ 	setup_trampolines();
+ 
++	trim_platform_memory_ranges();
++
+ 	init_gbpages();
+ 
+ 	/* max_pfn_mapped is updated here */
+diff --git a/drivers/block/drbd/drbd_req.c b/drivers/block/drbd/drbd_req.c
+index 4a0f314..be984e0 100644
+--- a/drivers/block/drbd/drbd_req.c
++++ b/drivers/block/drbd/drbd_req.c
+@@ -37,6 +37,7 @@ static void _drbd_start_io_acct(struct drbd_conf *mdev, struct drbd_request *req
+ 	const int rw = bio_data_dir(bio);
+ 	int cpu;
+ 	cpu = part_stat_lock();
++	part_round_stats(cpu, &mdev->vdisk->part0);
+ 	part_stat_inc(cpu, &mdev->vdisk->part0, ios[rw]);
+ 	part_stat_add(cpu, &mdev->vdisk->part0, sectors[rw], bio_sectors(bio));
+ 	part_inc_in_flight(&mdev->vdisk->part0, rw);
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index 9c34db8..be66606 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -2321,8 +2321,39 @@ static int domain_add_dev_info(struct dmar_domain *domain,
+ 	return 0;
+ }
+ 
++static bool device_has_rmrr(struct pci_dev *dev)
++{
++	struct dmar_rmrr_unit *rmrr;
++	int i;
++
++	for_each_rmrr_units(rmrr) {
++		for (i = 0; i < rmrr->devices_cnt; i++) {
++			/*
++			 * Return TRUE if this RMRR contains the device that
++			 * is passed in.
++			 */
++			if (rmrr->devices[i] == dev)
++				return true;
++		}
++	}
++	return false;
++}
++
+ static int iommu_should_identity_map(struct pci_dev *pdev, int startup)
+ {
++
++	/*
++	 * We want to prevent any device associated with an RMRR from
++	 * getting placed into the SI Domain. This is done because
++	 * problems exist when devices are moved in and out of domains
++	 * and their respective RMRR info is lost. We exempt USB devices
++	 * from this process due to their usage of RMRRs that are known
++	 * to not be needed after BIOS hand-off to OS.
++	 */
++	if (device_has_rmrr(pdev) &&
++	    (pdev->class >> 8) != PCI_CLASS_SERIAL_USB)
++		return 0;
++
+ 	if ((iommu_identity_mapping & IDENTMAP_AZALIA) && IS_AZALIA(pdev))
+ 		return 1;
+ 
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index 8683ca4..6b4f014 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -951,17 +951,18 @@ static int igb_request_msix(struct igb_adapter *adapter)
+ {
+ 	struct net_device *netdev = adapter->netdev;
+ 	struct e1000_hw *hw = &adapter->hw;
+-	int i, err = 0, vector = 0;
++	int i, err = 0, vector = 0, free_vector = 0;
+ 
+ 	err = request_irq(adapter->msix_entries[vector].vector,
+ 	                  igb_msix_other, 0, netdev->name, adapter);
+ 	if (err)
+-		goto out;
+-	vector++;
++		goto err_out;
+ 
+ 	for (i = 0; i < adapter->num_q_vectors; i++) {
+ 		struct igb_q_vector *q_vector = adapter->q_vector[i];
+ 
++		vector++;
++
+ 		q_vector->itr_register = hw->hw_addr + E1000_EITR(vector);
+ 
+ 		if (q_vector->rx.ring && q_vector->tx.ring)
+@@ -980,13 +981,22 @@ static int igb_request_msix(struct igb_adapter *adapter)
+ 		                  igb_msix_ring, 0, q_vector->name,
+ 		                  q_vector);
+ 		if (err)
+-			goto out;
+-		vector++;
++			goto err_free;
+ 	}
+ 
+ 	igb_configure_msix(adapter);
+ 	return 0;
+-out:
++
++err_free:
++	/* free already assigned IRQs */
++	free_irq(adapter->msix_entries[free_vector++].vector, adapter);
++
++	vector--;
++	for (i = 0; i < vector; i++) {
++		free_irq(adapter->msix_entries[free_vector++].vector,
++			 adapter->q_vector[i]);
++	}
++err_out:
+ 	return err;
+ }
+ 
+diff --git a/drivers/net/ethernet/realtek/r8169.c b/drivers/net/ethernet/realtek/r8169.c
+index 0dc70c2..06ee243 100644
+--- a/drivers/net/ethernet/realtek/r8169.c
++++ b/drivers/net/ethernet/realtek/r8169.c
+@@ -5516,11 +5516,7 @@ static void rtl_slow_event_work(struct rtl8169_private *tp)
+ 	if (status & LinkChg)
+ 		__rtl8169_check_link_status(dev, tp, tp->mmio_addr, true);
+ 
+-	napi_disable(&tp->napi);
+-	rtl_irq_disable(tp);
+-
+-	napi_enable(&tp->napi);
+-	napi_schedule(&tp->napi);
++	rtl_irq_enable_all(tp);
+ }
+ 
+ static void rtl_task(struct work_struct *work)
+diff --git a/drivers/staging/vt6656/bssdb.h b/drivers/staging/vt6656/bssdb.h
+index a8f97eb..991ce3e 100644
+--- a/drivers/staging/vt6656/bssdb.h
++++ b/drivers/staging/vt6656/bssdb.h
+@@ -92,7 +92,6 @@ typedef struct tagSRSNCapObject {
+ } SRSNCapObject, *PSRSNCapObject;
+ 
+ // BSS info(AP)
+-#pragma pack(1)
+ typedef struct tagKnownBSS {
+     // BSS info
+     BOOL            bActive;
+diff --git a/drivers/staging/vt6656/int.h b/drivers/staging/vt6656/int.h
+index a5d96b9..27bc7f5 100644
+--- a/drivers/staging/vt6656/int.h
++++ b/drivers/staging/vt6656/int.h
+@@ -34,7 +34,6 @@
+ #include "device.h"
+ 
+ /*---------------------  Export Definitions -------------------------*/
+-#pragma pack(1)
+ typedef struct tagSINTData {
+     BYTE    byTSR0;
+     BYTE    byPkt0;
+diff --git a/drivers/staging/vt6656/iocmd.h b/drivers/staging/vt6656/iocmd.h
+index 22710ce..ae6e2d2 100644
+--- a/drivers/staging/vt6656/iocmd.h
++++ b/drivers/staging/vt6656/iocmd.h
+@@ -95,13 +95,12 @@ typedef enum tagWZONETYPE {
+ // Ioctl interface structure
+ // Command structure
+ //
+-#pragma pack(1)
+ typedef struct tagSCmdRequest {
+ 	u8 name[16];
+ 	void	*data;
+ 	u16	    wResult;
+ 	u16     wCmdCode;
+-} SCmdRequest, *PSCmdRequest;
++} __packed SCmdRequest, *PSCmdRequest;
+ 
+ //
+ // Scan
+@@ -111,7 +110,7 @@ typedef struct tagSCmdScan {
+ 
+     u8	    ssid[SSID_MAXLEN + 2];
+ 
+-} SCmdScan, *PSCmdScan;
++} __packed SCmdScan, *PSCmdScan;
+ 
+ //
+ // BSS Join
+@@ -126,7 +125,7 @@ typedef struct tagSCmdBSSJoin {
+     BOOL    bPSEnable;
+     BOOL    bShareKeyAuth;
+ 
+-} SCmdBSSJoin, *PSCmdBSSJoin;
++} __packed SCmdBSSJoin, *PSCmdBSSJoin;
+ 
+ //
+ // Zonetype Setting
+@@ -137,7 +136,7 @@ typedef struct tagSCmdZoneTypeSet {
+  BOOL       bWrite;
+  WZONETYPE  ZoneType;
+ 
+-} SCmdZoneTypeSet, *PSCmdZoneTypeSet;
++} __packed SCmdZoneTypeSet, *PSCmdZoneTypeSet;
+ 
+ typedef struct tagSWPAResult {
+          char	ifname[100];
+@@ -145,7 +144,7 @@ typedef struct tagSWPAResult {
+ 	u8 key_mgmt;
+ 	u8 eap_type;
+          BOOL authenticated;
+-} SWPAResult, *PSWPAResult;
++} __packed SWPAResult, *PSWPAResult;
+ 
+ typedef struct tagSCmdStartAP {
+ 
+@@ -157,7 +156,7 @@ typedef struct tagSCmdStartAP {
+     BOOL    bShareKeyAuth;
+     u8      byBasicRate;
+ 
+-} SCmdStartAP, *PSCmdStartAP;
++} __packed SCmdStartAP, *PSCmdStartAP;
+ 
+ typedef struct tagSCmdSetWEP {
+ 
+@@ -167,7 +166,7 @@ typedef struct tagSCmdSetWEP {
+     BOOL    bWepKeyAvailable[WEP_NKEYS];
+     u32     auWepKeyLength[WEP_NKEYS];
+ 
+-} SCmdSetWEP, *PSCmdSetWEP;
++} __packed SCmdSetWEP, *PSCmdSetWEP;
+ 
+ typedef struct tagSBSSIDItem {
+ 
+@@ -180,14 +179,14 @@ typedef struct tagSBSSIDItem {
+     BOOL    bWEPOn;
+     u32     uRSSI;
+ 
+-} SBSSIDItem;
++} __packed SBSSIDItem;
+ 
+ 
+ typedef struct tagSBSSIDList {
+ 
+ 	u32		    uItem;
+ 	SBSSIDItem	sBSSIDList[0];
+-} SBSSIDList, *PSBSSIDList;
++} __packed SBSSIDList, *PSBSSIDList;
+ 
+ 
+ typedef struct tagSNodeItem {
+@@ -208,7 +207,7 @@ typedef struct tagSNodeItem {
+     u32            uTxAttempts;
+     u16            wFailureRatio;
+ 
+-} SNodeItem;
++} __packed SNodeItem;
+ 
+ 
+ typedef struct tagSNodeList {
+@@ -216,7 +215,7 @@ typedef struct tagSNodeList {
+ 	u32		    uItem;
+ 	SNodeItem	sNodeList[0];
+ 
+-} SNodeList, *PSNodeList;
++} __packed SNodeList, *PSNodeList;
+ 
+ 
+ typedef struct tagSCmdLinkStatus {
+@@ -229,7 +228,7 @@ typedef struct tagSCmdLinkStatus {
+     u32     uChannel;
+     u32     uLinkRate;
+ 
+-} SCmdLinkStatus, *PSCmdLinkStatus;
++} __packed SCmdLinkStatus, *PSCmdLinkStatus;
+ 
+ //
+ // 802.11 counter
+@@ -247,7 +246,7 @@ typedef struct tagSDot11MIBCount {
+     u32 ReceivedFragmentCount;
+     u32 MulticastReceivedFrameCount;
+     u32 FCSErrorCount;
+-} SDot11MIBCount, *PSDot11MIBCount;
++} __packed SDot11MIBCount, *PSDot11MIBCount;
+ 
+ 
+ 
+@@ -355,13 +354,13 @@ typedef struct tagSStatMIBCount {
+     u32   ullTxBroadcastBytes[2];
+     u32   ullTxMulticastBytes[2];
+     u32   ullTxDirectedBytes[2];
+-} SStatMIBCount, *PSStatMIBCount;
++} __packed SStatMIBCount, *PSStatMIBCount;
+ 
+ typedef struct tagSCmdValue {
+ 
+     u32     dwValue;
+ 
+-} SCmdValue,  *PSCmdValue;
++} __packed SCmdValue,  *PSCmdValue;
+ 
+ //
+ // hostapd & viawget ioctl related
+@@ -431,7 +430,7 @@ struct viawget_hostapd_param {
+ 			u8 ssid[32];
+ 		} scan_req;
+ 	} u;
+-};
++} __packed;
+ 
+ /*---------------------  Export Classes  ----------------------------*/
+ 
+diff --git a/drivers/staging/vt6656/iowpa.h b/drivers/staging/vt6656/iowpa.h
+index 959c886..2522dde 100644
+--- a/drivers/staging/vt6656/iowpa.h
++++ b/drivers/staging/vt6656/iowpa.h
+@@ -67,12 +67,11 @@ enum {
+ 
+ 
+ 
+-#pragma pack(1)
+ typedef struct viawget_wpa_header {
+ 	u8 type;
+ 	u16 req_ie_len;
+ 	u16 resp_ie_len;
+-} viawget_wpa_header;
++} __packed viawget_wpa_header;
+ 
+ struct viawget_wpa_param {
+ 	u32 cmd;
+@@ -113,9 +112,8 @@ struct viawget_wpa_param {
+ 			u8 *buf;
+ 		} scan_results;
+ 	} u;
+-};
++} __packed;
+ 
+-#pragma pack(1)
+ struct viawget_scan_result {
+ 	u8 bssid[6];
+ 	u8 ssid[32];
+@@ -130,7 +128,7 @@ struct viawget_scan_result {
+ 	int noise;
+ 	int level;
+ 	int maxrate;
+-};
++} __packed;
+ 
+ /*---------------------  Export Classes  ----------------------------*/
+ 
+diff --git a/drivers/staging/wlan-ng/prism2mgmt.c b/drivers/staging/wlan-ng/prism2mgmt.c
+index c3bb05d..4110a2f 100644
+--- a/drivers/staging/wlan-ng/prism2mgmt.c
++++ b/drivers/staging/wlan-ng/prism2mgmt.c
+@@ -406,7 +406,7 @@ int prism2mgmt_scan_results(wlandevice_t *wlandev, void *msgp)
+ 	/* SSID */
+ 	req->ssid.status = P80211ENUM_msgitem_status_data_ok;
+ 	req->ssid.data.len = le16_to_cpu(item->ssid.len);
+-	req->ssid.data.len = min_t(u16, req->ssid.data.len, WLAN_BSSID_LEN);
++	req->ssid.data.len = min_t(u16, req->ssid.data.len, WLAN_SSID_MAXLEN);
+ 	memcpy(req->ssid.data.data, item->ssid.data, req->ssid.data.len);
+ 
+ 	/* supported rates */
+diff --git a/drivers/target/target_core_device.c b/drivers/target/target_core_device.c
+index 4df8022..26c62f0 100644
+--- a/drivers/target/target_core_device.c
++++ b/drivers/target/target_core_device.c
+@@ -1665,6 +1665,7 @@ int core_dev_setup_virtual_lun0(void)
+ 		ret = PTR_ERR(dev);
+ 		goto out;
+ 	}
++	dev->dev_link_magic = SE_DEV_LINK_MAGIC;
+ 	se_dev->se_dev_ptr = dev;
+ 	g_lun0_dev = dev;
+ 
+diff --git a/drivers/target/target_core_fabric_configfs.c b/drivers/target/target_core_fabric_configfs.c
+index 405cc98..b009b89 100644
+--- a/drivers/target/target_core_fabric_configfs.c
++++ b/drivers/target/target_core_fabric_configfs.c
+@@ -72,6 +72,12 @@ static int target_fabric_mappedlun_link(
+ 	struct se_portal_group *se_tpg;
+ 	struct config_item *nacl_ci, *tpg_ci, *tpg_ci_s, *wwn_ci, *wwn_ci_s;
+ 	int ret = 0, lun_access;
++
++	if (lun->lun_link_magic != SE_LUN_LINK_MAGIC) {
++		pr_err("Bad lun->lun_link_magic, not a valid lun_ci pointer:"
++			" %p to struct lun: %p\n", lun_ci, lun);
++		return -EFAULT;
++	}
+ 	/*
+ 	 * Ensure that the source port exists
+ 	 */
+@@ -746,6 +752,12 @@ static int target_fabric_port_link(
+ 	struct target_fabric_configfs *tf;
+ 	int ret;
+ 
++	if (dev->dev_link_magic != SE_DEV_LINK_MAGIC) {
++		pr_err("Bad dev->dev_link_magic, not a valid se_dev_ci pointer:"
++			" %p to struct se_device: %p\n", se_dev_ci, dev);
++		return -EFAULT;
++	}
++
+ 	tpg_ci = &lun_ci->ci_parent->ci_group->cg_item;
+ 	se_tpg = container_of(to_config_group(tpg_ci),
+ 				struct se_portal_group, tpg_group);
+diff --git a/drivers/target/target_core_tpg.c b/drivers/target/target_core_tpg.c
+index e320ec2..ba537b6 100644
+--- a/drivers/target/target_core_tpg.c
++++ b/drivers/target/target_core_tpg.c
+@@ -677,6 +677,7 @@ int core_tpg_register(
+ 	for (i = 0; i < TRANSPORT_MAX_LUNS_PER_TPG; i++) {
+ 		lun = se_tpg->tpg_lun_list[i];
+ 		lun->unpacked_lun = i;
++		lun->lun_link_magic = SE_LUN_LINK_MAGIC;
+ 		lun->lun_status = TRANSPORT_LUN_STATUS_FREE;
+ 		atomic_set(&lun->lun_acl_count, 0);
+ 		init_completion(&lun->lun_shutdown_comp);
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 69f3f7d..f687892 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -1341,6 +1341,7 @@ struct se_device *transport_add_device_to_core_hba(
+ 	dev->se_hba		= hba;
+ 	dev->se_sub_dev		= se_dev;
+ 	dev->transport		= transport;
++	dev->dev_link_magic	= SE_DEV_LINK_MAGIC;
+ 	INIT_LIST_HEAD(&dev->dev_list);
+ 	INIT_LIST_HEAD(&dev->dev_sep_list);
+ 	INIT_LIST_HEAD(&dev->dev_tmr_list);
+@@ -1748,6 +1749,8 @@ static void target_complete_tmr_failure(struct work_struct *work)
+ 
+ 	se_cmd->se_tmr_req->response = TMR_LUN_DOES_NOT_EXIST;
+ 	se_cmd->se_tfo->queue_tm_rsp(se_cmd);
++
++	transport_cmd_check_stop_to_fabric(se_cmd);
+ }
+ 
+ /**
+diff --git a/drivers/target/tcm_fc/tfc_sess.c b/drivers/target/tcm_fc/tfc_sess.c
+index a426c40..9249998 100644
+--- a/drivers/target/tcm_fc/tfc_sess.c
++++ b/drivers/target/tcm_fc/tfc_sess.c
+@@ -356,11 +356,11 @@ static int ft_prli_locked(struct fc_rport_priv *rdata, u32 spp_len,
+ 
+ 	tport = ft_tport_create(rdata->local_port);
+ 	if (!tport)
+-		return 0;	/* not a target for this local port */
++		goto not_target;	/* not a target for this local port */
+ 
+ 	acl = ft_acl_get(tport->tpg, rdata);
+ 	if (!acl)
+-		return 0;
++		goto not_target;	/* no target for this remote */
+ 
+ 	if (!rspp)
+ 		goto fill;
+@@ -397,12 +397,18 @@ static int ft_prli_locked(struct fc_rport_priv *rdata, u32 spp_len,
+ 
+ 	/*
+ 	 * OR in our service parameters with other provider (initiator), if any.
+-	 * TBD XXX - indicate RETRY capability?
+ 	 */
+ fill:
+ 	fcp_parm = ntohl(spp->spp_params);
++	fcp_parm &= ~FCP_SPPF_RETRY;
+ 	spp->spp_params = htonl(fcp_parm | FCP_SPPF_TARG_FCN);
+ 	return FC_SPP_RESP_ACK;
++
++not_target:
++	fcp_parm = ntohl(spp->spp_params);
++	fcp_parm &= ~FCP_SPPF_TARG_FCN;
++	spp->spp_params = htonl(fcp_parm);
++	return 0;
+ }
+ 
+ /**
+diff --git a/drivers/tty/serial/8250/8250_dw.c b/drivers/tty/serial/8250/8250_dw.c
+index f574eef..b6dc908 100644
+--- a/drivers/tty/serial/8250/8250_dw.c
++++ b/drivers/tty/serial/8250/8250_dw.c
+@@ -79,7 +79,7 @@ static int dw8250_handle_irq(struct uart_port *p)
+ 	} else if ((iir & UART_IIR_BUSY) == UART_IIR_BUSY) {
+ 		/* Clear the USR and write the LCR again. */
+ 		(void)p->serial_in(p, UART_USR);
+-		p->serial_out(p, d->last_lcr, UART_LCR);
++		p->serial_out(p, UART_LCR, d->last_lcr);
+ 
+ 		return 1;
+ 	}
+diff --git a/drivers/tty/serial/ifx6x60.c b/drivers/tty/serial/ifx6x60.c
+index 144cd39..17f587c 100644
+--- a/drivers/tty/serial/ifx6x60.c
++++ b/drivers/tty/serial/ifx6x60.c
+@@ -552,6 +552,7 @@ static void ifx_port_shutdown(struct tty_port *port)
+ 		container_of(port, struct ifx_spi_device, tty_port);
+ 
+ 	mrdy_set_low(ifx_dev);
++	del_timer(&ifx_dev->spi_timer);
+ 	clear_bit(IFX_SPI_STATE_TIMER_PENDING, &ifx_dev->flags);
+ 	tasklet_kill(&ifx_dev->io_work_tasklet);
+ }
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index ba23ad5..0778cd0 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -449,6 +449,10 @@ static void option_instat_callback(struct urb *urb);
+ #define PETATEL_VENDOR_ID			0x1ff4
+ #define PETATEL_PRODUCT_NP10T			0x600e
+ 
++/* TP-LINK Incorporated products */
++#define TPLINK_VENDOR_ID			0x2357
++#define TPLINK_PRODUCT_MA180			0x0201
++
+ /* some devices interfaces need special handling due to a number of reasons */
+ enum option_blacklist_reason {
+ 		OPTION_BLACKLIST_NONE = 0,
+@@ -930,7 +934,8 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0254, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0257, 0xff, 0xff, 0xff), /* ZTE MF821 */
+ 	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
+-	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0265, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0265, 0xff, 0xff, 0xff), /* ONDA MT8205 */
++	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0284, 0xff, 0xff, 0xff), /* ZTE MF880 */
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0317, 0xff, 0xff, 0xff) },
+@@ -1311,6 +1316,8 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(MEDIATEK_VENDOR_ID, MEDIATEK_PRODUCT_DC_4COM2, 0xff, 0x00, 0x00) },
+ 	{ USB_DEVICE(CELLIENT_VENDOR_ID, CELLIENT_PRODUCT_MEN200) },
+ 	{ USB_DEVICE(PETATEL_VENDOR_ID, PETATEL_PRODUCT_NP10T) },
++	{ USB_DEVICE(TPLINK_VENDOR_ID, TPLINK_PRODUCT_MA180),
++	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ } /* Terminating entry */
+ };
+ MODULE_DEVICE_TABLE(usb, option_ids);
+diff --git a/drivers/xen/grant-table.c b/drivers/xen/grant-table.c
+index fda491c..7e34bee 100644
+--- a/drivers/xen/grant-table.c
++++ b/drivers/xen/grant-table.c
+@@ -53,10 +53,6 @@
+ /* External tools reserve first few grant table entries. */
+ #define NR_RESERVED_ENTRIES 8
+ #define GNTTAB_LIST_END 0xffffffff
+-#define GREFS_PER_GRANT_FRAME \
+-(grant_table_version == 1 ?                      \
+-(PAGE_SIZE / sizeof(struct grant_entry_v1)) :   \
+-(PAGE_SIZE / sizeof(union grant_entry_v2)))
+ 
+ static grant_ref_t **gnttab_list;
+ static unsigned int nr_grant_frames;
+@@ -151,6 +147,7 @@ static struct gnttab_ops *gnttab_interface;
+ static grant_status_t *grstatus;
+ 
+ static int grant_table_version;
++static int grefs_per_grant_frame;
+ 
+ static struct gnttab_free_callback *gnttab_free_callback_list;
+ 
+@@ -679,12 +676,14 @@ static int grow_gnttab_list(unsigned int more_frames)
+ 	unsigned int new_nr_grant_frames, extra_entries, i;
+ 	unsigned int nr_glist_frames, new_nr_glist_frames;
+ 
++	BUG_ON(grefs_per_grant_frame == 0);
++
+ 	new_nr_grant_frames = nr_grant_frames + more_frames;
+-	extra_entries       = more_frames * GREFS_PER_GRANT_FRAME;
++	extra_entries       = more_frames * grefs_per_grant_frame;
+ 
+-	nr_glist_frames = (nr_grant_frames * GREFS_PER_GRANT_FRAME + RPP - 1) / RPP;
++	nr_glist_frames = (nr_grant_frames * grefs_per_grant_frame + RPP - 1) / RPP;
+ 	new_nr_glist_frames =
+-		(new_nr_grant_frames * GREFS_PER_GRANT_FRAME + RPP - 1) / RPP;
++		(new_nr_grant_frames * grefs_per_grant_frame + RPP - 1) / RPP;
+ 	for (i = nr_glist_frames; i < new_nr_glist_frames; i++) {
+ 		gnttab_list[i] = (grant_ref_t *)__get_free_page(GFP_ATOMIC);
+ 		if (!gnttab_list[i])
+@@ -692,12 +691,12 @@ static int grow_gnttab_list(unsigned int more_frames)
+ 	}
+ 
+ 
+-	for (i = GREFS_PER_GRANT_FRAME * nr_grant_frames;
+-	     i < GREFS_PER_GRANT_FRAME * new_nr_grant_frames - 1; i++)
++	for (i = grefs_per_grant_frame * nr_grant_frames;
++	     i < grefs_per_grant_frame * new_nr_grant_frames - 1; i++)
+ 		gnttab_entry(i) = i + 1;
+ 
+ 	gnttab_entry(i) = gnttab_free_head;
+-	gnttab_free_head = GREFS_PER_GRANT_FRAME * nr_grant_frames;
++	gnttab_free_head = grefs_per_grant_frame * nr_grant_frames;
+ 	gnttab_free_count += extra_entries;
+ 
+ 	nr_grant_frames = new_nr_grant_frames;
+@@ -799,7 +798,8 @@ EXPORT_SYMBOL_GPL(gnttab_unmap_refs);
+ 
+ static unsigned nr_status_frames(unsigned nr_grant_frames)
+ {
+-	return (nr_grant_frames * GREFS_PER_GRANT_FRAME + SPP - 1) / SPP;
++	BUG_ON(grefs_per_grant_frame == 0);
++	return (nr_grant_frames * grefs_per_grant_frame + SPP - 1) / SPP;
+ }
+ 
+ static int gnttab_map_frames_v1(unsigned long *frames, unsigned int nr_gframes)
+@@ -957,6 +957,7 @@ static void gnttab_request_version(void)
+ 	rc = HYPERVISOR_grant_table_op(GNTTABOP_set_version, &gsv, 1);
+ 	if (rc == 0 && gsv.version == 2) {
+ 		grant_table_version = 2;
++		grefs_per_grant_frame = PAGE_SIZE / sizeof(union grant_entry_v2);
+ 		gnttab_interface = &gnttab_v2_ops;
+ 	} else if (grant_table_version == 2) {
+ 		/*
+@@ -969,17 +970,17 @@ static void gnttab_request_version(void)
+ 		panic("we need grant tables version 2, but only version 1 is available");
+ 	} else {
+ 		grant_table_version = 1;
++		grefs_per_grant_frame = PAGE_SIZE / sizeof(struct grant_entry_v1);
+ 		gnttab_interface = &gnttab_v1_ops;
+ 	}
+ 	printk(KERN_INFO "Grant tables using version %d layout.\n",
+ 		grant_table_version);
+ }
+ 
+-int gnttab_resume(void)
++static int gnttab_setup(void)
+ {
+ 	unsigned int max_nr_gframes;
+ 
+-	gnttab_request_version();
+ 	max_nr_gframes = gnttab_max_grant_frames();
+ 	if (max_nr_gframes < nr_grant_frames)
+ 		return -ENOSYS;
+@@ -1002,6 +1003,12 @@ int gnttab_resume(void)
+ 	return 0;
+ }
+ 
++int gnttab_resume(void)
++{
++	gnttab_request_version();
++	return gnttab_setup();
++}
++
+ int gnttab_suspend(void)
+ {
+ 	gnttab_interface->unmap_frames();
+@@ -1013,9 +1020,10 @@ static int gnttab_expand(unsigned int req_entries)
+ 	int rc;
+ 	unsigned int cur, extra;
+ 
++	BUG_ON(grefs_per_grant_frame == 0);
+ 	cur = nr_grant_frames;
+-	extra = ((req_entries + (GREFS_PER_GRANT_FRAME-1)) /
+-		 GREFS_PER_GRANT_FRAME);
++	extra = ((req_entries + (grefs_per_grant_frame-1)) /
++		 grefs_per_grant_frame);
+ 	if (cur + extra > gnttab_max_grant_frames())
+ 		return -ENOSPC;
+ 
+@@ -1033,21 +1041,23 @@ int gnttab_init(void)
+ 	unsigned int nr_init_grefs;
+ 	int ret;
+ 
++	gnttab_request_version();
+ 	nr_grant_frames = 1;
+ 	boot_max_nr_grant_frames = __max_nr_grant_frames();
+ 
+ 	/* Determine the maximum number of frames required for the
+ 	 * grant reference free list on the current hypervisor.
+ 	 */
++	BUG_ON(grefs_per_grant_frame == 0);
+ 	max_nr_glist_frames = (boot_max_nr_grant_frames *
+-			       GREFS_PER_GRANT_FRAME / RPP);
++			       grefs_per_grant_frame / RPP);
+ 
+ 	gnttab_list = kmalloc(max_nr_glist_frames * sizeof(grant_ref_t *),
+ 			      GFP_KERNEL);
+ 	if (gnttab_list == NULL)
+ 		return -ENOMEM;
+ 
+-	nr_glist_frames = (nr_grant_frames * GREFS_PER_GRANT_FRAME + RPP - 1) / RPP;
++	nr_glist_frames = (nr_grant_frames * grefs_per_grant_frame + RPP - 1) / RPP;
+ 	for (i = 0; i < nr_glist_frames; i++) {
+ 		gnttab_list[i] = (grant_ref_t *)__get_free_page(GFP_KERNEL);
+ 		if (gnttab_list[i] == NULL) {
+@@ -1056,12 +1066,12 @@ int gnttab_init(void)
+ 		}
+ 	}
+ 
+-	if (gnttab_resume() < 0) {
++	if (gnttab_setup() < 0) {
+ 		ret = -ENODEV;
+ 		goto ini_nomem;
+ 	}
+ 
+-	nr_init_grefs = nr_grant_frames * GREFS_PER_GRANT_FRAME;
++	nr_init_grefs = nr_grant_frames * grefs_per_grant_frame;
+ 
+ 	for (i = NR_RESERVED_ENTRIES; i < nr_init_grefs - 1; i++)
+ 		gnttab_entry(i) = i + 1;
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index dcd08e4..a0d7e26 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -1424,6 +1424,8 @@ static void ext4_da_block_invalidatepages(struct mpage_da_data *mpd)
+ 
+ 	index = mpd->first_page;
+ 	end   = mpd->next_page - 1;
++
++	pagevec_init(&pvec, 0);
+ 	while (index <= end) {
+ 		nr_pages = pagevec_lookup(&pvec, mapping, index, PAGEVEC_SIZE);
+ 		if (nr_pages == 0)
+diff --git a/include/target/target_core_base.h b/include/target/target_core_base.h
+index 3ad5b33..569c282 100644
+--- a/include/target/target_core_base.h
++++ b/include/target/target_core_base.h
+@@ -779,6 +779,8 @@ struct se_subsystem_dev {
+ };
+ 
+ struct se_device {
++#define SE_DEV_LINK_MAGIC			0xfeeddeef
++	u32			dev_link_magic;
+ 	/* RELATIVE TARGET PORT IDENTIFER Counter */
+ 	u16			dev_rpti_counter;
+ 	/* Used for SAM Task Attribute ordering */
+@@ -869,6 +871,8 @@ struct se_port_stat_grps {
+ };
+ 
+ struct se_lun {
++#define SE_LUN_LINK_MAGIC			0xffff7771
++	u32			lun_link_magic;
+ 	/* See transport_lun_status_table */
+ 	enum transport_lun_status_table lun_status;
+ 	u32			lun_access;
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index 2781726..c46171a 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -387,11 +387,13 @@ static int snd_usb_fasttrackpro_boot_quirk(struct usb_device *dev)
+ 		 * rules
+ 		 */
+ 		err = usb_driver_set_configuration(dev, 2);
+-		if (err < 0) {
++		if (err < 0)
+ 			snd_printdd("error usb_driver_set_configuration: %d\n",
+ 				    err);
+-			return -ENODEV;
+-		}
++		/* Always return an error, so that we stop creating a device
++		   that will just be destroyed and recreated with a new
++		   configuration */
++		return -ENODEV;
+ 	} else
+ 		snd_printk(KERN_INFO "usb-audio: Fast Track Pro config OK\n");
+ 

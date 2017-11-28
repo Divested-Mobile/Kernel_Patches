@@ -1,0 +1,574 @@
+diff --git a/Makefile b/Makefile
+index fe91076..cc34921 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 0
+-SUBLEVEL = 35
++SUBLEVEL = 36
+ EXTRAVERSION =
+ NAME = Sneaky Weasel
+ 
+diff --git a/arch/arm/mach-imx/mach-mx21ads.c b/arch/arm/mach-imx/mach-mx21ads.c
+index 74ac889..a37fe02 100644
+--- a/arch/arm/mach-imx/mach-mx21ads.c
++++ b/arch/arm/mach-imx/mach-mx21ads.c
+@@ -32,7 +32,7 @@
+  * Memory-mapped I/O on MX21ADS base board
+  */
+ #define MX21ADS_MMIO_BASE_ADDR   0xf5000000
+-#define MX21ADS_MMIO_SIZE        SZ_16M
++#define MX21ADS_MMIO_SIZE        0xc00000
+ 
+ #define MX21ADS_REG_ADDR(offset)    (void __force __iomem *) \
+ 		(MX21ADS_MMIO_BASE_ADDR + (offset))
+diff --git a/arch/x86/xen/enlighten.c b/arch/x86/xen/enlighten.c
+index b50c593..8385d1d 100644
+--- a/arch/x86/xen/enlighten.c
++++ b/arch/x86/xen/enlighten.c
+@@ -198,6 +198,9 @@ static void __init xen_banner(void)
+ 	       xen_feature(XENFEAT_mmu_pt_update_preserve_ad) ? " (preserve-AD)" : "");
+ }
+ 
++#define CPUID_THERM_POWER_LEAF 6
++#define APERFMPERF_PRESENT 0
++
+ static __read_mostly unsigned int cpuid_leaf1_edx_mask = ~0;
+ static __read_mostly unsigned int cpuid_leaf1_ecx_mask = ~0;
+ 
+@@ -218,6 +221,11 @@ static void xen_cpuid(unsigned int *ax, unsigned int *bx,
+ 		maskedx = cpuid_leaf1_edx_mask;
+ 		break;
+ 
++	case CPUID_THERM_POWER_LEAF:
++		/* Disabling APERFMPERF for kernel usage */
++		maskecx = ~(1 << APERFMPERF_PRESENT);
++		break;
++
+ 	case 0xb:
+ 		/* Suppress extended topology stuff */
+ 		maskebx = 0;
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index d549bbc..bf401ae 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -1682,6 +1682,11 @@ int pci_prepare_to_sleep(struct pci_dev *dev)
+ 	if (target_state == PCI_POWER_ERROR)
+ 		return -EIO;
+ 
++	/* Some devices mustn't be in D3 during system sleep */
++	if (target_state == PCI_D3hot &&
++			(dev->dev_flags & PCI_DEV_FLAGS_NO_D3_DURING_SLEEP))
++		return 0;
++
+ 	pci_enable_wake(dev, target_state, device_may_wakeup(&dev->dev));
+ 
+ 	error = pci_set_power_state(dev, target_state);
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index a6b07dd..975af43 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -2856,6 +2856,32 @@ static void __devinit disable_igfx_irq(struct pci_dev *dev)
+ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x0102, disable_igfx_irq);
+ DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x010a, disable_igfx_irq);
+ 
++/*
++ * The Intel 6 Series/C200 Series chipset's EHCI controllers on many
++ * ASUS motherboards will cause memory corruption or a system crash
++ * if they are in D3 while the system is put into S3 sleep.
++ */
++static void __devinit asus_ehci_no_d3(struct pci_dev *dev)
++{
++	const char *sys_info;
++	static const char good_Asus_board[] = "P8Z68-V";
++
++	if (dev->dev_flags & PCI_DEV_FLAGS_NO_D3_DURING_SLEEP)
++		return;
++	if (dev->subsystem_vendor != PCI_VENDOR_ID_ASUSTEK)
++		return;
++	sys_info = dmi_get_system_info(DMI_BOARD_NAME);
++	if (sys_info && memcmp(sys_info, good_Asus_board,
++			sizeof(good_Asus_board) - 1) == 0)
++		return;
++
++	dev_info(&dev->dev, "broken D3 during system sleep on ASUS\n");
++	dev->dev_flags |= PCI_DEV_FLAGS_NO_D3_DURING_SLEEP;
++	device_set_wakeup_capable(&dev->dev, false);
++}
++DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x1c26, asus_ehci_no_d3);
++DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_INTEL, 0x1c2d, asus_ehci_no_d3);
++
+ static void pci_do_fixups(struct pci_dev *dev, struct pci_fixup *f,
+ 			  struct pci_fixup *end)
+ {
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+index 158f631..496e06e 100644
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -498,6 +498,14 @@ static int acm_tty_open(struct tty_struct *tty, struct file *filp)
+ 
+ 	usb_autopm_put_interface(acm->control);
+ 
++	/*
++	 * Unthrottle device in case the TTY was closed while throttled.
++	 */
++	spin_lock_irq(&acm->read_lock);
++	acm->throttled = 0;
++	acm->throttle_req = 0;
++	spin_unlock_irq(&acm->read_lock);
++
+ 	if (acm_submit_read_urbs(acm, GFP_KERNEL))
+ 		goto bail_out;
+ 
+diff --git a/drivers/usb/core/hcd-pci.c b/drivers/usb/core/hcd-pci.c
+index aa7bbbc..6c1642b 100644
+--- a/drivers/usb/core/hcd-pci.c
++++ b/drivers/usb/core/hcd-pci.c
+@@ -495,15 +495,6 @@ static int hcd_pci_suspend_noirq(struct device *dev)
+ 
+ 	pci_save_state(pci_dev);
+ 
+-	/*
+-	 * Some systems crash if an EHCI controller is in D3 during
+-	 * a sleep transition.  We have to leave such controllers in D0.
+-	 */
+-	if (hcd->broken_pci_sleep) {
+-		dev_dbg(dev, "Staying in PCI D0\n");
+-		return retval;
+-	}
+-
+ 	/* If the root hub is dead rather than suspended, disallow remote
+ 	 * wakeup.  usb_hc_died() should ensure that both hosts are marked as
+ 	 * dying, so we only need to check the primary roothub.
+diff --git a/drivers/usb/core/message.c b/drivers/usb/core/message.c
+index 1eebd45..806060c 100644
+--- a/drivers/usb/core/message.c
++++ b/drivers/usb/core/message.c
+@@ -1803,7 +1803,6 @@ free_interfaces:
+ 		intfc = cp->intf_cache[i];
+ 		intf->altsetting = intfc->altsetting;
+ 		intf->num_altsetting = intfc->num_altsetting;
+-		intf->intf_assoc = find_iad(dev, cp, i);
+ 		kref_get(&intfc->ref);
+ 
+ 		alt = usb_altnum_to_altsetting(intf, 0);
+@@ -1816,6 +1815,8 @@ free_interfaces:
+ 		if (!alt)
+ 			alt = &intf->altsetting[0];
+ 
++		intf->intf_assoc =
++			find_iad(dev, cp, alt->desc.bInterfaceNumber);
+ 		intf->cur_altsetting = alt;
+ 		usb_enable_interface(dev, intf, true);
+ 		intf->dev.parent = &dev->dev;
+diff --git a/drivers/usb/host/ehci-pci.c b/drivers/usb/host/ehci-pci.c
+index efb9efc..f768314 100644
+--- a/drivers/usb/host/ehci-pci.c
++++ b/drivers/usb/host/ehci-pci.c
+@@ -144,14 +144,6 @@ static int ehci_pci_setup(struct usb_hcd *hcd)
+ 			hcd->has_tt = 1;
+ 			tdi_reset(ehci);
+ 		}
+-		if (pdev->subsystem_vendor == PCI_VENDOR_ID_ASUSTEK) {
+-			/* EHCI #1 or #2 on 6 Series/C200 Series chipset */
+-			if (pdev->device == 0x1c26 || pdev->device == 0x1c2d) {
+-				ehci_info(ehci, "broken D3 during system sleep on ASUS\n");
+-				hcd->broken_pci_sleep = 1;
+-				device_set_wakeup_capable(&pdev->dev, false);
+-			}
+-		}
+ 		break;
+ 	case PCI_VENDOR_ID_TDI:
+ 		if (pdev->device == PCI_DEVICE_ID_TDI_EHCI) {
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index dbba936..16ec4d3 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -730,8 +730,8 @@ int xhci_suspend(struct xhci_hcd *xhci)
+ 	command = xhci_readl(xhci, &xhci->op_regs->command);
+ 	command |= CMD_CSS;
+ 	xhci_writel(xhci, command, &xhci->op_regs->command);
+-	if (handshake(xhci, &xhci->op_regs->status, STS_SAVE, 0, 10*100)) {
+-		xhci_warn(xhci, "WARN: xHC CMD_CSS timeout\n");
++	if (handshake(xhci, &xhci->op_regs->status, STS_SAVE, 0, 10 * 1000)) {
++		xhci_warn(xhci, "WARN: xHC save state timeout\n");
+ 		spin_unlock_irq(&xhci->lock);
+ 		return -ETIMEDOUT;
+ 	}
+@@ -786,8 +786,8 @@ int xhci_resume(struct xhci_hcd *xhci, bool hibernated)
+ 		command |= CMD_CRS;
+ 		xhci_writel(xhci, command, &xhci->op_regs->command);
+ 		if (handshake(xhci, &xhci->op_regs->status,
+-			      STS_RESTORE, 0, 10*100)) {
+-			xhci_dbg(xhci, "WARN: xHC CMD_CSS timeout\n");
++			      STS_RESTORE, 0, 10 * 1000)) {
++			xhci_warn(xhci, "WARN: xHC restore state timeout\n");
+ 			spin_unlock_irq(&xhci->lock);
+ 			return -ETIMEDOUT;
+ 		}
+diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
+index f2c57e0..aa0c43f 100644
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@ -82,6 +82,7 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x10C4, 0x8066) }, /* Argussoft In-System Programmer */
+ 	{ USB_DEVICE(0x10C4, 0x806F) }, /* IMS USB to RS422 Converter Cable */
+ 	{ USB_DEVICE(0x10C4, 0x807A) }, /* Crumb128 board */
++	{ USB_DEVICE(0x10C4, 0x80C4) }, /* Cygnal Integrated Products, Inc., Optris infrared thermometer */
+ 	{ USB_DEVICE(0x10C4, 0x80CA) }, /* Degree Controls Inc */
+ 	{ USB_DEVICE(0x10C4, 0x80DD) }, /* Tracient RFID */
+ 	{ USB_DEVICE(0x10C4, 0x80F6) }, /* Suunto sports instrument */
+diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
+index f08d494..86fc8fc 100644
+--- a/drivers/usb/serial/ftdi_sio.c
++++ b/drivers/usb/serial/ftdi_sio.c
+@@ -735,6 +735,7 @@ static struct usb_device_id id_table_combined [] = {
+ 	{ USB_DEVICE(TELLDUS_VID, TELLDUS_TELLSTICK_PID) },
+ 	{ USB_DEVICE(RTSYSTEMS_VID, RTSYSTEMS_SERIAL_VX7_PID) },
+ 	{ USB_DEVICE(RTSYSTEMS_VID, RTSYSTEMS_CT29B_PID) },
++	{ USB_DEVICE(RTSYSTEMS_VID, RTSYSTEMS_RTS01_PID) },
+ 	{ USB_DEVICE(FTDI_VID, FTDI_MAXSTREAM_PID) },
+ 	{ USB_DEVICE(FTDI_VID, FTDI_PHI_FISCO_PID) },
+ 	{ USB_DEVICE(TML_VID, TML_USB_SERIAL_PID) },
+diff --git a/drivers/usb/serial/ftdi_sio_ids.h b/drivers/usb/serial/ftdi_sio_ids.h
+index 219b199..d27d7d7 100644
+--- a/drivers/usb/serial/ftdi_sio_ids.h
++++ b/drivers/usb/serial/ftdi_sio_ids.h
+@@ -784,6 +784,7 @@
+ #define RTSYSTEMS_VID			0x2100	/* Vendor ID */
+ #define RTSYSTEMS_SERIAL_VX7_PID	0x9e52	/* Serial converter for VX-7 Radios using FT232RL */
+ #define RTSYSTEMS_CT29B_PID		0x9e54	/* CT29B Radio Cable */
++#define RTSYSTEMS_RTS01_PID		0x9e57	/* USB-RTS01 Radio Cable */
+ 
+ 
+ /*
+diff --git a/drivers/usb/serial/mct_u232.c b/drivers/usb/serial/mct_u232.c
+index ba0d287..42de17b 100644
+--- a/drivers/usb/serial/mct_u232.c
++++ b/drivers/usb/serial/mct_u232.c
+@@ -359,13 +359,16 @@ static int mct_u232_set_modem_ctrl(struct usb_serial *serial,
+ 			MCT_U232_SET_REQUEST_TYPE,
+ 			0, 0, buf, MCT_U232_SET_MODEM_CTRL_SIZE,
+ 			WDR_TIMEOUT);
+-	if (rc < 0)
+-		dev_err(&serial->dev->dev,
+-			"Set MODEM CTRL 0x%x failed (error = %d)\n", mcr, rc);
++	kfree(buf);
++
+ 	dbg("set_modem_ctrl: state=0x%x ==> mcr=0x%x", control_state, mcr);
+ 
+-	kfree(buf);
+-	return rc;
++	if (rc < 0) {
++		dev_err(&serial->dev->dev,
++			"Set MODEM CTRL 0x%x failed (error = %d)\n", mcr, rc);
++		return rc;
++	}
++	return 0;
+ } /* mct_u232_set_modem_ctrl */
+ 
+ static int mct_u232_get_modem_stat(struct usb_serial *serial,
+diff --git a/drivers/usb/serial/mos7840.c b/drivers/usb/serial/mos7840.c
+index 3257519..fdbeb6a 100644
+--- a/drivers/usb/serial/mos7840.c
++++ b/drivers/usb/serial/mos7840.c
+@@ -206,7 +206,7 @@ static const struct usb_device_id moschip_port_id_table[] = {
+ 	{}			/* terminating entry */
+ };
+ 
+-static const struct usb_device_id moschip_id_table_combined[] __devinitconst = {
++static const struct usb_device_id moschip_id_table_combined[] = {
+ 	{USB_DEVICE(USB_VENDOR_ID_MOSCHIP, MOSCHIP_DEVICE_ID_7840)},
+ 	{USB_DEVICE(USB_VENDOR_ID_MOSCHIP, MOSCHIP_DEVICE_ID_7820)},
+ 	{USB_DEVICE(USB_VENDOR_ID_BANDB, BANDB_DEVICE_ID_USO9ML2_2)},
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index cbe3451..ce02457 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -47,6 +47,7 @@
+ /* Function prototypes */
+ static int  option_probe(struct usb_serial *serial,
+ 			const struct usb_device_id *id);
++static void option_release(struct usb_serial *serial);
+ static int option_send_setup(struct usb_serial_port *port);
+ static void option_instat_callback(struct urb *urb);
+ 
+@@ -150,6 +151,7 @@ static void option_instat_callback(struct urb *urb);
+ #define HUAWEI_PRODUCT_E14AC			0x14AC
+ #define HUAWEI_PRODUCT_K3806			0x14AE
+ #define HUAWEI_PRODUCT_K4605			0x14C6
++#define HUAWEI_PRODUCT_K5005			0x14C8
+ #define HUAWEI_PRODUCT_K3770			0x14C9
+ #define HUAWEI_PRODUCT_K3771			0x14CA
+ #define HUAWEI_PRODUCT_K4510			0x14CB
+@@ -425,7 +427,7 @@ static void option_instat_callback(struct urb *urb);
+ #define SAMSUNG_VENDOR_ID                       0x04e8
+ #define SAMSUNG_PRODUCT_GT_B3730                0x6889
+ 
+-/* YUGA products  www.yuga-info.com*/
++/* YUGA products  www.yuga-info.com gavin.kx@qq.com */
+ #define YUGA_VENDOR_ID				0x257A
+ #define YUGA_PRODUCT_CEM600			0x1601
+ #define YUGA_PRODUCT_CEM610			0x1602
+@@ -442,6 +444,8 @@ static void option_instat_callback(struct urb *urb);
+ #define YUGA_PRODUCT_CEU516			0x160C
+ #define YUGA_PRODUCT_CEU528			0x160D
+ #define YUGA_PRODUCT_CEU526			0x160F
++#define YUGA_PRODUCT_CEU881			0x161F
++#define YUGA_PRODUCT_CEU882			0x162F
+ 
+ #define YUGA_PRODUCT_CWM600			0x2601
+ #define YUGA_PRODUCT_CWM610			0x2602
+@@ -457,23 +461,26 @@ static void option_instat_callback(struct urb *urb);
+ #define YUGA_PRODUCT_CWU518			0x260B
+ #define YUGA_PRODUCT_CWU516			0x260C
+ #define YUGA_PRODUCT_CWU528			0x260D
++#define YUGA_PRODUCT_CWU581			0x260E
+ #define YUGA_PRODUCT_CWU526			0x260F
+-
+-#define YUGA_PRODUCT_CLM600			0x2601
+-#define YUGA_PRODUCT_CLM610			0x2602
+-#define YUGA_PRODUCT_CLM500			0x2603
+-#define YUGA_PRODUCT_CLM510			0x2604
+-#define YUGA_PRODUCT_CLM800			0x2605
+-#define YUGA_PRODUCT_CLM900			0x2606
+-
+-#define YUGA_PRODUCT_CLU718			0x2607
+-#define YUGA_PRODUCT_CLU716			0x2608
+-#define YUGA_PRODUCT_CLU728			0x2609
+-#define YUGA_PRODUCT_CLU726			0x260A
+-#define YUGA_PRODUCT_CLU518			0x260B
+-#define YUGA_PRODUCT_CLU516			0x260C
+-#define YUGA_PRODUCT_CLU528			0x260D
+-#define YUGA_PRODUCT_CLU526			0x260F
++#define YUGA_PRODUCT_CWU582			0x261F
++#define YUGA_PRODUCT_CWU583			0x262F
++
++#define YUGA_PRODUCT_CLM600			0x3601
++#define YUGA_PRODUCT_CLM610			0x3602
++#define YUGA_PRODUCT_CLM500			0x3603
++#define YUGA_PRODUCT_CLM510			0x3604
++#define YUGA_PRODUCT_CLM800			0x3605
++#define YUGA_PRODUCT_CLM900			0x3606
++
++#define YUGA_PRODUCT_CLU718			0x3607
++#define YUGA_PRODUCT_CLU716			0x3608
++#define YUGA_PRODUCT_CLU728			0x3609
++#define YUGA_PRODUCT_CLU726			0x360A
++#define YUGA_PRODUCT_CLU518			0x360B
++#define YUGA_PRODUCT_CLU516			0x360C
++#define YUGA_PRODUCT_CLU528			0x360D
++#define YUGA_PRODUCT_CLU526			0x360F
+ 
+ /* Viettel products */
+ #define VIETTEL_VENDOR_ID			0x2262
+@@ -666,6 +673,11 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K3806, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K4605, 0xff, 0xff, 0xff),
+ 		.driver_info = (kernel_ulong_t) &huawei_cdc12_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K4605, 0xff, 0x01, 0x31) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K4605, 0xff, 0x01, 0x32) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K5005, 0xff, 0x01, 0x31) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K5005, 0xff, 0x01, 0x32) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K5005, 0xff, 0x01, 0x33) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K3770, 0xff, 0x02, 0x31) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K3770, 0xff, 0x02, 0x32) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K3771, 0xff, 0x02, 0x31) },
+@@ -1207,6 +1219,11 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CLU516) },
+ 	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CLU528) },
+ 	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CLU526) },
++	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CEU881) },
++	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CEU882) },
++	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CWU581) },
++	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CWU582) },
++	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CWU583) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(VIETTEL_VENDOR_ID, VIETTEL_PRODUCT_VT1000, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZD_VENDOR_ID, ZD_PRODUCT_7000, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE(LG_VENDOR_ID, LG_PRODUCT_L02C) }, /* docomo L-02C modem */
+@@ -1257,7 +1274,7 @@ static struct usb_serial_driver option_1port_device = {
+ 	.ioctl             = usb_wwan_ioctl,
+ 	.attach            = usb_wwan_startup,
+ 	.disconnect        = usb_wwan_disconnect,
+-	.release           = usb_wwan_release,
++	.release           = option_release,
+ 	.read_int_callback = option_instat_callback,
+ #ifdef CONFIG_PM
+ 	.suspend           = usb_wwan_suspend,
+@@ -1267,35 +1284,6 @@ static struct usb_serial_driver option_1port_device = {
+ 
+ static int debug;
+ 
+-/* per port private data */
+-
+-#define N_IN_URB 4
+-#define N_OUT_URB 4
+-#define IN_BUFLEN 4096
+-#define OUT_BUFLEN 4096
+-
+-struct option_port_private {
+-	/* Input endpoints and buffer for this port */
+-	struct urb *in_urbs[N_IN_URB];
+-	u8 *in_buffer[N_IN_URB];
+-	/* Output endpoints and buffer for this port */
+-	struct urb *out_urbs[N_OUT_URB];
+-	u8 *out_buffer[N_OUT_URB];
+-	unsigned long out_busy;		/* Bit vector of URBs in use */
+-	int opened;
+-	struct usb_anchor delayed;
+-
+-	/* Settings for the port */
+-	int rts_state;	/* Handshaking pins (outputs) */
+-	int dtr_state;
+-	int cts_state;	/* Handshaking pins (inputs) */
+-	int dsr_state;
+-	int dcd_state;
+-	int ri_state;
+-
+-	unsigned long tx_start_time[N_OUT_URB];
+-};
+-
+ /* Functions used by new usb-serial code. */
+ static int __init option_init(void)
+ {
+@@ -1393,12 +1381,22 @@ static int option_probe(struct usb_serial *serial,
+ 	return 0;
+ }
+ 
++static void option_release(struct usb_serial *serial)
++{
++	struct usb_wwan_intf_private *priv = usb_get_serial_data(serial);
++
++	usb_wwan_release(serial);
++
++	kfree(priv);
++}
++
+ static void option_instat_callback(struct urb *urb)
+ {
+ 	int err;
+ 	int status = urb->status;
+ 	struct usb_serial_port *port =  urb->context;
+-	struct option_port_private *portdata = usb_get_serial_port_data(port);
++	struct usb_wwan_port_private *portdata =
++					usb_get_serial_port_data(port);
+ 
+ 	dbg("%s", __func__);
+ 	dbg("%s: urb %p port %p has data %p", __func__, urb, port, portdata);
+@@ -1459,7 +1457,7 @@ static int option_send_setup(struct usb_serial_port *port)
+ 	struct usb_serial *serial = port->serial;
+ 	struct usb_wwan_intf_private *intfdata =
+ 		(struct usb_wwan_intf_private *) serial->private;
+-	struct option_port_private *portdata;
++	struct usb_wwan_port_private *portdata;
+ 	int ifNum = serial->interface->cur_altsetting->desc.bInterfaceNumber;
+ 	int val = 0;
+ 	dbg("%s", __func__);
+diff --git a/drivers/usb/serial/qcserial.c b/drivers/usb/serial/qcserial.c
+index 247c014..7cd2c26 100644
+--- a/drivers/usb/serial/qcserial.c
++++ b/drivers/usb/serial/qcserial.c
+@@ -104,7 +104,13 @@ static const struct usb_device_id id_table[] = {
+ 	{USB_DEVICE(0x1410, 0xa021)},	/* Novatel Gobi 3000 Composite */
+ 	{USB_DEVICE(0x413c, 0x8193)},	/* Dell Gobi 3000 QDL */
+ 	{USB_DEVICE(0x413c, 0x8194)},	/* Dell Gobi 3000 Composite */
++	{USB_DEVICE(0x1199, 0x9010)},	/* Sierra Wireless Gobi 3000 QDL */
++	{USB_DEVICE(0x1199, 0x9012)},	/* Sierra Wireless Gobi 3000 QDL */
+ 	{USB_DEVICE(0x1199, 0x9013)},	/* Sierra Wireless Gobi 3000 Modem device (MC8355) */
++	{USB_DEVICE(0x1199, 0x9014)},	/* Sierra Wireless Gobi 3000 QDL */
++	{USB_DEVICE(0x1199, 0x9015)},	/* Sierra Wireless Gobi 3000 Modem device */
++	{USB_DEVICE(0x1199, 0x9018)},	/* Sierra Wireless Gobi 3000 QDL */
++	{USB_DEVICE(0x1199, 0x9019)},	/* Sierra Wireless Gobi 3000 Modem device */
+ 	{USB_DEVICE(0x12D1, 0x14F0)},	/* Sony Gobi 3000 QDL */
+ 	{USB_DEVICE(0x12D1, 0x14F1)},	/* Sony Gobi 3000 Composite */
+ 	{ }				/* Terminating entry */
+diff --git a/drivers/usb/serial/sierra.c b/drivers/usb/serial/sierra.c
+index ef71ba3..d547638 100644
+--- a/drivers/usb/serial/sierra.c
++++ b/drivers/usb/serial/sierra.c
+@@ -304,6 +304,10 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x1199, 0x68A3), 	/* Sierra Wireless Direct IP modems */
+ 	  .driver_info = (kernel_ulong_t)&direct_ip_interface_blacklist
+ 	},
++	/* AT&T Direct IP LTE modems */
++	{ USB_DEVICE_AND_INTERFACE_INFO(0x0F3D, 0x68AA, 0xFF, 0xFF, 0xFF),
++	  .driver_info = (kernel_ulong_t)&direct_ip_interface_blacklist
++	},
+ 	{ USB_DEVICE(0x0f3d, 0x68A3), 	/* Airprime/Sierra Wireless Direct IP modems */
+ 	  .driver_info = (kernel_ulong_t)&direct_ip_interface_blacklist
+ 	},
+diff --git a/drivers/usb/serial/usb-serial.c b/drivers/usb/serial/usb-serial.c
+index 5d7b71b..6f81aa5 100644
+--- a/drivers/usb/serial/usb-serial.c
++++ b/drivers/usb/serial/usb-serial.c
+@@ -669,12 +669,14 @@ exit:
+ static struct usb_serial_driver *search_serial_device(
+ 					struct usb_interface *iface)
+ {
+-	const struct usb_device_id *id;
++	const struct usb_device_id *id = NULL;
+ 	struct usb_serial_driver *drv;
++	struct usb_driver *driver = to_usb_driver(iface->dev.driver);
+ 
+ 	/* Check if the usb id matches a known device */
+ 	list_for_each_entry(drv, &usb_serial_driver_list, driver_list) {
+-		id = get_iface_id(drv, iface);
++		if (drv->usb_driver == driver)
++			id = get_iface_id(drv, iface);
+ 		if (id)
+ 			return drv;
+ 	}
+diff --git a/fs/hfsplus/wrapper.c b/fs/hfsplus/wrapper.c
+index 7b8112da..aac1563 100644
+--- a/fs/hfsplus/wrapper.c
++++ b/fs/hfsplus/wrapper.c
+@@ -56,7 +56,7 @@ int hfsplus_submit_bio(struct super_block *sb, sector_t sector,
+ 	DECLARE_COMPLETION_ONSTACK(wait);
+ 	struct bio *bio;
+ 	int ret = 0;
+-	unsigned int io_size;
++	u64 io_size;
+ 	loff_t start;
+ 	int offset;
+ 
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index c446b5c..ff5970b 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -174,6 +174,8 @@ enum pci_dev_flags {
+ 	PCI_DEV_FLAGS_MSI_INTX_DISABLE_BUG = (__force pci_dev_flags_t) 1,
+ 	/* Device configuration is irrevocably lost if disabled into D3 */
+ 	PCI_DEV_FLAGS_NO_D3 = (__force pci_dev_flags_t) 2,
++	/* Device causes system crash if in D3 during S3 sleep */
++	PCI_DEV_FLAGS_NO_D3_DURING_SLEEP = (__force pci_dev_flags_t) 8,
+ };
+ 
+ enum pci_irq_reroute_variant {
+diff --git a/include/linux/usb/hcd.h b/include/linux/usb/hcd.h
+index 32ba8c5..c0ecc5a 100644
+--- a/include/linux/usb/hcd.h
++++ b/include/linux/usb/hcd.h
+@@ -128,8 +128,6 @@ struct usb_hcd {
+ 	unsigned		wireless:1;	/* Wireless USB HCD */
+ 	unsigned		authorized_default:1;
+ 	unsigned		has_tt:1;	/* Integrated TT in root hub */
+-	unsigned		broken_pci_sleep:1;	/* Don't put the
+-			controller in PCI-D3 for system sleep */
+ 
+ 	int			irq;		/* irq allocated */
+ 	void __iomem		*regs;		/* device memory/io */
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index ce5f111..54c59ab 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -1302,7 +1302,8 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
+ 						sizeof(req->rq_snd_buf));
+ 		return bc_send(req);
+ 	} else {
+-		/* Nothing to do to drop request */
++		/* drop request */
++		xprt_free_bc_request(req);
+ 		return 0;
+ 	}
+ }

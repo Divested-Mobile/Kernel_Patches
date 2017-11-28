@@ -1,0 +1,601 @@
+diff --git a/Makefile b/Makefile
+index f82a70f..71e8efa 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 0
+-SUBLEVEL = 73
++SUBLEVEL = 74
+ EXTRAVERSION =
+ NAME = Sneaky Weasel
+ 
+diff --git a/arch/x86/include/asm/paravirt.h b/arch/x86/include/asm/paravirt.h
+index ebbc4d8..2fdfe31 100644
+--- a/arch/x86/include/asm/paravirt.h
++++ b/arch/x86/include/asm/paravirt.h
+@@ -731,7 +731,10 @@ static inline void arch_leave_lazy_mmu_mode(void)
+ 	PVOP_VCALL0(pv_mmu_ops.lazy_mode.leave);
+ }
+ 
+-void arch_flush_lazy_mmu_mode(void);
++static inline void arch_flush_lazy_mmu_mode(void)
++{
++	PVOP_VCALL0(pv_mmu_ops.lazy_mode.flush);
++}
+ 
+ static inline void __set_fixmap(unsigned /* enum fixed_addresses */ idx,
+ 				phys_addr_t phys, pgprot_t flags)
+diff --git a/arch/x86/include/asm/paravirt_types.h b/arch/x86/include/asm/paravirt_types.h
+index 8288509..4b67ec9 100644
+--- a/arch/x86/include/asm/paravirt_types.h
++++ b/arch/x86/include/asm/paravirt_types.h
+@@ -85,6 +85,7 @@ struct pv_lazy_ops {
+ 	/* Set deferred update mode, used for batching operations. */
+ 	void (*enter)(void);
+ 	void (*leave)(void);
++	void (*flush)(void);
+ };
+ 
+ struct pv_time_ops {
+@@ -673,6 +674,7 @@ void paravirt_end_context_switch(struct task_struct *next);
+ 
+ void paravirt_enter_lazy_mmu(void);
+ void paravirt_leave_lazy_mmu(void);
++void paravirt_flush_lazy_mmu(void);
+ 
+ void _paravirt_nop(void);
+ u32 _paravirt_ident_32(u32);
+diff --git a/arch/x86/kernel/paravirt.c b/arch/x86/kernel/paravirt.c
+index 869e1ae..704faba 100644
+--- a/arch/x86/kernel/paravirt.c
++++ b/arch/x86/kernel/paravirt.c
+@@ -253,6 +253,18 @@ void paravirt_leave_lazy_mmu(void)
+ 	leave_lazy(PARAVIRT_LAZY_MMU);
+ }
+ 
++void paravirt_flush_lazy_mmu(void)
++{
++	preempt_disable();
++
++	if (paravirt_get_lazy_mode() == PARAVIRT_LAZY_MMU) {
++		arch_leave_lazy_mmu_mode();
++		arch_enter_lazy_mmu_mode();
++	}
++
++	preempt_enable();
++}
++
+ void paravirt_start_context_switch(struct task_struct *prev)
+ {
+ 	BUG_ON(preemptible());
+@@ -282,18 +294,6 @@ enum paravirt_lazy_mode paravirt_get_lazy_mode(void)
+ 	return percpu_read(paravirt_lazy_mode);
+ }
+ 
+-void arch_flush_lazy_mmu_mode(void)
+-{
+-	preempt_disable();
+-
+-	if (paravirt_get_lazy_mode() == PARAVIRT_LAZY_MMU) {
+-		arch_leave_lazy_mmu_mode();
+-		arch_enter_lazy_mmu_mode();
+-	}
+-
+-	preempt_enable();
+-}
+-
+ struct pv_info pv_info = {
+ 	.name = "bare hardware",
+ 	.paravirt_enabled = 0,
+@@ -462,6 +462,7 @@ struct pv_mmu_ops pv_mmu_ops = {
+ 	.lazy_mode = {
+ 		.enter = paravirt_nop,
+ 		.leave = paravirt_nop,
++		.flush = paravirt_nop,
+ 	},
+ 
+ 	.set_fixmap = native_set_fixmap,
+diff --git a/arch/x86/lguest/boot.c b/arch/x86/lguest/boot.c
+index db832fd..2d45247 100644
+--- a/arch/x86/lguest/boot.c
++++ b/arch/x86/lguest/boot.c
+@@ -1309,6 +1309,7 @@ __init void lguest_init(void)
+ 	pv_mmu_ops.read_cr3 = lguest_read_cr3;
+ 	pv_mmu_ops.lazy_mode.enter = paravirt_enter_lazy_mmu;
+ 	pv_mmu_ops.lazy_mode.leave = lguest_leave_lazy_mmu_mode;
++	pv_mmu_ops.lazy_mode.flush = paravirt_flush_lazy_mmu;
+ 	pv_mmu_ops.pte_update = lguest_pte_update;
+ 	pv_mmu_ops.pte_update_defer = lguest_pte_update;
+ 
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 3b2ad91..7653f14 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -376,10 +376,12 @@ static noinline __kprobes int vmalloc_fault(unsigned long address)
+ 	if (pgd_none(*pgd_ref))
+ 		return -1;
+ 
+-	if (pgd_none(*pgd))
++	if (pgd_none(*pgd)) {
+ 		set_pgd(pgd, *pgd_ref);
+-	else
++		arch_flush_lazy_mmu_mode();
++	} else {
+ 		BUG_ON(pgd_page_vaddr(*pgd) != pgd_page_vaddr(*pgd_ref));
++	}
+ 
+ 	/*
+ 	 * Below here mismatches are bugs because these lower tables
+diff --git a/arch/x86/mm/numa_32.c b/arch/x86/mm/numa_32.c
+index 849a975..025d469 100644
+--- a/arch/x86/mm/numa_32.c
++++ b/arch/x86/mm/numa_32.c
+@@ -73,167 +73,6 @@ unsigned long node_memmap_size_bytes(int nid, unsigned long start_pfn,
+ 
+ extern unsigned long highend_pfn, highstart_pfn;
+ 
+-#define LARGE_PAGE_BYTES (PTRS_PER_PTE * PAGE_SIZE)
+-
+-static void *node_remap_start_vaddr[MAX_NUMNODES];
+-void set_pmd_pfn(unsigned long vaddr, unsigned long pfn, pgprot_t flags);
+-
+-/*
+- * Remap memory allocator
+- */
+-static unsigned long node_remap_start_pfn[MAX_NUMNODES];
+-static void *node_remap_end_vaddr[MAX_NUMNODES];
+-static void *node_remap_alloc_vaddr[MAX_NUMNODES];
+-
+-/**
+- * alloc_remap - Allocate remapped memory
+- * @nid: NUMA node to allocate memory from
+- * @size: The size of allocation
+- *
+- * Allocate @size bytes from the remap area of NUMA node @nid.  The
+- * size of the remap area is predetermined by init_alloc_remap() and
+- * only the callers considered there should call this function.  For
+- * more info, please read the comment on top of init_alloc_remap().
+- *
+- * The caller must be ready to handle allocation failure from this
+- * function and fall back to regular memory allocator in such cases.
+- *
+- * CONTEXT:
+- * Single CPU early boot context.
+- *
+- * RETURNS:
+- * Pointer to the allocated memory on success, %NULL on failure.
+- */
+-void *alloc_remap(int nid, unsigned long size)
+-{
+-	void *allocation = node_remap_alloc_vaddr[nid];
+-
+-	size = ALIGN(size, L1_CACHE_BYTES);
+-
+-	if (!allocation || (allocation + size) > node_remap_end_vaddr[nid])
+-		return NULL;
+-
+-	node_remap_alloc_vaddr[nid] += size;
+-	memset(allocation, 0, size);
+-
+-	return allocation;
+-}
+-
+-#ifdef CONFIG_HIBERNATION
+-/**
+- * resume_map_numa_kva - add KVA mapping to the temporary page tables created
+- *                       during resume from hibernation
+- * @pgd_base - temporary resume page directory
+- */
+-void resume_map_numa_kva(pgd_t *pgd_base)
+-{
+-	int node;
+-
+-	for_each_online_node(node) {
+-		unsigned long start_va, start_pfn, nr_pages, pfn;
+-
+-		start_va = (unsigned long)node_remap_start_vaddr[node];
+-		start_pfn = node_remap_start_pfn[node];
+-		nr_pages = (node_remap_end_vaddr[node] -
+-			    node_remap_start_vaddr[node]) >> PAGE_SHIFT;
+-
+-		printk(KERN_DEBUG "%s: node %d\n", __func__, node);
+-
+-		for (pfn = 0; pfn < nr_pages; pfn += PTRS_PER_PTE) {
+-			unsigned long vaddr = start_va + (pfn << PAGE_SHIFT);
+-			pgd_t *pgd = pgd_base + pgd_index(vaddr);
+-			pud_t *pud = pud_offset(pgd, vaddr);
+-			pmd_t *pmd = pmd_offset(pud, vaddr);
+-
+-			set_pmd(pmd, pfn_pmd(start_pfn + pfn,
+-						PAGE_KERNEL_LARGE_EXEC));
+-
+-			printk(KERN_DEBUG "%s: %08lx -> pfn %08lx\n",
+-				__func__, vaddr, start_pfn + pfn);
+-		}
+-	}
+-}
+-#endif
+-
+-/**
+- * init_alloc_remap - Initialize remap allocator for a NUMA node
+- * @nid: NUMA node to initizlie remap allocator for
+- *
+- * NUMA nodes may end up without any lowmem.  As allocating pgdat and
+- * memmap on a different node with lowmem is inefficient, a special
+- * remap allocator is implemented which can be used by alloc_remap().
+- *
+- * For each node, the amount of memory which will be necessary for
+- * pgdat and memmap is calculated and two memory areas of the size are
+- * allocated - one in the node and the other in lowmem; then, the area
+- * in the node is remapped to the lowmem area.
+- *
+- * As pgdat and memmap must be allocated in lowmem anyway, this
+- * doesn't waste lowmem address space; however, the actual lowmem
+- * which gets remapped over is wasted.  The amount shouldn't be
+- * problematic on machines this feature will be used.
+- *
+- * Initialization failure isn't fatal.  alloc_remap() is used
+- * opportunistically and the callers will fall back to other memory
+- * allocation mechanisms on failure.
+- */
+-void __init init_alloc_remap(int nid, u64 start, u64 end)
+-{
+-	unsigned long start_pfn = start >> PAGE_SHIFT;
+-	unsigned long end_pfn = end >> PAGE_SHIFT;
+-	unsigned long size, pfn;
+-	u64 node_pa, remap_pa;
+-	void *remap_va;
+-
+-	/*
+-	 * The acpi/srat node info can show hot-add memroy zones where
+-	 * memory could be added but not currently present.
+-	 */
+-	printk(KERN_DEBUG "node %d pfn: [%lx - %lx]\n",
+-	       nid, start_pfn, end_pfn);
+-
+-	/* calculate the necessary space aligned to large page size */
+-	size = node_memmap_size_bytes(nid, start_pfn, end_pfn);
+-	size += ALIGN(sizeof(pg_data_t), PAGE_SIZE);
+-	size = ALIGN(size, LARGE_PAGE_BYTES);
+-
+-	/* allocate node memory and the lowmem remap area */
+-	node_pa = memblock_find_in_range(start, end, size, LARGE_PAGE_BYTES);
+-	if (node_pa == MEMBLOCK_ERROR) {
+-		pr_warning("remap_alloc: failed to allocate %lu bytes for node %d\n",
+-			   size, nid);
+-		return;
+-	}
+-	memblock_x86_reserve_range(node_pa, node_pa + size, "KVA RAM");
+-
+-	remap_pa = memblock_find_in_range(min_low_pfn << PAGE_SHIFT,
+-					  max_low_pfn << PAGE_SHIFT,
+-					  size, LARGE_PAGE_BYTES);
+-	if (remap_pa == MEMBLOCK_ERROR) {
+-		pr_warning("remap_alloc: failed to allocate %lu bytes remap area for node %d\n",
+-			   size, nid);
+-		memblock_x86_free_range(node_pa, node_pa + size);
+-		return;
+-	}
+-	memblock_x86_reserve_range(remap_pa, remap_pa + size, "KVA PG");
+-	remap_va = phys_to_virt(remap_pa);
+-
+-	/* perform actual remap */
+-	for (pfn = 0; pfn < size >> PAGE_SHIFT; pfn += PTRS_PER_PTE)
+-		set_pmd_pfn((unsigned long)remap_va + (pfn << PAGE_SHIFT),
+-			    (node_pa >> PAGE_SHIFT) + pfn,
+-			    PAGE_KERNEL_LARGE);
+-
+-	/* initialize remap allocator parameters */
+-	node_remap_start_pfn[nid] = node_pa >> PAGE_SHIFT;
+-	node_remap_start_vaddr[nid] = remap_va;
+-	node_remap_end_vaddr[nid] = remap_va + size;
+-	node_remap_alloc_vaddr[nid] = remap_va;
+-
+-	printk(KERN_DEBUG "remap_alloc: node %d [%08llx-%08llx) -> [%p-%p)\n",
+-	       nid, node_pa, node_pa + size, remap_va, remap_va + size);
+-}
+-
+ void __init initmem_init(void)
+ {
+ 	x86_numa_init();
+diff --git a/arch/x86/xen/mmu.c b/arch/x86/xen/mmu.c
+index d957dce..a0aed70 100644
+--- a/arch/x86/xen/mmu.c
++++ b/arch/x86/xen/mmu.c
+@@ -2011,6 +2011,7 @@ static const struct pv_mmu_ops xen_mmu_ops __initconst = {
+ 	.lazy_mode = {
+ 		.enter = paravirt_enter_lazy_mmu,
+ 		.leave = xen_leave_lazy_mmu,
++		.flush = paravirt_flush_lazy_mmu,
+ 	},
+ 
+ 	.set_fixmap = xen_set_fixmap,
+diff --git a/drivers/mtd/mtdchar.c b/drivers/mtd/mtdchar.c
+index 9f8658e..9892dcc 100644
+--- a/drivers/mtd/mtdchar.c
++++ b/drivers/mtd/mtdchar.c
+@@ -1064,6 +1064,33 @@ static unsigned long mtd_get_unmapped_area(struct file *file,
+ }
+ #endif
+ 
++static inline unsigned long get_vm_size(struct vm_area_struct *vma)
++{
++	return vma->vm_end - vma->vm_start;
++}
++
++static inline resource_size_t get_vm_offset(struct vm_area_struct *vma)
++{
++	return (resource_size_t) vma->vm_pgoff << PAGE_SHIFT;
++}
++
++/*
++ * Set a new vm offset.
++ *
++ * Verify that the incoming offset really works as a page offset,
++ * and that the offset and size fit in a resource_size_t.
++ */
++static inline int set_vm_offset(struct vm_area_struct *vma, resource_size_t off)
++{
++	pgoff_t pgoff = off >> PAGE_SHIFT;
++	if (off != (resource_size_t) pgoff << PAGE_SHIFT)
++		return -EINVAL;
++	if (off + get_vm_size(vma) - 1 < off)
++		return -EINVAL;
++	vma->vm_pgoff = pgoff;
++	return 0;
++}
++
+ /*
+  * set up a mapping for shared memory segments
+  */
+@@ -1073,20 +1100,33 @@ static int mtd_mmap(struct file *file, struct vm_area_struct *vma)
+ 	struct mtd_file_info *mfi = file->private_data;
+ 	struct mtd_info *mtd = mfi->mtd;
+ 	struct map_info *map = mtd->priv;
+-	unsigned long start;
+-	unsigned long off;
+-	u32 len;
+-
+-	if (mtd->type == MTD_RAM || mtd->type == MTD_ROM) {
+-		off = vma->vm_pgoff << PAGE_SHIFT;
++	resource_size_t start, off;
++	unsigned long len, vma_len;
++
++        /* This is broken because it assumes the MTD device is map-based
++	   and that mtd->priv is a valid struct map_info.  It should be
++	   replaced with something that uses the mtd_get_unmapped_area()
++	   operation properly. */
++	if (0 /*mtd->type == MTD_RAM || mtd->type == MTD_ROM*/) {
++		off = get_vm_offset(vma);
+ 		start = map->phys;
+ 		len = PAGE_ALIGN((start & ~PAGE_MASK) + map->size);
+ 		start &= PAGE_MASK;
+-		if ((vma->vm_end - vma->vm_start + off) > len)
++		vma_len = get_vm_size(vma);
++
++		/* Overflow in off+len? */
++		if (vma_len + off < off)
++			return -EINVAL;
++		/* Does it fit in the mapping? */
++		if (vma_len + off > len)
+ 			return -EINVAL;
+ 
+ 		off += start;
+-		vma->vm_pgoff = off >> PAGE_SHIFT;
++		/* Did that overflow? */
++		if (off < start)
++			return -EINVAL;
++		if (set_vm_offset(vma, off) < 0)
++			return -EINVAL;
+ 		vma->vm_flags |= VM_IO | VM_RESERVED;
+ 
+ #ifdef pgprot_noncached
+diff --git a/drivers/net/r8169.c b/drivers/net/r8169.c
+index 80b230e..8350f8d 100644
+--- a/drivers/net/r8169.c
++++ b/drivers/net/r8169.c
+@@ -3105,11 +3105,34 @@ static void r810x_phy_power_up(struct rtl8169_private *tp)
+ 	rtl_writephy(tp, MII_BMCR, BMCR_ANENABLE);
+ }
+ 
++static void rtl_speed_down(struct rtl8169_private *tp)
++{
++	u32 adv;
++	int lpa;
++
++	rtl_writephy(tp, 0x1f, 0x0000);
++	lpa = rtl_readphy(tp, MII_LPA);
++
++	if (lpa & (LPA_10HALF | LPA_10FULL))
++		adv = ADVERTISED_10baseT_Half | ADVERTISED_10baseT_Full;
++	else if (lpa & (LPA_100HALF | LPA_100FULL))
++		adv = ADVERTISED_10baseT_Half | ADVERTISED_10baseT_Full |
++		      ADVERTISED_100baseT_Half | ADVERTISED_100baseT_Full;
++	else
++		adv = ADVERTISED_10baseT_Half | ADVERTISED_10baseT_Full |
++		      ADVERTISED_100baseT_Half | ADVERTISED_100baseT_Full |
++		      (tp->mii.supports_gmii ?
++		       ADVERTISED_1000baseT_Half |
++		       ADVERTISED_1000baseT_Full : 0);
++
++	rtl8169_set_speed(tp->dev, AUTONEG_ENABLE, SPEED_1000, DUPLEX_FULL,
++			  adv);
++}
++
+ static void r810x_pll_power_down(struct rtl8169_private *tp)
+ {
+ 	if (__rtl8169_get_wol(tp) & WAKE_ANY) {
+-		rtl_writephy(tp, 0x1f, 0x0000);
+-		rtl_writephy(tp, MII_BMCR, 0x0000);
++		rtl_speed_down(tp);
+ 		return;
+ 	}
+ 
+@@ -3201,8 +3224,7 @@ static void r8168_pll_power_down(struct rtl8169_private *tp)
+ 		rtl_ephy_write(ioaddr, 0x19, 0xff64);
+ 
+ 	if (__rtl8169_get_wol(tp) & WAKE_ANY) {
+-		rtl_writephy(tp, 0x1f, 0x0000);
+-		rtl_writephy(tp, MII_BMCR, 0x0000);
++		rtl_speed_down(tp);
+ 
+ 		if (tp->mac_version == RTL_GIGA_MAC_VER_32 ||
+ 		    tp->mac_version == RTL_GIGA_MAC_VER_33)
+diff --git a/drivers/target/target_core_alua.c b/drivers/target/target_core_alua.c
+index c967405..527bda4 100644
+--- a/drivers/target/target_core_alua.c
++++ b/drivers/target/target_core_alua.c
+@@ -351,6 +351,7 @@ static inline int core_alua_state_standby(
+ 	case REPORT_LUNS:
+ 	case RECEIVE_DIAGNOSTIC:
+ 	case SEND_DIAGNOSTIC:
++		return 0;
+ 	case MAINTENANCE_IN:
+ 		switch (cdb[1]) {
+ 		case MI_REPORT_TARGET_PGS:
+@@ -393,6 +394,7 @@ static inline int core_alua_state_unavailable(
+ 	switch (cdb[0]) {
+ 	case INQUIRY:
+ 	case REPORT_LUNS:
++		return 0;
+ 	case MAINTENANCE_IN:
+ 		switch (cdb[1]) {
+ 		case MI_REPORT_TARGET_PGS:
+@@ -433,6 +435,7 @@ static inline int core_alua_state_transition(
+ 	switch (cdb[0]) {
+ 	case INQUIRY:
+ 	case REPORT_LUNS:
++		return 0;
+ 	case MAINTENANCE_IN:
+ 		switch (cdb[1]) {
+ 		case MI_REPORT_TARGET_PGS:
+diff --git a/kernel/sched_clock.c b/kernel/sched_clock.c
+index 9d8af0b..1eeaf74 100644
+--- a/kernel/sched_clock.c
++++ b/kernel/sched_clock.c
+@@ -176,10 +176,36 @@ static u64 sched_clock_remote(struct sched_clock_data *scd)
+ 	u64 this_clock, remote_clock;
+ 	u64 *ptr, old_val, val;
+ 
++#if BITS_PER_LONG != 64
++again:
++	/*
++	 * Careful here: The local and the remote clock values need to
++	 * be read out atomic as we need to compare the values and
++	 * then update either the local or the remote side. So the
++	 * cmpxchg64 below only protects one readout.
++	 *
++	 * We must reread via sched_clock_local() in the retry case on
++	 * 32bit as an NMI could use sched_clock_local() via the
++	 * tracer and hit between the readout of
++	 * the low32bit and the high 32bit portion.
++	 */
++	this_clock = sched_clock_local(my_scd);
++	/*
++	 * We must enforce atomic readout on 32bit, otherwise the
++	 * update on the remote cpu can hit inbetween the readout of
++	 * the low32bit and the high 32bit portion.
++	 */
++	remote_clock = cmpxchg64(&scd->clock, 0, 0);
++#else
++	/*
++	 * On 64bit the read of [my]scd->clock is atomic versus the
++	 * update, so we can avoid the above 32bit dance.
++	 */
+ 	sched_clock_local(my_scd);
+ again:
+ 	this_clock = my_scd->clock;
+ 	remote_clock = scd->clock;
++#endif
+ 
+ 	/*
+ 	 * Use the opportunity that we have both locks
+diff --git a/kernel/sys.c b/kernel/sys.c
+index 84e353b1..1c69aa7 100644
+--- a/kernel/sys.c
++++ b/kernel/sys.c
+@@ -320,7 +320,6 @@ void kernel_restart_prepare(char *cmd)
+ 	system_state = SYSTEM_RESTART;
+ 	usermodehelper_disable();
+ 	device_shutdown();
+-	syscore_shutdown();
+ }
+ 
+ /**
+@@ -335,6 +334,7 @@ void kernel_restart(char *cmd)
+ {
+ 	kernel_restart_prepare(cmd);
+ 	disable_nonboot_cpus();
++	syscore_shutdown();
+ 	if (!cmd)
+ 		printk(KERN_EMERG "Restarting system.\n");
+ 	else
+@@ -360,6 +360,7 @@ static void kernel_shutdown_prepare(enum system_states state)
+ void kernel_halt(void)
+ {
+ 	kernel_shutdown_prepare(SYSTEM_HALT);
++	disable_nonboot_cpus();
+ 	syscore_shutdown();
+ 	printk(KERN_EMERG "System halted.\n");
+ 	kmsg_dump(KMSG_DUMP_HALT);
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index 63ce76f..5312d96 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -566,7 +566,6 @@ int ftrace_profile_pages_init(struct ftrace_profile_stat *stat)
+ 		free_page(tmp);
+ 	}
+ 
+-	free_page((unsigned long)stat->pages);
+ 	stat->pages = NULL;
+ 	stat->start = NULL;
+ 
+diff --git a/sound/soc/codecs/wm8903.c b/sound/soc/codecs/wm8903.c
+index 43e3d76..fea5b7a 100644
+--- a/sound/soc/codecs/wm8903.c
++++ b/sound/soc/codecs/wm8903.c
+@@ -1101,6 +1101,8 @@ static const struct snd_soc_dapm_route wm8903_intercon[] = {
+ 	{ "ROP", NULL, "Right Speaker PGA" },
+ 	{ "RON", NULL, "Right Speaker PGA" },
+ 
++	{ "Charge Pump", NULL, "CLK_DSP" },
++
+ 	{ "Left Headphone Output PGA", NULL, "Charge Pump" },
+ 	{ "Right Headphone Output PGA", NULL, "Charge Pump" },
+ 	{ "Left Line Output PGA", NULL, "Charge Pump" },
+diff --git a/sound/usb/mixer_quirks.c b/sound/usb/mixer_quirks.c
+index b4c516a..2d224f4 100644
+--- a/sound/usb/mixer_quirks.c
++++ b/sound/usb/mixer_quirks.c
+@@ -396,7 +396,7 @@ static int snd_nativeinstruments_control_get(struct snd_kcontrol *kcontrol,
+ 	else
+ 		ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), bRequest,
+ 				  USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
+-				  0, cpu_to_le16(wIndex),
++				  0, wIndex,
+ 				  &tmp, sizeof(tmp), 1000);
+ 	up_read(&mixer->chip->shutdown_rwsem);
+ 
+@@ -427,7 +427,7 @@ static int snd_nativeinstruments_control_put(struct snd_kcontrol *kcontrol,
+ 	else
+ 		ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0), bRequest,
+ 				  USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
+-				  cpu_to_le16(wValue), cpu_to_le16(wIndex),
++				  wValue, wIndex,
+ 				  NULL, 0, 1000);
+ 	up_read(&mixer->chip->shutdown_rwsem);
+ 
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index 090e193..eb22768 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -455,7 +455,7 @@ static int snd_usb_nativeinstruments_boot_quirk(struct usb_device *dev)
+ {
+ 	int ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0),
+ 				  0xaf, USB_TYPE_VENDOR | USB_RECIP_DEVICE,
+-				  cpu_to_le16(1), 0, NULL, 0, 1000);
++				  1, 0, NULL, 0, 1000);
+ 
+ 	if (ret < 0)
+ 		return ret;
