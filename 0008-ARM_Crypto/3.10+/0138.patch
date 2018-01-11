@@ -1,0 +1,133 @@
+From 6d6254d728a2e696aa697b4b44cb7736851f62e3 Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date: Mon, 24 Jul 2017 11:28:05 +0100
+Subject: [PATCH] crypto: arm64/ghash-ce - add non-SIMD scalar fallback
+
+The arm64 kernel will shortly disallow nested kernel mode NEON, so
+add a fallback to scalar C code that can be invoked in that case.
+
+Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+---
+ arch/arm64/crypto/Kconfig         |  3 ++-
+ arch/arm64/crypto/ghash-ce-glue.c | 49 ++++++++++++++++++++++++++++++++-------
+ 2 files changed, 43 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm64/crypto/Kconfig b/arch/arm64/crypto/Kconfig
+index d92293747d631..7d75a363e3172 100644
+--- a/arch/arm64/crypto/Kconfig
++++ b/arch/arm64/crypto/Kconfig
+@@ -28,8 +28,9 @@ config CRYPTO_SHA2_ARM64_CE
+ 
+ config CRYPTO_GHASH_ARM64_CE
+ 	tristate "GHASH (for GCM chaining mode) using ARMv8 Crypto Extensions"
+-	depends on ARM64 && KERNEL_MODE_NEON
++	depends on KERNEL_MODE_NEON
+ 	select CRYPTO_HASH
++	select CRYPTO_GF128MUL
+ 
+ config CRYPTO_CRCT10DIF_ARM64_CE
+ 	tristate "CRCT10DIF digest algorithm using PMULL instructions"
+diff --git a/arch/arm64/crypto/ghash-ce-glue.c b/arch/arm64/crypto/ghash-ce-glue.c
+index 833ec1e3f3e9b..30221ef56e70d 100644
+--- a/arch/arm64/crypto/ghash-ce-glue.c
++++ b/arch/arm64/crypto/ghash-ce-glue.c
+@@ -1,7 +1,7 @@
+ /*
+  * Accelerated GHASH implementation with ARMv8 PMULL instructions.
+  *
+- * Copyright (C) 2014 Linaro Ltd. <ard.biesheuvel@linaro.org>
++ * Copyright (C) 2014 - 2017 Linaro Ltd. <ard.biesheuvel@linaro.org>
+  *
+  * This program is free software; you can redistribute it and/or modify it
+  * under the terms of the GNU General Public License version 2 as published
+@@ -9,7 +9,9 @@
+  */
+ 
+ #include <asm/neon.h>
++#include <asm/simd.h>
+ #include <asm/unaligned.h>
++#include <crypto/gf128mul.h>
+ #include <crypto/internal/hash.h>
+ #include <linux/cpufeature.h>
+ #include <linux/crypto.h>
+@@ -25,6 +27,7 @@ MODULE_LICENSE("GPL v2");
+ struct ghash_key {
+ 	u64 a;
+ 	u64 b;
++	be128 k;
+ };
+ 
+ struct ghash_desc_ctx {
+@@ -44,6 +47,36 @@ static int ghash_init(struct shash_desc *desc)
+ 	return 0;
+ }
+ 
++static void ghash_do_update(int blocks, u64 dg[], const char *src,
++			    struct ghash_key *key, const char *head)
++{
++	if (likely(may_use_simd())) {
++		kernel_neon_begin();
++		pmull_ghash_update(blocks, dg, src, key, head);
++		kernel_neon_end();
++	} else {
++		be128 dst = { cpu_to_be64(dg[1]), cpu_to_be64(dg[0]) };
++
++		do {
++			const u8 *in = src;
++
++			if (head) {
++				in = head;
++				blocks++;
++				head = NULL;
++			} else {
++				src += GHASH_BLOCK_SIZE;
++			}
++
++			crypto_xor((u8 *)&dst, in, GHASH_BLOCK_SIZE);
++			gf128mul_lle(&dst, &key->k);
++		} while (--blocks);
++
++		dg[0] = be64_to_cpu(dst.b);
++		dg[1] = be64_to_cpu(dst.a);
++	}
++}
++
+ static int ghash_update(struct shash_desc *desc, const u8 *src,
+ 			unsigned int len)
+ {
+@@ -67,10 +100,9 @@ static int ghash_update(struct shash_desc *desc, const u8 *src,
+ 		blocks = len / GHASH_BLOCK_SIZE;
+ 		len %= GHASH_BLOCK_SIZE;
+ 
+-		kernel_neon_begin_partial(8);
+-		pmull_ghash_update(blocks, ctx->digest, src, key,
+-				   partial ? ctx->buf : NULL);
+-		kernel_neon_end();
++		ghash_do_update(blocks, ctx->digest, src, key,
++				partial ? ctx->buf : NULL);
++
+ 		src += blocks * GHASH_BLOCK_SIZE;
+ 		partial = 0;
+ 	}
+@@ -89,9 +121,7 @@ static int ghash_final(struct shash_desc *desc, u8 *dst)
+ 
+ 		memset(ctx->buf + partial, 0, GHASH_BLOCK_SIZE - partial);
+ 
+-		kernel_neon_begin_partial(8);
+-		pmull_ghash_update(1, ctx->digest, ctx->buf, key, NULL);
+-		kernel_neon_end();
++		ghash_do_update(1, ctx->digest, ctx->buf, key, NULL);
+ 	}
+ 	put_unaligned_be64(ctx->digest[1], dst);
+ 	put_unaligned_be64(ctx->digest[0], dst + 8);
+@@ -111,6 +141,9 @@ static int ghash_setkey(struct crypto_shash *tfm,
+ 		return -EINVAL;
+ 	}
+ 
++	/* needed for the fallback */
++	memcpy(&key->k, inkey, GHASH_BLOCK_SIZE);
++
+ 	/* perform multiplication by 'x' in GF(2^128) */
+ 	b = get_unaligned_be64(inkey);
+ 	a = get_unaligned_be64(inkey + 8);
