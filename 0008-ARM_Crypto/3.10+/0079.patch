@@ -1,0 +1,1597 @@
+From 49788fe2a128217f78a21ee4edbe6e92e988f222 Mon Sep 17 00:00:00 2001
+From: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Date: Fri, 21 Mar 2014 10:19:17 +0100
+Subject: [PATCH] arm64/crypto: AES-ECB/CBC/CTR/XTS using ARMv8 NEON and Crypto
+ Extensions
+
+This adds ARMv8 implementations of AES in ECB, CBC, CTR and XTS modes,
+both for ARMv8 with Crypto Extensions and for plain ARMv8 NEON.
+
+The Crypto Extensions version can only run on ARMv8 implementations that
+have support for these optional extensions.
+
+The plain NEON version is a table based yet time invariant implementation.
+All S-box substitutions are performed in parallel, leveraging the wide range
+of ARMv8's tbl/tbx instructions, and the huge NEON register file, which can
+comfortably hold the entire S-box and still have room to spare for doing the
+actual computations.
+
+The key expansion routines were borrowed from aes_generic.
+
+Signed-off-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
+---
+ arch/arm64/crypto/Kconfig     |  14 ++
+ arch/arm64/crypto/Makefile    |  14 ++
+ arch/arm64/crypto/aes-ce.S    | 133 +++++++++++
+ arch/arm64/crypto/aes-glue.c  | 446 +++++++++++++++++++++++++++++++++++
+ arch/arm64/crypto/aes-modes.S | 532 ++++++++++++++++++++++++++++++++++++++++++
+ arch/arm64/crypto/aes-neon.S  | 382 ++++++++++++++++++++++++++++++
+ 6 files changed, 1521 insertions(+)
+ create mode 100644 arch/arm64/crypto/aes-ce.S
+ create mode 100644 arch/arm64/crypto/aes-glue.c
+ create mode 100644 arch/arm64/crypto/aes-modes.S
+ create mode 100644 arch/arm64/crypto/aes-neon.S
+
+diff --git a/arch/arm64/crypto/Kconfig b/arch/arm64/crypto/Kconfig
+index 8fffd5af65efa..5562652c53166 100644
+--- a/arch/arm64/crypto/Kconfig
++++ b/arch/arm64/crypto/Kconfig
+@@ -36,4 +36,18 @@ config CRYPTO_AES_ARM64_CE_CCM
+ 	select CRYPTO_AES
+ 	select CRYPTO_AEAD
+ 
++config CRYPTO_AES_ARM64_CE_BLK
++	tristate "AES in ECB/CBC/CTR/XTS modes using ARMv8 Crypto Extensions"
++	depends on ARM64 && KERNEL_MODE_NEON
++	select CRYPTO_BLKCIPHER
++	select CRYPTO_AES
++	select CRYPTO_ABLK_HELPER
++
++config CRYPTO_AES_ARM64_NEON_BLK
++	tristate "AES in ECB/CBC/CTR/XTS modes using NEON instructions"
++	depends on ARM64 && KERNEL_MODE_NEON
++	select CRYPTO_BLKCIPHER
++	select CRYPTO_AES
++	select CRYPTO_ABLK_HELPER
++
+ endif
+diff --git a/arch/arm64/crypto/Makefile b/arch/arm64/crypto/Makefile
+index 311287d680781..2070a56ecc468 100644
+--- a/arch/arm64/crypto/Makefile
++++ b/arch/arm64/crypto/Makefile
+@@ -22,3 +22,17 @@ CFLAGS_aes-ce-cipher.o += -march=armv8-a+crypto
+ 
+ obj-$(CONFIG_CRYPTO_AES_ARM64_CE_CCM) += aes-ce-ccm.o
+ aes-ce-ccm-y := aes-ce-ccm-glue.o aes-ce-ccm-core.o
++
++obj-$(CONFIG_CRYPTO_AES_ARM64_CE_BLK) += aes-ce-blk.o
++aes-ce-blk-y := aes-glue-ce.o aes-ce.o
++
++obj-$(CONFIG_CRYPTO_AES_ARM64_NEON_BLK) += aes-neon-blk.o
++aes-neon-blk-y := aes-glue-neon.o aes-neon.o
++
++AFLAGS_aes-ce.o		:= -DINTERLEAVE=2 -DINTERLEAVE_INLINE
++AFLAGS_aes-neon.o	:= -DINTERLEAVE=4
++
++CFLAGS_aes-glue-ce.o	:= -DUSE_V8_CRYPTO_EXTENSIONS
++
++$(obj)/aes-glue-%.o: $(src)/aes-glue.c FORCE
++	$(call if_changed_dep,cc_o_c)
+diff --git a/arch/arm64/crypto/aes-ce.S b/arch/arm64/crypto/aes-ce.S
+new file mode 100644
+index 0000000000000..685a18f731eb6
+--- /dev/null
++++ b/arch/arm64/crypto/aes-ce.S
+@@ -0,0 +1,133 @@
++/*
++ * linux/arch/arm64/crypto/aes-ce.S - AES cipher for ARMv8 with
++ *                                    Crypto Extensions
++ *
++ * Copyright (C) 2013 Linaro Ltd <ard.biesheuvel@linaro.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/linkage.h>
++
++#define AES_ENTRY(func)		ENTRY(ce_ ## func)
++#define AES_ENDPROC(func)	ENDPROC(ce_ ## func)
++
++	.arch		armv8-a+crypto
++
++	/* preload all round keys */
++	.macro		load_round_keys, rounds, rk
++	cmp		\rounds, #12
++	blo		2222f		/* 128 bits */
++	beq		1111f		/* 192 bits */
++	ld1		{v17.16b-v18.16b}, [\rk], #32
++1111:	ld1		{v19.16b-v20.16b}, [\rk], #32
++2222:	ld1		{v21.16b-v24.16b}, [\rk], #64
++	ld1		{v25.16b-v28.16b}, [\rk], #64
++	ld1		{v29.16b-v31.16b}, [\rk]
++	.endm
++
++	/* prepare for encryption with key in rk[] */
++	.macro		enc_prepare, rounds, rk, ignore
++	load_round_keys	\rounds, \rk
++	.endm
++
++	/* prepare for encryption (again) but with new key in rk[] */
++	.macro		enc_switch_key, rounds, rk, ignore
++	load_round_keys	\rounds, \rk
++	.endm
++
++	/* prepare for decryption with key in rk[] */
++	.macro		dec_prepare, rounds, rk, ignore
++	load_round_keys	\rounds, \rk
++	.endm
++
++	.macro		do_enc_Nx, de, mc, k, i0, i1, i2, i3
++	aes\de		\i0\().16b, \k\().16b
++	.ifnb		\i1
++	aes\de		\i1\().16b, \k\().16b
++	.ifnb		\i3
++	aes\de		\i2\().16b, \k\().16b
++	aes\de		\i3\().16b, \k\().16b
++	.endif
++	.endif
++	aes\mc		\i0\().16b, \i0\().16b
++	.ifnb		\i1
++	aes\mc		\i1\().16b, \i1\().16b
++	.ifnb		\i3
++	aes\mc		\i2\().16b, \i2\().16b
++	aes\mc		\i3\().16b, \i3\().16b
++	.endif
++	.endif
++	.endm
++
++	/* up to 4 interleaved encryption rounds with the same round key */
++	.macro		round_Nx, enc, k, i0, i1, i2, i3
++	.ifc		\enc, e
++	do_enc_Nx	e, mc, \k, \i0, \i1, \i2, \i3
++	.else
++	do_enc_Nx	d, imc, \k, \i0, \i1, \i2, \i3
++	.endif
++	.endm
++
++	/* up to 4 interleaved final rounds */
++	.macro		fin_round_Nx, de, k, k2, i0, i1, i2, i3
++	aes\de		\i0\().16b, \k\().16b
++	.ifnb		\i1
++	aes\de		\i1\().16b, \k\().16b
++	.ifnb		\i3
++	aes\de		\i2\().16b, \k\().16b
++	aes\de		\i3\().16b, \k\().16b
++	.endif
++	.endif
++	eor		\i0\().16b, \i0\().16b, \k2\().16b
++	.ifnb		\i1
++	eor		\i1\().16b, \i1\().16b, \k2\().16b
++	.ifnb		\i3
++	eor		\i2\().16b, \i2\().16b, \k2\().16b
++	eor		\i3\().16b, \i3\().16b, \k2\().16b
++	.endif
++	.endif
++	.endm
++
++	/* up to 4 interleaved blocks */
++	.macro		do_block_Nx, enc, rounds, i0, i1, i2, i3
++	cmp		\rounds, #12
++	blo		2222f		/* 128 bits */
++	beq		1111f		/* 192 bits */
++	round_Nx	\enc, v17, \i0, \i1, \i2, \i3
++	round_Nx	\enc, v18, \i0, \i1, \i2, \i3
++1111:	round_Nx	\enc, v19, \i0, \i1, \i2, \i3
++	round_Nx	\enc, v20, \i0, \i1, \i2, \i3
++2222:	.irp		key, v21, v22, v23, v24, v25, v26, v27, v28, v29
++	round_Nx	\enc, \key, \i0, \i1, \i2, \i3
++	.endr
++	fin_round_Nx	\enc, v30, v31, \i0, \i1, \i2, \i3
++	.endm
++
++	.macro		encrypt_block, in, rounds, t0, t1, t2
++	do_block_Nx	e, \rounds, \in
++	.endm
++
++	.macro		encrypt_block2x, i0, i1, rounds, t0, t1, t2
++	do_block_Nx	e, \rounds, \i0, \i1
++	.endm
++
++	.macro		encrypt_block4x, i0, i1, i2, i3, rounds, t0, t1, t2
++	do_block_Nx	e, \rounds, \i0, \i1, \i2, \i3
++	.endm
++
++	.macro		decrypt_block, in, rounds, t0, t1, t2
++	do_block_Nx	d, \rounds, \in
++	.endm
++
++	.macro		decrypt_block2x, i0, i1, rounds, t0, t1, t2
++	do_block_Nx	d, \rounds, \i0, \i1
++	.endm
++
++	.macro		decrypt_block4x, i0, i1, i2, i3, rounds, t0, t1, t2
++	do_block_Nx	d, \rounds, \i0, \i1, \i2, \i3
++	.endm
++
++#include "aes-modes.S"
+diff --git a/arch/arm64/crypto/aes-glue.c b/arch/arm64/crypto/aes-glue.c
+new file mode 100644
+index 0000000000000..60f2f4c122561
+--- /dev/null
++++ b/arch/arm64/crypto/aes-glue.c
+@@ -0,0 +1,446 @@
++/*
++ * linux/arch/arm64/crypto/aes-glue.c - wrapper code for ARMv8 AES
++ *
++ * Copyright (C) 2013 Linaro Ltd <ard.biesheuvel@linaro.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <asm/neon.h>
++#include <asm/hwcap.h>
++#include <crypto/aes.h>
++#include <crypto/ablk_helper.h>
++#include <crypto/algapi.h>
++#include <linux/module.h>
++#include <linux/cpufeature.h>
++
++#ifdef USE_V8_CRYPTO_EXTENSIONS
++#define MODE			"ce"
++#define PRIO			300
++#define aes_ecb_encrypt		ce_aes_ecb_encrypt
++#define aes_ecb_decrypt		ce_aes_ecb_decrypt
++#define aes_cbc_encrypt		ce_aes_cbc_encrypt
++#define aes_cbc_decrypt		ce_aes_cbc_decrypt
++#define aes_ctr_encrypt		ce_aes_ctr_encrypt
++#define aes_xts_encrypt		ce_aes_xts_encrypt
++#define aes_xts_decrypt		ce_aes_xts_decrypt
++MODULE_DESCRIPTION("AES-ECB/CBC/CTR/XTS using ARMv8 Crypto Extensions");
++#else
++#define MODE			"neon"
++#define PRIO			200
++#define aes_ecb_encrypt		neon_aes_ecb_encrypt
++#define aes_ecb_decrypt		neon_aes_ecb_decrypt
++#define aes_cbc_encrypt		neon_aes_cbc_encrypt
++#define aes_cbc_decrypt		neon_aes_cbc_decrypt
++#define aes_ctr_encrypt		neon_aes_ctr_encrypt
++#define aes_xts_encrypt		neon_aes_xts_encrypt
++#define aes_xts_decrypt		neon_aes_xts_decrypt
++MODULE_DESCRIPTION("AES-ECB/CBC/CTR/XTS using ARMv8 NEON");
++MODULE_ALIAS("ecb(aes)");
++MODULE_ALIAS("cbc(aes)");
++MODULE_ALIAS("ctr(aes)");
++MODULE_ALIAS("xts(aes)");
++#endif
++
++MODULE_AUTHOR("Ard Biesheuvel <ard.biesheuvel@linaro.org>");
++MODULE_LICENSE("GPL v2");
++
++/* defined in aes-modes.S */
++asmlinkage void aes_ecb_encrypt(u8 out[], u8 const in[], u8 const rk[],
++				int rounds, int blocks, int first);
++asmlinkage void aes_ecb_decrypt(u8 out[], u8 const in[], u8 const rk[],
++				int rounds, int blocks, int first);
++
++asmlinkage void aes_cbc_encrypt(u8 out[], u8 const in[], u8 const rk[],
++				int rounds, int blocks, u8 iv[], int first);
++asmlinkage void aes_cbc_decrypt(u8 out[], u8 const in[], u8 const rk[],
++				int rounds, int blocks, u8 iv[], int first);
++
++asmlinkage void aes_ctr_encrypt(u8 out[], u8 const in[], u8 const rk[],
++				int rounds, int blocks, u8 ctr[], int first);
++
++asmlinkage void aes_xts_encrypt(u8 out[], u8 const in[], u8 const rk1[],
++				int rounds, int blocks, u8 const rk2[], u8 iv[],
++				int first);
++asmlinkage void aes_xts_decrypt(u8 out[], u8 const in[], u8 const rk1[],
++				int rounds, int blocks, u8 const rk2[], u8 iv[],
++				int first);
++
++struct crypto_aes_xts_ctx {
++	struct crypto_aes_ctx key1;
++	struct crypto_aes_ctx __aligned(8) key2;
++};
++
++static int xts_set_key(struct crypto_tfm *tfm, const u8 *in_key,
++		       unsigned int key_len)
++{
++	struct crypto_aes_xts_ctx *ctx = crypto_tfm_ctx(tfm);
++	int ret;
++
++	ret = crypto_aes_expand_key(&ctx->key1, in_key, key_len / 2);
++	if (!ret)
++		ret = crypto_aes_expand_key(&ctx->key2, &in_key[key_len / 2],
++					    key_len / 2);
++	if (!ret)
++		return 0;
++
++	tfm->crt_flags |= CRYPTO_TFM_RES_BAD_KEY_LEN;
++	return -EINVAL;
++}
++
++static int ecb_encrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		       struct scatterlist *src, unsigned int nbytes)
++{
++	struct crypto_aes_ctx *ctx = crypto_blkcipher_ctx(desc->tfm);
++	int err, first, rounds = 6 + ctx->key_length / 4;
++	struct blkcipher_walk walk;
++	unsigned int blocks;
++
++	desc->flags &= ~CRYPTO_TFM_REQ_MAY_SLEEP;
++	blkcipher_walk_init(&walk, dst, src, nbytes);
++	err = blkcipher_walk_virt(desc, &walk);
++
++	kernel_neon_begin();
++	for (first = 1; (blocks = (walk.nbytes / AES_BLOCK_SIZE)); first = 0) {
++		aes_ecb_encrypt(walk.dst.virt.addr, walk.src.virt.addr,
++				(u8 *)ctx->key_enc, rounds, blocks, first);
++		err = blkcipher_walk_done(desc, &walk, 0);
++	}
++	kernel_neon_end();
++	return err;
++}
++
++static int ecb_decrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		       struct scatterlist *src, unsigned int nbytes)
++{
++	struct crypto_aes_ctx *ctx = crypto_blkcipher_ctx(desc->tfm);
++	int err, first, rounds = 6 + ctx->key_length / 4;
++	struct blkcipher_walk walk;
++	unsigned int blocks;
++
++	desc->flags &= ~CRYPTO_TFM_REQ_MAY_SLEEP;
++	blkcipher_walk_init(&walk, dst, src, nbytes);
++	err = blkcipher_walk_virt(desc, &walk);
++
++	kernel_neon_begin();
++	for (first = 1; (blocks = (walk.nbytes / AES_BLOCK_SIZE)); first = 0) {
++		aes_ecb_decrypt(walk.dst.virt.addr, walk.src.virt.addr,
++				(u8 *)ctx->key_dec, rounds, blocks, first);
++		err = blkcipher_walk_done(desc, &walk, 0);
++	}
++	kernel_neon_end();
++	return err;
++}
++
++static int cbc_encrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		       struct scatterlist *src, unsigned int nbytes)
++{
++	struct crypto_aes_ctx *ctx = crypto_blkcipher_ctx(desc->tfm);
++	int err, first, rounds = 6 + ctx->key_length / 4;
++	struct blkcipher_walk walk;
++	unsigned int blocks;
++
++	desc->flags &= ~CRYPTO_TFM_REQ_MAY_SLEEP;
++	blkcipher_walk_init(&walk, dst, src, nbytes);
++	err = blkcipher_walk_virt(desc, &walk);
++
++	kernel_neon_begin();
++	for (first = 1; (blocks = (walk.nbytes / AES_BLOCK_SIZE)); first = 0) {
++		aes_cbc_encrypt(walk.dst.virt.addr, walk.src.virt.addr,
++				(u8 *)ctx->key_enc, rounds, blocks, walk.iv,
++				first);
++		err = blkcipher_walk_done(desc, &walk, 0);
++	}
++	kernel_neon_end();
++	return err;
++}
++
++static int cbc_decrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		       struct scatterlist *src, unsigned int nbytes)
++{
++	struct crypto_aes_ctx *ctx = crypto_blkcipher_ctx(desc->tfm);
++	int err, first, rounds = 6 + ctx->key_length / 4;
++	struct blkcipher_walk walk;
++	unsigned int blocks;
++
++	desc->flags &= ~CRYPTO_TFM_REQ_MAY_SLEEP;
++	blkcipher_walk_init(&walk, dst, src, nbytes);
++	err = blkcipher_walk_virt(desc, &walk);
++
++	kernel_neon_begin();
++	for (first = 1; (blocks = (walk.nbytes / AES_BLOCK_SIZE)); first = 0) {
++		aes_cbc_decrypt(walk.dst.virt.addr, walk.src.virt.addr,
++				(u8 *)ctx->key_dec, rounds, blocks, walk.iv,
++				first);
++		err = blkcipher_walk_done(desc, &walk, 0);
++	}
++	kernel_neon_end();
++	return err;
++}
++
++static int ctr_encrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		       struct scatterlist *src, unsigned int nbytes)
++{
++	struct crypto_aes_ctx *ctx = crypto_blkcipher_ctx(desc->tfm);
++	int err, first, rounds = 6 + ctx->key_length / 4;
++	struct blkcipher_walk walk;
++	int blocks;
++
++	desc->flags &= ~CRYPTO_TFM_REQ_MAY_SLEEP;
++	blkcipher_walk_init(&walk, dst, src, nbytes);
++	err = blkcipher_walk_virt_block(desc, &walk, AES_BLOCK_SIZE);
++
++	first = 1;
++	kernel_neon_begin();
++	while ((blocks = (walk.nbytes / AES_BLOCK_SIZE))) {
++		aes_ctr_encrypt(walk.dst.virt.addr, walk.src.virt.addr,
++				(u8 *)ctx->key_enc, rounds, blocks, walk.iv,
++				first);
++		first = 0;
++		nbytes -= blocks * AES_BLOCK_SIZE;
++		if (nbytes && nbytes == walk.nbytes % AES_BLOCK_SIZE)
++			break;
++		err = blkcipher_walk_done(desc, &walk,
++					  walk.nbytes % AES_BLOCK_SIZE);
++	}
++	if (nbytes) {
++		u8 *tdst = walk.dst.virt.addr + blocks * AES_BLOCK_SIZE;
++		u8 *tsrc = walk.src.virt.addr + blocks * AES_BLOCK_SIZE;
++		u8 __aligned(8) tail[AES_BLOCK_SIZE];
++
++		/*
++		 * Minimum alignment is 8 bytes, so if nbytes is <= 8, we need
++		 * to tell aes_ctr_encrypt() to only read half a block.
++		 */
++		blocks = (nbytes <= 8) ? -1 : 1;
++
++		aes_ctr_encrypt(tail, tsrc, (u8 *)ctx->key_enc, rounds,
++				blocks, walk.iv, first);
++		memcpy(tdst, tail, nbytes);
++		err = blkcipher_walk_done(desc, &walk, 0);
++	}
++	kernel_neon_end();
++
++	return err;
++}
++
++static int xts_encrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		       struct scatterlist *src, unsigned int nbytes)
++{
++	struct crypto_aes_xts_ctx *ctx = crypto_blkcipher_ctx(desc->tfm);
++	int err, first, rounds = 6 + ctx->key1.key_length / 4;
++	struct blkcipher_walk walk;
++	unsigned int blocks;
++
++	desc->flags &= ~CRYPTO_TFM_REQ_MAY_SLEEP;
++	blkcipher_walk_init(&walk, dst, src, nbytes);
++	err = blkcipher_walk_virt(desc, &walk);
++
++	kernel_neon_begin();
++	for (first = 1; (blocks = (walk.nbytes / AES_BLOCK_SIZE)); first = 0) {
++		aes_xts_encrypt(walk.dst.virt.addr, walk.src.virt.addr,
++				(u8 *)ctx->key1.key_enc, rounds, blocks,
++				(u8 *)ctx->key2.key_enc, walk.iv, first);
++		err = blkcipher_walk_done(desc, &walk, 0);
++	}
++	kernel_neon_end();
++
++	return err;
++}
++
++static int xts_decrypt(struct blkcipher_desc *desc, struct scatterlist *dst,
++		       struct scatterlist *src, unsigned int nbytes)
++{
++	struct crypto_aes_xts_ctx *ctx = crypto_blkcipher_ctx(desc->tfm);
++	int err, first, rounds = 6 + ctx->key1.key_length / 4;
++	struct blkcipher_walk walk;
++	unsigned int blocks;
++
++	desc->flags &= ~CRYPTO_TFM_REQ_MAY_SLEEP;
++	blkcipher_walk_init(&walk, dst, src, nbytes);
++	err = blkcipher_walk_virt(desc, &walk);
++
++	kernel_neon_begin();
++	for (first = 1; (blocks = (walk.nbytes / AES_BLOCK_SIZE)); first = 0) {
++		aes_xts_decrypt(walk.dst.virt.addr, walk.src.virt.addr,
++				(u8 *)ctx->key1.key_dec, rounds, blocks,
++				(u8 *)ctx->key2.key_enc, walk.iv, first);
++		err = blkcipher_walk_done(desc, &walk, 0);
++	}
++	kernel_neon_end();
++
++	return err;
++}
++
++static struct crypto_alg aes_algs[] = { {
++	.cra_name		= "__ecb-aes-" MODE,
++	.cra_driver_name	= "__driver-ecb-aes-" MODE,
++	.cra_priority		= 0,
++	.cra_flags		= CRYPTO_ALG_TYPE_BLKCIPHER,
++	.cra_blocksize		= AES_BLOCK_SIZE,
++	.cra_ctxsize		= sizeof(struct crypto_aes_ctx),
++	.cra_alignmask		= 7,
++	.cra_type		= &crypto_blkcipher_type,
++	.cra_module		= THIS_MODULE,
++	.cra_blkcipher = {
++		.min_keysize	= AES_MIN_KEY_SIZE,
++		.max_keysize	= AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= crypto_aes_set_key,
++		.encrypt	= ecb_encrypt,
++		.decrypt	= ecb_decrypt,
++	},
++}, {
++	.cra_name		= "__cbc-aes-" MODE,
++	.cra_driver_name	= "__driver-cbc-aes-" MODE,
++	.cra_priority		= 0,
++	.cra_flags		= CRYPTO_ALG_TYPE_BLKCIPHER,
++	.cra_blocksize		= AES_BLOCK_SIZE,
++	.cra_ctxsize		= sizeof(struct crypto_aes_ctx),
++	.cra_alignmask		= 7,
++	.cra_type		= &crypto_blkcipher_type,
++	.cra_module		= THIS_MODULE,
++	.cra_blkcipher = {
++		.min_keysize	= AES_MIN_KEY_SIZE,
++		.max_keysize	= AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= crypto_aes_set_key,
++		.encrypt	= cbc_encrypt,
++		.decrypt	= cbc_decrypt,
++	},
++}, {
++	.cra_name		= "__ctr-aes-" MODE,
++	.cra_driver_name	= "__driver-ctr-aes-" MODE,
++	.cra_priority		= 0,
++	.cra_flags		= CRYPTO_ALG_TYPE_BLKCIPHER,
++	.cra_blocksize		= 1,
++	.cra_ctxsize		= sizeof(struct crypto_aes_ctx),
++	.cra_alignmask		= 7,
++	.cra_type		= &crypto_blkcipher_type,
++	.cra_module		= THIS_MODULE,
++	.cra_blkcipher = {
++		.min_keysize	= AES_MIN_KEY_SIZE,
++		.max_keysize	= AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= crypto_aes_set_key,
++		.encrypt	= ctr_encrypt,
++		.decrypt	= ctr_encrypt,
++	},
++}, {
++	.cra_name		= "__xts-aes-" MODE,
++	.cra_driver_name	= "__driver-xts-aes-" MODE,
++	.cra_priority		= 0,
++	.cra_flags		= CRYPTO_ALG_TYPE_BLKCIPHER,
++	.cra_blocksize		= AES_BLOCK_SIZE,
++	.cra_ctxsize		= sizeof(struct crypto_aes_xts_ctx),
++	.cra_alignmask		= 7,
++	.cra_type		= &crypto_blkcipher_type,
++	.cra_module		= THIS_MODULE,
++	.cra_blkcipher = {
++		.min_keysize	= 2 * AES_MIN_KEY_SIZE,
++		.max_keysize	= 2 * AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= xts_set_key,
++		.encrypt	= xts_encrypt,
++		.decrypt	= xts_decrypt,
++	},
++}, {
++	.cra_name		= "ecb(aes)",
++	.cra_driver_name	= "ecb-aes-" MODE,
++	.cra_priority		= PRIO,
++	.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER|CRYPTO_ALG_ASYNC,
++	.cra_blocksize		= AES_BLOCK_SIZE,
++	.cra_ctxsize		= sizeof(struct async_helper_ctx),
++	.cra_alignmask		= 7,
++	.cra_type		= &crypto_ablkcipher_type,
++	.cra_module		= THIS_MODULE,
++	.cra_init		= ablk_init,
++	.cra_exit		= ablk_exit,
++	.cra_ablkcipher = {
++		.min_keysize	= AES_MIN_KEY_SIZE,
++		.max_keysize	= AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= ablk_set_key,
++		.encrypt	= ablk_encrypt,
++		.decrypt	= ablk_decrypt,
++	}
++}, {
++	.cra_name		= "cbc(aes)",
++	.cra_driver_name	= "cbc-aes-" MODE,
++	.cra_priority		= PRIO,
++	.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER|CRYPTO_ALG_ASYNC,
++	.cra_blocksize		= AES_BLOCK_SIZE,
++	.cra_ctxsize		= sizeof(struct async_helper_ctx),
++	.cra_alignmask		= 7,
++	.cra_type		= &crypto_ablkcipher_type,
++	.cra_module		= THIS_MODULE,
++	.cra_init		= ablk_init,
++	.cra_exit		= ablk_exit,
++	.cra_ablkcipher = {
++		.min_keysize	= AES_MIN_KEY_SIZE,
++		.max_keysize	= AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= ablk_set_key,
++		.encrypt	= ablk_encrypt,
++		.decrypt	= ablk_decrypt,
++	}
++}, {
++	.cra_name		= "ctr(aes)",
++	.cra_driver_name	= "ctr-aes-" MODE,
++	.cra_priority		= PRIO,
++	.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER|CRYPTO_ALG_ASYNC,
++	.cra_blocksize		= 1,
++	.cra_ctxsize		= sizeof(struct async_helper_ctx),
++	.cra_alignmask		= 7,
++	.cra_type		= &crypto_ablkcipher_type,
++	.cra_module		= THIS_MODULE,
++	.cra_init		= ablk_init,
++	.cra_exit		= ablk_exit,
++	.cra_ablkcipher = {
++		.min_keysize	= AES_MIN_KEY_SIZE,
++		.max_keysize	= AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= ablk_set_key,
++		.encrypt	= ablk_encrypt,
++		.decrypt	= ablk_decrypt,
++	}
++}, {
++	.cra_name		= "xts(aes)",
++	.cra_driver_name	= "xts-aes-" MODE,
++	.cra_priority		= PRIO,
++	.cra_flags		= CRYPTO_ALG_TYPE_ABLKCIPHER|CRYPTO_ALG_ASYNC,
++	.cra_blocksize		= AES_BLOCK_SIZE,
++	.cra_ctxsize		= sizeof(struct async_helper_ctx),
++	.cra_alignmask		= 7,
++	.cra_type		= &crypto_ablkcipher_type,
++	.cra_module		= THIS_MODULE,
++	.cra_init		= ablk_init,
++	.cra_exit		= ablk_exit,
++	.cra_ablkcipher = {
++		.min_keysize	= 2 * AES_MIN_KEY_SIZE,
++		.max_keysize	= 2 * AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= ablk_set_key,
++		.encrypt	= ablk_encrypt,
++		.decrypt	= ablk_decrypt,
++	}
++} };
++
++static int __init aes_init(void)
++{
++	return crypto_register_algs(aes_algs, ARRAY_SIZE(aes_algs));
++}
++
++static void __exit aes_exit(void)
++{
++	crypto_unregister_algs(aes_algs, ARRAY_SIZE(aes_algs));
++}
++
++#ifdef USE_V8_CRYPTO_EXTENSIONS
++module_cpu_feature_match(AES, aes_init);
++#else
++module_init(aes_init);
++#endif
++module_exit(aes_exit);
+diff --git a/arch/arm64/crypto/aes-modes.S b/arch/arm64/crypto/aes-modes.S
+new file mode 100644
+index 0000000000000..f6e372c528eb4
+--- /dev/null
++++ b/arch/arm64/crypto/aes-modes.S
+@@ -0,0 +1,532 @@
++/*
++ * linux/arch/arm64/crypto/aes-modes.S - chaining mode wrappers for AES
++ *
++ * Copyright (C) 2013 Linaro Ltd <ard.biesheuvel@linaro.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++/* included by aes-ce.S and aes-neon.S */
++
++	.text
++	.align		4
++
++/*
++ * There are several ways to instantiate this code:
++ * - no interleave, all inline
++ * - 2-way interleave, 2x calls out of line (-DINTERLEAVE=2)
++ * - 2-way interleave, all inline (-DINTERLEAVE=2 -DINTERLEAVE_INLINE)
++ * - 4-way interleave, 4x calls out of line (-DINTERLEAVE=4)
++ * - 4-way interleave, all inline (-DINTERLEAVE=4 -DINTERLEAVE_INLINE)
++ *
++ * Macros imported by this code:
++ * - enc_prepare	- setup NEON registers for encryption
++ * - dec_prepare	- setup NEON registers for decryption
++ * - enc_switch_key	- change to new key after having prepared for encryption
++ * - encrypt_block	- encrypt a single block
++ * - decrypt block	- decrypt a single block
++ * - encrypt_block2x	- encrypt 2 blocks in parallel (if INTERLEAVE == 2)
++ * - decrypt_block2x	- decrypt 2 blocks in parallel (if INTERLEAVE == 2)
++ * - encrypt_block4x	- encrypt 4 blocks in parallel (if INTERLEAVE == 4)
++ * - decrypt_block4x	- decrypt 4 blocks in parallel (if INTERLEAVE == 4)
++ */
++
++#if defined(INTERLEAVE) && !defined(INTERLEAVE_INLINE)
++#define FRAME_PUSH	stp x29, x30, [sp,#-16]! ; mov x29, sp
++#define FRAME_POP	ldp x29, x30, [sp],#16
++
++#if INTERLEAVE == 2
++
++aes_encrypt_block2x:
++	encrypt_block2x	v0, v1, w3, x2, x6, w7
++	ret
++ENDPROC(aes_encrypt_block2x)
++
++aes_decrypt_block2x:
++	decrypt_block2x	v0, v1, w3, x2, x6, w7
++	ret
++ENDPROC(aes_decrypt_block2x)
++
++#elif INTERLEAVE == 4
++
++aes_encrypt_block4x:
++	encrypt_block4x	v0, v1, v2, v3, w3, x2, x6, w7
++	ret
++ENDPROC(aes_encrypt_block4x)
++
++aes_decrypt_block4x:
++	decrypt_block4x	v0, v1, v2, v3, w3, x2, x6, w7
++	ret
++ENDPROC(aes_decrypt_block4x)
++
++#else
++#error INTERLEAVE should equal 2 or 4
++#endif
++
++	.macro		do_encrypt_block2x
++	bl		aes_encrypt_block2x
++	.endm
++
++	.macro		do_decrypt_block2x
++	bl		aes_decrypt_block2x
++	.endm
++
++	.macro		do_encrypt_block4x
++	bl		aes_encrypt_block4x
++	.endm
++
++	.macro		do_decrypt_block4x
++	bl		aes_decrypt_block4x
++	.endm
++
++#else
++#define FRAME_PUSH
++#define FRAME_POP
++
++	.macro		do_encrypt_block2x
++	encrypt_block2x	v0, v1, w3, x2, x6, w7
++	.endm
++
++	.macro		do_decrypt_block2x
++	decrypt_block2x	v0, v1, w3, x2, x6, w7
++	.endm
++
++	.macro		do_encrypt_block4x
++	encrypt_block4x	v0, v1, v2, v3, w3, x2, x6, w7
++	.endm
++
++	.macro		do_decrypt_block4x
++	decrypt_block4x	v0, v1, v2, v3, w3, x2, x6, w7
++	.endm
++
++#endif
++
++	/*
++	 * aes_ecb_encrypt(u8 out[], u8 const in[], u8 const rk[], int rounds,
++	 *		   int blocks, int first)
++	 * aes_ecb_decrypt(u8 out[], u8 const in[], u8 const rk[], int rounds,
++	 *		   int blocks, int first)
++	 */
++
++AES_ENTRY(aes_ecb_encrypt)
++	FRAME_PUSH
++	cbz		w5, .LecbencloopNx
++
++	enc_prepare	w3, x2, x5
++
++.LecbencloopNx:
++#if INTERLEAVE >= 2
++	subs		w4, w4, #INTERLEAVE
++	bmi		.Lecbenc1x
++#if INTERLEAVE == 2
++	ld1		{v0.16b-v1.16b}, [x1], #32	/* get 2 pt blocks */
++	do_encrypt_block2x
++	st1		{v0.16b-v1.16b}, [x0], #32
++#else
++	ld1		{v0.16b-v3.16b}, [x1], #64	/* get 4 pt blocks */
++	do_encrypt_block4x
++	st1		{v0.16b-v3.16b}, [x0], #64
++#endif
++	b		.LecbencloopNx
++.Lecbenc1x:
++	adds		w4, w4, #INTERLEAVE
++	beq		.Lecbencout
++#endif
++.Lecbencloop:
++	ld1		{v0.16b}, [x1], #16		/* get next pt block */
++	encrypt_block	v0, w3, x2, x5, w6
++	st1		{v0.16b}, [x0], #16
++	subs		w4, w4, #1
++	bne		.Lecbencloop
++.Lecbencout:
++	FRAME_POP
++	ret
++AES_ENDPROC(aes_ecb_encrypt)
++
++
++AES_ENTRY(aes_ecb_decrypt)
++	FRAME_PUSH
++	cbz		w5, .LecbdecloopNx
++
++	dec_prepare	w3, x2, x5
++
++.LecbdecloopNx:
++#if INTERLEAVE >= 2
++	subs		w4, w4, #INTERLEAVE
++	bmi		.Lecbdec1x
++#if INTERLEAVE == 2
++	ld1		{v0.16b-v1.16b}, [x1], #32	/* get 2 ct blocks */
++	do_decrypt_block2x
++	st1		{v0.16b-v1.16b}, [x0], #32
++#else
++	ld1		{v0.16b-v3.16b}, [x1], #64	/* get 4 ct blocks */
++	do_decrypt_block4x
++	st1		{v0.16b-v3.16b}, [x0], #64
++#endif
++	b		.LecbdecloopNx
++.Lecbdec1x:
++	adds		w4, w4, #INTERLEAVE
++	beq		.Lecbdecout
++#endif
++.Lecbdecloop:
++	ld1		{v0.16b}, [x1], #16		/* get next ct block */
++	decrypt_block	v0, w3, x2, x5, w6
++	st1		{v0.16b}, [x0], #16
++	subs		w4, w4, #1
++	bne		.Lecbdecloop
++.Lecbdecout:
++	FRAME_POP
++	ret
++AES_ENDPROC(aes_ecb_decrypt)
++
++
++	/*
++	 * aes_cbc_encrypt(u8 out[], u8 const in[], u8 const rk[], int rounds,
++	 *		   int blocks, u8 iv[], int first)
++	 * aes_cbc_decrypt(u8 out[], u8 const in[], u8 const rk[], int rounds,
++	 *		   int blocks, u8 iv[], int first)
++	 */
++
++AES_ENTRY(aes_cbc_encrypt)
++	cbz		w6, .Lcbcencloop
++
++	ld1		{v0.16b}, [x5]			/* get iv */
++	enc_prepare	w3, x2, x5
++
++.Lcbcencloop:
++	ld1		{v1.16b}, [x1], #16		/* get next pt block */
++	eor		v0.16b, v0.16b, v1.16b		/* ..and xor with iv */
++	encrypt_block	v0, w3, x2, x5, w6
++	st1		{v0.16b}, [x0], #16
++	subs		w4, w4, #1
++	bne		.Lcbcencloop
++	ret
++AES_ENDPROC(aes_cbc_encrypt)
++
++
++AES_ENTRY(aes_cbc_decrypt)
++	FRAME_PUSH
++	cbz		w6, .LcbcdecloopNx
++
++	ld1		{v7.16b}, [x5]			/* get iv */
++	dec_prepare	w3, x2, x5
++
++.LcbcdecloopNx:
++#if INTERLEAVE >= 2
++	subs		w4, w4, #INTERLEAVE
++	bmi		.Lcbcdec1x
++#if INTERLEAVE == 2
++	ld1		{v0.16b-v1.16b}, [x1], #32	/* get 2 ct blocks */
++	mov		v2.16b, v0.16b
++	mov		v3.16b, v1.16b
++	do_decrypt_block2x
++	eor		v0.16b, v0.16b, v7.16b
++	eor		v1.16b, v1.16b, v2.16b
++	mov		v7.16b, v3.16b
++	st1		{v0.16b-v1.16b}, [x0], #32
++#else
++	ld1		{v0.16b-v3.16b}, [x1], #64	/* get 4 ct blocks */
++	mov		v4.16b, v0.16b
++	mov		v5.16b, v1.16b
++	mov		v6.16b, v2.16b
++	do_decrypt_block4x
++	sub		x1, x1, #16
++	eor		v0.16b, v0.16b, v7.16b
++	eor		v1.16b, v1.16b, v4.16b
++	ld1		{v7.16b}, [x1], #16		/* reload 1 ct block */
++	eor		v2.16b, v2.16b, v5.16b
++	eor		v3.16b, v3.16b, v6.16b
++	st1		{v0.16b-v3.16b}, [x0], #64
++#endif
++	b		.LcbcdecloopNx
++.Lcbcdec1x:
++	adds		w4, w4, #INTERLEAVE
++	beq		.Lcbcdecout
++#endif
++.Lcbcdecloop:
++	ld1		{v1.16b}, [x1], #16		/* get next ct block */
++	mov		v0.16b, v1.16b			/* ...and copy to v0 */
++	decrypt_block	v0, w3, x2, x5, w6
++	eor		v0.16b, v0.16b, v7.16b		/* xor with iv => pt */
++	mov		v7.16b, v1.16b			/* ct is next iv */
++	st1		{v0.16b}, [x0], #16
++	subs		w4, w4, #1
++	bne		.Lcbcdecloop
++.Lcbcdecout:
++	FRAME_POP
++	ret
++AES_ENDPROC(aes_cbc_decrypt)
++
++
++	/*
++	 * aes_ctr_encrypt(u8 out[], u8 const in[], u8 const rk[], int rounds,
++	 *		   int blocks, u8 ctr[], int first)
++	 */
++
++AES_ENTRY(aes_ctr_encrypt)
++	FRAME_PUSH
++	cbnz		w6, .Lctrfirst		/* 1st time around? */
++	umov		x5, v4.d[1]		/* keep swabbed ctr in reg */
++	rev		x5, x5
++#if INTERLEAVE >= 2
++	cmn		w5, w4			/* 32 bit overflow? */
++	bcs		.Lctrinc
++	add		x5, x5, #1		/* increment BE ctr */
++	b		.LctrincNx
++#else
++	b		.Lctrinc
++#endif
++.Lctrfirst:
++	enc_prepare	w3, x2, x6
++	ld1		{v4.16b}, [x5]
++	umov		x5, v4.d[1]		/* keep swabbed ctr in reg */
++	rev		x5, x5
++#if INTERLEAVE >= 2
++	cmn		w5, w4			/* 32 bit overflow? */
++	bcs		.Lctrloop
++.LctrloopNx:
++	subs		w4, w4, #INTERLEAVE
++	bmi		.Lctr1x
++#if INTERLEAVE == 2
++	mov		v0.8b, v4.8b
++	mov		v1.8b, v4.8b
++	rev		x7, x5
++	add		x5, x5, #1
++	ins		v0.d[1], x7
++	rev		x7, x5
++	add		x5, x5, #1
++	ins		v1.d[1], x7
++	ld1		{v2.16b-v3.16b}, [x1], #32	/* get 2 input blocks */
++	do_encrypt_block2x
++	eor		v0.16b, v0.16b, v2.16b
++	eor		v1.16b, v1.16b, v3.16b
++	st1		{v0.16b-v1.16b}, [x0], #32
++#else
++	ldr		q8, =0x30000000200000001	/* addends 1,2,3[,0] */
++	dup		v7.4s, w5
++	mov		v0.16b, v4.16b
++	add		v7.4s, v7.4s, v8.4s
++	mov		v1.16b, v4.16b
++	rev32		v8.16b, v7.16b
++	mov		v2.16b, v4.16b
++	mov		v3.16b, v4.16b
++	mov		v1.s[3], v8.s[0]
++	mov		v2.s[3], v8.s[1]
++	mov		v3.s[3], v8.s[2]
++	ld1		{v5.16b-v7.16b}, [x1], #48	/* get 3 input blocks */
++	do_encrypt_block4x
++	eor		v0.16b, v5.16b, v0.16b
++	ld1		{v5.16b}, [x1], #16		/* get 1 input block  */
++	eor		v1.16b, v6.16b, v1.16b
++	eor		v2.16b, v7.16b, v2.16b
++	eor		v3.16b, v5.16b, v3.16b
++	st1		{v0.16b-v3.16b}, [x0], #64
++	add		x5, x5, #INTERLEAVE
++#endif
++	cbz		w4, .LctroutNx
++.LctrincNx:
++	rev		x7, x5
++	ins		v4.d[1], x7
++	b		.LctrloopNx
++.LctroutNx:
++	sub		x5, x5, #1
++	rev		x7, x5
++	ins		v4.d[1], x7
++	b		.Lctrout
++.Lctr1x:
++	adds		w4, w4, #INTERLEAVE
++	beq		.Lctrout
++#endif
++.Lctrloop:
++	mov		v0.16b, v4.16b
++	encrypt_block	v0, w3, x2, x6, w7
++	subs		w4, w4, #1
++	bmi		.Lctrhalfblock		/* blocks < 0 means 1/2 block */
++	ld1		{v3.16b}, [x1], #16
++	eor		v3.16b, v0.16b, v3.16b
++	st1		{v3.16b}, [x0], #16
++	beq		.Lctrout
++.Lctrinc:
++	adds		x5, x5, #1		/* increment BE ctr */
++	rev		x7, x5
++	ins		v4.d[1], x7
++	bcc		.Lctrloop		/* no overflow? */
++	umov		x7, v4.d[0]		/* load upper word of ctr  */
++	rev		x7, x7			/* ... to handle the carry */
++	add		x7, x7, #1
++	rev		x7, x7
++	ins		v4.d[0], x7
++	b		.Lctrloop
++.Lctrhalfblock:
++	ld1		{v3.8b}, [x1]
++	eor		v3.8b, v0.8b, v3.8b
++	st1		{v3.8b}, [x0]
++.Lctrout:
++	FRAME_POP
++	ret
++AES_ENDPROC(aes_ctr_encrypt)
++	.ltorg
++
++
++	/*
++	 * aes_xts_decrypt(u8 out[], u8 const in[], u8 const rk1[], int rounds,
++	 *		   int blocks, u8 const rk2[], u8 iv[], int first)
++	 * aes_xts_decrypt(u8 out[], u8 const in[], u8 const rk1[], int rounds,
++	 *		   int blocks, u8 const rk2[], u8 iv[], int first)
++	 */
++
++	.macro		next_tweak, out, in, const, tmp
++	sshr		\tmp\().2d,  \in\().2d,   #63
++	and		\tmp\().16b, \tmp\().16b, \const\().16b
++	add		\out\().2d,  \in\().2d,   \in\().2d
++	ext		\tmp\().16b, \tmp\().16b, \tmp\().16b, #8
++	eor		\out\().16b, \out\().16b, \tmp\().16b
++	.endm
++
++.Lxts_mul_x:
++	.word		1, 0, 0x87, 0
++
++AES_ENTRY(aes_xts_encrypt)
++	FRAME_PUSH
++	cbz		w7, .LxtsencloopNx
++
++	ld1		{v4.16b}, [x6]
++	enc_prepare	w3, x5, x6
++	encrypt_block	v4, w3, x5, x6, w7		/* first tweak */
++	enc_switch_key	w3, x2, x6
++	ldr		q7, .Lxts_mul_x
++	b		.LxtsencNx
++
++.LxtsencloopNx:
++	ldr		q7, .Lxts_mul_x
++	next_tweak	v4, v4, v7, v8
++.LxtsencNx:
++#if INTERLEAVE >= 2
++	subs		w4, w4, #INTERLEAVE
++	bmi		.Lxtsenc1x
++#if INTERLEAVE == 2
++	ld1		{v0.16b-v1.16b}, [x1], #32	/* get 2 pt blocks */
++	next_tweak	v5, v4, v7, v8
++	eor		v0.16b, v0.16b, v4.16b
++	eor		v1.16b, v1.16b, v5.16b
++	do_encrypt_block2x
++	eor		v0.16b, v0.16b, v4.16b
++	eor		v1.16b, v1.16b, v5.16b
++	st1		{v0.16b-v1.16b}, [x0], #32
++	cbz		w4, .LxtsencoutNx
++	next_tweak	v4, v5, v7, v8
++	b		.LxtsencNx
++.LxtsencoutNx:
++	mov		v4.16b, v5.16b
++	b		.Lxtsencout
++#else
++	ld1		{v0.16b-v3.16b}, [x1], #64	/* get 4 pt blocks */
++	next_tweak	v5, v4, v7, v8
++	eor		v0.16b, v0.16b, v4.16b
++	next_tweak	v6, v5, v7, v8
++	eor		v1.16b, v1.16b, v5.16b
++	eor		v2.16b, v2.16b, v6.16b
++	next_tweak	v7, v6, v7, v8
++	eor		v3.16b, v3.16b, v7.16b
++	do_encrypt_block4x
++	eor		v3.16b, v3.16b, v7.16b
++	eor		v0.16b, v0.16b, v4.16b
++	eor		v1.16b, v1.16b, v5.16b
++	eor		v2.16b, v2.16b, v6.16b
++	st1		{v0.16b-v3.16b}, [x0], #64
++	mov		v4.16b, v7.16b
++	cbz		w4, .Lxtsencout
++	b		.LxtsencloopNx
++#endif
++.Lxtsenc1x:
++	adds		w4, w4, #INTERLEAVE
++	beq		.Lxtsencout
++#endif
++.Lxtsencloop:
++	ld1		{v1.16b}, [x1], #16
++	eor		v0.16b, v1.16b, v4.16b
++	encrypt_block	v0, w3, x2, x6, w7
++	eor		v0.16b, v0.16b, v4.16b
++	st1		{v0.16b}, [x0], #16
++	subs		w4, w4, #1
++	beq		.Lxtsencout
++	next_tweak	v4, v4, v7, v8
++	b		.Lxtsencloop
++.Lxtsencout:
++	FRAME_POP
++	ret
++AES_ENDPROC(aes_xts_encrypt)
++
++
++AES_ENTRY(aes_xts_decrypt)
++	FRAME_PUSH
++	cbz		w7, .LxtsdecloopNx
++
++	ld1		{v4.16b}, [x6]
++	enc_prepare	w3, x5, x6
++	encrypt_block	v4, w3, x5, x6, w7		/* first tweak */
++	dec_prepare	w3, x2, x6
++	ldr		q7, .Lxts_mul_x
++	b		.LxtsdecNx
++
++.LxtsdecloopNx:
++	ldr		q7, .Lxts_mul_x
++	next_tweak	v4, v4, v7, v8
++.LxtsdecNx:
++#if INTERLEAVE >= 2
++	subs		w4, w4, #INTERLEAVE
++	bmi		.Lxtsdec1x
++#if INTERLEAVE == 2
++	ld1		{v0.16b-v1.16b}, [x1], #32	/* get 2 ct blocks */
++	next_tweak	v5, v4, v7, v8
++	eor		v0.16b, v0.16b, v4.16b
++	eor		v1.16b, v1.16b, v5.16b
++	do_decrypt_block2x
++	eor		v0.16b, v0.16b, v4.16b
++	eor		v1.16b, v1.16b, v5.16b
++	st1		{v0.16b-v1.16b}, [x0], #32
++	cbz		w4, .LxtsdecoutNx
++	next_tweak	v4, v5, v7, v8
++	b		.LxtsdecNx
++.LxtsdecoutNx:
++	mov		v4.16b, v5.16b
++	b		.Lxtsdecout
++#else
++	ld1		{v0.16b-v3.16b}, [x1], #64	/* get 4 ct blocks */
++	next_tweak	v5, v4, v7, v8
++	eor		v0.16b, v0.16b, v4.16b
++	next_tweak	v6, v5, v7, v8
++	eor		v1.16b, v1.16b, v5.16b
++	eor		v2.16b, v2.16b, v6.16b
++	next_tweak	v7, v6, v7, v8
++	eor		v3.16b, v3.16b, v7.16b
++	do_decrypt_block4x
++	eor		v3.16b, v3.16b, v7.16b
++	eor		v0.16b, v0.16b, v4.16b
++	eor		v1.16b, v1.16b, v5.16b
++	eor		v2.16b, v2.16b, v6.16b
++	st1		{v0.16b-v3.16b}, [x0], #64
++	mov		v4.16b, v7.16b
++	cbz		w4, .Lxtsdecout
++	b		.LxtsdecloopNx
++#endif
++.Lxtsdec1x:
++	adds		w4, w4, #INTERLEAVE
++	beq		.Lxtsdecout
++#endif
++.Lxtsdecloop:
++	ld1		{v1.16b}, [x1], #16
++	eor		v0.16b, v1.16b, v4.16b
++	decrypt_block	v0, w3, x2, x6, w7
++	eor		v0.16b, v0.16b, v4.16b
++	st1		{v0.16b}, [x0], #16
++	subs		w4, w4, #1
++	beq		.Lxtsdecout
++	next_tweak	v4, v4, v7, v8
++	b		.Lxtsdecloop
++.Lxtsdecout:
++	FRAME_POP
++	ret
++AES_ENDPROC(aes_xts_decrypt)
+diff --git a/arch/arm64/crypto/aes-neon.S b/arch/arm64/crypto/aes-neon.S
+new file mode 100644
+index 0000000000000..b93170e1cc933
+--- /dev/null
++++ b/arch/arm64/crypto/aes-neon.S
+@@ -0,0 +1,382 @@
++/*
++ * linux/arch/arm64/crypto/aes-neon.S - AES cipher for ARMv8 NEON
++ *
++ * Copyright (C) 2013 Linaro Ltd <ard.biesheuvel@linaro.org>
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ */
++
++#include <linux/linkage.h>
++
++#define AES_ENTRY(func)		ENTRY(neon_ ## func)
++#define AES_ENDPROC(func)	ENDPROC(neon_ ## func)
++
++	/* multiply by polynomial 'x' in GF(2^8) */
++	.macro		mul_by_x, out, in, temp, const
++	sshr		\temp, \in, #7
++	add		\out, \in, \in
++	and		\temp, \temp, \const
++	eor		\out, \out, \temp
++	.endm
++
++	/* preload the entire Sbox */
++	.macro		prepare, sbox, shiftrows, temp
++	adr		\temp, \sbox
++	movi		v12.16b, #0x40
++	ldr		q13, \shiftrows
++	movi		v14.16b, #0x1b
++	ld1		{v16.16b-v19.16b}, [\temp], #64
++	ld1		{v20.16b-v23.16b}, [\temp], #64
++	ld1		{v24.16b-v27.16b}, [\temp], #64
++	ld1		{v28.16b-v31.16b}, [\temp]
++	.endm
++
++	/* do preload for encryption */
++	.macro		enc_prepare, ignore0, ignore1, temp
++	prepare		.LForward_Sbox, .LForward_ShiftRows, \temp
++	.endm
++
++	.macro		enc_switch_key, ignore0, ignore1, temp
++	/* do nothing */
++	.endm
++
++	/* do preload for decryption */
++	.macro		dec_prepare, ignore0, ignore1, temp
++	prepare		.LReverse_Sbox, .LReverse_ShiftRows, \temp
++	.endm
++
++	/* apply SubBytes transformation using the the preloaded Sbox */
++	.macro		sub_bytes, in
++	sub		v9.16b, \in\().16b, v12.16b
++	tbl		\in\().16b, {v16.16b-v19.16b}, \in\().16b
++	sub		v10.16b, v9.16b, v12.16b
++	tbx		\in\().16b, {v20.16b-v23.16b}, v9.16b
++	sub		v11.16b, v10.16b, v12.16b
++	tbx		\in\().16b, {v24.16b-v27.16b}, v10.16b
++	tbx		\in\().16b, {v28.16b-v31.16b}, v11.16b
++	.endm
++
++	/* apply MixColumns transformation */
++	.macro		mix_columns, in
++	mul_by_x	v10.16b, \in\().16b, v9.16b, v14.16b
++	rev32		v8.8h, \in\().8h
++	eor		\in\().16b, v10.16b, \in\().16b
++	shl		v9.4s, v8.4s, #24
++	shl		v11.4s, \in\().4s, #24
++	sri		v9.4s, v8.4s, #8
++	sri		v11.4s, \in\().4s, #8
++	eor		v9.16b, v9.16b, v8.16b
++	eor		v10.16b, v10.16b, v9.16b
++	eor		\in\().16b, v10.16b, v11.16b
++	.endm
++
++	/* Inverse MixColumns: pre-multiply by { 5, 0, 4, 0 } */
++	.macro		inv_mix_columns, in
++	mul_by_x	v11.16b, \in\().16b, v10.16b, v14.16b
++	mul_by_x	v11.16b, v11.16b, v10.16b, v14.16b
++	eor		\in\().16b, \in\().16b, v11.16b
++	rev32		v11.8h, v11.8h
++	eor		\in\().16b, \in\().16b, v11.16b
++	mix_columns	\in
++	.endm
++
++	.macro		do_block, enc, in, rounds, rk, rkp, i
++	ld1		{v15.16b}, [\rk]
++	add		\rkp, \rk, #16
++	mov		\i, \rounds
++1111:	eor		\in\().16b, \in\().16b, v15.16b		/* ^round key */
++	tbl		\in\().16b, {\in\().16b}, v13.16b	/* ShiftRows */
++	sub_bytes	\in
++	ld1		{v15.16b}, [\rkp], #16
++	subs		\i, \i, #1
++	beq		2222f
++	.if		\enc == 1
++	mix_columns	\in
++	.else
++	inv_mix_columns	\in
++	.endif
++	b		1111b
++2222:	eor		\in\().16b, \in\().16b, v15.16b		/* ^round key */
++	.endm
++
++	.macro		encrypt_block, in, rounds, rk, rkp, i
++	do_block	1, \in, \rounds, \rk, \rkp, \i
++	.endm
++
++	.macro		decrypt_block, in, rounds, rk, rkp, i
++	do_block	0, \in, \rounds, \rk, \rkp, \i
++	.endm
++
++	/*
++	 * Interleaved versions: functionally equivalent to the
++	 * ones above, but applied to 2 or 4 AES states in parallel.
++	 */
++
++	.macro		sub_bytes_2x, in0, in1
++	sub		v8.16b, \in0\().16b, v12.16b
++	sub		v9.16b, \in1\().16b, v12.16b
++	tbl		\in0\().16b, {v16.16b-v19.16b}, \in0\().16b
++	tbl		\in1\().16b, {v16.16b-v19.16b}, \in1\().16b
++	sub		v10.16b, v8.16b, v12.16b
++	sub		v11.16b, v9.16b, v12.16b
++	tbx		\in0\().16b, {v20.16b-v23.16b}, v8.16b
++	tbx		\in1\().16b, {v20.16b-v23.16b}, v9.16b
++	sub		v8.16b, v10.16b, v12.16b
++	sub		v9.16b, v11.16b, v12.16b
++	tbx		\in0\().16b, {v24.16b-v27.16b}, v10.16b
++	tbx		\in1\().16b, {v24.16b-v27.16b}, v11.16b
++	tbx		\in0\().16b, {v28.16b-v31.16b}, v8.16b
++	tbx		\in1\().16b, {v28.16b-v31.16b}, v9.16b
++	.endm
++
++	.macro		sub_bytes_4x, in0, in1, in2, in3
++	sub		v8.16b, \in0\().16b, v12.16b
++	tbl		\in0\().16b, {v16.16b-v19.16b}, \in0\().16b
++	sub		v9.16b, \in1\().16b, v12.16b
++	tbl		\in1\().16b, {v16.16b-v19.16b}, \in1\().16b
++	sub		v10.16b, \in2\().16b, v12.16b
++	tbl		\in2\().16b, {v16.16b-v19.16b}, \in2\().16b
++	sub		v11.16b, \in3\().16b, v12.16b
++	tbl		\in3\().16b, {v16.16b-v19.16b}, \in3\().16b
++	tbx		\in0\().16b, {v20.16b-v23.16b}, v8.16b
++	tbx		\in1\().16b, {v20.16b-v23.16b}, v9.16b
++	sub		v8.16b, v8.16b, v12.16b
++	tbx		\in2\().16b, {v20.16b-v23.16b}, v10.16b
++	sub		v9.16b, v9.16b, v12.16b
++	tbx		\in3\().16b, {v20.16b-v23.16b}, v11.16b
++	sub		v10.16b, v10.16b, v12.16b
++	tbx		\in0\().16b, {v24.16b-v27.16b}, v8.16b
++	sub		v11.16b, v11.16b, v12.16b
++	tbx		\in1\().16b, {v24.16b-v27.16b}, v9.16b
++	sub		v8.16b, v8.16b, v12.16b
++	tbx		\in2\().16b, {v24.16b-v27.16b}, v10.16b
++	sub		v9.16b, v9.16b, v12.16b
++	tbx		\in3\().16b, {v24.16b-v27.16b}, v11.16b
++	sub		v10.16b, v10.16b, v12.16b
++	tbx		\in0\().16b, {v28.16b-v31.16b}, v8.16b
++	sub		v11.16b, v11.16b, v12.16b
++	tbx		\in1\().16b, {v28.16b-v31.16b}, v9.16b
++	tbx		\in2\().16b, {v28.16b-v31.16b}, v10.16b
++	tbx		\in3\().16b, {v28.16b-v31.16b}, v11.16b
++	.endm
++
++	.macro		mul_by_x_2x, out0, out1, in0, in1, tmp0, tmp1, const
++	sshr		\tmp0\().16b, \in0\().16b,  #7
++	add		\out0\().16b, \in0\().16b,  \in0\().16b
++	sshr		\tmp1\().16b, \in1\().16b,  #7
++	and		\tmp0\().16b, \tmp0\().16b, \const\().16b
++	add		\out1\().16b, \in1\().16b,  \in1\().16b
++	and		\tmp1\().16b, \tmp1\().16b, \const\().16b
++	eor		\out0\().16b, \out0\().16b, \tmp0\().16b
++	eor		\out1\().16b, \out1\().16b, \tmp1\().16b
++	.endm
++
++	.macro		mix_columns_2x, in0, in1
++	mul_by_x_2x	v8, v9, \in0, \in1, v10, v11, v14
++	rev32		v10.8h, \in0\().8h
++	rev32		v11.8h, \in1\().8h
++	eor		\in0\().16b, v8.16b, \in0\().16b
++	eor		\in1\().16b, v9.16b, \in1\().16b
++	shl		v12.4s, v10.4s, #24
++	shl		v13.4s, v11.4s, #24
++	eor		v8.16b, v8.16b, v10.16b
++	sri		v12.4s, v10.4s, #8
++	shl		v10.4s, \in0\().4s, #24
++	eor		v9.16b, v9.16b, v11.16b
++	sri		v13.4s, v11.4s, #8
++	shl		v11.4s, \in1\().4s, #24
++	sri		v10.4s, \in0\().4s, #8
++	eor		\in0\().16b, v8.16b, v12.16b
++	sri		v11.4s, \in1\().4s, #8
++	eor		\in1\().16b, v9.16b, v13.16b
++	eor		\in0\().16b, v10.16b, \in0\().16b
++	eor		\in1\().16b, v11.16b, \in1\().16b
++	.endm
++
++	.macro		inv_mix_cols_2x, in0, in1
++	mul_by_x_2x	v8, v9, \in0, \in1, v10, v11, v14
++	mul_by_x_2x	v8, v9, v8, v9, v10, v11, v14
++	eor		\in0\().16b, \in0\().16b, v8.16b
++	eor		\in1\().16b, \in1\().16b, v9.16b
++	rev32		v8.8h, v8.8h
++	rev32		v9.8h, v9.8h
++	eor		\in0\().16b, \in0\().16b, v8.16b
++	eor		\in1\().16b, \in1\().16b, v9.16b
++	mix_columns_2x	\in0, \in1
++	.endm
++
++	.macro		inv_mix_cols_4x, in0, in1, in2, in3
++	mul_by_x_2x	v8, v9, \in0, \in1, v10, v11, v14
++	mul_by_x_2x	v10, v11, \in2, \in3, v12, v13, v14
++	mul_by_x_2x	v8, v9, v8, v9, v12, v13, v14
++	mul_by_x_2x	v10, v11, v10, v11, v12, v13, v14
++	eor		\in0\().16b, \in0\().16b, v8.16b
++	eor		\in1\().16b, \in1\().16b, v9.16b
++	eor		\in2\().16b, \in2\().16b, v10.16b
++	eor		\in3\().16b, \in3\().16b, v11.16b
++	rev32		v8.8h, v8.8h
++	rev32		v9.8h, v9.8h
++	rev32		v10.8h, v10.8h
++	rev32		v11.8h, v11.8h
++	eor		\in0\().16b, \in0\().16b, v8.16b
++	eor		\in1\().16b, \in1\().16b, v9.16b
++	eor		\in2\().16b, \in2\().16b, v10.16b
++	eor		\in3\().16b, \in3\().16b, v11.16b
++	mix_columns_2x	\in0, \in1
++	mix_columns_2x	\in2, \in3
++	.endm
++
++	.macro		do_block_2x, enc, in0, in1 rounds, rk, rkp, i
++	ld1		{v15.16b}, [\rk]
++	add		\rkp, \rk, #16
++	mov		\i, \rounds
++1111:	eor		\in0\().16b, \in0\().16b, v15.16b	/* ^round key */
++	eor		\in1\().16b, \in1\().16b, v15.16b	/* ^round key */
++	sub_bytes_2x	\in0, \in1
++	tbl		\in0\().16b, {\in0\().16b}, v13.16b	/* ShiftRows */
++	tbl		\in1\().16b, {\in1\().16b}, v13.16b	/* ShiftRows */
++	ld1		{v15.16b}, [\rkp], #16
++	subs		\i, \i, #1
++	beq		2222f
++	.if		\enc == 1
++	mix_columns_2x	\in0, \in1
++	ldr		q13, .LForward_ShiftRows
++	.else
++	inv_mix_cols_2x	\in0, \in1
++	ldr		q13, .LReverse_ShiftRows
++	.endif
++	movi		v12.16b, #0x40
++	b		1111b
++2222:	eor		\in0\().16b, \in0\().16b, v15.16b	/* ^round key */
++	eor		\in1\().16b, \in1\().16b, v15.16b	/* ^round key */
++	.endm
++
++	.macro		do_block_4x, enc, in0, in1, in2, in3, rounds, rk, rkp, i
++	ld1		{v15.16b}, [\rk]
++	add		\rkp, \rk, #16
++	mov		\i, \rounds
++1111:	eor		\in0\().16b, \in0\().16b, v15.16b	/* ^round key */
++	eor		\in1\().16b, \in1\().16b, v15.16b	/* ^round key */
++	eor		\in2\().16b, \in2\().16b, v15.16b	/* ^round key */
++	eor		\in3\().16b, \in3\().16b, v15.16b	/* ^round key */
++	sub_bytes_4x	\in0, \in1, \in2, \in3
++	tbl		\in0\().16b, {\in0\().16b}, v13.16b	/* ShiftRows */
++	tbl		\in1\().16b, {\in1\().16b}, v13.16b	/* ShiftRows */
++	tbl		\in2\().16b, {\in2\().16b}, v13.16b	/* ShiftRows */
++	tbl		\in3\().16b, {\in3\().16b}, v13.16b	/* ShiftRows */
++	ld1		{v15.16b}, [\rkp], #16
++	subs		\i, \i, #1
++	beq		2222f
++	.if		\enc == 1
++	mix_columns_2x	\in0, \in1
++	mix_columns_2x	\in2, \in3
++	ldr		q13, .LForward_ShiftRows
++	.else
++	inv_mix_cols_4x	\in0, \in1, \in2, \in3
++	ldr		q13, .LReverse_ShiftRows
++	.endif
++	movi		v12.16b, #0x40
++	b		1111b
++2222:	eor		\in0\().16b, \in0\().16b, v15.16b	/* ^round key */
++	eor		\in1\().16b, \in1\().16b, v15.16b	/* ^round key */
++	eor		\in2\().16b, \in2\().16b, v15.16b	/* ^round key */
++	eor		\in3\().16b, \in3\().16b, v15.16b	/* ^round key */
++	.endm
++
++	.macro		encrypt_block2x, in0, in1, rounds, rk, rkp, i
++	do_block_2x	1, \in0, \in1, \rounds, \rk, \rkp, \i
++	.endm
++
++	.macro		decrypt_block2x, in0, in1, rounds, rk, rkp, i
++	do_block_2x	0, \in0, \in1, \rounds, \rk, \rkp, \i
++	.endm
++
++	.macro		encrypt_block4x, in0, in1, in2, in3, rounds, rk, rkp, i
++	do_block_4x	1, \in0, \in1, \in2, \in3, \rounds, \rk, \rkp, \i
++	.endm
++
++	.macro		decrypt_block4x, in0, in1, in2, in3, rounds, rk, rkp, i
++	do_block_4x	0, \in0, \in1, \in2, \in3, \rounds, \rk, \rkp, \i
++	.endm
++
++#include "aes-modes.S"
++
++	.text
++	.align		4
++.LForward_ShiftRows:
++	.byte		0x0, 0x5, 0xa, 0xf, 0x4, 0x9, 0xe, 0x3
++	.byte		0x8, 0xd, 0x2, 0x7, 0xc, 0x1, 0x6, 0xb
++
++.LReverse_ShiftRows:
++	.byte		0x0, 0xd, 0xa, 0x7, 0x4, 0x1, 0xe, 0xb
++	.byte		0x8, 0x5, 0x2, 0xf, 0xc, 0x9, 0x6, 0x3
++
++.LForward_Sbox:
++	.byte		0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5
++	.byte		0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76
++	.byte		0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0
++	.byte		0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0
++	.byte		0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc
++	.byte		0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15
++	.byte		0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a
++	.byte		0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75
++	.byte		0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0
++	.byte		0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84
++	.byte		0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b
++	.byte		0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf
++	.byte		0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85
++	.byte		0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8
++	.byte		0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5
++	.byte		0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2
++	.byte		0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17
++	.byte		0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73
++	.byte		0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88
++	.byte		0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb
++	.byte		0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c
++	.byte		0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79
++	.byte		0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9
++	.byte		0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08
++	.byte		0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6
++	.byte		0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a
++	.byte		0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e
++	.byte		0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e
++	.byte		0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94
++	.byte		0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf
++	.byte		0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68
++	.byte		0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16
++
++.LReverse_Sbox:
++	.byte		0x52, 0x09, 0x6a, 0xd5, 0x30, 0x36, 0xa5, 0x38
++	.byte		0xbf, 0x40, 0xa3, 0x9e, 0x81, 0xf3, 0xd7, 0xfb
++	.byte		0x7c, 0xe3, 0x39, 0x82, 0x9b, 0x2f, 0xff, 0x87
++	.byte		0x34, 0x8e, 0x43, 0x44, 0xc4, 0xde, 0xe9, 0xcb
++	.byte		0x54, 0x7b, 0x94, 0x32, 0xa6, 0xc2, 0x23, 0x3d
++	.byte		0xee, 0x4c, 0x95, 0x0b, 0x42, 0xfa, 0xc3, 0x4e
++	.byte		0x08, 0x2e, 0xa1, 0x66, 0x28, 0xd9, 0x24, 0xb2
++	.byte		0x76, 0x5b, 0xa2, 0x49, 0x6d, 0x8b, 0xd1, 0x25
++	.byte		0x72, 0xf8, 0xf6, 0x64, 0x86, 0x68, 0x98, 0x16
++	.byte		0xd4, 0xa4, 0x5c, 0xcc, 0x5d, 0x65, 0xb6, 0x92
++	.byte		0x6c, 0x70, 0x48, 0x50, 0xfd, 0xed, 0xb9, 0xda
++	.byte		0x5e, 0x15, 0x46, 0x57, 0xa7, 0x8d, 0x9d, 0x84
++	.byte		0x90, 0xd8, 0xab, 0x00, 0x8c, 0xbc, 0xd3, 0x0a
++	.byte		0xf7, 0xe4, 0x58, 0x05, 0xb8, 0xb3, 0x45, 0x06
++	.byte		0xd0, 0x2c, 0x1e, 0x8f, 0xca, 0x3f, 0x0f, 0x02
++	.byte		0xc1, 0xaf, 0xbd, 0x03, 0x01, 0x13, 0x8a, 0x6b
++	.byte		0x3a, 0x91, 0x11, 0x41, 0x4f, 0x67, 0xdc, 0xea
++	.byte		0x97, 0xf2, 0xcf, 0xce, 0xf0, 0xb4, 0xe6, 0x73
++	.byte		0x96, 0xac, 0x74, 0x22, 0xe7, 0xad, 0x35, 0x85
++	.byte		0xe2, 0xf9, 0x37, 0xe8, 0x1c, 0x75, 0xdf, 0x6e
++	.byte		0x47, 0xf1, 0x1a, 0x71, 0x1d, 0x29, 0xc5, 0x89
++	.byte		0x6f, 0xb7, 0x62, 0x0e, 0xaa, 0x18, 0xbe, 0x1b
++	.byte		0xfc, 0x56, 0x3e, 0x4b, 0xc6, 0xd2, 0x79, 0x20
++	.byte		0x9a, 0xdb, 0xc0, 0xfe, 0x78, 0xcd, 0x5a, 0xf4
++	.byte		0x1f, 0xdd, 0xa8, 0x33, 0x88, 0x07, 0xc7, 0x31
++	.byte		0xb1, 0x12, 0x10, 0x59, 0x27, 0x80, 0xec, 0x5f
++	.byte		0x60, 0x51, 0x7f, 0xa9, 0x19, 0xb5, 0x4a, 0x0d
++	.byte		0x2d, 0xe5, 0x7a, 0x9f, 0x93, 0xc9, 0x9c, 0xef
++	.byte		0xa0, 0xe0, 0x3b, 0x4d, 0xae, 0x2a, 0xf5, 0xb0
++	.byte		0xc8, 0xeb, 0xbb, 0x3c, 0x83, 0x53, 0x99, 0x61
++	.byte		0x17, 0x2b, 0x04, 0x7e, 0xba, 0x77, 0xd6, 0x26
++	.byte		0xe1, 0x69, 0x14, 0x63, 0x55, 0x21, 0x0c, 0x7d
