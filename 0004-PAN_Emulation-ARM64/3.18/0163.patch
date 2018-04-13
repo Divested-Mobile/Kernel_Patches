@@ -1,0 +1,367 @@
+From 7730c96f657b834fafcb1a8795e522a3ba44283f Mon Sep 17 00:00:00 2001
+From: Catalin Marinas <catalin.marinas@arm.com>
+Date: Fri, 1 Jul 2016 16:53:00 +0100
+Subject: [PATCH] BACKPORT: arm64: Introduce uaccess_{disable,enable}
+ functionality based on TTBR0_EL1
+
+This patch adds the uaccess macros/functions to disable access to user
+space by setting TTBR0_EL1 to a reserved zeroed page. Since the value
+written to TTBR0_EL1 must be a physical address, for simplicity this
+patch introduces a reserved_ttbr0 page at a constant offset from
+swapper_pg_dir. The uaccess_disable code uses the ttbr1_el1 value
+adjusted by the reserved_ttbr0 offset.
+
+Enabling access to user is done by restoring TTBR0_EL1 with the value
+from the struct thread_info ttbr0 variable. Interrupts must be disabled
+during the uaccess_ttbr0_enable code to ensure the atomicity of the
+thread_info.ttbr0 read and TTBR0_EL1 write. This patch also moves the
+get_thread_info asm macro from entry.S to assembler.h for reuse in the
+uaccess_ttbr0_* macros.
+
+Cc: Will Deacon <will.deacon@arm.com>
+Cc: James Morse <james.morse@arm.com>
+Cc: Kees Cook <keescook@chromium.org>
+Cc: Mark Rutland <mark.rutland@arm.com>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+
+Bug: 31432001
+Change-Id: I54ada623160cb47f5762e0e39a5e84a75252dbfd
+(cherry picked from commit 4b65a5db362783ab4b04ca1c1d2ad70ed9b0ba2a)
+Signed-off-by: Sami Tolvanen <samitolvanen@google.com>
+---
+ arch/arm64/include/asm/assembler.h      |  16 +++++
+ arch/arm64/include/asm/cpufeature.h     |   6 ++
+ arch/arm64/include/asm/kernel-pgtable.h |   9 +++
+ arch/arm64/include/asm/thread_info.h    |   3 +
+ arch/arm64/include/asm/uaccess.h        | 108 ++++++++++++++++++++++++++++++--
+ arch/arm64/kernel/asm-offsets.c         |   3 +
+ arch/arm64/kernel/cpufeature.c          |   1 +
+ arch/arm64/kernel/entry.S               |   4 --
+ arch/arm64/kernel/head.S                |   6 +-
+ arch/arm64/kernel/vmlinux.lds.S         |   5 ++
+ 10 files changed, 148 insertions(+), 13 deletions(-)
+
+diff --git a/arch/arm64/include/asm/assembler.h b/arch/arm64/include/asm/assembler.h
+index 81ee4f142e21..c66a176f4ee8 100644
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -51,6 +51,15 @@
+ 	msr	daifclr, #2
+ 	.endm
+ 
++	.macro	save_and_disable_irq, flags
++	mrs	\flags, daif
++	msr	daifset, #2
++	.endm
++
++	.macro	restore_irq, flags
++	msr	daif, \flags
++	.endm
++
+ /*
+  * Save/disable and restore interrupts.
+  */
+@@ -305,4 +314,11 @@ lr	.req	x30		// link register
+ 	.size	__pi_##x, . - x;	\
+ 	ENDPROC(x)
+ 
++/*
++ * Return the current thread_info.
++ */
++	.macro	get_thread_info, rd
++	mrs	\rd, sp_el0
++	.endm
++
+ #endif	/* __ASM_ASSEMBLER_H */
+diff --git a/arch/arm64/include/asm/cpufeature.h b/arch/arm64/include/asm/cpufeature.h
+index 33ef80c42962..a0789bfc4ac6 100644
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -183,6 +183,12 @@ static inline bool system_supports_mixed_endian_el0(void)
+ 	return id_aa64mmfr0_mixed_endian_el0(read_system_reg(SYS_ID_AA64MMFR0_EL1));
+ }
+ 
++static inline bool system_uses_ttbr0_pan(void)
++{
++	return IS_ENABLED(CONFIG_ARM64_SW_TTBR0_PAN) &&
++		!cpus_have_cap(ARM64_HAS_PAN);
++}
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif
+diff --git a/arch/arm64/include/asm/kernel-pgtable.h b/arch/arm64/include/asm/kernel-pgtable.h
+index 3c92fa7bad2b..d06d7f06a583 100644
+--- a/arch/arm64/include/asm/kernel-pgtable.h
++++ b/arch/arm64/include/asm/kernel-pgtable.h
+@@ -19,6 +19,9 @@
+ #ifndef __ASM_KERNEL_PGTABLE_H
+ #define __ASM_KERNEL_PGTABLE_H
+ 
++#include <asm/page.h>
++#include <asm/pgtable.h>
++
+ /*
+  * The idmap and swapper page tables need some space reserved in the kernel
+  * image. Both require pgd, pud (4 levels only) and pmd tables to (section)
+@@ -37,6 +40,12 @@
+ #define SWAPPER_DIR_SIZE	(SWAPPER_PGTABLE_LEVELS * PAGE_SIZE)
+ #define IDMAP_DIR_SIZE		(3 * PAGE_SIZE)
+ 
++#ifdef CONFIG_ARM64_SW_TTBR0_PAN
++#define RESERVED_TTBR0_SIZE	(PAGE_SIZE)
++#else
++#define RESERVED_TTBR0_SIZE	(0)
++#endif
++
+ /* Initial memory map size */
+ #ifdef CONFIG_ARM64_64K_PAGES
+ #define SWAPPER_BLOCK_SHIFT	PAGE_SHIFT
+diff --git a/arch/arm64/include/asm/thread_info.h b/arch/arm64/include/asm/thread_info.h
+index ec73c97de4a5..1b0c8e12e79f 100644
+--- a/arch/arm64/include/asm/thread_info.h
++++ b/arch/arm64/include/asm/thread_info.h
+@@ -48,6 +48,9 @@ struct thread_info {
+ 	mm_segment_t		addr_limit;	/* address limit */
+ 	struct task_struct	*task;		/* main task structure */
+ 	struct exec_domain	*exec_domain;	/* execution domain */
++#ifdef CONFIG_ARM64_SW_TTBR0_PAN
++	u64			ttbr0;		/* saved TTBR0_EL1 */
++#endif
+ 	int			preempt_count;	/* 0 => preemptable, <0 => bug */
+ 	int			cpu;		/* cpu */
+ };
+diff --git a/arch/arm64/include/asm/uaccess.h b/arch/arm64/include/asm/uaccess.h
+index 42795baad14b..65e64dc354aa 100644
+--- a/arch/arm64/include/asm/uaccess.h
++++ b/arch/arm64/include/asm/uaccess.h
+@@ -19,6 +19,7 @@
+ #define __ASM_UACCESS_H
+ 
+ #include <asm/alternative.h>
++#include <asm/kernel-pgtable.h>
+ #include <asm/sysreg.h>
+ 
+ #ifndef __ASSEMBLY__
+@@ -121,16 +122,71 @@ static inline void set_fs(mm_segment_t fs)
+ /*
+  * User access enabling/disabling.
+  */
++#ifdef CONFIG_ARM64_SW_TTBR0_PAN
++static inline void __uaccess_ttbr0_disable(void)
++{
++	unsigned long ttbr;
++
++	/* reserved_ttbr0 placed at the end of swapper_pg_dir */
++	ttbr = read_sysreg(ttbr1_el1) + SWAPPER_DIR_SIZE;
++	write_sysreg(ttbr, ttbr0_el1);
++	isb();
++}
++
++static inline void __uaccess_ttbr0_enable(void)
++{
++	unsigned long flags;
++
++	/*
++	 * Disable interrupts to avoid preemption between reading the 'ttbr0'
++	 * variable and the MSR. A context switch could trigger an ASID
++	 * roll-over and an update of 'ttbr0'.
++	 */
++	local_irq_save(flags);
++	write_sysreg(current_thread_info()->ttbr0, ttbr0_el1);
++	isb();
++	local_irq_restore(flags);
++}
++
++static inline bool uaccess_ttbr0_disable(void)
++{
++	if (!system_uses_ttbr0_pan())
++		return false;
++	__uaccess_ttbr0_disable();
++	return true;
++}
++
++static inline bool uaccess_ttbr0_enable(void)
++{
++	if (!system_uses_ttbr0_pan())
++		return false;
++	__uaccess_ttbr0_enable();
++	return true;
++}
++#else
++static inline bool uaccess_ttbr0_disable(void)
++{
++	return false;
++}
++
++static inline bool uaccess_ttbr0_enable(void)
++{
++	return false;
++}
++#endif
++
+ #define __uaccess_disable(alt)						\
+ do {									\
+-	asm(ALTERNATIVE("nop", SET_PSTATE_PAN(1), alt,			\
+-			CONFIG_ARM64_PAN));				\
++	if (!uaccess_ttbr0_disable())					\
++		asm(ALTERNATIVE("nop", SET_PSTATE_PAN(1), alt,		\
++				CONFIG_ARM64_PAN));			\
+ } while (0)
+ 
+ #define __uaccess_enable(alt)						\
+ do {									\
+-	asm(ALTERNATIVE("nop", SET_PSTATE_PAN(0), alt,			\
+-			CONFIG_ARM64_PAN));				\
++	if (uaccess_ttbr0_enable())					\
++		asm(ALTERNATIVE("nop", SET_PSTATE_PAN(0), alt,		\
++				CONFIG_ARM64_PAN));			\
+ } while (0)
+ 
+ static inline void uaccess_disable(void)
+@@ -367,16 +423,56 @@ extern __must_check long strnlen_user(const char __user *str, long n);
+ #include <asm/assembler.h>
+ 
+ /*
+- * User access enabling/disabling macros. These are no-ops when UAO is
+- * present.
++ * User access enabling/disabling macros.
++ */
++#ifdef CONFIG_ARM64_SW_TTBR0_PAN
++	.macro	__uaccess_ttbr0_disable, tmp1
++	mrs	\tmp1, ttbr1_el1		// swapper_pg_dir
++	add	\tmp1, \tmp1, #SWAPPER_DIR_SIZE	// reserved_ttbr0 at the end of swapper_pg_dir
++	msr	ttbr0_el1, \tmp1		// set reserved TTBR0_EL1
++	isb
++	.endm
++
++	.macro	__uaccess_ttbr0_enable, tmp1
++	get_thread_info \tmp1
++	ldr	\tmp1, [\tmp1, #TSK_TI_TTBR0]	// load saved TTBR0_EL1
++	msr	ttbr0_el1, \tmp1		// set the non-PAN TTBR0_EL1
++	isb
++	.endm
++
++	.macro	uaccess_ttbr0_disable, tmp1
++alternative_if_not ARM64_HAS_PAN
++	__uaccess_ttbr0_disable \tmp1
++alternative_else_nop_endif
++	.endm
++
++	.macro	uaccess_ttbr0_enable, tmp1, tmp2
++alternative_if_not ARM64_HAS_PAN
++	save_and_disable_irq \tmp2		// avoid preemption
++	__uaccess_ttbr0_enable \tmp1
++	restore_irq \tmp2
++alternative_else_nop_endif
++	.endm
++#else
++	.macro	uaccess_ttbr0_disable, tmp1
++	.endm
++
++	.macro	uaccess_ttbr0_enable, tmp1, tmp2
++	.endm
++#endif
++
++/*
++ * These macros are no-ops when UAO is present.
+  */
+ 	.macro	uaccess_disable_not_uao, tmp1
++	uaccess_ttbr0_disable \tmp1
+ alternative_if ARM64_ALT_PAN_NOT_UAO
+ 	SET_PSTATE_PAN(1)
+ alternative_else_nop_endif
+ 	.endm
+ 
+ 	.macro	uaccess_enable_not_uao, tmp1, tmp2
++	uaccess_ttbr0_enable \tmp1, \tmp2
+ alternative_if ARM64_ALT_PAN_NOT_UAO
+ 	SET_PSTATE_PAN(0)
+ alternative_else_nop_endif
+diff --git a/arch/arm64/kernel/asm-offsets.c b/arch/arm64/kernel/asm-offsets.c
+index 01304c2f9b59..a7c301cf2bec 100644
+--- a/arch/arm64/kernel/asm-offsets.c
++++ b/arch/arm64/kernel/asm-offsets.c
+@@ -39,6 +39,9 @@ int main(void)
+   DEFINE(TI_TASK,		offsetof(struct thread_info, task));
+   DEFINE(TI_EXEC_DOMAIN,	offsetof(struct thread_info, exec_domain));
+   DEFINE(TI_CPU,		offsetof(struct thread_info, cpu));
++#ifdef CONFIG_ARM64_SW_TTBR0_PAN
++  DEFINE(TSK_TI_TTBR0,		offsetof(struct thread_info, ttbr0));
++#endif
+   BLANK();
+   DEFINE(THREAD_CPU_CONTEXT,	offsetof(struct task_struct, thread.cpu_context));
+   BLANK();
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index 7df6570e5488..58347534d765 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -43,6 +43,7 @@ unsigned int compat_elf_hwcap2 __read_mostly;
+ #endif
+ 
+ DECLARE_BITMAP(cpu_hwcaps, ARM64_NCAPS);
++EXPORT_SYMBOL(cpu_hwcaps);
+ 
+ #define __ARM64_FTR_BITS(SIGNED, STRICT, TYPE, SHIFT, WIDTH, SAFE_VAL) \
+ 	{						\
+diff --git a/arch/arm64/kernel/entry.S b/arch/arm64/kernel/entry.S
+index e747c9e55b80..e378e1b31fec 100644
+--- a/arch/arm64/kernel/entry.S
++++ b/arch/arm64/kernel/entry.S
+@@ -187,10 +187,6 @@ alternative_endif
+ 	eret					// return to kernel
+ 	.endm
+ 
+-	.macro	get_thread_info, rd
+-	mrs	\rd, sp_el0
+-	.endm
+-
+ /*
+  * These are the registers used in the syscall handler, and allow us to
+  * have in theory up to 7 arguments to a function - x0 to x6.
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 93cddeb79e7b..5754806a7af1 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -335,14 +335,14 @@ __create_page_tables:
+ 	 * dirty cache lines being evicted.
+ 	 */
+ 	mov	x0, x25
+-	add	x1, x26, #SWAPPER_DIR_SIZE
++	add	x1, x26, #SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE
+ 	bl	__inval_cache_range
+ 
+ 	/*
+ 	 * Clear the idmap and swapper page tables.
+ 	 */
+ 	mov	x0, x25
+-	add	x6, x26, #SWAPPER_DIR_SIZE
++	add	x6, x26, #SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE
+ 1:	stp	xzr, xzr, [x0], #16
+ 	stp	xzr, xzr, [x0], #16
+ 	stp	xzr, xzr, [x0], #16
+@@ -434,7 +434,7 @@ __create_page_tables:
+ 	 * tables again to remove any speculatively loaded cache lines.
+ 	 */
+ 	mov	x0, x25
+-	add	x1, x26, #SWAPPER_DIR_SIZE
++	add	x1, x26, #SWAPPER_DIR_SIZE + RESERVED_TTBR0_SIZE
+ 	dmb	sy
+ 	bl	__inval_cache_range
+ 
+diff --git a/arch/arm64/kernel/vmlinux.lds.S b/arch/arm64/kernel/vmlinux.lds.S
+index 124cb6a06dad..724ed30e4992 100644
+--- a/arch/arm64/kernel/vmlinux.lds.S
++++ b/arch/arm64/kernel/vmlinux.lds.S
+@@ -156,6 +156,11 @@ SECTIONS
+ 	swapper_pg_dir = .;
+ 	. += SWAPPER_DIR_SIZE;
+ 
++#ifdef CONFIG_ARM64_SW_TTBR0_PAN
++	reserved_ttbr0 = .;
++	. += RESERVED_TTBR0_SIZE;
++#endif
++
+ 	_end = .;
+ 
+ 	STABS_DEBUG
