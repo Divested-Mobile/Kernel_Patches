@@ -1,0 +1,548 @@
+diff --git a/Makefile b/Makefile
+index 34d4d9f8a4b2..77953bf3f40a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 9
+-SUBLEVEL = 42
++SUBLEVEL = 43
+ EXTRAVERSION =
+ NAME = Roaring Lionus
+ 
+diff --git a/arch/arm/boot/dts/Makefile b/arch/arm/boot/dts/Makefile
+index f3baa896ce84..7037201c5e3a 100644
+--- a/arch/arm/boot/dts/Makefile
++++ b/arch/arm/boot/dts/Makefile
+@@ -820,7 +820,6 @@ dtb-$(CONFIG_MACH_SUN8I) += \
+ 	sun8i-a83t-allwinner-h8homlet-v2.dtb \
+ 	sun8i-a83t-cubietruck-plus.dtb \
+ 	sun8i-h3-bananapi-m2-plus.dtb \
+-	sun8i-h3-nanopi-m1.dtb	\
+ 	sun8i-h3-nanopi-neo.dtb \
+ 	sun8i-h3-orangepi-2.dtb \
+ 	sun8i-h3-orangepi-lite.dtb \
+diff --git a/arch/arm/kvm/mmu.c b/arch/arm/kvm/mmu.c
+index 332ce3b5a34f..710511cadd50 100644
+--- a/arch/arm/kvm/mmu.c
++++ b/arch/arm/kvm/mmu.c
+@@ -1664,12 +1664,16 @@ static int kvm_test_age_hva_handler(struct kvm *kvm, gpa_t gpa, void *data)
+ 
+ int kvm_age_hva(struct kvm *kvm, unsigned long start, unsigned long end)
+ {
++	if (!kvm->arch.pgd)
++		return 0;
+ 	trace_kvm_age_hva(start, end);
+ 	return handle_hva_to_gpa(kvm, start, end, kvm_age_hva_handler, NULL);
+ }
+ 
+ int kvm_test_age_hva(struct kvm *kvm, unsigned long hva)
+ {
++	if (!kvm->arch.pgd)
++		return 0;
+ 	trace_kvm_test_age_hva(hva);
+ 	return handle_hva_to_gpa(kvm, hva, hva, kvm_test_age_hva_handler, NULL);
+ }
+diff --git a/arch/s390/net/bpf_jit_comp.c b/arch/s390/net/bpf_jit_comp.c
+index bee281f3163d..e8dee623d545 100644
+--- a/arch/s390/net/bpf_jit_comp.c
++++ b/arch/s390/net/bpf_jit_comp.c
+@@ -1252,7 +1252,8 @@ static int bpf_jit_prog(struct bpf_jit *jit, struct bpf_prog *fp)
+ 		insn_count = bpf_jit_insn(jit, fp, i);
+ 		if (insn_count < 0)
+ 			return -1;
+-		jit->addrs[i + 1] = jit->prg; /* Next instruction address */
++		/* Next instruction address */
++		jit->addrs[i + insn_count] = jit->prg;
+ 	}
+ 	bpf_jit_epilogue(jit);
+ 
+diff --git a/arch/sparc/include/asm/mmu_context_64.h b/arch/sparc/include/asm/mmu_context_64.h
+index 349dd23e2876..0cdeb2b483a0 100644
+--- a/arch/sparc/include/asm/mmu_context_64.h
++++ b/arch/sparc/include/asm/mmu_context_64.h
+@@ -25,9 +25,11 @@ void destroy_context(struct mm_struct *mm);
+ void __tsb_context_switch(unsigned long pgd_pa,
+ 			  struct tsb_config *tsb_base,
+ 			  struct tsb_config *tsb_huge,
+-			  unsigned long tsb_descr_pa);
++			  unsigned long tsb_descr_pa,
++			  unsigned long secondary_ctx);
+ 
+-static inline void tsb_context_switch(struct mm_struct *mm)
++static inline void tsb_context_switch_ctx(struct mm_struct *mm,
++					  unsigned long ctx)
+ {
+ 	__tsb_context_switch(__pa(mm->pgd),
+ 			     &mm->context.tsb_block[0],
+@@ -38,9 +40,12 @@ static inline void tsb_context_switch(struct mm_struct *mm)
+ #else
+ 			     NULL
+ #endif
+-			     , __pa(&mm->context.tsb_descr[0]));
++			     , __pa(&mm->context.tsb_descr[0]),
++			     ctx);
+ }
+ 
++#define tsb_context_switch(X) tsb_context_switch_ctx(X, 0)
++
+ void tsb_grow(struct mm_struct *mm,
+ 	      unsigned long tsb_index,
+ 	      unsigned long mm_rss);
+@@ -110,8 +115,7 @@ static inline void switch_mm(struct mm_struct *old_mm, struct mm_struct *mm, str
+ 	 * cpu0 to update it's TSB because at that point the cpu_vm_mask
+ 	 * only had cpu1 set in it.
+ 	 */
+-	load_secondary_context(mm);
+-	tsb_context_switch(mm);
++	tsb_context_switch_ctx(mm, CTX_HWBITS(mm->context));
+ 
+ 	/* Any time a processor runs a context on an address space
+ 	 * for the first time, we must flush that context out of the
+diff --git a/arch/sparc/kernel/tsb.S b/arch/sparc/kernel/tsb.S
+index 395ec1800530..7d961f6e3907 100644
+--- a/arch/sparc/kernel/tsb.S
++++ b/arch/sparc/kernel/tsb.S
+@@ -375,6 +375,7 @@ tsb_flush:
+ 	 * %o1:	TSB base config pointer
+ 	 * %o2:	TSB huge config pointer, or NULL if none
+ 	 * %o3:	Hypervisor TSB descriptor physical address
++	 * %o4: Secondary context to load, if non-zero
+ 	 *
+ 	 * We have to run this whole thing with interrupts
+ 	 * disabled so that the current cpu doesn't change
+@@ -387,6 +388,17 @@ __tsb_context_switch:
+ 	rdpr	%pstate, %g1
+ 	wrpr	%g1, PSTATE_IE, %pstate
+ 
++	brz,pn	%o4, 1f
++	 mov	SECONDARY_CONTEXT, %o5
++
++661:	stxa	%o4, [%o5] ASI_DMMU
++	.section .sun4v_1insn_patch, "ax"
++	.word	661b
++	stxa	%o4, [%o5] ASI_MMU
++	.previous
++	flush	%g6
++
++1:
+ 	TRAP_LOAD_TRAP_BLOCK(%g2, %g3)
+ 
+ 	stx	%o0, [%g2 + TRAP_PER_CPU_PGD_PADDR]
+diff --git a/arch/sparc/power/hibernate.c b/arch/sparc/power/hibernate.c
+index 17bd2e167e07..df707a8ad311 100644
+--- a/arch/sparc/power/hibernate.c
++++ b/arch/sparc/power/hibernate.c
+@@ -35,6 +35,5 @@ void restore_processor_state(void)
+ {
+ 	struct mm_struct *mm = current->active_mm;
+ 
+-	load_secondary_context(mm);
+-	tsb_context_switch(mm);
++	tsb_context_switch_ctx(mm, CTX_HWBITS(mm->context));
+ }
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_rx.c b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+index 5d484581becd..bcbb80ff86a7 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_rx.c
+@@ -724,16 +724,21 @@ static inline __wsum get_fixed_vlan_csum(__wsum hw_checksum,
+  * header, the HW adds it. To address that, we are subtracting the pseudo
+  * header checksum from the checksum value provided by the HW.
+  */
+-static void get_fixed_ipv4_csum(__wsum hw_checksum, struct sk_buff *skb,
+-				struct iphdr *iph)
++static int get_fixed_ipv4_csum(__wsum hw_checksum, struct sk_buff *skb,
++			       struct iphdr *iph)
+ {
+ 	__u16 length_for_csum = 0;
+ 	__wsum csum_pseudo_header = 0;
++	__u8 ipproto = iph->protocol;
++
++	if (unlikely(ipproto == IPPROTO_SCTP))
++		return -1;
+ 
+ 	length_for_csum = (be16_to_cpu(iph->tot_len) - (iph->ihl << 2));
+ 	csum_pseudo_header = csum_tcpudp_nofold(iph->saddr, iph->daddr,
+-						length_for_csum, iph->protocol, 0);
++						length_for_csum, ipproto, 0);
+ 	skb->csum = csum_sub(hw_checksum, csum_pseudo_header);
++	return 0;
+ }
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+@@ -744,17 +749,20 @@ static void get_fixed_ipv4_csum(__wsum hw_checksum, struct sk_buff *skb,
+ static int get_fixed_ipv6_csum(__wsum hw_checksum, struct sk_buff *skb,
+ 			       struct ipv6hdr *ipv6h)
+ {
++	__u8 nexthdr = ipv6h->nexthdr;
+ 	__wsum csum_pseudo_hdr = 0;
+ 
+-	if (unlikely(ipv6h->nexthdr == IPPROTO_FRAGMENT ||
+-		     ipv6h->nexthdr == IPPROTO_HOPOPTS))
++	if (unlikely(nexthdr == IPPROTO_FRAGMENT ||
++		     nexthdr == IPPROTO_HOPOPTS ||
++		     nexthdr == IPPROTO_SCTP))
+ 		return -1;
+-	hw_checksum = csum_add(hw_checksum, (__force __wsum)htons(ipv6h->nexthdr));
++	hw_checksum = csum_add(hw_checksum, (__force __wsum)htons(nexthdr));
+ 
+ 	csum_pseudo_hdr = csum_partial(&ipv6h->saddr,
+ 				       sizeof(ipv6h->saddr) + sizeof(ipv6h->daddr), 0);
+ 	csum_pseudo_hdr = csum_add(csum_pseudo_hdr, (__force __wsum)ipv6h->payload_len);
+-	csum_pseudo_hdr = csum_add(csum_pseudo_hdr, (__force __wsum)ntohs(ipv6h->nexthdr));
++	csum_pseudo_hdr = csum_add(csum_pseudo_hdr,
++				   (__force __wsum)htons(nexthdr));
+ 
+ 	skb->csum = csum_sub(hw_checksum, csum_pseudo_hdr);
+ 	skb->csum = csum_add(skb->csum, csum_partial(ipv6h, sizeof(struct ipv6hdr), 0));
+@@ -777,11 +785,10 @@ static int check_csum(struct mlx4_cqe *cqe, struct sk_buff *skb, void *va,
+ 	}
+ 
+ 	if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPV4))
+-		get_fixed_ipv4_csum(hw_checksum, skb, hdr);
++		return get_fixed_ipv4_csum(hw_checksum, skb, hdr);
+ #if IS_ENABLED(CONFIG_IPV6)
+-	else if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPV6))
+-		if (unlikely(get_fixed_ipv6_csum(hw_checksum, skb, hdr)))
+-			return -1;
++	if (cqe->status & cpu_to_be16(MLX4_CQE_STATUS_IPV6))
++		return get_fixed_ipv6_csum(hw_checksum, skb, hdr);
+ #endif
+ 	return 0;
+ }
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+index 5489c0ec1d9a..96fa0e61d3af 100644
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -119,6 +119,7 @@ struct ppp {
+ 	int		n_channels;	/* how many channels are attached 54 */
+ 	spinlock_t	rlock;		/* lock for receive side 58 */
+ 	spinlock_t	wlock;		/* lock for transmit side 5c */
++	int		*xmit_recursion __percpu; /* xmit recursion detect */
+ 	int		mru;		/* max receive unit 60 */
+ 	unsigned int	flags;		/* control bits 64 */
+ 	unsigned int	xstate;		/* transmit state bits 68 */
+@@ -1024,6 +1025,7 @@ static int ppp_dev_configure(struct net *src_net, struct net_device *dev,
+ 	struct ppp *ppp = netdev_priv(dev);
+ 	int indx;
+ 	int err;
++	int cpu;
+ 
+ 	ppp->dev = dev;
+ 	ppp->ppp_net = src_net;
+@@ -1038,6 +1040,15 @@ static int ppp_dev_configure(struct net *src_net, struct net_device *dev,
+ 	INIT_LIST_HEAD(&ppp->channels);
+ 	spin_lock_init(&ppp->rlock);
+ 	spin_lock_init(&ppp->wlock);
++
++	ppp->xmit_recursion = alloc_percpu(int);
++	if (!ppp->xmit_recursion) {
++		err = -ENOMEM;
++		goto err1;
++	}
++	for_each_possible_cpu(cpu)
++		(*per_cpu_ptr(ppp->xmit_recursion, cpu)) = 0;
++
+ #ifdef CONFIG_PPP_MULTILINK
+ 	ppp->minseq = -1;
+ 	skb_queue_head_init(&ppp->mrq);
+@@ -1049,11 +1060,15 @@ static int ppp_dev_configure(struct net *src_net, struct net_device *dev,
+ 
+ 	err = ppp_unit_register(ppp, conf->unit, conf->ifname_is_set);
+ 	if (err < 0)
+-		return err;
++		goto err2;
+ 
+ 	conf->file->private_data = &ppp->file;
+ 
+ 	return 0;
++err2:
++	free_percpu(ppp->xmit_recursion);
++err1:
++	return err;
+ }
+ 
+ static const struct nla_policy ppp_nl_policy[IFLA_PPP_MAX + 1] = {
+@@ -1399,18 +1414,16 @@ static void __ppp_xmit_process(struct ppp *ppp)
+ 	ppp_xmit_unlock(ppp);
+ }
+ 
+-static DEFINE_PER_CPU(int, ppp_xmit_recursion);
+-
+ static void ppp_xmit_process(struct ppp *ppp)
+ {
+ 	local_bh_disable();
+ 
+-	if (unlikely(__this_cpu_read(ppp_xmit_recursion)))
++	if (unlikely(*this_cpu_ptr(ppp->xmit_recursion)))
+ 		goto err;
+ 
+-	__this_cpu_inc(ppp_xmit_recursion);
++	(*this_cpu_ptr(ppp->xmit_recursion))++;
+ 	__ppp_xmit_process(ppp);
+-	__this_cpu_dec(ppp_xmit_recursion);
++	(*this_cpu_ptr(ppp->xmit_recursion))--;
+ 
+ 	local_bh_enable();
+ 
+@@ -1901,23 +1914,23 @@ static void __ppp_channel_push(struct channel *pch)
+ 	spin_unlock_bh(&pch->downl);
+ 	/* see if there is anything from the attached unit to be sent */
+ 	if (skb_queue_empty(&pch->file.xq)) {
+-		read_lock_bh(&pch->upl);
+ 		ppp = pch->ppp;
+ 		if (ppp)
+ 			__ppp_xmit_process(ppp);
+-		read_unlock_bh(&pch->upl);
+ 	}
+ }
+ 
+ static void ppp_channel_push(struct channel *pch)
+ {
+-	local_bh_disable();
+-
+-	__this_cpu_inc(ppp_xmit_recursion);
+-	__ppp_channel_push(pch);
+-	__this_cpu_dec(ppp_xmit_recursion);
+-
+-	local_bh_enable();
++	read_lock_bh(&pch->upl);
++	if (pch->ppp) {
++		(*this_cpu_ptr(pch->ppp->xmit_recursion))++;
++		__ppp_channel_push(pch);
++		(*this_cpu_ptr(pch->ppp->xmit_recursion))--;
++	} else {
++		__ppp_channel_push(pch);
++	}
++	read_unlock_bh(&pch->upl);
+ }
+ 
+ /*
+@@ -3056,6 +3069,7 @@ static void ppp_destroy_interface(struct ppp *ppp)
+ #endif /* CONFIG_PPP_FILTER */
+ 
+ 	kfree_skb(ppp->xmit_pending);
++	free_percpu(ppp->xmit_recursion);
+ 
+ 	free_netdev(ppp->dev);
+ }
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 0af019dfe846..1d0a7369d5a2 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -2703,7 +2703,7 @@ static inline bool skb_needs_check(struct sk_buff *skb, bool tx_path)
+ {
+ 	if (tx_path)
+ 		return skb->ip_summed != CHECKSUM_PARTIAL &&
+-		       skb->ip_summed != CHECKSUM_NONE;
++		       skb->ip_summed != CHECKSUM_UNNECESSARY;
+ 
+ 	return skb->ip_summed == CHECKSUM_NONE;
+ }
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index f60fe82c2c1e..b5116ec31757 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -1693,6 +1693,13 @@ static __net_init int inet_init_net(struct net *net)
+ 	net->ipv4.sysctl_ip_dynaddr = 0;
+ 	net->ipv4.sysctl_ip_early_demux = 1;
+ 
++	/* Some igmp sysctl, whose values are always used */
++	net->ipv4.sysctl_igmp_max_memberships = 20;
++	net->ipv4.sysctl_igmp_max_msf = 10;
++	/* IGMP reports for link-local multicast groups are enabled by default */
++	net->ipv4.sysctl_igmp_llm_reports = 1;
++	net->ipv4.sysctl_igmp_qrv = 2;
++
+ 	return 0;
+ }
+ 
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+index 19930da56b0a..08575e3bd135 100644
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -2974,12 +2974,6 @@ static int __net_init igmp_net_init(struct net *net)
+ 		goto out_sock;
+ 	}
+ 
+-	/* Sysctl initialization */
+-	net->ipv4.sysctl_igmp_max_memberships = 20;
+-	net->ipv4.sysctl_igmp_max_msf = 10;
+-	/* IGMP reports for link-local multicast groups are enabled by default */
+-	net->ipv4.sysctl_igmp_llm_reports = 1;
+-	net->ipv4.sysctl_igmp_qrv = 2;
+ 	return 0;
+ 
+ out_sock:
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 06215ba88b93..2c3c1a223df4 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -936,11 +936,12 @@ static int __ip_append_data(struct sock *sk,
+ 		csummode = CHECKSUM_PARTIAL;
+ 
+ 	cork->length += length;
+-	if ((((length + (skb ? skb->len : fragheaderlen)) > mtu) ||
+-	     (skb && skb_is_gso(skb))) &&
++	if ((skb && skb_is_gso(skb)) ||
++	    ((length > mtu) &&
++	    (skb_queue_len(queue) <= 1) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO) && !rt->dst.header_len &&
+-	    (sk->sk_type == SOCK_DGRAM) && !sk->sk_no_check_tx) {
++	    (sk->sk_type == SOCK_DGRAM) && !sk->sk_no_check_tx)) {
+ 		err = ip_ufo_append_data(sk, queue, getfrag, from, length,
+ 					 hh_len, fragheaderlen, transhdrlen,
+ 					 maxfraglen, flags);
+@@ -1256,6 +1257,7 @@ ssize_t	ip_append_page(struct sock *sk, struct flowi4 *fl4, struct page *page,
+ 		return -EINVAL;
+ 
+ 	if ((size + skb->len > mtu) &&
++	    (skb_queue_len(&sk->sk_write_queue) == 1) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO)) {
+ 		if (skb->ip_summed != CHECKSUM_PARTIAL)
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 01336aa5f973..32c540145c17 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -2560,8 +2560,8 @@ static inline void tcp_end_cwnd_reduction(struct sock *sk)
+ 		return;
+ 
+ 	/* Reset cwnd to ssthresh in CWR or Recovery (unless it's undone) */
+-	if (inet_csk(sk)->icsk_ca_state == TCP_CA_CWR ||
+-	    (tp->undo_marker && tp->snd_ssthresh < TCP_INFINITE_SSTHRESH)) {
++	if (tp->snd_ssthresh < TCP_INFINITE_SSTHRESH &&
++	    (inet_csk(sk)->icsk_ca_state == TCP_CA_CWR || tp->undo_marker)) {
+ 		tp->snd_cwnd = tp->snd_ssthresh;
+ 		tp->snd_cwnd_stamp = tcp_time_stamp;
+ 	}
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index dc4258fd15dc..5d836b037442 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -3344,6 +3344,9 @@ int tcp_connect(struct sock *sk)
+ 	struct sk_buff *buff;
+ 	int err;
+ 
++	if (inet_csk(sk)->icsk_af_ops->rebuild_header(sk))
++		return -EHOSTUNREACH; /* Routing failure or similar. */
++
+ 	tcp_connect_init(sk);
+ 
+ 	if (unlikely(tp->repair)) {
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index b1e65b3b4361..74db43b47917 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -654,7 +654,8 @@ static void tcp_keepalive_timer (unsigned long data)
+ 		goto death;
+ 	}
+ 
+-	if (!sock_flag(sk, SOCK_KEEPOPEN) || sk->sk_state == TCP_CLOSE)
++	if (!sock_flag(sk, SOCK_KEEPOPEN) ||
++	    ((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_SYN_SENT)))
+ 		goto out;
+ 
+ 	elapsed = keepalive_time_when(tp);
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 5bab6c3f7a2f..4363b1e89bdf 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -813,7 +813,7 @@ static int udp_send_skb(struct sk_buff *skb, struct flowi4 *fl4)
+ 	if (is_udplite)  				 /*     UDP-Lite      */
+ 		csum = udplite_csum(skb);
+ 
+-	else if (sk->sk_no_check_tx) {   /* UDP csum disabled */
++	else if (sk->sk_no_check_tx && !skb_is_gso(skb)) {   /* UDP csum off */
+ 
+ 		skb->ip_summed = CHECKSUM_NONE;
+ 		goto send;
+diff --git a/net/ipv4/udp_offload.c b/net/ipv4/udp_offload.c
+index b2be1d9757ef..6de016f80f17 100644
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -232,7 +232,7 @@ static struct sk_buff *udp4_ufo_fragment(struct sk_buff *skb,
+ 	if (uh->check == 0)
+ 		uh->check = CSUM_MANGLED_0;
+ 
+-	skb->ip_summed = CHECKSUM_NONE;
++	skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+ 	/* If there is no outer header we can fake a checksum offload
+ 	 * due to the fact that we have already done the checksum in
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index a5cdf2a23609..e0236e902ea7 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1372,11 +1372,12 @@ static int __ip6_append_data(struct sock *sk,
+ 	 */
+ 
+ 	cork->length += length;
+-	if ((((length + (skb ? skb->len : headersize)) > mtu) ||
+-	     (skb && skb_is_gso(skb))) &&
++	if ((skb && skb_is_gso(skb)) ||
++	    (((length + fragheaderlen) > mtu) &&
++	    (skb_queue_len(queue) <= 1) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO) && !rt->dst.header_len &&
+-	    (sk->sk_type == SOCK_DGRAM) && !udp_get_no_check6_tx(sk)) {
++	    (sk->sk_type == SOCK_DGRAM) && !udp_get_no_check6_tx(sk))) {
+ 		err = ip6_ufo_append_data(sk, queue, getfrag, from, length,
+ 					  hh_len, fragheaderlen, exthdrlen,
+ 					  transhdrlen, mtu, flags, fl6);
+diff --git a/net/ipv6/udp_offload.c b/net/ipv6/udp_offload.c
+index a2267f80febb..e7d378c032cb 100644
+--- a/net/ipv6/udp_offload.c
++++ b/net/ipv6/udp_offload.c
+@@ -72,7 +72,7 @@ static struct sk_buff *udp6_ufo_fragment(struct sk_buff *skb,
+ 		if (uh->check == 0)
+ 			uh->check = CSUM_MANGLED_0;
+ 
+-		skb->ip_summed = CHECKSUM_NONE;
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+ 		/* If there is no outer header we can fake a checksum offload
+ 		 * due to the fact that we have already done the checksum in
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 365c83fcee02..ae7bfd26cd91 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -3698,14 +3698,19 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
+ 
+ 		if (optlen != sizeof(val))
+ 			return -EINVAL;
+-		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec)
+-			return -EBUSY;
+ 		if (copy_from_user(&val, optval, sizeof(val)))
+ 			return -EFAULT;
+ 		if (val > INT_MAX)
+ 			return -EINVAL;
+-		po->tp_reserve = val;
+-		return 0;
++		lock_sock(sk);
++		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec) {
++			ret = -EBUSY;
++		} else {
++			po->tp_reserve = val;
++			ret = 0;
++		}
++		release_sock(sk);
++		return ret;
+ 	}
+ 	case PACKET_LOSS:
+ 	{
+diff --git a/net/sched/act_ipt.c b/net/sched/act_ipt.c
+index 378c1c976058..a1aec0a6c789 100644
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@ -49,8 +49,8 @@ static int ipt_init_target(struct xt_entry_target *t, char *table,
+ 		return PTR_ERR(target);
+ 
+ 	t->u.kernel.target = target;
++	memset(&par, 0, sizeof(par));
+ 	par.table     = table;
+-	par.entryinfo = NULL;
+ 	par.target    = target;
+ 	par.targinfo  = t->data;
+ 	par.hook_mask = hook;

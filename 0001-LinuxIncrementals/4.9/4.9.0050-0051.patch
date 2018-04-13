@@ -1,0 +1,3912 @@
+diff --git a/Makefile b/Makefile
+index 038d126a15fc..b48aebbe187f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 9
+-SUBLEVEL = 50
++SUBLEVEL = 51
+ EXTRAVERSION =
+ NAME = Roaring Lionus
+ 
+diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
+index b31761ecce63..7bcd138c3aa9 100644
+--- a/arch/x86/include/asm/elf.h
++++ b/arch/x86/include/asm/elf.h
+@@ -204,6 +204,7 @@ void set_personality_ia32(bool);
+ 
+ #define ELF_CORE_COPY_REGS(pr_reg, regs)			\
+ do {								\
++	unsigned long base;					\
+ 	unsigned v;						\
+ 	(pr_reg)[0] = (regs)->r15;				\
+ 	(pr_reg)[1] = (regs)->r14;				\
+@@ -226,8 +227,8 @@ do {								\
+ 	(pr_reg)[18] = (regs)->flags;				\
+ 	(pr_reg)[19] = (regs)->sp;				\
+ 	(pr_reg)[20] = (regs)->ss;				\
+-	(pr_reg)[21] = current->thread.fsbase;			\
+-	(pr_reg)[22] = current->thread.gsbase;			\
++	rdmsrl(MSR_FS_BASE, base); (pr_reg)[21] = base;		\
++	rdmsrl(MSR_KERNEL_GS_BASE, base); (pr_reg)[22] = base;	\
+ 	asm("movl %%ds,%0" : "=r" (v)); (pr_reg)[23] = v;	\
+ 	asm("movl %%es,%0" : "=r" (v)); (pr_reg)[24] = v;	\
+ 	asm("movl %%fs,%0" : "=r" (v)); (pr_reg)[25] = v;	\
+diff --git a/arch/x86/kernel/process_64.c b/arch/x86/kernel/process_64.c
+index b3760b3c1ca0..0887d2ae3797 100644
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@ -136,6 +136,123 @@ void release_thread(struct task_struct *dead_task)
+ 	}
+ }
+ 
++enum which_selector {
++	FS,
++	GS
++};
++
++/*
++ * Saves the FS or GS base for an outgoing thread if FSGSBASE extensions are
++ * not available.  The goal is to be reasonably fast on non-FSGSBASE systems.
++ * It's forcibly inlined because it'll generate better code and this function
++ * is hot.
++ */
++static __always_inline void save_base_legacy(struct task_struct *prev_p,
++					     unsigned short selector,
++					     enum which_selector which)
++{
++	if (likely(selector == 0)) {
++		/*
++		 * On Intel (without X86_BUG_NULL_SEG), the segment base could
++		 * be the pre-existing saved base or it could be zero.  On AMD
++		 * (with X86_BUG_NULL_SEG), the segment base could be almost
++		 * anything.
++		 *
++		 * This branch is very hot (it's hit twice on almost every
++		 * context switch between 64-bit programs), and avoiding
++		 * the RDMSR helps a lot, so we just assume that whatever
++		 * value is already saved is correct.  This matches historical
++		 * Linux behavior, so it won't break existing applications.
++		 *
++		 * To avoid leaking state, on non-X86_BUG_NULL_SEG CPUs, if we
++		 * report that the base is zero, it needs to actually be zero:
++		 * see the corresponding logic in load_seg_legacy.
++		 */
++	} else {
++		/*
++		 * If the selector is 1, 2, or 3, then the base is zero on
++		 * !X86_BUG_NULL_SEG CPUs and could be anything on
++		 * X86_BUG_NULL_SEG CPUs.  In the latter case, Linux
++		 * has never attempted to preserve the base across context
++		 * switches.
++		 *
++		 * If selector > 3, then it refers to a real segment, and
++		 * saving the base isn't necessary.
++		 */
++		if (which == FS)
++			prev_p->thread.fsbase = 0;
++		else
++			prev_p->thread.gsbase = 0;
++	}
++}
++
++static __always_inline void save_fsgs(struct task_struct *task)
++{
++	savesegment(fs, task->thread.fsindex);
++	savesegment(gs, task->thread.gsindex);
++	save_base_legacy(task, task->thread.fsindex, FS);
++	save_base_legacy(task, task->thread.gsindex, GS);
++}
++
++static __always_inline void loadseg(enum which_selector which,
++				    unsigned short sel)
++{
++	if (which == FS)
++		loadsegment(fs, sel);
++	else
++		load_gs_index(sel);
++}
++
++static __always_inline void load_seg_legacy(unsigned short prev_index,
++					    unsigned long prev_base,
++					    unsigned short next_index,
++					    unsigned long next_base,
++					    enum which_selector which)
++{
++	if (likely(next_index <= 3)) {
++		/*
++		 * The next task is using 64-bit TLS, is not using this
++		 * segment at all, or is having fun with arcane CPU features.
++		 */
++		if (next_base == 0) {
++			/*
++			 * Nasty case: on AMD CPUs, we need to forcibly zero
++			 * the base.
++			 */
++			if (static_cpu_has_bug(X86_BUG_NULL_SEG)) {
++				loadseg(which, __USER_DS);
++				loadseg(which, next_index);
++			} else {
++				/*
++				 * We could try to exhaustively detect cases
++				 * under which we can skip the segment load,
++				 * but there's really only one case that matters
++				 * for performance: if both the previous and
++				 * next states are fully zeroed, we can skip
++				 * the load.
++				 *
++				 * (This assumes that prev_base == 0 has no
++				 * false positives.  This is the case on
++				 * Intel-style CPUs.)
++				 */
++				if (likely(prev_index | next_index | prev_base))
++					loadseg(which, next_index);
++			}
++		} else {
++			if (prev_index != next_index)
++				loadseg(which, next_index);
++			wrmsrl(which == FS ? MSR_FS_BASE : MSR_KERNEL_GS_BASE,
++			       next_base);
++		}
++	} else {
++		/*
++		 * The next task is using a real segment.  Loading the selector
++		 * is sufficient.
++		 */
++		loadseg(which, next_index);
++	}
++}
++
+ int copy_thread_tls(unsigned long clone_flags, unsigned long sp,
+ 		unsigned long arg, struct task_struct *p, unsigned long tls)
+ {
+@@ -216,10 +333,19 @@ start_thread_common(struct pt_regs *regs, unsigned long new_ip,
+ 		    unsigned long new_sp,
+ 		    unsigned int _cs, unsigned int _ss, unsigned int _ds)
+ {
++	WARN_ON_ONCE(regs != current_pt_regs());
++
++	if (static_cpu_has(X86_BUG_NULL_SEG)) {
++		/* Loading zero below won't clear the base. */
++		loadsegment(fs, __USER_DS);
++		load_gs_index(__USER_DS);
++	}
++
+ 	loadsegment(fs, 0);
+ 	loadsegment(es, _ds);
+ 	loadsegment(ds, _ds);
+ 	load_gs_index(0);
++
+ 	regs->ip		= new_ip;
+ 	regs->sp		= new_sp;
+ 	regs->cs		= _cs;
+@@ -264,7 +390,6 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 	struct fpu *next_fpu = &next->fpu;
+ 	int cpu = smp_processor_id();
+ 	struct tss_struct *tss = &per_cpu(cpu_tss, cpu);
+-	unsigned prev_fsindex, prev_gsindex;
+ 	fpu_switch_t fpu_switch;
+ 
+ 	fpu_switch = switch_fpu_prepare(prev_fpu, next_fpu, cpu);
+@@ -274,8 +399,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 	 *
+ 	 * (e.g. xen_load_tls())
+ 	 */
+-	savesegment(fs, prev_fsindex);
+-	savesegment(gs, prev_gsindex);
++	save_fsgs(prev_p);
+ 
+ 	/*
+ 	 * Load TLS before restoring any segments so that segment loads
+@@ -314,108 +438,10 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
+ 	if (unlikely(next->ds | prev->ds))
+ 		loadsegment(ds, next->ds);
+ 
+-	/*
+-	 * Switch FS and GS.
+-	 *
+-	 * These are even more complicated than DS and ES: they have
+-	 * 64-bit bases are that controlled by arch_prctl.  The bases
+-	 * don't necessarily match the selectors, as user code can do
+-	 * any number of things to cause them to be inconsistent.
+-	 *
+-	 * We don't promise to preserve the bases if the selectors are
+-	 * nonzero.  We also don't promise to preserve the base if the
+-	 * selector is zero and the base doesn't match whatever was
+-	 * most recently passed to ARCH_SET_FS/GS.  (If/when the
+-	 * FSGSBASE instructions are enabled, we'll need to offer
+-	 * stronger guarantees.)
+-	 *
+-	 * As an invariant,
+-	 * (fsbase != 0 && fsindex != 0) || (gsbase != 0 && gsindex != 0) is
+-	 * impossible.
+-	 */
+-	if (next->fsindex) {
+-		/* Loading a nonzero value into FS sets the index and base. */
+-		loadsegment(fs, next->fsindex);
+-	} else {
+-		if (next->fsbase) {
+-			/* Next index is zero but next base is nonzero. */
+-			if (prev_fsindex)
+-				loadsegment(fs, 0);
+-			wrmsrl(MSR_FS_BASE, next->fsbase);
+-		} else {
+-			/* Next base and index are both zero. */
+-			if (static_cpu_has_bug(X86_BUG_NULL_SEG)) {
+-				/*
+-				 * We don't know the previous base and can't
+-				 * find out without RDMSR.  Forcibly clear it.
+-				 */
+-				loadsegment(fs, __USER_DS);
+-				loadsegment(fs, 0);
+-			} else {
+-				/*
+-				 * If the previous index is zero and ARCH_SET_FS
+-				 * didn't change the base, then the base is
+-				 * also zero and we don't need to do anything.
+-				 */
+-				if (prev->fsbase || prev_fsindex)
+-					loadsegment(fs, 0);
+-			}
+-		}
+-	}
+-	/*
+-	 * Save the old state and preserve the invariant.
+-	 * NB: if prev_fsindex == 0, then we can't reliably learn the base
+-	 * without RDMSR because Intel user code can zero it without telling
+-	 * us and AMD user code can program any 32-bit value without telling
+-	 * us.
+-	 */
+-	if (prev_fsindex)
+-		prev->fsbase = 0;
+-	prev->fsindex = prev_fsindex;
+-
+-	if (next->gsindex) {
+-		/* Loading a nonzero value into GS sets the index and base. */
+-		load_gs_index(next->gsindex);
+-	} else {
+-		if (next->gsbase) {
+-			/* Next index is zero but next base is nonzero. */
+-			if (prev_gsindex)
+-				load_gs_index(0);
+-			wrmsrl(MSR_KERNEL_GS_BASE, next->gsbase);
+-		} else {
+-			/* Next base and index are both zero. */
+-			if (static_cpu_has_bug(X86_BUG_NULL_SEG)) {
+-				/*
+-				 * We don't know the previous base and can't
+-				 * find out without RDMSR.  Forcibly clear it.
+-				 *
+-				 * This contains a pointless SWAPGS pair.
+-				 * Fixing it would involve an explicit check
+-				 * for Xen or a new pvop.
+-				 */
+-				load_gs_index(__USER_DS);
+-				load_gs_index(0);
+-			} else {
+-				/*
+-				 * If the previous index is zero and ARCH_SET_GS
+-				 * didn't change the base, then the base is
+-				 * also zero and we don't need to do anything.
+-				 */
+-				if (prev->gsbase || prev_gsindex)
+-					load_gs_index(0);
+-			}
+-		}
+-	}
+-	/*
+-	 * Save the old state and preserve the invariant.
+-	 * NB: if prev_gsindex == 0, then we can't reliably learn the base
+-	 * without RDMSR because Intel user code can zero it without telling
+-	 * us and AMD user code can program any 32-bit value without telling
+-	 * us.
+-	 */
+-	if (prev_gsindex)
+-		prev->gsbase = 0;
+-	prev->gsindex = prev_gsindex;
++	load_seg_legacy(prev->fsindex, prev->fsbase,
++			next->fsindex, next->fsbase, FS);
++	load_seg_legacy(prev->gsindex, prev->gsbase,
++			next->gsindex, next->gsbase, GS);
+ 
+ 	switch_fpu_finish(next_fpu, fpu_switch);
+ 
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 383f19c6bf24..549b4afd12e1 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5844,6 +5844,8 @@ static void raid5_do_work(struct work_struct *work)
+ 
+ 	spin_unlock_irq(&conf->device_lock);
+ 
++	r5l_flush_stripe_to_raid(conf->log);
++
+ 	async_tx_issue_pending_all();
+ 	blk_finish_plug(&plug);
+ 
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+index e8139514d32c..9e073fb6870a 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_hw.c
+@@ -317,12 +317,12 @@ int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
+ 
+ 	if (v != MBOX_OWNER_DRV) {
+ 		ret = (v == MBOX_OWNER_FW) ? -EBUSY : -ETIMEDOUT;
+-		t4_record_mbox(adap, cmd, MBOX_LEN, access, ret);
++		t4_record_mbox(adap, cmd, size, access, ret);
+ 		return ret;
+ 	}
+ 
+ 	/* Copy in the new mailbox command and send it on its way ... */
+-	t4_record_mbox(adap, cmd, MBOX_LEN, access, 0);
++	t4_record_mbox(adap, cmd, size, access, 0);
+ 	for (i = 0; i < size; i += 8)
+ 		t4_write_reg64(adap, data_reg + i, be64_to_cpu(*p++));
+ 
+@@ -371,7 +371,7 @@ int t4_wr_mbox_meat_timeout(struct adapter *adap, int mbox, const void *cmd,
+ 	}
+ 
+ 	ret = (pcie_fw & PCIE_FW_ERR_F) ? -ENXIO : -ETIMEDOUT;
+-	t4_record_mbox(adap, cmd, MBOX_LEN, access, ret);
++	t4_record_mbox(adap, cmd, size, access, ret);
+ 	dev_err(adap->pdev_dev, "command %#x in mailbox %d timed out\n",
+ 		*(const u8 *)cmd, mbox);
+ 	t4_report_fw_error(adap);
+diff --git a/drivers/net/ethernet/freescale/fman/mac.c b/drivers/net/ethernet/freescale/fman/mac.c
+index 736db9d9b0ad..81021f87e4f3 100644
+--- a/drivers/net/ethernet/freescale/fman/mac.c
++++ b/drivers/net/ethernet/freescale/fman/mac.c
+@@ -622,6 +622,9 @@ static struct platform_device *dpaa_eth_add_device(int fman_id,
+ 		goto no_mem;
+ 	}
+ 
++	pdev->dev.of_node = node;
++	pdev->dev.parent = priv->dev;
++
+ 	ret = platform_device_add_data(pdev, &data, sizeof(data));
+ 	if (ret)
+ 		goto err;
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index 3f4e71148808..fd206889a433 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -3690,7 +3690,7 @@ static noinline void gfar_update_link_state(struct gfar_private *priv)
+ 		u32 tempval1 = gfar_read(&regs->maccfg1);
+ 		u32 tempval = gfar_read(&regs->maccfg2);
+ 		u32 ecntrl = gfar_read(&regs->ecntrl);
+-		u32 tx_flow_oldval = (tempval & MACCFG1_TX_FLOW);
++		u32 tx_flow_oldval = (tempval1 & MACCFG1_TX_FLOW);
+ 
+ 		if (phydev->duplex != priv->oldduplex) {
+ 			if (!(phydev->duplex))
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+index f902c4d3de99..1806b1fc6e4c 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum.c
+@@ -4172,6 +4172,8 @@ static int mlxsw_sp_netdevice_port_upper_event(struct net_device *dev,
+ 			return -EINVAL;
+ 		if (!info->linking)
+ 			break;
++		if (netdev_has_any_upper_dev(upper_dev))
++			return -EINVAL;
+ 		/* HW limitation forbids to put ports to multiple bridges. */
+ 		if (netif_is_bridge_master(upper_dev) &&
+ 		    !mlxsw_sp_master_bridge_check(mlxsw_sp, upper_dev))
+@@ -4185,6 +4187,10 @@ static int mlxsw_sp_netdevice_port_upper_event(struct net_device *dev,
+ 		if (netif_is_lag_port(dev) && is_vlan_dev(upper_dev) &&
+ 		    !netif_is_lag_master(vlan_dev_real_dev(upper_dev)))
+ 			return -EINVAL;
++		if (!info->linking)
++			break;
++		if (netdev_has_any_upper_dev(upper_dev))
++			return -EINVAL;
+ 		break;
+ 	case NETDEV_CHANGEUPPER:
+ 		upper_dev = info->upper_dev;
+diff --git a/drivers/net/ethernet/qlogic/qlge/qlge_dbg.c b/drivers/net/ethernet/qlogic/qlge/qlge_dbg.c
+index 829be21f97b2..be258d90de9e 100644
+--- a/drivers/net/ethernet/qlogic/qlge/qlge_dbg.c
++++ b/drivers/net/ethernet/qlogic/qlge/qlge_dbg.c
+@@ -724,7 +724,7 @@ static void ql_build_coredump_seg_header(
+ 	seg_hdr->cookie = MPI_COREDUMP_COOKIE;
+ 	seg_hdr->segNum = seg_number;
+ 	seg_hdr->segSize = seg_size;
+-	memcpy(seg_hdr->description, desc, (sizeof(seg_hdr->description)) - 1);
++	strncpy(seg_hdr->description, desc, (sizeof(seg_hdr->description)) - 1);
+ }
+ 
+ /*
+diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
+index ff038e507fd6..36a04e182af1 100644
+--- a/drivers/net/hyperv/netvsc_drv.c
++++ b/drivers/net/hyperv/netvsc_drv.c
+@@ -1084,7 +1084,12 @@ static void netvsc_link_change(struct work_struct *w)
+ 	bool notify = false, reschedule = false;
+ 	unsigned long flags, next_reconfig, delay;
+ 
+-	rtnl_lock();
++	/* if changes are happening, comeback later */
++	if (!rtnl_trylock()) {
++		schedule_delayed_work(&ndev_ctx->dwork, LINKCHANGE_INT);
++		return;
++	}
++
+ 	if (ndev_ctx->start_remove)
+ 		goto out_unlock;
+ 
+diff --git a/drivers/net/macsec.c b/drivers/net/macsec.c
+index a5d66e205bb2..2caac0c37059 100644
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@ -3510,6 +3510,7 @@ module_init(macsec_init);
+ module_exit(macsec_exit);
+ 
+ MODULE_ALIAS_RTNL_LINK("macsec");
++MODULE_ALIAS_GENL_FAMILY("macsec");
+ 
+ MODULE_DESCRIPTION("MACsec IEEE 802.1AE");
+ MODULE_LICENSE("GPL v2");
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index 775a6e1fdef9..6e12401b5102 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -674,9 +674,6 @@ void phy_stop_machine(struct phy_device *phydev)
+ 	if (phydev->state > PHY_UP && phydev->state != PHY_HALTED)
+ 		phydev->state = PHY_UP;
+ 	mutex_unlock(&phydev->lock);
+-
+-	/* Now we can run the state machine synchronously */
+-	phy_state_machine(&phydev->state_queue.work);
+ }
+ 
+ /**
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index 5dc128a8da83..96a0661011fd 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -537,8 +537,13 @@ static int vhost_net_rx_peek_head_len(struct vhost_net *net, struct sock *sk)
+ 
+ 		preempt_enable();
+ 
+-		if (vhost_enable_notify(&net->dev, vq))
++		if (!vhost_vq_avail_empty(&net->dev, vq))
+ 			vhost_poll_queue(&vq->poll);
++		else if (unlikely(vhost_enable_notify(&net->dev, vq))) {
++			vhost_disable_notify(&net->dev, vq);
++			vhost_poll_queue(&vq->poll);
++		}
++
+ 		mutex_unlock(&vq->mutex);
+ 
+ 		len = peek_head_len(sk);
+diff --git a/fs/f2fs/recovery.c b/fs/f2fs/recovery.c
+index 2fc84a991325..98c1a63a4614 100644
+--- a/fs/f2fs/recovery.c
++++ b/fs/f2fs/recovery.c
+@@ -316,7 +316,7 @@ static int check_index_in_prev_nodes(struct f2fs_sb_info *sbi,
+ 		return 0;
+ 
+ 	/* Get the previous summary */
+-	for (i = CURSEG_WARM_DATA; i <= CURSEG_COLD_DATA; i++) {
++	for (i = CURSEG_HOT_DATA; i <= CURSEG_COLD_DATA; i++) {
+ 		struct curseg_info *curseg = CURSEG_I(sbi, i);
+ 		if (curseg->segno == segno) {
+ 			sum = curseg->sum_blk->entries[blkoff];
+@@ -626,8 +626,6 @@ int recover_fsync_data(struct f2fs_sb_info *sbi, bool check_only)
+ 	}
+ 
+ 	clear_sbi_flag(sbi, SBI_POR_DOING);
+-	if (err)
+-		set_ckpt_flags(sbi, CP_ERROR_FLAG);
+ 	mutex_unlock(&sbi->cp_mutex);
+ 
+ 	/* let's drop all the directory inodes for clean checkpoint */
+diff --git a/fs/inode.c b/fs/inode.c
+index 88110fd0b282..920aa0b1c6b0 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -637,6 +637,7 @@ void evict_inodes(struct super_block *sb)
+ 
+ 	dispose_list(&dispose);
+ }
++EXPORT_SYMBOL_GPL(evict_inodes);
+ 
+ /**
+  * invalidate_inodes	- attempt to free all inodes on a superblock
+diff --git a/fs/internal.h b/fs/internal.h
+index f4da3341b4a3..8b7143b0211c 100644
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@ -136,7 +136,6 @@ extern bool atime_needs_update_rcu(const struct path *, struct inode *);
+ extern void inode_io_list_del(struct inode *inode);
+ 
+ extern long get_nr_dirty_inodes(void);
+-extern void evict_inodes(struct super_block *);
+ extern int invalidate_inodes(struct super_block *, bool);
+ 
+ /*
+diff --git a/fs/iomap.c b/fs/iomap.c
+index 798c291cbc75..a49db8806a3a 100644
+--- a/fs/iomap.c
++++ b/fs/iomap.c
+@@ -281,7 +281,7 @@ iomap_dirty_actor(struct inode *inode, loff_t pos, loff_t length, void *data,
+ 		unsigned long bytes;	/* Bytes to write to page */
+ 
+ 		offset = (pos & (PAGE_SIZE - 1));
+-		bytes = min_t(unsigned long, PAGE_SIZE - offset, length);
++		bytes = min_t(loff_t, PAGE_SIZE - offset, length);
+ 
+ 		rpage = __iomap_read_page(inode, pos);
+ 		if (IS_ERR(rpage))
+@@ -376,7 +376,7 @@ iomap_zero_range_actor(struct inode *inode, loff_t pos, loff_t count,
+ 		unsigned offset, bytes;
+ 
+ 		offset = pos & (PAGE_SIZE - 1); /* Within page */
+-		bytes = min_t(unsigned, PAGE_SIZE - offset, count);
++		bytes = min_t(loff_t, PAGE_SIZE - offset, count);
+ 
+ 		if (IS_DAX(inode))
+ 			status = iomap_dax_zero(pos, offset, bytes, iomap);
+diff --git a/fs/xfs/libxfs/xfs_attr_leaf.c b/fs/xfs/libxfs/xfs_attr_leaf.c
+index 2852521fc8ec..c6c15e5717e4 100644
+--- a/fs/xfs/libxfs/xfs_attr_leaf.c
++++ b/fs/xfs/libxfs/xfs_attr_leaf.c
+@@ -351,7 +351,7 @@ xfs_attr3_leaf_read(
+ 
+ 	err = xfs_da_read_buf(tp, dp, bno, mappedbno, bpp,
+ 				XFS_ATTR_FORK, &xfs_attr3_leaf_buf_ops);
+-	if (!err && tp)
++	if (!err && tp && *bpp)
+ 		xfs_trans_buf_set_type(tp, *bpp, XFS_BLFT_ATTR_LEAF_BUF);
+ 	return err;
+ }
+diff --git a/fs/xfs/libxfs/xfs_bmap.c b/fs/xfs/libxfs/xfs_bmap.c
+index 2a8cbd15d5d1..d2f4ab175096 100644
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@ -579,7 +579,7 @@ xfs_bmap_validate_ret(
+ 
+ #else
+ #define xfs_bmap_check_leaf_extents(cur, ip, whichfork)		do { } while (0)
+-#define	xfs_bmap_validate_ret(bno,len,flags,mval,onmap,nmap)
++#define	xfs_bmap_validate_ret(bno,len,flags,mval,onmap,nmap)	do { } while (0)
+ #endif /* DEBUG */
+ 
+ /*
+@@ -5555,6 +5555,8 @@ __xfs_bunmapi(
+ 	int			whichfork;	/* data or attribute fork */
+ 	xfs_fsblock_t		sum;
+ 	xfs_filblks_t		len = *rlen;	/* length to unmap in file */
++	xfs_fileoff_t		max_len;
++	xfs_agnumber_t		prev_agno = NULLAGNUMBER, agno;
+ 
+ 	trace_xfs_bunmap(ip, bno, len, flags, _RET_IP_);
+ 
+@@ -5576,6 +5578,16 @@ __xfs_bunmapi(
+ 	ASSERT(len > 0);
+ 	ASSERT(nexts >= 0);
+ 
++	/*
++	 * Guesstimate how many blocks we can unmap without running the risk of
++	 * blowing out the transaction with a mix of EFIs and reflink
++	 * adjustments.
++	 */
++	if (xfs_is_reflink_inode(ip) && whichfork == XFS_DATA_FORK)
++		max_len = min(len, xfs_refcount_max_unmap(tp->t_log_res));
++	else
++		max_len = len;
++
+ 	if (!(ifp->if_flags & XFS_IFEXTENTS) &&
+ 	    (error = xfs_iread_extents(tp, ip, whichfork)))
+ 		return error;
+@@ -5621,7 +5633,7 @@ __xfs_bunmapi(
+ 
+ 	extno = 0;
+ 	while (bno != (xfs_fileoff_t)-1 && bno >= start && lastx >= 0 &&
+-	       (nexts == 0 || extno < nexts)) {
++	       (nexts == 0 || extno < nexts) && max_len > 0) {
+ 		/*
+ 		 * Is the found extent after a hole in which bno lives?
+ 		 * Just back up to the previous extent, if so.
+@@ -5647,6 +5659,17 @@ __xfs_bunmapi(
+ 		ASSERT(ep != NULL);
+ 		del = got;
+ 		wasdel = isnullstartblock(del.br_startblock);
++
++		/*
++		 * Make sure we don't touch multiple AGF headers out of order
++		 * in a single transaction, as that could cause AB-BA deadlocks.
++		 */
++		if (!wasdel) {
++			agno = XFS_FSB_TO_AGNO(mp, del.br_startblock);
++			if (prev_agno != NULLAGNUMBER && prev_agno > agno)
++				break;
++			prev_agno = agno;
++		}
+ 		if (got.br_startoff < start) {
+ 			del.br_startoff = start;
+ 			del.br_blockcount -= start - got.br_startoff;
+@@ -5655,6 +5678,15 @@ __xfs_bunmapi(
+ 		}
+ 		if (del.br_startoff + del.br_blockcount > bno + 1)
+ 			del.br_blockcount = bno + 1 - del.br_startoff;
++
++		/* How much can we safely unmap? */
++		if (max_len < del.br_blockcount) {
++			del.br_startoff += del.br_blockcount - max_len;
++			if (!wasdel)
++				del.br_startblock += del.br_blockcount - max_len;
++			del.br_blockcount = max_len;
++		}
++
+ 		sum = del.br_startblock + del.br_blockcount;
+ 		if (isrt &&
+ 		    (mod = do_mod(sum, mp->m_sb.sb_rextsize))) {
+@@ -5835,6 +5867,7 @@ __xfs_bunmapi(
+ 		if (!isrt && wasdel)
+ 			xfs_mod_fdblocks(mp, (int64_t)del.br_blockcount, false);
+ 
++		max_len -= del.br_blockcount;
+ 		bno = del.br_startoff - 1;
+ nodelete:
+ 		/*
+@@ -6604,25 +6637,33 @@ xfs_bmap_finish_one(
+ 	int				whichfork,
+ 	xfs_fileoff_t			startoff,
+ 	xfs_fsblock_t			startblock,
+-	xfs_filblks_t			blockcount,
++	xfs_filblks_t			*blockcount,
+ 	xfs_exntst_t			state)
+ {
+ 	struct xfs_bmbt_irec		bmap;
+ 	int				nimaps = 1;
+ 	xfs_fsblock_t			firstfsb;
+ 	int				flags = XFS_BMAPI_REMAP;
+-	int				done;
+ 	int				error = 0;
+ 
+ 	bmap.br_startblock = startblock;
+ 	bmap.br_startoff = startoff;
+-	bmap.br_blockcount = blockcount;
++	bmap.br_blockcount = *blockcount;
+ 	bmap.br_state = state;
+ 
++	/*
++	 * firstfsb is tied to the transaction lifetime and is used to
++	 * ensure correct AG locking order and schedule work item
++	 * continuations.  XFS_BUI_MAX_FAST_EXTENTS (== 1) restricts us
++	 * to only making one bmap call per transaction, so it should
++	 * be safe to have it as a local variable here.
++	 */
++	firstfsb = NULLFSBLOCK;
++
+ 	trace_xfs_bmap_deferred(tp->t_mountp,
+ 			XFS_FSB_TO_AGNO(tp->t_mountp, startblock), type,
+ 			XFS_FSB_TO_AGBNO(tp->t_mountp, startblock),
+-			ip->i_ino, whichfork, startoff, blockcount, state);
++			ip->i_ino, whichfork, startoff, *blockcount, state);
+ 
+ 	if (whichfork != XFS_DATA_FORK && whichfork != XFS_ATTR_FORK)
+ 		return -EFSCORRUPTED;
+@@ -6641,12 +6682,11 @@ xfs_bmap_finish_one(
+ 					bmap.br_blockcount, flags, &firstfsb,
+ 					bmap.br_blockcount, &bmap, &nimaps,
+ 					dfops);
++		*blockcount = 0;
+ 		break;
+ 	case XFS_BMAP_UNMAP:
+-		error = xfs_bunmapi(tp, ip, bmap.br_startoff,
+-				bmap.br_blockcount, flags, 1, &firstfsb,
+-				dfops, &done);
+-		ASSERT(done);
++		error = __xfs_bunmapi(tp, ip, startoff, blockcount,
++				XFS_BMAPI_REMAP, 1, &firstfsb, dfops);
+ 		break;
+ 	default:
+ 		ASSERT(0);
+diff --git a/fs/xfs/libxfs/xfs_bmap.h b/fs/xfs/libxfs/xfs_bmap.h
+index e7d40b39f18f..db53ac7ff6df 100644
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@ -265,7 +265,7 @@ struct xfs_bmap_intent {
+ int	xfs_bmap_finish_one(struct xfs_trans *tp, struct xfs_defer_ops *dfops,
+ 		struct xfs_inode *ip, enum xfs_bmap_intent_type type,
+ 		int whichfork, xfs_fileoff_t startoff, xfs_fsblock_t startblock,
+-		xfs_filblks_t blockcount, xfs_exntst_t state);
++		xfs_filblks_t *blockcount, xfs_exntst_t state);
+ int	xfs_bmap_map_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
+ 		struct xfs_inode *ip, struct xfs_bmbt_irec *imap);
+ int	xfs_bmap_unmap_extent(struct xfs_mount *mp, struct xfs_defer_ops *dfops,
+diff --git a/fs/xfs/libxfs/xfs_bmap_btree.c b/fs/xfs/libxfs/xfs_bmap_btree.c
+index 5c3918678bb6..9968a746c649 100644
+--- a/fs/xfs/libxfs/xfs_bmap_btree.c
++++ b/fs/xfs/libxfs/xfs_bmap_btree.c
+@@ -888,6 +888,7 @@ xfs_bmbt_change_owner(
+ 	cur = xfs_bmbt_init_cursor(ip->i_mount, tp, ip, whichfork);
+ 	if (!cur)
+ 		return -ENOMEM;
++	cur->bc_private.b.flags |= XFS_BTCUR_BPRV_INVALID_OWNER;
+ 
+ 	error = xfs_btree_change_owner(cur, new_owner, buffer_list);
+ 	xfs_btree_del_cursor(cur, error ? XFS_BTREE_ERROR : XFS_BTREE_NOERROR);
+diff --git a/fs/xfs/libxfs/xfs_btree.c b/fs/xfs/libxfs/xfs_btree.c
+index 91c68913d495..4ad1e214b1b2 100644
+--- a/fs/xfs/libxfs/xfs_btree.c
++++ b/fs/xfs/libxfs/xfs_btree.c
+@@ -714,7 +714,8 @@ xfs_btree_firstrec(
+ 	 * Get the block pointer for this level.
+ 	 */
+ 	block = xfs_btree_get_block(cur, level, &bp);
+-	xfs_btree_check_block(cur, block, level, bp);
++	if (xfs_btree_check_block(cur, block, level, bp))
++		return 0;
+ 	/*
+ 	 * It's empty, there is no such record.
+ 	 */
+@@ -743,7 +744,8 @@ xfs_btree_lastrec(
+ 	 * Get the block pointer for this level.
+ 	 */
+ 	block = xfs_btree_get_block(cur, level, &bp);
+-	xfs_btree_check_block(cur, block, level, bp);
++	if (xfs_btree_check_block(cur, block, level, bp))
++		return 0;
+ 	/*
+ 	 * It's empty, there is no such record.
+ 	 */
+@@ -1772,6 +1774,7 @@ xfs_btree_lookup_get_block(
+ 
+ 	/* Check the inode owner since the verifiers don't. */
+ 	if (xfs_sb_version_hascrc(&cur->bc_mp->m_sb) &&
++	    !(cur->bc_private.b.flags & XFS_BTCUR_BPRV_INVALID_OWNER) &&
+ 	    (cur->bc_flags & XFS_BTREE_LONG_PTRS) &&
+ 	    be64_to_cpu((*blkp)->bb_u.l.bb_owner) !=
+ 			cur->bc_private.b.ip->i_ino)
+@@ -4432,10 +4435,15 @@ xfs_btree_block_change_owner(
+ 
+ 	/* modify the owner */
+ 	block = xfs_btree_get_block(cur, level, &bp);
+-	if (cur->bc_flags & XFS_BTREE_LONG_PTRS)
++	if (cur->bc_flags & XFS_BTREE_LONG_PTRS) {
++		if (block->bb_u.l.bb_owner == cpu_to_be64(bbcoi->new_owner))
++			return 0;
+ 		block->bb_u.l.bb_owner = cpu_to_be64(bbcoi->new_owner);
+-	else
++	} else {
++		if (block->bb_u.s.bb_owner == cpu_to_be32(bbcoi->new_owner))
++			return 0;
+ 		block->bb_u.s.bb_owner = cpu_to_be32(bbcoi->new_owner);
++	}
+ 
+ 	/*
+ 	 * If the block is a root block hosted in an inode, we might not have a
+@@ -4444,16 +4452,19 @@ xfs_btree_block_change_owner(
+ 	 * block is formatted into the on-disk inode fork. We still change it,
+ 	 * though, so everything is consistent in memory.
+ 	 */
+-	if (bp) {
+-		if (cur->bc_tp) {
+-			xfs_trans_ordered_buf(cur->bc_tp, bp);
++	if (!bp) {
++		ASSERT(cur->bc_flags & XFS_BTREE_ROOT_IN_INODE);
++		ASSERT(level == cur->bc_nlevels - 1);
++		return 0;
++	}
++
++	if (cur->bc_tp) {
++		if (!xfs_trans_ordered_buf(cur->bc_tp, bp)) {
+ 			xfs_btree_log_block(cur, bp, XFS_BB_OWNER);
+-		} else {
+-			xfs_buf_delwri_queue(bp, bbcoi->buffer_list);
++			return -EAGAIN;
+ 		}
+ 	} else {
+-		ASSERT(cur->bc_flags & XFS_BTREE_ROOT_IN_INODE);
+-		ASSERT(level == cur->bc_nlevels - 1);
++		xfs_buf_delwri_queue(bp, bbcoi->buffer_list);
+ 	}
+ 
+ 	return 0;
+diff --git a/fs/xfs/libxfs/xfs_btree.h b/fs/xfs/libxfs/xfs_btree.h
+index 3b0fc1afada5..33c7be2357b9 100644
+--- a/fs/xfs/libxfs/xfs_btree.h
++++ b/fs/xfs/libxfs/xfs_btree.h
+@@ -268,7 +268,8 @@ typedef struct xfs_btree_cur
+ 			short		forksize;	/* fork's inode space */
+ 			char		whichfork;	/* data or attr fork */
+ 			char		flags;		/* flags */
+-#define	XFS_BTCUR_BPRV_WASDEL	1			/* was delayed */
++#define	XFS_BTCUR_BPRV_WASDEL		(1<<0)		/* was delayed */
++#define	XFS_BTCUR_BPRV_INVALID_OWNER	(1<<1)		/* for ext swap */
+ 		} b;
+ 	}		bc_private;	/* per-btree type data */
+ } xfs_btree_cur_t;
+diff --git a/fs/xfs/libxfs/xfs_da_btree.c b/fs/xfs/libxfs/xfs_da_btree.c
+index 1bdf2888295b..b305dbfd81c4 100644
+--- a/fs/xfs/libxfs/xfs_da_btree.c
++++ b/fs/xfs/libxfs/xfs_da_btree.c
+@@ -263,7 +263,7 @@ xfs_da3_node_read(
+ 
+ 	err = xfs_da_read_buf(tp, dp, bno, mappedbno, bpp,
+ 					which_fork, &xfs_da3_node_buf_ops);
+-	if (!err && tp) {
++	if (!err && tp && *bpp) {
+ 		struct xfs_da_blkinfo	*info = (*bpp)->b_addr;
+ 		int			type;
+ 
+diff --git a/fs/xfs/libxfs/xfs_dir2_block.c b/fs/xfs/libxfs/xfs_dir2_block.c
+index aa17cb788946..43c902f7a68d 100644
+--- a/fs/xfs/libxfs/xfs_dir2_block.c
++++ b/fs/xfs/libxfs/xfs_dir2_block.c
+@@ -139,7 +139,7 @@ xfs_dir3_block_read(
+ 
+ 	err = xfs_da_read_buf(tp, dp, mp->m_dir_geo->datablk, -1, bpp,
+ 				XFS_DATA_FORK, &xfs_dir3_block_buf_ops);
+-	if (!err && tp)
++	if (!err && tp && *bpp)
+ 		xfs_trans_buf_set_type(tp, *bpp, XFS_BLFT_DIR_BLOCK_BUF);
+ 	return err;
+ }
+diff --git a/fs/xfs/libxfs/xfs_dir2_leaf.c b/fs/xfs/libxfs/xfs_dir2_leaf.c
+index b887fb2a2bcf..f2e342e05365 100644
+--- a/fs/xfs/libxfs/xfs_dir2_leaf.c
++++ b/fs/xfs/libxfs/xfs_dir2_leaf.c
+@@ -268,7 +268,7 @@ xfs_dir3_leaf_read(
+ 
+ 	err = xfs_da_read_buf(tp, dp, fbno, mappedbno, bpp,
+ 				XFS_DATA_FORK, &xfs_dir3_leaf1_buf_ops);
+-	if (!err && tp)
++	if (!err && tp && *bpp)
+ 		xfs_trans_buf_set_type(tp, *bpp, XFS_BLFT_DIR_LEAF1_BUF);
+ 	return err;
+ }
+@@ -285,7 +285,7 @@ xfs_dir3_leafn_read(
+ 
+ 	err = xfs_da_read_buf(tp, dp, fbno, mappedbno, bpp,
+ 				XFS_DATA_FORK, &xfs_dir3_leafn_buf_ops);
+-	if (!err && tp)
++	if (!err && tp && *bpp)
+ 		xfs_trans_buf_set_type(tp, *bpp, XFS_BLFT_DIR_LEAFN_BUF);
+ 	return err;
+ }
+diff --git a/fs/xfs/libxfs/xfs_ialloc.c b/fs/xfs/libxfs/xfs_ialloc.c
+index a2818f6e8598..42fef0731e2a 100644
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@ -368,8 +368,6 @@ xfs_ialloc_inode_init(
+ 				 * transaction and pin the log appropriately.
+ 				 */
+ 				xfs_trans_ordered_buf(tp, fbuf);
+-				xfs_trans_log_buf(tp, fbuf, 0,
+-						  BBTOB(fbuf->b_length) - 1);
+ 			}
+ 		} else {
+ 			fbuf->b_flags |= XBF_DONE;
+@@ -1123,6 +1121,7 @@ xfs_dialloc_ag_inobt(
+ 	int			error;
+ 	int			offset;
+ 	int			i, j;
++	int			searchdistance = 10;
+ 
+ 	pag = xfs_perag_get(mp, agno);
+ 
+@@ -1149,7 +1148,6 @@ xfs_dialloc_ag_inobt(
+ 	if (pagno == agno) {
+ 		int		doneleft;	/* done, to the left */
+ 		int		doneright;	/* done, to the right */
+-		int		searchdistance = 10;
+ 
+ 		error = xfs_inobt_lookup(cur, pagino, XFS_LOOKUP_LE, &i);
+ 		if (error)
+@@ -1210,21 +1208,9 @@ xfs_dialloc_ag_inobt(
+ 		/*
+ 		 * Loop until we find an inode chunk with a free inode.
+ 		 */
+-		while (!doneleft || !doneright) {
++		while (--searchdistance > 0 && (!doneleft || !doneright)) {
+ 			int	useleft;  /* using left inode chunk this time */
+ 
+-			if (!--searchdistance) {
+-				/*
+-				 * Not in range - save last search
+-				 * location and allocate a new inode
+-				 */
+-				xfs_btree_del_cursor(tcur, XFS_BTREE_NOERROR);
+-				pag->pagl_leftrec = trec.ir_startino;
+-				pag->pagl_rightrec = rec.ir_startino;
+-				pag->pagl_pagino = pagino;
+-				goto newino;
+-			}
+-
+ 			/* figure out the closer block if both are valid. */
+ 			if (!doneleft && !doneright) {
+ 				useleft = pagino -
+@@ -1236,13 +1222,13 @@ xfs_dialloc_ag_inobt(
+ 
+ 			/* free inodes to the left? */
+ 			if (useleft && trec.ir_freecount) {
+-				rec = trec;
+ 				xfs_btree_del_cursor(cur, XFS_BTREE_NOERROR);
+ 				cur = tcur;
+ 
+ 				pag->pagl_leftrec = trec.ir_startino;
+ 				pag->pagl_rightrec = rec.ir_startino;
+ 				pag->pagl_pagino = pagino;
++				rec = trec;
+ 				goto alloc_inode;
+ 			}
+ 
+@@ -1268,26 +1254,37 @@ xfs_dialloc_ag_inobt(
+ 				goto error1;
+ 		}
+ 
+-		/*
+-		 * We've reached the end of the btree. because
+-		 * we are only searching a small chunk of the
+-		 * btree each search, there is obviously free
+-		 * inodes closer to the parent inode than we
+-		 * are now. restart the search again.
+-		 */
+-		pag->pagl_pagino = NULLAGINO;
+-		pag->pagl_leftrec = NULLAGINO;
+-		pag->pagl_rightrec = NULLAGINO;
+-		xfs_btree_del_cursor(tcur, XFS_BTREE_NOERROR);
+-		xfs_btree_del_cursor(cur, XFS_BTREE_NOERROR);
+-		goto restart_pagno;
++		if (searchdistance <= 0) {
++			/*
++			 * Not in range - save last search
++			 * location and allocate a new inode
++			 */
++			xfs_btree_del_cursor(tcur, XFS_BTREE_NOERROR);
++			pag->pagl_leftrec = trec.ir_startino;
++			pag->pagl_rightrec = rec.ir_startino;
++			pag->pagl_pagino = pagino;
++
++		} else {
++			/*
++			 * We've reached the end of the btree. because
++			 * we are only searching a small chunk of the
++			 * btree each search, there is obviously free
++			 * inodes closer to the parent inode than we
++			 * are now. restart the search again.
++			 */
++			pag->pagl_pagino = NULLAGINO;
++			pag->pagl_leftrec = NULLAGINO;
++			pag->pagl_rightrec = NULLAGINO;
++			xfs_btree_del_cursor(tcur, XFS_BTREE_NOERROR);
++			xfs_btree_del_cursor(cur, XFS_BTREE_NOERROR);
++			goto restart_pagno;
++		}
+ 	}
+ 
+ 	/*
+ 	 * In a different AG from the parent.
+ 	 * See if the most recently allocated block has any free.
+ 	 */
+-newino:
+ 	if (agi->agi_newino != cpu_to_be32(NULLAGINO)) {
+ 		error = xfs_inobt_lookup(cur, be32_to_cpu(agi->agi_newino),
+ 					 XFS_LOOKUP_EQ, &i);
+diff --git a/fs/xfs/libxfs/xfs_inode_fork.c b/fs/xfs/libxfs/xfs_inode_fork.c
+index 8a37efe04de3..4e30448c4465 100644
+--- a/fs/xfs/libxfs/xfs_inode_fork.c
++++ b/fs/xfs/libxfs/xfs_inode_fork.c
+@@ -1539,14 +1539,11 @@ xfs_iext_realloc_indirect(
+ 	xfs_ifork_t	*ifp,		/* inode fork pointer */
+ 	int		new_size)	/* new indirection array size */
+ {
+-	int		nlists;		/* number of irec's (ex lists) */
+-	int		size;		/* current indirection array size */
+-
+ 	ASSERT(ifp->if_flags & XFS_IFEXTIREC);
+-	nlists = ifp->if_real_bytes / XFS_IEXT_BUFSZ;
+-	size = nlists * sizeof(xfs_ext_irec_t);
+ 	ASSERT(ifp->if_real_bytes);
+-	ASSERT((new_size >= 0) && (new_size != size));
++	ASSERT((new_size >= 0) &&
++	       (new_size != ((ifp->if_real_bytes / XFS_IEXT_BUFSZ) *
++			     sizeof(xfs_ext_irec_t))));
+ 	if (new_size == 0) {
+ 		xfs_iext_destroy(ifp);
+ 	} else {
+diff --git a/fs/xfs/libxfs/xfs_refcount.c b/fs/xfs/libxfs/xfs_refcount.c
+index 82a38d86ebad..d71cb63cdea3 100644
+--- a/fs/xfs/libxfs/xfs_refcount.c
++++ b/fs/xfs/libxfs/xfs_refcount.c
+@@ -784,14 +784,6 @@ xfs_refcount_merge_extents(
+ }
+ 
+ /*
+- * While we're adjusting the refcounts records of an extent, we have
+- * to keep an eye on the number of extents we're dirtying -- run too
+- * many in a single transaction and we'll exceed the transaction's
+- * reservation and crash the fs.  Each record adds 12 bytes to the
+- * log (plus any key updates) so we'll conservatively assume 24 bytes
+- * per record.  We must also leave space for btree splits on both ends
+- * of the range and space for the CUD and a new CUI.
+- *
+  * XXX: This is a pretty hand-wavy estimate.  The penalty for guessing
+  * true incorrectly is a shutdown FS; the penalty for guessing false
+  * incorrectly is more transaction rolls than might be necessary.
+@@ -822,7 +814,7 @@ xfs_refcount_still_have_space(
+ 	else if (overhead > cur->bc_tp->t_log_res)
+ 		return false;
+ 	return  cur->bc_tp->t_log_res - overhead >
+-		cur->bc_private.a.priv.refc.nr_ops * 32;
++		cur->bc_private.a.priv.refc.nr_ops * XFS_REFCOUNT_ITEM_OVERHEAD;
+ }
+ 
+ /*
+@@ -1648,6 +1640,10 @@ xfs_refcount_recover_cow_leftovers(
+ 	error = xfs_alloc_read_agf(mp, tp, agno, 0, &agbp);
+ 	if (error)
+ 		goto out_trans;
++	if (!agbp) {
++		error = -ENOMEM;
++		goto out_trans;
++	}
+ 	cur = xfs_refcountbt_init_cursor(mp, tp, agbp, agno, NULL);
+ 
+ 	/* Find all the leftover CoW staging extents. */
+diff --git a/fs/xfs/libxfs/xfs_refcount.h b/fs/xfs/libxfs/xfs_refcount.h
+index 098dc668ab2c..eafb9d1f3b37 100644
+--- a/fs/xfs/libxfs/xfs_refcount.h
++++ b/fs/xfs/libxfs/xfs_refcount.h
+@@ -67,4 +67,20 @@ extern int xfs_refcount_free_cow_extent(struct xfs_mount *mp,
+ extern int xfs_refcount_recover_cow_leftovers(struct xfs_mount *mp,
+ 		xfs_agnumber_t agno);
+ 
++/*
++ * While we're adjusting the refcounts records of an extent, we have
++ * to keep an eye on the number of extents we're dirtying -- run too
++ * many in a single transaction and we'll exceed the transaction's
++ * reservation and crash the fs.  Each record adds 12 bytes to the
++ * log (plus any key updates) so we'll conservatively assume 32 bytes
++ * per record.  We must also leave space for btree splits on both ends
++ * of the range and space for the CUD and a new CUI.
++ */
++#define XFS_REFCOUNT_ITEM_OVERHEAD	32
++
++static inline xfs_fileoff_t xfs_refcount_max_unmap(int log_res)
++{
++	return (log_res * 3 / 4) / XFS_REFCOUNT_ITEM_OVERHEAD;
++}
++
+ #endif	/* __XFS_REFCOUNT_H__ */
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 578981412615..d23889e0bedc 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -90,11 +90,11 @@ xfs_find_bdev_for_inode(
+  * associated buffer_heads, paying attention to the start and end offsets that
+  * we need to process on the page.
+  *
+- * Landmine Warning: bh->b_end_io() will call end_page_writeback() on the last
+- * buffer in the IO. Once it does this, it is unsafe to access the bufferhead or
+- * the page at all, as we may be racing with memory reclaim and it can free both
+- * the bufferhead chain and the page as it will see the page as clean and
+- * unused.
++ * Note that we open code the action in end_buffer_async_write here so that we
++ * only have to iterate over the buffers attached to the page once.  This is not
++ * only more efficient, but also ensures that we only calls end_page_writeback
++ * at the end of the iteration, and thus avoids the pitfall of having the page
++ * and buffers potentially freed after every call to end_buffer_async_write.
+  */
+ static void
+ xfs_finish_page_writeback(
+@@ -102,29 +102,45 @@ xfs_finish_page_writeback(
+ 	struct bio_vec		*bvec,
+ 	int			error)
+ {
+-	unsigned int		end = bvec->bv_offset + bvec->bv_len - 1;
+-	struct buffer_head	*head, *bh, *next;
++	struct buffer_head	*head = page_buffers(bvec->bv_page), *bh = head;
++	bool			busy = false;
+ 	unsigned int		off = 0;
+-	unsigned int		bsize;
++	unsigned long		flags;
+ 
+ 	ASSERT(bvec->bv_offset < PAGE_SIZE);
+ 	ASSERT((bvec->bv_offset & (i_blocksize(inode) - 1)) == 0);
+-	ASSERT(end < PAGE_SIZE);
++	ASSERT(bvec->bv_offset + bvec->bv_len <= PAGE_SIZE);
+ 	ASSERT((bvec->bv_len & (i_blocksize(inode) - 1)) == 0);
+ 
+-	bh = head = page_buffers(bvec->bv_page);
+-
+-	bsize = bh->b_size;
++	local_irq_save(flags);
++	bit_spin_lock(BH_Uptodate_Lock, &head->b_state);
+ 	do {
+-		if (off > end)
+-			break;
+-		next = bh->b_this_page;
+-		if (off < bvec->bv_offset)
+-			goto next_bh;
+-		bh->b_end_io(bh, !error);
+-next_bh:
+-		off += bsize;
+-	} while ((bh = next) != head);
++		if (off >= bvec->bv_offset &&
++		    off < bvec->bv_offset + bvec->bv_len) {
++			ASSERT(buffer_async_write(bh));
++			ASSERT(bh->b_end_io == NULL);
++
++			if (error) {
++				mapping_set_error(bvec->bv_page->mapping, -EIO);
++				set_buffer_write_io_error(bh);
++				clear_buffer_uptodate(bh);
++				SetPageError(bvec->bv_page);
++			} else {
++				set_buffer_uptodate(bh);
++			}
++			clear_buffer_async_write(bh);
++			unlock_buffer(bh);
++		} else if (buffer_async_write(bh)) {
++			ASSERT(buffer_locked(bh));
++			busy = true;
++		}
++		off += bh->b_size;
++	} while ((bh = bh->b_this_page) != head);
++	bit_spin_unlock(BH_Uptodate_Lock, &head->b_state);
++	local_irq_restore(flags);
++
++	if (!busy)
++		end_page_writeback(bvec->bv_page);
+ }
+ 
+ /*
+@@ -138,8 +154,10 @@ xfs_destroy_ioend(
+ 	int			error)
+ {
+ 	struct inode		*inode = ioend->io_inode;
+-	struct bio		*last = ioend->io_bio;
+-	struct bio		*bio, *next;
++	struct bio		*bio = &ioend->io_inline_bio;
++	struct bio		*last = ioend->io_bio, *next;
++	u64			start = bio->bi_iter.bi_sector;
++	bool			quiet = bio_flagged(bio, BIO_QUIET);
+ 
+ 	for (bio = &ioend->io_inline_bio; bio; bio = next) {
+ 		struct bio_vec	*bvec;
+@@ -160,6 +178,11 @@ xfs_destroy_ioend(
+ 
+ 		bio_put(bio);
+ 	}
++
++	if (unlikely(error && !quiet)) {
++		xfs_err_ratelimited(XFS_I(inode)->i_mount,
++			"writeback error on sector %llu", start);
++	}
+ }
+ 
+ /*
+@@ -427,7 +450,8 @@ xfs_start_buffer_writeback(
+ 	ASSERT(!buffer_delay(bh));
+ 	ASSERT(!buffer_unwritten(bh));
+ 
+-	mark_buffer_async_write(bh);
++	bh->b_end_io = NULL;
++	set_buffer_async_write(bh);
+ 	set_buffer_uptodate(bh);
+ 	clear_buffer_dirty(bh);
+ }
+@@ -1566,9 +1590,12 @@ xfs_vm_bmap(
+ 	 * The swap code (ab-)uses ->bmap to get a block mapping and then
+ 	 * bypasseѕ the file system for actual I/O.  We really can't allow
+ 	 * that on reflinks inodes, so we have to skip out here.  And yes,
+-	 * 0 is the magic code for a bmap error..
++	 * 0 is the magic code for a bmap error.
++	 *
++	 * Since we don't pass back blockdev info, we can't return bmap
++	 * information for rt files either.
+ 	 */
+-	if (xfs_is_reflink_inode(ip)) {
++	if (xfs_is_reflink_inode(ip) || XFS_IS_REALTIME_INODE(ip)) {
+ 		xfs_iunlock(ip, XFS_IOLOCK_SHARED);
+ 		return 0;
+ 	}
+diff --git a/fs/xfs/xfs_bmap_item.c b/fs/xfs/xfs_bmap_item.c
+index c4b90e794e41..5a54dcd7e7b1 100644
+--- a/fs/xfs/xfs_bmap_item.c
++++ b/fs/xfs/xfs_bmap_item.c
+@@ -395,6 +395,7 @@ xfs_bui_recover(
+ 	struct xfs_map_extent		*bmap;
+ 	xfs_fsblock_t			startblock_fsb;
+ 	xfs_fsblock_t			inode_fsb;
++	xfs_filblks_t			count;
+ 	bool				op_ok;
+ 	struct xfs_bud_log_item		*budp;
+ 	enum xfs_bmap_intent_type	type;
+@@ -403,6 +404,7 @@ xfs_bui_recover(
+ 	struct xfs_trans		*tp;
+ 	struct xfs_inode		*ip = NULL;
+ 	struct xfs_defer_ops		dfops;
++	struct xfs_bmbt_irec		irec;
+ 	xfs_fsblock_t			firstfsb;
+ 
+ 	ASSERT(!test_bit(XFS_BUI_RECOVERED, &buip->bui_flags));
+@@ -480,13 +482,24 @@ xfs_bui_recover(
+ 	}
+ 	xfs_trans_ijoin(tp, ip, 0);
+ 
++	count = bmap->me_len;
+ 	error = xfs_trans_log_finish_bmap_update(tp, budp, &dfops, type,
+ 			ip, whichfork, bmap->me_startoff,
+-			bmap->me_startblock, bmap->me_len,
+-			state);
++			bmap->me_startblock, &count, state);
+ 	if (error)
+ 		goto err_dfops;
+ 
++	if (count > 0) {
++		ASSERT(type == XFS_BMAP_UNMAP);
++		irec.br_startblock = bmap->me_startblock;
++		irec.br_blockcount = count;
++		irec.br_startoff = bmap->me_startoff;
++		irec.br_state = state;
++		error = xfs_bmap_unmap_extent(tp->t_mountp, &dfops, ip, &irec);
++		if (error)
++			goto err_dfops;
++	}
++
+ 	/* Finish transaction, free inodes. */
+ 	error = xfs_defer_finish(&tp, &dfops, NULL);
+ 	if (error)
+diff --git a/fs/xfs/xfs_bmap_util.c b/fs/xfs/xfs_bmap_util.c
+index 87b495e2f15a..5ffefac081f7 100644
+--- a/fs/xfs/xfs_bmap_util.c
++++ b/fs/xfs/xfs_bmap_util.c
+@@ -1825,29 +1825,18 @@ xfs_swap_extent_forks(
+ 	}
+ 
+ 	/*
+-	 * Before we've swapped the forks, lets set the owners of the forks
+-	 * appropriately. We have to do this as we are demand paging the btree
+-	 * buffers, and so the validation done on read will expect the owner
+-	 * field to be correctly set. Once we change the owners, we can swap the
+-	 * inode forks.
++	 * Btree format (v3) inodes have the inode number stamped in the bmbt
++	 * block headers. We can't start changing the bmbt blocks until the
++	 * inode owner change is logged so recovery does the right thing in the
++	 * event of a crash. Set the owner change log flags now and leave the
++	 * bmbt scan as the last step.
+ 	 */
+ 	if (ip->i_d.di_version == 3 &&
+-	    ip->i_d.di_format == XFS_DINODE_FMT_BTREE) {
++	    ip->i_d.di_format == XFS_DINODE_FMT_BTREE)
+ 		(*target_log_flags) |= XFS_ILOG_DOWNER;
+-		error = xfs_bmbt_change_owner(tp, ip, XFS_DATA_FORK,
+-					      tip->i_ino, NULL);
+-		if (error)
+-			return error;
+-	}
+-
+ 	if (tip->i_d.di_version == 3 &&
+-	    tip->i_d.di_format == XFS_DINODE_FMT_BTREE) {
++	    tip->i_d.di_format == XFS_DINODE_FMT_BTREE)
+ 		(*src_log_flags) |= XFS_ILOG_DOWNER;
+-		error = xfs_bmbt_change_owner(tp, tip, XFS_DATA_FORK,
+-					      ip->i_ino, NULL);
+-		if (error)
+-			return error;
+-	}
+ 
+ 	/*
+ 	 * Swap the data forks of the inodes
+@@ -1925,6 +1914,48 @@ xfs_swap_extent_forks(
+ 	return 0;
+ }
+ 
++/*
++ * Fix up the owners of the bmbt blocks to refer to the current inode. The
++ * change owner scan attempts to order all modified buffers in the current
++ * transaction. In the event of ordered buffer failure, the offending buffer is
++ * physically logged as a fallback and the scan returns -EAGAIN. We must roll
++ * the transaction in this case to replenish the fallback log reservation and
++ * restart the scan. This process repeats until the scan completes.
++ */
++static int
++xfs_swap_change_owner(
++	struct xfs_trans	**tpp,
++	struct xfs_inode	*ip,
++	struct xfs_inode	*tmpip)
++{
++	int			error;
++	struct xfs_trans	*tp = *tpp;
++
++	do {
++		error = xfs_bmbt_change_owner(tp, ip, XFS_DATA_FORK, ip->i_ino,
++					      NULL);
++		/* success or fatal error */
++		if (error != -EAGAIN)
++			break;
++
++		error = xfs_trans_roll(tpp, NULL);
++		if (error)
++			break;
++		tp = *tpp;
++
++		/*
++		 * Redirty both inodes so they can relog and keep the log tail
++		 * moving forward.
++		 */
++		xfs_trans_ijoin(tp, ip, 0);
++		xfs_trans_ijoin(tp, tmpip, 0);
++		xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
++		xfs_trans_log_inode(tp, tmpip, XFS_ILOG_CORE);
++	} while (true);
++
++	return error;
++}
++
+ int
+ xfs_swap_extents(
+ 	struct xfs_inode	*ip,	/* target inode */
+@@ -1938,8 +1969,8 @@ xfs_swap_extents(
+ 	int			error = 0;
+ 	int			lock_flags;
+ 	struct xfs_ifork	*cowfp;
+-	__uint64_t		f;
+-	int			resblks;
++	uint64_t		f;
++	int			resblks = 0;
+ 
+ 	/*
+ 	 * Lock the inodes against other IO, page faults and truncate to
+@@ -1987,11 +2018,8 @@ xfs_swap_extents(
+ 			  XFS_SWAP_RMAP_SPACE_RES(mp,
+ 				XFS_IFORK_NEXTENTS(tip, XFS_DATA_FORK),
+ 				XFS_DATA_FORK);
+-		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks,
+-				0, 0, &tp);
+-	} else
+-		error = xfs_trans_alloc(mp, &M_RES(mp)->tr_ichange, 0,
+-				0, 0, &tp);
++	}
++	error = xfs_trans_alloc(mp, &M_RES(mp)->tr_write, resblks, 0, 0, &tp);
+ 	if (error)
+ 		goto out_unlock;
+ 
+@@ -2076,6 +2104,23 @@ xfs_swap_extents(
+ 	xfs_trans_log_inode(tp, ip,  src_log_flags);
+ 	xfs_trans_log_inode(tp, tip, target_log_flags);
+ 
++	/*
++	 * The extent forks have been swapped, but crc=1,rmapbt=0 filesystems
++	 * have inode number owner values in the bmbt blocks that still refer to
++	 * the old inode. Scan each bmbt to fix up the owner values with the
++	 * inode number of the current inode.
++	 */
++	if (src_log_flags & XFS_ILOG_DOWNER) {
++		error = xfs_swap_change_owner(&tp, ip, tip);
++		if (error)
++			goto out_trans_cancel;
++	}
++	if (target_log_flags & XFS_ILOG_DOWNER) {
++		error = xfs_swap_change_owner(&tp, tip, ip);
++		if (error)
++			goto out_trans_cancel;
++	}
++
+ 	/*
+ 	 * If this is a synchronous mount, make sure that the
+ 	 * transaction goes to disk before returning to the user.
+diff --git a/fs/xfs/xfs_buf.c b/fs/xfs/xfs_buf.c
+index 16269271ebd6..eca7baecc9f0 100644
+--- a/fs/xfs/xfs_buf.c
++++ b/fs/xfs/xfs_buf.c
+@@ -116,7 +116,7 @@ static inline void
+ __xfs_buf_ioacct_dec(
+ 	struct xfs_buf	*bp)
+ {
+-	ASSERT(spin_is_locked(&bp->b_lock));
++	lockdep_assert_held(&bp->b_lock);
+ 
+ 	if (bp->b_state & XFS_BSTATE_IN_FLIGHT) {
+ 		bp->b_state &= ~XFS_BSTATE_IN_FLIGHT;
+@@ -2022,6 +2022,66 @@ xfs_buf_delwri_submit(
+ 	return error;
+ }
+ 
++/*
++ * Push a single buffer on a delwri queue.
++ *
++ * The purpose of this function is to submit a single buffer of a delwri queue
++ * and return with the buffer still on the original queue. The waiting delwri
++ * buffer submission infrastructure guarantees transfer of the delwri queue
++ * buffer reference to a temporary wait list. We reuse this infrastructure to
++ * transfer the buffer back to the original queue.
++ *
++ * Note the buffer transitions from the queued state, to the submitted and wait
++ * listed state and back to the queued state during this call. The buffer
++ * locking and queue management logic between _delwri_pushbuf() and
++ * _delwri_queue() guarantee that the buffer cannot be queued to another list
++ * before returning.
++ */
++int
++xfs_buf_delwri_pushbuf(
++	struct xfs_buf		*bp,
++	struct list_head	*buffer_list)
++{
++	LIST_HEAD		(submit_list);
++	int			error;
++
++	ASSERT(bp->b_flags & _XBF_DELWRI_Q);
++
++	trace_xfs_buf_delwri_pushbuf(bp, _RET_IP_);
++
++	/*
++	 * Isolate the buffer to a new local list so we can submit it for I/O
++	 * independently from the rest of the original list.
++	 */
++	xfs_buf_lock(bp);
++	list_move(&bp->b_list, &submit_list);
++	xfs_buf_unlock(bp);
++
++	/*
++	 * Delwri submission clears the DELWRI_Q buffer flag and returns with
++	 * the buffer on the wait list with an associated reference. Rather than
++	 * bounce the buffer from a local wait list back to the original list
++	 * after I/O completion, reuse the original list as the wait list.
++	 */
++	xfs_buf_delwri_submit_buffers(&submit_list, buffer_list);
++
++	/*
++	 * The buffer is now under I/O and wait listed as during typical delwri
++	 * submission. Lock the buffer to wait for I/O completion. Rather than
++	 * remove the buffer from the wait list and release the reference, we
++	 * want to return with the buffer queued to the original list. The
++	 * buffer already sits on the original list with a wait list reference,
++	 * however. If we let the queue inherit that wait list reference, all we
++	 * need to do is reset the DELWRI_Q flag.
++	 */
++	xfs_buf_lock(bp);
++	error = bp->b_error;
++	bp->b_flags |= _XBF_DELWRI_Q;
++	xfs_buf_unlock(bp);
++
++	return error;
++}
++
+ int __init
+ xfs_buf_init(void)
+ {
+diff --git a/fs/xfs/xfs_buf.h b/fs/xfs/xfs_buf.h
+index ad514a8025dd..f961b19b9cc2 100644
+--- a/fs/xfs/xfs_buf.h
++++ b/fs/xfs/xfs_buf.h
+@@ -333,6 +333,7 @@ extern void xfs_buf_delwri_cancel(struct list_head *);
+ extern bool xfs_buf_delwri_queue(struct xfs_buf *, struct list_head *);
+ extern int xfs_buf_delwri_submit(struct list_head *);
+ extern int xfs_buf_delwri_submit_nowait(struct list_head *);
++extern int xfs_buf_delwri_pushbuf(struct xfs_buf *, struct list_head *);
+ 
+ /* Buffer Daemon Setup Routines */
+ extern int xfs_buf_init(void);
+diff --git a/fs/xfs/xfs_buf_item.c b/fs/xfs/xfs_buf_item.c
+index 0306168af332..e0a0af0946f2 100644
+--- a/fs/xfs/xfs_buf_item.c
++++ b/fs/xfs/xfs_buf_item.c
+@@ -29,6 +29,7 @@
+ #include "xfs_error.h"
+ #include "xfs_trace.h"
+ #include "xfs_log.h"
++#include "xfs_inode.h"
+ 
+ 
+ kmem_zone_t	*xfs_buf_item_zone;
+@@ -322,6 +323,8 @@ xfs_buf_item_format(
+ 	ASSERT((bip->bli_flags & XFS_BLI_STALE) ||
+ 	       (xfs_blft_from_flags(&bip->__bli_format) > XFS_BLFT_UNKNOWN_BUF
+ 	        && xfs_blft_from_flags(&bip->__bli_format) < XFS_BLFT_MAX_BUF));
++	ASSERT(!(bip->bli_flags & XFS_BLI_ORDERED) ||
++	       (bip->bli_flags & XFS_BLI_STALE));
+ 
+ 
+ 	/*
+@@ -346,16 +349,6 @@ xfs_buf_item_format(
+ 		bip->bli_flags &= ~XFS_BLI_INODE_BUF;
+ 	}
+ 
+-	if ((bip->bli_flags & (XFS_BLI_ORDERED|XFS_BLI_STALE)) ==
+-							XFS_BLI_ORDERED) {
+-		/*
+-		 * The buffer has been logged just to order it.  It is not being
+-		 * included in the transaction commit, so don't format it.
+-		 */
+-		trace_xfs_buf_item_format_ordered(bip);
+-		return;
+-	}
+-
+ 	for (i = 0; i < bip->bli_format_count; i++) {
+ 		xfs_buf_item_format_segment(bip, lv, &vecp, offset,
+ 					    &bip->bli_formats[i]);
+@@ -574,26 +567,20 @@ xfs_buf_item_unlock(
+ {
+ 	struct xfs_buf_log_item	*bip = BUF_ITEM(lip);
+ 	struct xfs_buf		*bp = bip->bli_buf;
+-	bool			clean;
+-	bool			aborted;
+-	int			flags;
++	bool			aborted = !!(lip->li_flags & XFS_LI_ABORTED);
++	bool			hold = !!(bip->bli_flags & XFS_BLI_HOLD);
++	bool			dirty = !!(bip->bli_flags & XFS_BLI_DIRTY);
++#if defined(DEBUG) || defined(XFS_WARN)
++	bool			ordered = !!(bip->bli_flags & XFS_BLI_ORDERED);
++#endif
+ 
+ 	/* Clear the buffer's association with this transaction. */
+ 	bp->b_transp = NULL;
+ 
+ 	/*
+-	 * If this is a transaction abort, don't return early.  Instead, allow
+-	 * the brelse to happen.  Normally it would be done for stale
+-	 * (cancelled) buffers at unpin time, but we'll never go through the
+-	 * pin/unpin cycle if we abort inside commit.
+-	 */
+-	aborted = (lip->li_flags & XFS_LI_ABORTED) ? true : false;
+-	/*
+-	 * Before possibly freeing the buf item, copy the per-transaction state
+-	 * so we can reference it safely later after clearing it from the
+-	 * buffer log item.
++	 * The per-transaction state has been copied above so clear it from the
++	 * bli.
+ 	 */
+-	flags = bip->bli_flags;
+ 	bip->bli_flags &= ~(XFS_BLI_LOGGED | XFS_BLI_HOLD | XFS_BLI_ORDERED);
+ 
+ 	/*
+@@ -601,7 +588,7 @@ xfs_buf_item_unlock(
+ 	 * unlock the buffer and free the buf item when the buffer is unpinned
+ 	 * for the last time.
+ 	 */
+-	if (flags & XFS_BLI_STALE) {
++	if (bip->bli_flags & XFS_BLI_STALE) {
+ 		trace_xfs_buf_item_unlock_stale(bip);
+ 		ASSERT(bip->__bli_format.blf_flags & XFS_BLF_CANCEL);
+ 		if (!aborted) {
+@@ -619,40 +606,34 @@ xfs_buf_item_unlock(
+ 	 * regardless of whether it is dirty or not. A dirty abort implies a
+ 	 * shutdown, anyway.
+ 	 *
+-	 * Ordered buffers are dirty but may have no recorded changes, so ensure
+-	 * we only release clean items here.
++	 * The bli dirty state should match whether the blf has logged segments
++	 * except for ordered buffers, where only the bli should be dirty.
+ 	 */
+-	clean = (flags & XFS_BLI_DIRTY) ? false : true;
+-	if (clean) {
+-		int i;
+-		for (i = 0; i < bip->bli_format_count; i++) {
+-			if (!xfs_bitmap_empty(bip->bli_formats[i].blf_data_map,
+-				     bip->bli_formats[i].blf_map_size)) {
+-				clean = false;
+-				break;
+-			}
+-		}
+-	}
++	ASSERT((!ordered && dirty == xfs_buf_item_dirty_format(bip)) ||
++	       (ordered && dirty && !xfs_buf_item_dirty_format(bip)));
+ 
+ 	/*
+ 	 * Clean buffers, by definition, cannot be in the AIL. However, aborted
+-	 * buffers may be dirty and hence in the AIL. Therefore if we are
+-	 * aborting a buffer and we've just taken the last refernce away, we
+-	 * have to check if it is in the AIL before freeing it. We need to free
+-	 * it in this case, because an aborted transaction has already shut the
+-	 * filesystem down and this is the last chance we will have to do so.
++	 * buffers may be in the AIL regardless of dirty state. An aborted
++	 * transaction that invalidates a buffer already in the AIL may have
++	 * marked it stale and cleared the dirty state, for example.
++	 *
++	 * Therefore if we are aborting a buffer and we've just taken the last
++	 * reference away, we have to check if it is in the AIL before freeing
++	 * it. We need to free it in this case, because an aborted transaction
++	 * has already shut the filesystem down and this is the last chance we
++	 * will have to do so.
+ 	 */
+ 	if (atomic_dec_and_test(&bip->bli_refcount)) {
+-		if (clean)
+-			xfs_buf_item_relse(bp);
+-		else if (aborted) {
++		if (aborted) {
+ 			ASSERT(XFS_FORCED_SHUTDOWN(lip->li_mountp));
+ 			xfs_trans_ail_remove(lip, SHUTDOWN_LOG_IO_ERROR);
+ 			xfs_buf_item_relse(bp);
+-		}
++		} else if (!dirty)
++			xfs_buf_item_relse(bp);
+ 	}
+ 
+-	if (!(flags & XFS_BLI_HOLD))
++	if (!hold)
+ 		xfs_buf_relse(bp);
+ }
+ 
+@@ -942,14 +923,22 @@ xfs_buf_item_log(
+ 
+ 
+ /*
+- * Return 1 if the buffer has been logged or ordered in a transaction (at any
+- * point, not just the current transaction) and 0 if not.
++ * Return true if the buffer has any ranges logged/dirtied by a transaction,
++ * false otherwise.
+  */
+-uint
+-xfs_buf_item_dirty(
+-	xfs_buf_log_item_t	*bip)
++bool
++xfs_buf_item_dirty_format(
++	struct xfs_buf_log_item	*bip)
+ {
+-	return (bip->bli_flags & XFS_BLI_DIRTY);
++	int			i;
++
++	for (i = 0; i < bip->bli_format_count; i++) {
++		if (!xfs_bitmap_empty(bip->bli_formats[i].blf_data_map,
++			     bip->bli_formats[i].blf_map_size))
++			return true;
++	}
++
++	return false;
+ }
+ 
+ STATIC void
+@@ -1051,6 +1040,31 @@ xfs_buf_do_callbacks(
+ 	}
+ }
+ 
++/*
++ * Invoke the error state callback for each log item affected by the failed I/O.
++ *
++ * If a metadata buffer write fails with a non-permanent error, the buffer is
++ * eventually resubmitted and so the completion callbacks are not run. The error
++ * state may need to be propagated to the log items attached to the buffer,
++ * however, so the next AIL push of the item knows hot to handle it correctly.
++ */
++STATIC void
++xfs_buf_do_callbacks_fail(
++	struct xfs_buf		*bp)
++{
++	struct xfs_log_item	*next;
++	struct xfs_log_item	*lip = bp->b_fspriv;
++	struct xfs_ail		*ailp = lip->li_ailp;
++
++	spin_lock(&ailp->xa_lock);
++	for (; lip; lip = next) {
++		next = lip->li_bio_list;
++		if (lip->li_ops->iop_error)
++			lip->li_ops->iop_error(lip, bp);
++	}
++	spin_unlock(&ailp->xa_lock);
++}
++
+ static bool
+ xfs_buf_iodone_callback_error(
+ 	struct xfs_buf		*bp)
+@@ -1120,7 +1134,11 @@ xfs_buf_iodone_callback_error(
+ 	if ((mp->m_flags & XFS_MOUNT_UNMOUNTING) && mp->m_fail_unmount)
+ 		goto permanent_error;
+ 
+-	/* still a transient error, higher layers will retry */
++	/*
++	 * Still a transient error, run IO completion failure callbacks and let
++	 * the higher layers retry the buffer.
++	 */
++	xfs_buf_do_callbacks_fail(bp);
+ 	xfs_buf_ioerror(bp, 0);
+ 	xfs_buf_relse(bp);
+ 	return true;
+@@ -1201,3 +1219,31 @@ xfs_buf_iodone(
+ 	xfs_trans_ail_delete(ailp, lip, SHUTDOWN_CORRUPT_INCORE);
+ 	xfs_buf_item_free(BUF_ITEM(lip));
+ }
++
++/*
++ * Requeue a failed buffer for writeback
++ *
++ * Return true if the buffer has been re-queued properly, false otherwise
++ */
++bool
++xfs_buf_resubmit_failed_buffers(
++	struct xfs_buf		*bp,
++	struct xfs_log_item	*lip,
++	struct list_head	*buffer_list)
++{
++	struct xfs_log_item	*next;
++
++	/*
++	 * Clear XFS_LI_FAILED flag from all items before resubmit
++	 *
++	 * XFS_LI_FAILED set/clear is protected by xa_lock, caller  this
++	 * function already have it acquired
++	 */
++	for (; lip; lip = next) {
++		next = lip->li_bio_list;
++		xfs_clear_li_failed(lip);
++	}
++
++	/* Add this buffer back to the delayed write list */
++	return xfs_buf_delwri_queue(bp, buffer_list);
++}
+diff --git a/fs/xfs/xfs_buf_item.h b/fs/xfs/xfs_buf_item.h
+index f7eba99d19dd..9690ce62c9a7 100644
+--- a/fs/xfs/xfs_buf_item.h
++++ b/fs/xfs/xfs_buf_item.h
+@@ -64,12 +64,15 @@ typedef struct xfs_buf_log_item {
+ int	xfs_buf_item_init(struct xfs_buf *, struct xfs_mount *);
+ void	xfs_buf_item_relse(struct xfs_buf *);
+ void	xfs_buf_item_log(xfs_buf_log_item_t *, uint, uint);
+-uint	xfs_buf_item_dirty(xfs_buf_log_item_t *);
++bool	xfs_buf_item_dirty_format(struct xfs_buf_log_item *);
+ void	xfs_buf_attach_iodone(struct xfs_buf *,
+ 			      void(*)(struct xfs_buf *, xfs_log_item_t *),
+ 			      xfs_log_item_t *);
+ void	xfs_buf_iodone_callbacks(struct xfs_buf *);
+ void	xfs_buf_iodone(struct xfs_buf *, struct xfs_log_item *);
++bool	xfs_buf_resubmit_failed_buffers(struct xfs_buf *,
++					struct xfs_log_item *,
++					struct list_head *);
+ 
+ extern kmem_zone_t	*xfs_buf_item_zone;
+ 
+diff --git a/fs/xfs/xfs_file.c b/fs/xfs/xfs_file.c
+index df206cfc21f7..586b398f268d 100644
+--- a/fs/xfs/xfs_file.c
++++ b/fs/xfs/xfs_file.c
+@@ -729,6 +729,7 @@ xfs_file_buffered_aio_write(
+ 		xfs_rw_iunlock(ip, iolock);
+ 		eofb.eof_flags = XFS_EOF_FLAGS_SYNC;
+ 		xfs_icache_free_eofblocks(ip->i_mount, &eofb);
++		xfs_icache_free_cowblocks(ip->i_mount, &eofb);
+ 		goto write_retry;
+ 	}
+ 
+@@ -1139,29 +1140,8 @@ xfs_find_get_desired_pgoff(
+ 		want = min_t(pgoff_t, end - index, PAGEVEC_SIZE - 1) + 1;
+ 		nr_pages = pagevec_lookup(&pvec, inode->i_mapping, index,
+ 					  want);
+-		/*
+-		 * No page mapped into given range.  If we are searching holes
+-		 * and if this is the first time we got into the loop, it means
+-		 * that the given offset is landed in a hole, return it.
+-		 *
+-		 * If we have already stepped through some block buffers to find
+-		 * holes but they all contains data.  In this case, the last
+-		 * offset is already updated and pointed to the end of the last
+-		 * mapped page, if it does not reach the endpoint to search,
+-		 * that means there should be a hole between them.
+-		 */
+-		if (nr_pages == 0) {
+-			/* Data search found nothing */
+-			if (type == DATA_OFF)
+-				break;
+-
+-			ASSERT(type == HOLE_OFF);
+-			if (lastoff == startoff || lastoff < endoff) {
+-				found = true;
+-				*offset = lastoff;
+-			}
++		if (nr_pages == 0)
+ 			break;
+-		}
+ 
+ 		for (i = 0; i < nr_pages; i++) {
+ 			struct page	*page = pvec.pages[i];
+@@ -1227,21 +1207,20 @@ xfs_find_get_desired_pgoff(
+ 
+ 		/*
+ 		 * The number of returned pages less than our desired, search
+-		 * done.  In this case, nothing was found for searching data,
+-		 * but we found a hole behind the last offset.
++		 * done.
+ 		 */
+-		if (nr_pages < want) {
+-			if (type == HOLE_OFF) {
+-				*offset = lastoff;
+-				found = true;
+-			}
++		if (nr_pages < want)
+ 			break;
+-		}
+ 
+ 		index = pvec.pages[i - 1]->index + 1;
+ 		pagevec_release(&pvec);
+ 	} while (index <= end);
+ 
++	/* No page at lastoff and we are not done - we found a hole. */
++	if (type == HOLE_OFF && lastoff < endoff) {
++		*offset = lastoff;
++		found = true;
++	}
+ out:
+ 	pagevec_release(&pvec);
+ 	return found;
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 74304b6ce84b..86a4911520cc 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -66,7 +66,6 @@ xfs_inode_alloc(
+ 
+ 	XFS_STATS_INC(mp, vn_active);
+ 	ASSERT(atomic_read(&ip->i_pincount) == 0);
+-	ASSERT(!spin_is_locked(&ip->i_flags_lock));
+ 	ASSERT(!xfs_isiflocked(ip));
+ 	ASSERT(ip->i_ino == 0);
+ 
+@@ -192,7 +191,7 @@ xfs_perag_set_reclaim_tag(
+ {
+ 	struct xfs_mount	*mp = pag->pag_mount;
+ 
+-	ASSERT(spin_is_locked(&pag->pag_ici_lock));
++	lockdep_assert_held(&pag->pag_ici_lock);
+ 	if (pag->pag_ici_reclaimable++)
+ 		return;
+ 
+@@ -214,7 +213,7 @@ xfs_perag_clear_reclaim_tag(
+ {
+ 	struct xfs_mount	*mp = pag->pag_mount;
+ 
+-	ASSERT(spin_is_locked(&pag->pag_ici_lock));
++	lockdep_assert_held(&pag->pag_ici_lock);
+ 	if (--pag->pag_ici_reclaimable)
+ 		return;
+ 
+@@ -1079,11 +1078,11 @@ xfs_reclaim_inode(
+ 	 * Because we use RCU freeing we need to ensure the inode always appears
+ 	 * to be reclaimed with an invalid inode number when in the free state.
+ 	 * We do this as early as possible under the ILOCK so that
+-	 * xfs_iflush_cluster() can be guaranteed to detect races with us here.
+-	 * By doing this, we guarantee that once xfs_iflush_cluster has locked
+-	 * XFS_ILOCK that it will see either a valid, flushable inode that will
+-	 * serialise correctly, or it will see a clean (and invalid) inode that
+-	 * it can skip.
++	 * xfs_iflush_cluster() and xfs_ifree_cluster() can be guaranteed to
++	 * detect races with us here. By doing this, we guarantee that once
++	 * xfs_iflush_cluster() or xfs_ifree_cluster() has locked XFS_ILOCK that
++	 * it will see either a valid inode that will serialise correctly, or it
++	 * will see an invalid inode that it can skip.
+ 	 */
+ 	spin_lock(&ip->i_flags_lock);
+ 	ip->i_flags = XFS_IRECLAIM;
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index 7a0b4eeb99e4..9e795ab08a53 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -881,7 +881,6 @@ xfs_ialloc(
+ 	case S_IFREG:
+ 	case S_IFDIR:
+ 		if (pip && (pip->i_d.di_flags & XFS_DIFLAG_ANY)) {
+-			uint64_t	di_flags2 = 0;
+ 			uint		di_flags = 0;
+ 
+ 			if (S_ISDIR(mode)) {
+@@ -918,20 +917,23 @@ xfs_ialloc(
+ 				di_flags |= XFS_DIFLAG_NODEFRAG;
+ 			if (pip->i_d.di_flags & XFS_DIFLAG_FILESTREAM)
+ 				di_flags |= XFS_DIFLAG_FILESTREAM;
+-			if (pip->i_d.di_flags2 & XFS_DIFLAG2_DAX)
+-				di_flags2 |= XFS_DIFLAG2_DAX;
+ 
+ 			ip->i_d.di_flags |= di_flags;
+-			ip->i_d.di_flags2 |= di_flags2;
+ 		}
+ 		if (pip &&
+ 		    (pip->i_d.di_flags2 & XFS_DIFLAG2_ANY) &&
+ 		    pip->i_d.di_version == 3 &&
+ 		    ip->i_d.di_version == 3) {
++			uint64_t	di_flags2 = 0;
++
+ 			if (pip->i_d.di_flags2 & XFS_DIFLAG2_COWEXTSIZE) {
+-				ip->i_d.di_flags2 |= XFS_DIFLAG2_COWEXTSIZE;
++				di_flags2 |= XFS_DIFLAG2_COWEXTSIZE;
+ 				ip->i_d.di_cowextsize = pip->i_d.di_cowextsize;
+ 			}
++			if (pip->i_d.di_flags2 & XFS_DIFLAG2_DAX)
++				di_flags2 |= XFS_DIFLAG2_DAX;
++
++			ip->i_d.di_flags2 |= di_flags2;
+ 		}
+ 		/* FALLTHROUGH */
+ 	case S_IFLNK:
+@@ -2366,11 +2368,24 @@ xfs_ifree_cluster(
+ 			 * already marked stale. If we can't lock it, back off
+ 			 * and retry.
+ 			 */
+-			if (ip != free_ip &&
+-			    !xfs_ilock_nowait(ip, XFS_ILOCK_EXCL)) {
+-				rcu_read_unlock();
+-				delay(1);
+-				goto retry;
++			if (ip != free_ip) {
++				if (!xfs_ilock_nowait(ip, XFS_ILOCK_EXCL)) {
++					rcu_read_unlock();
++					delay(1);
++					goto retry;
++				}
++
++				/*
++				 * Check the inode number again in case we're
++				 * racing with freeing in xfs_reclaim_inode().
++				 * See the comments in that function for more
++				 * information as to why the initial check is
++				 * not sufficient.
++				 */
++				if (ip->i_ino != inum + i) {
++					xfs_iunlock(ip, XFS_ILOCK_EXCL);
++					continue;
++				}
+ 			}
+ 			rcu_read_unlock();
+ 
+diff --git a/fs/xfs/xfs_inode_item.c b/fs/xfs/xfs_inode_item.c
+index d90e7811ccdd..94915747042c 100644
+--- a/fs/xfs/xfs_inode_item.c
++++ b/fs/xfs/xfs_inode_item.c
+@@ -27,6 +27,7 @@
+ #include "xfs_error.h"
+ #include "xfs_trace.h"
+ #include "xfs_trans_priv.h"
++#include "xfs_buf_item.h"
+ #include "xfs_log.h"
+ 
+ 
+@@ -475,6 +476,23 @@ xfs_inode_item_unpin(
+ 		wake_up_bit(&ip->i_flags, __XFS_IPINNED_BIT);
+ }
+ 
++/*
++ * Callback used to mark a buffer with XFS_LI_FAILED when items in the buffer
++ * have been failed during writeback
++ *
++ * This informs the AIL that the inode is already flush locked on the next push,
++ * and acquires a hold on the buffer to ensure that it isn't reclaimed before
++ * dirty data makes it to disk.
++ */
++STATIC void
++xfs_inode_item_error(
++	struct xfs_log_item	*lip,
++	struct xfs_buf		*bp)
++{
++	ASSERT(xfs_isiflocked(INODE_ITEM(lip)->ili_inode));
++	xfs_set_li_failed(lip, bp);
++}
++
+ STATIC uint
+ xfs_inode_item_push(
+ 	struct xfs_log_item	*lip,
+@@ -484,13 +502,28 @@ xfs_inode_item_push(
+ {
+ 	struct xfs_inode_log_item *iip = INODE_ITEM(lip);
+ 	struct xfs_inode	*ip = iip->ili_inode;
+-	struct xfs_buf		*bp = NULL;
++	struct xfs_buf		*bp = lip->li_buf;
+ 	uint			rval = XFS_ITEM_SUCCESS;
+ 	int			error;
+ 
+ 	if (xfs_ipincount(ip) > 0)
+ 		return XFS_ITEM_PINNED;
+ 
++	/*
++	 * The buffer containing this item failed to be written back
++	 * previously. Resubmit the buffer for IO.
++	 */
++	if (lip->li_flags & XFS_LI_FAILED) {
++		if (!xfs_buf_trylock(bp))
++			return XFS_ITEM_LOCKED;
++
++		if (!xfs_buf_resubmit_failed_buffers(bp, lip, buffer_list))
++			rval = XFS_ITEM_FLUSHING;
++
++		xfs_buf_unlock(bp);
++		return rval;
++	}
++
+ 	if (!xfs_ilock_nowait(ip, XFS_ILOCK_SHARED))
+ 		return XFS_ITEM_LOCKED;
+ 
+@@ -622,7 +655,8 @@ static const struct xfs_item_ops xfs_inode_item_ops = {
+ 	.iop_unlock	= xfs_inode_item_unlock,
+ 	.iop_committed	= xfs_inode_item_committed,
+ 	.iop_push	= xfs_inode_item_push,
+-	.iop_committing = xfs_inode_item_committing
++	.iop_committing = xfs_inode_item_committing,
++	.iop_error	= xfs_inode_item_error
+ };
+ 
+ 
+@@ -710,7 +744,8 @@ xfs_iflush_done(
+ 		 * the AIL lock.
+ 		 */
+ 		iip = INODE_ITEM(blip);
+-		if (iip->ili_logged && blip->li_lsn == iip->ili_flush_lsn)
++		if ((iip->ili_logged && blip->li_lsn == iip->ili_flush_lsn) ||
++		    lip->li_flags & XFS_LI_FAILED)
+ 			need_ail++;
+ 
+ 		blip = next;
+@@ -718,7 +753,8 @@ xfs_iflush_done(
+ 
+ 	/* make sure we capture the state of the initial inode. */
+ 	iip = INODE_ITEM(lip);
+-	if (iip->ili_logged && lip->li_lsn == iip->ili_flush_lsn)
++	if ((iip->ili_logged && lip->li_lsn == iip->ili_flush_lsn) ||
++	    lip->li_flags & XFS_LI_FAILED)
+ 		need_ail++;
+ 
+ 	/*
+@@ -731,22 +767,30 @@ xfs_iflush_done(
+ 	 * holding the lock before removing the inode from the AIL.
+ 	 */
+ 	if (need_ail) {
+-		struct xfs_log_item *log_items[need_ail];
+-		int i = 0;
++		bool			mlip_changed = false;
++
++		/* this is an opencoded batch version of xfs_trans_ail_delete */
+ 		spin_lock(&ailp->xa_lock);
+ 		for (blip = lip; blip; blip = blip->li_bio_list) {
+-			iip = INODE_ITEM(blip);
+-			if (iip->ili_logged &&
+-			    blip->li_lsn == iip->ili_flush_lsn) {
+-				log_items[i++] = blip;
++			if (INODE_ITEM(blip)->ili_logged &&
++			    blip->li_lsn == INODE_ITEM(blip)->ili_flush_lsn)
++				mlip_changed |= xfs_ail_delete_one(ailp, blip);
++			else {
++				xfs_clear_li_failed(blip);
+ 			}
+-			ASSERT(i <= need_ail);
+ 		}
+-		/* xfs_trans_ail_delete_bulk() drops the AIL lock. */
+-		xfs_trans_ail_delete_bulk(ailp, log_items, i,
+-					  SHUTDOWN_CORRUPT_INCORE);
+-	}
+ 
++		if (mlip_changed) {
++			if (!XFS_FORCED_SHUTDOWN(ailp->xa_mount))
++				xlog_assign_tail_lsn_locked(ailp->xa_mount);
++			if (list_empty(&ailp->xa_ail))
++				wake_up_all(&ailp->xa_empty);
++		}
++		spin_unlock(&ailp->xa_lock);
++
++		if (mlip_changed)
++			xfs_log_space_wake(ailp->xa_mount);
++	}
+ 
+ 	/*
+ 	 * clean up and unlock the flush lock now we are done. We can clear the
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 73cfc7179124..bce2e260f55e 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -928,16 +928,15 @@ xfs_ioc_fsgetxattr(
+ 	return 0;
+ }
+ 
+-STATIC void
+-xfs_set_diflags(
++STATIC uint16_t
++xfs_flags2diflags(
+ 	struct xfs_inode	*ip,
+ 	unsigned int		xflags)
+ {
+-	unsigned int		di_flags;
+-	uint64_t		di_flags2;
+-
+ 	/* can't set PREALLOC this way, just preserve it */
+-	di_flags = (ip->i_d.di_flags & XFS_DIFLAG_PREALLOC);
++	uint16_t		di_flags =
++		(ip->i_d.di_flags & XFS_DIFLAG_PREALLOC);
++
+ 	if (xflags & FS_XFLAG_IMMUTABLE)
+ 		di_flags |= XFS_DIFLAG_IMMUTABLE;
+ 	if (xflags & FS_XFLAG_APPEND)
+@@ -967,19 +966,24 @@ xfs_set_diflags(
+ 		if (xflags & FS_XFLAG_EXTSIZE)
+ 			di_flags |= XFS_DIFLAG_EXTSIZE;
+ 	}
+-	ip->i_d.di_flags = di_flags;
+ 
+-	/* diflags2 only valid for v3 inodes. */
+-	if (ip->i_d.di_version < 3)
+-		return;
++	return di_flags;
++}
++
++STATIC uint64_t
++xfs_flags2diflags2(
++	struct xfs_inode	*ip,
++	unsigned int		xflags)
++{
++	uint64_t		di_flags2 =
++		(ip->i_d.di_flags2 & XFS_DIFLAG2_REFLINK);
+ 
+-	di_flags2 = (ip->i_d.di_flags2 & XFS_DIFLAG2_REFLINK);
+ 	if (xflags & FS_XFLAG_DAX)
+ 		di_flags2 |= XFS_DIFLAG2_DAX;
+ 	if (xflags & FS_XFLAG_COWEXTSIZE)
+ 		di_flags2 |= XFS_DIFLAG2_COWEXTSIZE;
+ 
+-	ip->i_d.di_flags2 = di_flags2;
++	return di_flags2;
+ }
+ 
+ STATIC void
+@@ -1005,11 +1009,12 @@ xfs_diflags_to_linux(
+ 		inode->i_flags |= S_NOATIME;
+ 	else
+ 		inode->i_flags &= ~S_NOATIME;
++#if 0	/* disabled until the flag switching races are sorted out */
+ 	if (xflags & FS_XFLAG_DAX)
+ 		inode->i_flags |= S_DAX;
+ 	else
+ 		inode->i_flags &= ~S_DAX;
+-
++#endif
+ }
+ 
+ static int
+@@ -1019,6 +1024,7 @@ xfs_ioctl_setattr_xflags(
+ 	struct fsxattr		*fa)
+ {
+ 	struct xfs_mount	*mp = ip->i_mount;
++	uint64_t		di_flags2;
+ 
+ 	/* Can't change realtime flag if any extents are allocated. */
+ 	if ((ip->i_d.di_nextents || ip->i_delayed_blks) &&
+@@ -1049,7 +1055,14 @@ xfs_ioctl_setattr_xflags(
+ 	    !capable(CAP_LINUX_IMMUTABLE))
+ 		return -EPERM;
+ 
+-	xfs_set_diflags(ip, fa->fsx_xflags);
++	/* diflags2 only valid for v3 inodes. */
++	di_flags2 = xfs_flags2diflags2(ip, fa->fsx_xflags);
++	if (di_flags2 && ip->i_d.di_version < 3)
++		return -EINVAL;
++
++	ip->i_d.di_flags = xfs_flags2diflags(ip, fa->fsx_xflags);
++	ip->i_d.di_flags2 = di_flags2;
++
+ 	xfs_diflags_to_linux(ip);
+ 	xfs_trans_ichgtime(tp, ip, XFS_ICHGTIME_CHG);
+ 	xfs_trans_log_inode(tp, ip, XFS_ILOG_CORE);
+diff --git a/fs/xfs/xfs_iops.c b/fs/xfs/xfs_iops.c
+index a1247c3c1efb..5b81f7f41b80 100644
+--- a/fs/xfs/xfs_iops.c
++++ b/fs/xfs/xfs_iops.c
+@@ -802,7 +802,7 @@ xfs_vn_setattr_nonsize(
+  * Caution: The caller of this function is responsible for calling
+  * setattr_prepare() or otherwise verifying the change is fine.
+  */
+-int
++STATIC int
+ xfs_setattr_size(
+ 	struct xfs_inode	*ip,
+ 	struct iattr		*iattr)
+diff --git a/fs/xfs/xfs_log.c b/fs/xfs/xfs_log.c
+index b57ab34fbf3c..33c9a3aae948 100644
+--- a/fs/xfs/xfs_log.c
++++ b/fs/xfs/xfs_log.c
+@@ -743,15 +743,45 @@ xfs_log_mount_finish(
+ 	struct xfs_mount	*mp)
+ {
+ 	int	error = 0;
++	bool	readonly = (mp->m_flags & XFS_MOUNT_RDONLY);
+ 
+ 	if (mp->m_flags & XFS_MOUNT_NORECOVERY) {
+ 		ASSERT(mp->m_flags & XFS_MOUNT_RDONLY);
+ 		return 0;
++	} else if (readonly) {
++		/* Allow unlinked processing to proceed */
++		mp->m_flags &= ~XFS_MOUNT_RDONLY;
+ 	}
+ 
++	/*
++	 * During the second phase of log recovery, we need iget and
++	 * iput to behave like they do for an active filesystem.
++	 * xfs_fs_drop_inode needs to be able to prevent the deletion
++	 * of inodes before we're done replaying log items on those
++	 * inodes.  Turn it off immediately after recovery finishes
++	 * so that we don't leak the quota inodes if subsequent mount
++	 * activities fail.
++	 *
++	 * We let all inodes involved in redo item processing end up on
++	 * the LRU instead of being evicted immediately so that if we do
++	 * something to an unlinked inode, the irele won't cause
++	 * premature truncation and freeing of the inode, which results
++	 * in log recovery failure.  We have to evict the unreferenced
++	 * lru inodes after clearing MS_ACTIVE because we don't
++	 * otherwise clean up the lru if there's a subsequent failure in
++	 * xfs_mountfs, which leads to us leaking the inodes if nothing
++	 * else (e.g. quotacheck) references the inodes before the
++	 * mount failure occurs.
++	 */
++	mp->m_super->s_flags |= MS_ACTIVE;
+ 	error = xlog_recover_finish(mp->m_log);
+ 	if (!error)
+ 		xfs_log_work_queue(mp);
++	mp->m_super->s_flags &= ~MS_ACTIVE;
++	evict_inodes(mp->m_super);
++
++	if (readonly)
++		mp->m_flags |= XFS_MOUNT_RDONLY;
+ 
+ 	return error;
+ }
+@@ -801,11 +831,14 @@ xfs_log_unmount_write(xfs_mount_t *mp)
+ 	int		 error;
+ 
+ 	/*
+-	 * Don't write out unmount record on read-only mounts.
++	 * Don't write out unmount record on norecovery mounts or ro devices.
+ 	 * Or, if we are doing a forced umount (typically because of IO errors).
+ 	 */
+-	if (mp->m_flags & XFS_MOUNT_RDONLY)
++	if (mp->m_flags & XFS_MOUNT_NORECOVERY ||
++	    xfs_readonly_buftarg(log->l_mp->m_logdev_targp)) {
++		ASSERT(mp->m_flags & XFS_MOUNT_RDONLY);
+ 		return 0;
++	}
+ 
+ 	error = _xfs_log_force(mp, XFS_LOG_SYNC, NULL);
+ 	ASSERT(error || !(XLOG_FORCED_SHUTDOWN(log)));
+@@ -3304,8 +3337,6 @@ _xfs_log_force(
+ 		 */
+ 		if (iclog->ic_state & XLOG_STATE_IOERROR)
+ 			return -EIO;
+-		if (log_flushed)
+-			*log_flushed = 1;
+ 	} else {
+ 
+ no_sleep:
+@@ -3409,8 +3440,6 @@ _xfs_log_force_lsn(
+ 
+ 				xlog_wait(&iclog->ic_prev->ic_write_wait,
+ 							&log->l_icloglock);
+-				if (log_flushed)
+-					*log_flushed = 1;
+ 				already_slept = 1;
+ 				goto try_again;
+ 			}
+@@ -3444,9 +3473,6 @@ _xfs_log_force_lsn(
+ 			 */
+ 			if (iclog->ic_state & XLOG_STATE_IOERROR)
+ 				return -EIO;
+-
+-			if (log_flushed)
+-				*log_flushed = 1;
+ 		} else {		/* just return */
+ 			spin_unlock(&log->l_icloglock);
+ 		}
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index 9b3d7c76915d..05909269f973 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -1029,61 +1029,106 @@ xlog_seek_logrec_hdr(
+ }
+ 
+ /*
+- * Check the log tail for torn writes. This is required when torn writes are
+- * detected at the head and the head had to be walked back to a previous record.
+- * The tail of the previous record must now be verified to ensure the torn
+- * writes didn't corrupt the previous tail.
++ * Calculate distance from head to tail (i.e., unused space in the log).
++ */
++static inline int
++xlog_tail_distance(
++	struct xlog	*log,
++	xfs_daddr_t	head_blk,
++	xfs_daddr_t	tail_blk)
++{
++	if (head_blk < tail_blk)
++		return tail_blk - head_blk;
++
++	return tail_blk + (log->l_logBBsize - head_blk);
++}
++
++/*
++ * Verify the log tail. This is particularly important when torn or incomplete
++ * writes have been detected near the front of the log and the head has been
++ * walked back accordingly.
+  *
+- * Return an error if CRC verification fails as recovery cannot proceed.
++ * We also have to handle the case where the tail was pinned and the head
++ * blocked behind the tail right before a crash. If the tail had been pushed
++ * immediately prior to the crash and the subsequent checkpoint was only
++ * partially written, it's possible it overwrote the last referenced tail in the
++ * log with garbage. This is not a coherency problem because the tail must have
++ * been pushed before it can be overwritten, but appears as log corruption to
++ * recovery because we have no way to know the tail was updated if the
++ * subsequent checkpoint didn't write successfully.
++ *
++ * Therefore, CRC check the log from tail to head. If a failure occurs and the
++ * offending record is within max iclog bufs from the head, walk the tail
++ * forward and retry until a valid tail is found or corruption is detected out
++ * of the range of a possible overwrite.
+  */
+ STATIC int
+ xlog_verify_tail(
+ 	struct xlog		*log,
+ 	xfs_daddr_t		head_blk,
+-	xfs_daddr_t		tail_blk)
++	xfs_daddr_t		*tail_blk,
++	int			hsize)
+ {
+ 	struct xlog_rec_header	*thead;
+ 	struct xfs_buf		*bp;
+ 	xfs_daddr_t		first_bad;
+-	int			count;
+ 	int			error = 0;
+ 	bool			wrapped;
+-	xfs_daddr_t		tmp_head;
++	xfs_daddr_t		tmp_tail;
++	xfs_daddr_t		orig_tail = *tail_blk;
+ 
+ 	bp = xlog_get_bp(log, 1);
+ 	if (!bp)
+ 		return -ENOMEM;
+ 
+ 	/*
+-	 * Seek XLOG_MAX_ICLOGS + 1 records past the current tail record to get
+-	 * a temporary head block that points after the last possible
+-	 * concurrently written record of the tail.
++	 * Make sure the tail points to a record (returns positive count on
++	 * success).
+ 	 */
+-	count = xlog_seek_logrec_hdr(log, head_blk, tail_blk,
+-				     XLOG_MAX_ICLOGS + 1, bp, &tmp_head, &thead,
+-				     &wrapped);
+-	if (count < 0) {
+-		error = count;
++	error = xlog_seek_logrec_hdr(log, head_blk, *tail_blk, 1, bp,
++			&tmp_tail, &thead, &wrapped);
++	if (error < 0)
+ 		goto out;
+-	}
+-
+-	/*
+-	 * If the call above didn't find XLOG_MAX_ICLOGS + 1 records, we ran
+-	 * into the actual log head. tmp_head points to the start of the record
+-	 * so update it to the actual head block.
+-	 */
+-	if (count < XLOG_MAX_ICLOGS + 1)
+-		tmp_head = head_blk;
++	if (*tail_blk != tmp_tail)
++		*tail_blk = tmp_tail;
+ 
+ 	/*
+-	 * We now have a tail and temporary head block that covers at least
+-	 * XLOG_MAX_ICLOGS records from the tail. We need to verify that these
+-	 * records were completely written. Run a CRC verification pass from
+-	 * tail to head and return the result.
++	 * Run a CRC check from the tail to the head. We can't just check
++	 * MAX_ICLOGS records past the tail because the tail may point to stale
++	 * blocks cleared during the search for the head/tail. These blocks are
++	 * overwritten with zero-length records and thus record count is not a
++	 * reliable indicator of the iclog state before a crash.
+ 	 */
+-	error = xlog_do_recovery_pass(log, tmp_head, tail_blk,
++	first_bad = 0;
++	error = xlog_do_recovery_pass(log, head_blk, *tail_blk,
+ 				      XLOG_RECOVER_CRCPASS, &first_bad);
++	while ((error == -EFSBADCRC || error == -EFSCORRUPTED) && first_bad) {
++		int	tail_distance;
++
++		/*
++		 * Is corruption within range of the head? If so, retry from
++		 * the next record. Otherwise return an error.
++		 */
++		tail_distance = xlog_tail_distance(log, head_blk, first_bad);
++		if (tail_distance > BTOBB(XLOG_MAX_ICLOGS * hsize))
++			break;
++
++		/* skip to the next record; returns positive count on success */
++		error = xlog_seek_logrec_hdr(log, head_blk, first_bad, 2, bp,
++				&tmp_tail, &thead, &wrapped);
++		if (error < 0)
++			goto out;
++
++		*tail_blk = tmp_tail;
++		first_bad = 0;
++		error = xlog_do_recovery_pass(log, head_blk, *tail_blk,
++					      XLOG_RECOVER_CRCPASS, &first_bad);
++	}
+ 
++	if (!error && *tail_blk != orig_tail)
++		xfs_warn(log->l_mp,
++		"Tail block (0x%llx) overwrite detected. Updated to 0x%llx",
++			 orig_tail, *tail_blk);
+ out:
+ 	xlog_put_bp(bp);
+ 	return error;
+@@ -1143,7 +1188,7 @@ xlog_verify_head(
+ 	 */
+ 	error = xlog_do_recovery_pass(log, *head_blk, tmp_rhead_blk,
+ 				      XLOG_RECOVER_CRCPASS, &first_bad);
+-	if (error == -EFSBADCRC) {
++	if ((error == -EFSBADCRC || error == -EFSCORRUPTED) && first_bad) {
+ 		/*
+ 		 * We've hit a potential torn write. Reset the error and warn
+ 		 * about it.
+@@ -1183,31 +1228,12 @@ xlog_verify_head(
+ 			ASSERT(0);
+ 			return 0;
+ 		}
+-
+-		/*
+-		 * Now verify the tail based on the updated head. This is
+-		 * required because the torn writes trimmed from the head could
+-		 * have been written over the tail of a previous record. Return
+-		 * any errors since recovery cannot proceed if the tail is
+-		 * corrupt.
+-		 *
+-		 * XXX: This leaves a gap in truly robust protection from torn
+-		 * writes in the log. If the head is behind the tail, the tail
+-		 * pushes forward to create some space and then a crash occurs
+-		 * causing the writes into the previous record's tail region to
+-		 * tear, log recovery isn't able to recover.
+-		 *
+-		 * How likely is this to occur? If possible, can we do something
+-		 * more intelligent here? Is it safe to push the tail forward if
+-		 * we can determine that the tail is within the range of the
+-		 * torn write (e.g., the kernel can only overwrite the tail if
+-		 * it has actually been pushed forward)? Alternatively, could we
+-		 * somehow prevent this condition at runtime?
+-		 */
+-		error = xlog_verify_tail(log, *head_blk, *tail_blk);
+ 	}
++	if (error)
++		return error;
+ 
+-	return error;
++	return xlog_verify_tail(log, *head_blk, tail_blk,
++				be32_to_cpu((*rhead)->h_size));
+ }
+ 
+ /*
+@@ -4152,7 +4178,7 @@ xlog_recover_commit_trans(
+ 
+ 	#define XLOG_RECOVER_COMMIT_QUEUE_MAX 100
+ 
+-	hlist_del(&trans->r_list);
++	hlist_del_init(&trans->r_list);
+ 
+ 	error = xlog_recover_reorder_trans(log, trans, pass);
+ 	if (error)
+@@ -4354,6 +4380,8 @@ xlog_recover_free_trans(
+ 	xlog_recover_item_t	*item, *n;
+ 	int			i;
+ 
++	hlist_del_init(&trans->r_list);
++
+ 	list_for_each_entry_safe(item, n, &trans->r_itemq, ri_list) {
+ 		/* Free the regions in the item. */
+ 		list_del(&item->ri_list);
+@@ -4799,12 +4827,16 @@ xlog_recover_process_intents(
+ 	int			error = 0;
+ 	struct xfs_ail_cursor	cur;
+ 	struct xfs_ail		*ailp;
++#if defined(DEBUG) || defined(XFS_WARN)
+ 	xfs_lsn_t		last_lsn;
++#endif
+ 
+ 	ailp = log->l_ailp;
+ 	spin_lock(&ailp->xa_lock);
+ 	lip = xfs_trans_ail_cursor_first(ailp, &cur, 0);
++#if defined(DEBUG) || defined(XFS_WARN)
+ 	last_lsn = xlog_assign_lsn(log->l_curr_cycle, log->l_curr_block);
++#endif
+ 	while (lip != NULL) {
+ 		/*
+ 		 * We're done when we see something other than an intent.
+@@ -5214,7 +5246,7 @@ xlog_do_recovery_pass(
+ 	xfs_daddr_t		*first_bad)	/* out: first bad log rec */
+ {
+ 	xlog_rec_header_t	*rhead;
+-	xfs_daddr_t		blk_no;
++	xfs_daddr_t		blk_no, rblk_no;
+ 	xfs_daddr_t		rhead_blk;
+ 	char			*offset;
+ 	xfs_buf_t		*hbp, *dbp;
+@@ -5222,11 +5254,15 @@ xlog_do_recovery_pass(
+ 	int			error2 = 0;
+ 	int			bblks, split_bblks;
+ 	int			hblks, split_hblks, wrapped_hblks;
++	int			i;
+ 	struct hlist_head	rhash[XLOG_RHASH_SIZE];
+ 	LIST_HEAD		(buffer_list);
+ 
+ 	ASSERT(head_blk != tail_blk);
+-	rhead_blk = 0;
++	blk_no = rhead_blk = tail_blk;
++
++	for (i = 0; i < XLOG_RHASH_SIZE; i++)
++		INIT_HLIST_HEAD(&rhash[i]);
+ 
+ 	/*
+ 	 * Read the header of the tail block and get the iclog buffer size from
+@@ -5301,7 +5337,6 @@ xlog_do_recovery_pass(
+ 	}
+ 
+ 	memset(rhash, 0, sizeof(rhash));
+-	blk_no = rhead_blk = tail_blk;
+ 	if (tail_blk > head_blk) {
+ 		/*
+ 		 * Perform recovery around the end of the physical log.
+@@ -5363,9 +5398,19 @@ xlog_do_recovery_pass(
+ 			bblks = (int)BTOBB(be32_to_cpu(rhead->h_len));
+ 			blk_no += hblks;
+ 
+-			/* Read in data for log record */
+-			if (blk_no + bblks <= log->l_logBBsize) {
+-				error = xlog_bread(log, blk_no, bblks, dbp,
++			/*
++			 * Read the log record data in multiple reads if it
++			 * wraps around the end of the log. Note that if the
++			 * header already wrapped, blk_no could point past the
++			 * end of the log. The record data is contiguous in
++			 * that case.
++			 */
++			if (blk_no + bblks <= log->l_logBBsize ||
++			    blk_no >= log->l_logBBsize) {
++				/* mod blk_no in case the header wrapped and
++				 * pushed it beyond the end of the log */
++				rblk_no = do_mod(blk_no, log->l_logBBsize);
++				error = xlog_bread(log, rblk_no, bblks, dbp,
+ 						   &offset);
+ 				if (error)
+ 					goto bread_err2;
+@@ -5464,6 +5509,19 @@ xlog_do_recovery_pass(
+ 	if (error && first_bad)
+ 		*first_bad = rhead_blk;
+ 
++	/*
++	 * Transactions are freed at commit time but transactions without commit
++	 * records on disk are never committed. Free any that may be left in the
++	 * hash table.
++	 */
++	for (i = 0; i < XLOG_RHASH_SIZE; i++) {
++		struct hlist_node	*tmp;
++		struct xlog_recover	*trans;
++
++		hlist_for_each_entry_safe(trans, tmp, &rhash[i], r_list)
++			xlog_recover_free_trans(trans);
++	}
++
+ 	return error ? error : error2;
+ }
+ 
+@@ -5542,6 +5600,8 @@ xlog_do_recover(
+ 	xfs_buf_t	*bp;
+ 	xfs_sb_t	*sbp;
+ 
++	trace_xfs_log_recover(log, head_blk, tail_blk);
++
+ 	/*
+ 	 * First replay the images in the log.
+ 	 */
+diff --git a/fs/xfs/xfs_mount.c b/fs/xfs/xfs_mount.c
+index 13796f212f98..d4ce8d277992 100644
+--- a/fs/xfs/xfs_mount.c
++++ b/fs/xfs/xfs_mount.c
+@@ -924,15 +924,6 @@ xfs_mountfs(
+ 		}
+ 	}
+ 
+-	/*
+-	 * During the second phase of log recovery, we need iget and
+-	 * iput to behave like they do for an active filesystem.
+-	 * xfs_fs_drop_inode needs to be able to prevent the deletion
+-	 * of inodes before we're done replaying log items on those
+-	 * inodes.
+-	 */
+-	mp->m_super->s_flags |= MS_ACTIVE;
+-
+ 	/*
+ 	 * Finish recovering the file system.  This part needed to be delayed
+ 	 * until after the root and real-time bitmap inodes were consistently
+@@ -1008,12 +999,13 @@ xfs_mountfs(
+  out_quota:
+ 	xfs_qm_unmount_quotas(mp);
+  out_rtunmount:
+-	mp->m_super->s_flags &= ~MS_ACTIVE;
+ 	xfs_rtunmount_inodes(mp);
+  out_rele_rip:
+ 	IRELE(rip);
+ 	cancel_delayed_work_sync(&mp->m_reclaim_work);
+ 	xfs_reclaim_inodes(mp, SYNC_WAIT);
++	/* Clean out dquots that might be in memory after quotacheck. */
++	xfs_qm_unmount(mp);
+  out_log_dealloc:
+ 	mp->m_flags |= XFS_MOUNT_UNMOUNTING;
+ 	xfs_log_mount_cancel(mp);
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index 8b9a9f15f022..1fdd3face2d9 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -111,6 +111,9 @@ xfs_qm_dquot_walk(
+ 			skipped = 0;
+ 			break;
+ 		}
++		/* we're done if id overflows back to zero */
++		if (!next_index)
++			break;
+ 	}
+ 
+ 	if (skipped) {
+@@ -1247,6 +1250,7 @@ xfs_qm_flush_one(
+ 	struct xfs_dquot	*dqp,
+ 	void			*data)
+ {
++	struct xfs_mount	*mp = dqp->q_mount;
+ 	struct list_head	*buffer_list = data;
+ 	struct xfs_buf		*bp = NULL;
+ 	int			error = 0;
+@@ -1257,7 +1261,32 @@ xfs_qm_flush_one(
+ 	if (!XFS_DQ_IS_DIRTY(dqp))
+ 		goto out_unlock;
+ 
+-	xfs_dqflock(dqp);
++	/*
++	 * The only way the dquot is already flush locked by the time quotacheck
++	 * gets here is if reclaim flushed it before the dqadjust walk dirtied
++	 * it for the final time. Quotacheck collects all dquot bufs in the
++	 * local delwri queue before dquots are dirtied, so reclaim can't have
++	 * possibly queued it for I/O. The only way out is to push the buffer to
++	 * cycle the flush lock.
++	 */
++	if (!xfs_dqflock_nowait(dqp)) {
++		/* buf is pinned in-core by delwri list */
++		DEFINE_SINGLE_BUF_MAP(map, dqp->q_blkno,
++				      mp->m_quotainfo->qi_dqchunklen);
++		bp = _xfs_buf_find(mp->m_ddev_targp, &map, 1, 0, NULL);
++		if (!bp) {
++			error = -EINVAL;
++			goto out_unlock;
++		}
++		xfs_buf_unlock(bp);
++
++		xfs_buf_delwri_pushbuf(bp, buffer_list);
++		xfs_buf_rele(bp);
++
++		error = -EAGAIN;
++		goto out_unlock;
++	}
++
+ 	error = xfs_qm_dqflush(dqp, &bp);
+ 	if (error)
+ 		goto out_unlock;
+diff --git a/fs/xfs/xfs_reflink.c b/fs/xfs/xfs_reflink.c
+index 29a75ecb2425..0015c19c7455 100644
+--- a/fs/xfs/xfs_reflink.c
++++ b/fs/xfs/xfs_reflink.c
+@@ -169,6 +169,8 @@ xfs_reflink_find_shared(
+ 	error = xfs_alloc_read_agf(mp, NULL, agno, 0, &agbp);
+ 	if (error)
+ 		return error;
++	if (!agbp)
++		return -ENOMEM;
+ 
+ 	cur = xfs_refcountbt_init_cursor(mp, NULL, agbp, agno, NULL);
+ 
+@@ -333,7 +335,7 @@ xfs_reflink_convert_cow_extent(
+ 	struct xfs_defer_ops		*dfops)
+ {
+ 	struct xfs_bmbt_irec		irec = *imap;
+-	xfs_fsblock_t			first_block;
++	xfs_fsblock_t			first_block = NULLFSBLOCK;
+ 	int				nimaps = 1;
+ 
+ 	if (imap->br_state == XFS_EXT_NORM)
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index 882fb8524fcb..67d589e0a49f 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -1214,7 +1214,7 @@ xfs_test_remount_options(
+ 	tmp_mp->m_super = sb;
+ 	error = xfs_parseargs(tmp_mp, options);
+ 	xfs_free_fsname(tmp_mp);
+-	kfree(tmp_mp);
++	kmem_free(tmp_mp);
+ 
+ 	return error;
+ }
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 828f383df121..bdf69e1c7410 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -366,6 +366,7 @@ DEFINE_BUF_EVENT(xfs_buf_iowait_done);
+ DEFINE_BUF_EVENT(xfs_buf_delwri_queue);
+ DEFINE_BUF_EVENT(xfs_buf_delwri_queued);
+ DEFINE_BUF_EVENT(xfs_buf_delwri_split);
++DEFINE_BUF_EVENT(xfs_buf_delwri_pushbuf);
+ DEFINE_BUF_EVENT(xfs_buf_get_uncached);
+ DEFINE_BUF_EVENT(xfs_bdstrat_shut);
+ DEFINE_BUF_EVENT(xfs_buf_item_relse);
+@@ -519,7 +520,6 @@ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_size);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_size_ordered);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_size_stale);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_format);
+-DEFINE_BUF_ITEM_EVENT(xfs_buf_item_format_ordered);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_format_stale);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_ordered);
+ DEFINE_BUF_ITEM_EVENT(xfs_buf_item_pin);
+@@ -1990,6 +1990,24 @@ DEFINE_EVENT(xfs_swap_extent_class, name, \
+ DEFINE_SWAPEXT_EVENT(xfs_swap_extent_before);
+ DEFINE_SWAPEXT_EVENT(xfs_swap_extent_after);
+ 
++TRACE_EVENT(xfs_log_recover,
++	TP_PROTO(struct xlog *log, xfs_daddr_t headblk, xfs_daddr_t tailblk),
++	TP_ARGS(log, headblk, tailblk),
++	TP_STRUCT__entry(
++		__field(dev_t, dev)
++		__field(xfs_daddr_t, headblk)
++		__field(xfs_daddr_t, tailblk)
++	),
++	TP_fast_assign(
++		__entry->dev = log->l_mp->m_super->s_dev;
++		__entry->headblk = headblk;
++		__entry->tailblk = tailblk;
++	),
++	TP_printk("dev %d:%d headblk 0x%llx tailblk 0x%llx",
++		  MAJOR(__entry->dev), MINOR(__entry->dev), __entry->headblk,
++		  __entry->tailblk)
++)
++
+ TRACE_EVENT(xfs_log_recover_record,
+ 	TP_PROTO(struct xlog *log, struct xlog_rec_header *rhead, int pass),
+ 	TP_ARGS(log, rhead, pass),
+diff --git a/fs/xfs/xfs_trans.h b/fs/xfs/xfs_trans.h
+index 98024cb933ef..5669cf00bae0 100644
+--- a/fs/xfs/xfs_trans.h
++++ b/fs/xfs/xfs_trans.h
+@@ -50,6 +50,7 @@ typedef struct xfs_log_item {
+ 	struct xfs_ail			*li_ailp;	/* ptr to AIL */
+ 	uint				li_type;	/* item type */
+ 	uint				li_flags;	/* misc flags */
++	struct xfs_buf			*li_buf;	/* real buffer pointer */
+ 	struct xfs_log_item		*li_bio_list;	/* buffer item list */
+ 	void				(*li_cb)(struct xfs_buf *,
+ 						 struct xfs_log_item *);
+@@ -65,11 +66,13 @@ typedef struct xfs_log_item {
+ } xfs_log_item_t;
+ 
+ #define	XFS_LI_IN_AIL	0x1
+-#define XFS_LI_ABORTED	0x2
++#define	XFS_LI_ABORTED	0x2
++#define	XFS_LI_FAILED	0x4
+ 
+ #define XFS_LI_FLAGS \
+ 	{ XFS_LI_IN_AIL,	"IN_AIL" }, \
+-	{ XFS_LI_ABORTED,	"ABORTED" }
++	{ XFS_LI_ABORTED,	"ABORTED" }, \
++	{ XFS_LI_FAILED,	"FAILED" }
+ 
+ struct xfs_item_ops {
+ 	void (*iop_size)(xfs_log_item_t *, int *, int *);
+@@ -80,6 +83,7 @@ struct xfs_item_ops {
+ 	void (*iop_unlock)(xfs_log_item_t *);
+ 	xfs_lsn_t (*iop_committed)(xfs_log_item_t *, xfs_lsn_t);
+ 	void (*iop_committing)(xfs_log_item_t *, xfs_lsn_t);
++	void (*iop_error)(xfs_log_item_t *, xfs_buf_t *);
+ };
+ 
+ void	xfs_log_item_init(struct xfs_mount *mp, struct xfs_log_item *item,
+@@ -213,12 +217,14 @@ void		xfs_trans_bhold_release(xfs_trans_t *, struct xfs_buf *);
+ void		xfs_trans_binval(xfs_trans_t *, struct xfs_buf *);
+ void		xfs_trans_inode_buf(xfs_trans_t *, struct xfs_buf *);
+ void		xfs_trans_stale_inode_buf(xfs_trans_t *, struct xfs_buf *);
+-void		xfs_trans_ordered_buf(xfs_trans_t *, struct xfs_buf *);
++bool		xfs_trans_ordered_buf(xfs_trans_t *, struct xfs_buf *);
+ void		xfs_trans_dquot_buf(xfs_trans_t *, struct xfs_buf *, uint);
+ void		xfs_trans_inode_alloc_buf(xfs_trans_t *, struct xfs_buf *);
+ void		xfs_trans_ichgtime(struct xfs_trans *, struct xfs_inode *, int);
+ void		xfs_trans_ijoin(struct xfs_trans *, struct xfs_inode *, uint);
+-void		xfs_trans_log_buf(xfs_trans_t *, struct xfs_buf *, uint, uint);
++void		xfs_trans_log_buf(struct xfs_trans *, struct xfs_buf *, uint,
++				  uint);
++void		xfs_trans_dirty_buf(struct xfs_trans *, struct xfs_buf *);
+ void		xfs_trans_log_inode(xfs_trans_t *, struct xfs_inode *, uint);
+ 
+ void		xfs_extent_free_init_defer_op(void);
+@@ -277,6 +283,6 @@ int xfs_trans_log_finish_bmap_update(struct xfs_trans *tp,
+ 		struct xfs_bud_log_item *rudp, struct xfs_defer_ops *dfops,
+ 		enum xfs_bmap_intent_type type, struct xfs_inode *ip,
+ 		int whichfork, xfs_fileoff_t startoff, xfs_fsblock_t startblock,
+-		xfs_filblks_t blockcount, xfs_exntst_t state);
++		xfs_filblks_t *blockcount, xfs_exntst_t state);
+ 
+ #endif	/* __XFS_TRANS_H__ */
+diff --git a/fs/xfs/xfs_trans_ail.c b/fs/xfs/xfs_trans_ail.c
+index d6c9c3e9e02b..70f5ab017323 100644
+--- a/fs/xfs/xfs_trans_ail.c
++++ b/fs/xfs/xfs_trans_ail.c
+@@ -684,8 +684,24 @@ xfs_trans_ail_update_bulk(
+ 	}
+ }
+ 
+-/*
+- * xfs_trans_ail_delete_bulk - remove multiple log items from the AIL
++bool
++xfs_ail_delete_one(
++	struct xfs_ail		*ailp,
++	struct xfs_log_item	*lip)
++{
++	struct xfs_log_item	*mlip = xfs_ail_min(ailp);
++
++	trace_xfs_ail_delete(lip, mlip->li_lsn, lip->li_lsn);
++	xfs_ail_delete(ailp, lip);
++	xfs_clear_li_failed(lip);
++	lip->li_flags &= ~XFS_LI_IN_AIL;
++	lip->li_lsn = 0;
++
++	return mlip == lip;
++}
++
++/**
++ * Remove a log items from the AIL
+  *
+  * @xfs_trans_ail_delete_bulk takes an array of log items that all need to
+  * removed from the AIL. The caller is already holding the AIL lock, and done
+@@ -706,52 +722,36 @@ xfs_trans_ail_update_bulk(
+  * before returning.
+  */
+ void
+-xfs_trans_ail_delete_bulk(
++xfs_trans_ail_delete(
+ 	struct xfs_ail		*ailp,
+-	struct xfs_log_item	**log_items,
+-	int			nr_items,
++	struct xfs_log_item	*lip,
+ 	int			shutdown_type) __releases(ailp->xa_lock)
+ {
+-	xfs_log_item_t		*mlip;
+-	int			mlip_changed = 0;
+-	int			i;
+-
+-	mlip = xfs_ail_min(ailp);
++	struct xfs_mount	*mp = ailp->xa_mount;
++	bool			mlip_changed;
+ 
+-	for (i = 0; i < nr_items; i++) {
+-		struct xfs_log_item *lip = log_items[i];
+-		if (!(lip->li_flags & XFS_LI_IN_AIL)) {
+-			struct xfs_mount	*mp = ailp->xa_mount;
+-
+-			spin_unlock(&ailp->xa_lock);
+-			if (!XFS_FORCED_SHUTDOWN(mp)) {
+-				xfs_alert_tag(mp, XFS_PTAG_AILDELETE,
+-		"%s: attempting to delete a log item that is not in the AIL",
+-						__func__);
+-				xfs_force_shutdown(mp, shutdown_type);
+-			}
+-			return;
++	if (!(lip->li_flags & XFS_LI_IN_AIL)) {
++		spin_unlock(&ailp->xa_lock);
++		if (!XFS_FORCED_SHUTDOWN(mp)) {
++			xfs_alert_tag(mp, XFS_PTAG_AILDELETE,
++	"%s: attempting to delete a log item that is not in the AIL",
++					__func__);
++			xfs_force_shutdown(mp, shutdown_type);
+ 		}
+-
+-		trace_xfs_ail_delete(lip, mlip->li_lsn, lip->li_lsn);
+-		xfs_ail_delete(ailp, lip);
+-		lip->li_flags &= ~XFS_LI_IN_AIL;
+-		lip->li_lsn = 0;
+-		if (mlip == lip)
+-			mlip_changed = 1;
++		return;
+ 	}
+ 
++	mlip_changed = xfs_ail_delete_one(ailp, lip);
+ 	if (mlip_changed) {
+-		if (!XFS_FORCED_SHUTDOWN(ailp->xa_mount))
+-			xlog_assign_tail_lsn_locked(ailp->xa_mount);
++		if (!XFS_FORCED_SHUTDOWN(mp))
++			xlog_assign_tail_lsn_locked(mp);
+ 		if (list_empty(&ailp->xa_ail))
+ 			wake_up_all(&ailp->xa_empty);
+-		spin_unlock(&ailp->xa_lock);
++	}
+ 
++	spin_unlock(&ailp->xa_lock);
++	if (mlip_changed)
+ 		xfs_log_space_wake(ailp->xa_mount);
+-	} else {
+-		spin_unlock(&ailp->xa_lock);
+-	}
+ }
+ 
+ int
+diff --git a/fs/xfs/xfs_trans_bmap.c b/fs/xfs/xfs_trans_bmap.c
+index 6408e7d7c08c..14543d93cd4b 100644
+--- a/fs/xfs/xfs_trans_bmap.c
++++ b/fs/xfs/xfs_trans_bmap.c
+@@ -63,7 +63,7 @@ xfs_trans_log_finish_bmap_update(
+ 	int				whichfork,
+ 	xfs_fileoff_t			startoff,
+ 	xfs_fsblock_t			startblock,
+-	xfs_filblks_t			blockcount,
++	xfs_filblks_t			*blockcount,
+ 	xfs_exntst_t			state)
+ {
+ 	int				error;
+@@ -196,16 +196,23 @@ xfs_bmap_update_finish_item(
+ 	void				**state)
+ {
+ 	struct xfs_bmap_intent		*bmap;
++	xfs_filblks_t			count;
+ 	int				error;
+ 
+ 	bmap = container_of(item, struct xfs_bmap_intent, bi_list);
++	count = bmap->bi_bmap.br_blockcount;
+ 	error = xfs_trans_log_finish_bmap_update(tp, done_item, dop,
+ 			bmap->bi_type,
+ 			bmap->bi_owner, bmap->bi_whichfork,
+ 			bmap->bi_bmap.br_startoff,
+ 			bmap->bi_bmap.br_startblock,
+-			bmap->bi_bmap.br_blockcount,
++			&count,
+ 			bmap->bi_bmap.br_state);
++	if (!error && count > 0) {
++		ASSERT(bmap->bi_type == XFS_BMAP_UNMAP);
++		bmap->bi_bmap.br_blockcount = count;
++		return -EAGAIN;
++	}
+ 	kmem_free(bmap);
+ 	return error;
+ }
+diff --git a/fs/xfs/xfs_trans_buf.c b/fs/xfs/xfs_trans_buf.c
+index 8ee29ca132dc..3ba7a96a8abd 100644
+--- a/fs/xfs/xfs_trans_buf.c
++++ b/fs/xfs/xfs_trans_buf.c
+@@ -356,6 +356,7 @@ xfs_trans_brelse(xfs_trans_t	*tp,
+ 		 xfs_buf_t	*bp)
+ {
+ 	xfs_buf_log_item_t	*bip;
++	int			freed;
+ 
+ 	/*
+ 	 * Default to a normal brelse() call if the tp is NULL.
+@@ -419,16 +420,22 @@ xfs_trans_brelse(xfs_trans_t	*tp,
+ 	/*
+ 	 * Drop our reference to the buf log item.
+ 	 */
+-	atomic_dec(&bip->bli_refcount);
++	freed = atomic_dec_and_test(&bip->bli_refcount);
+ 
+ 	/*
+-	 * If the buf item is not tracking data in the log, then
+-	 * we must free it before releasing the buffer back to the
+-	 * free pool.  Before releasing the buffer to the free pool,
+-	 * clear the transaction pointer in b_fsprivate2 to dissolve
+-	 * its relation to this transaction.
++	 * If the buf item is not tracking data in the log, then we must free it
++	 * before releasing the buffer back to the free pool.
++	 *
++	 * If the fs has shutdown and we dropped the last reference, it may fall
++	 * on us to release a (possibly dirty) bli if it never made it to the
++	 * AIL (e.g., the aborted unpin already happened and didn't release it
++	 * due to our reference). Since we're already shutdown and need xa_lock,
++	 * just force remove from the AIL and release the bli here.
+ 	 */
+-	if (!xfs_buf_item_dirty(bip)) {
++	if (XFS_FORCED_SHUTDOWN(tp->t_mountp) && freed) {
++		xfs_trans_ail_remove(&bip->bli_item, SHUTDOWN_LOG_IO_ERROR);
++		xfs_buf_item_relse(bp);
++	} else if (!(bip->bli_flags & XFS_BLI_DIRTY)) {
+ /***
+ 		ASSERT(bp->b_pincount == 0);
+ ***/
+@@ -486,25 +493,17 @@ xfs_trans_bhold_release(xfs_trans_t	*tp,
+ }
+ 
+ /*
+- * This is called to mark bytes first through last inclusive of the given
+- * buffer as needing to be logged when the transaction is committed.
+- * The buffer must already be associated with the given transaction.
+- *
+- * First and last are numbers relative to the beginning of this buffer,
+- * so the first byte in the buffer is numbered 0 regardless of the
+- * value of b_blkno.
++ * Mark a buffer dirty in the transaction.
+  */
+ void
+-xfs_trans_log_buf(xfs_trans_t	*tp,
+-		  xfs_buf_t	*bp,
+-		  uint		first,
+-		  uint		last)
++xfs_trans_dirty_buf(
++	struct xfs_trans	*tp,
++	struct xfs_buf		*bp)
+ {
+-	xfs_buf_log_item_t	*bip = bp->b_fspriv;
++	struct xfs_buf_log_item	*bip = bp->b_fspriv;
+ 
+ 	ASSERT(bp->b_transp == tp);
+ 	ASSERT(bip != NULL);
+-	ASSERT(first <= last && last < BBTOB(bp->b_length));
+ 	ASSERT(bp->b_iodone == NULL ||
+ 	       bp->b_iodone == xfs_buf_iodone_callbacks);
+ 
+@@ -524,8 +523,6 @@ xfs_trans_log_buf(xfs_trans_t	*tp,
+ 	bp->b_iodone = xfs_buf_iodone_callbacks;
+ 	bip->bli_item.li_cb = xfs_buf_iodone;
+ 
+-	trace_xfs_trans_log_buf(bip);
+-
+ 	/*
+ 	 * If we invalidated the buffer within this transaction, then
+ 	 * cancel the invalidation now that we're dirtying the buffer
+@@ -538,17 +535,37 @@ xfs_trans_log_buf(xfs_trans_t	*tp,
+ 		bp->b_flags &= ~XBF_STALE;
+ 		bip->__bli_format.blf_flags &= ~XFS_BLF_CANCEL;
+ 	}
++	bip->bli_flags |= XFS_BLI_DIRTY | XFS_BLI_LOGGED;
+ 
+ 	tp->t_flags |= XFS_TRANS_DIRTY;
+ 	bip->bli_item.li_desc->lid_flags |= XFS_LID_DIRTY;
++}
+ 
+-	/*
+-	 * If we have an ordered buffer we are not logging any dirty range but
+-	 * it still needs to be marked dirty and that it has been logged.
+-	 */
+-	bip->bli_flags |= XFS_BLI_DIRTY | XFS_BLI_LOGGED;
+-	if (!(bip->bli_flags & XFS_BLI_ORDERED))
+-		xfs_buf_item_log(bip, first, last);
++/*
++ * This is called to mark bytes first through last inclusive of the given
++ * buffer as needing to be logged when the transaction is committed.
++ * The buffer must already be associated with the given transaction.
++ *
++ * First and last are numbers relative to the beginning of this buffer,
++ * so the first byte in the buffer is numbered 0 regardless of the
++ * value of b_blkno.
++ */
++void
++xfs_trans_log_buf(
++	struct xfs_trans	*tp,
++	struct xfs_buf		*bp,
++	uint			first,
++	uint			last)
++{
++	struct xfs_buf_log_item	*bip = bp->b_fspriv;
++
++	ASSERT(first <= last && last < BBTOB(bp->b_length));
++	ASSERT(!(bip->bli_flags & XFS_BLI_ORDERED));
++
++	xfs_trans_dirty_buf(tp, bp);
++
++	trace_xfs_trans_log_buf(bip);
++	xfs_buf_item_log(bip, first, last);
+ }
+ 
+ 
+@@ -701,14 +718,13 @@ xfs_trans_inode_alloc_buf(
+ }
+ 
+ /*
+- * Mark the buffer as ordered for this transaction. This means
+- * that the contents of the buffer are not recorded in the transaction
+- * but it is tracked in the AIL as though it was. This allows us
+- * to record logical changes in transactions rather than the physical
+- * changes we make to the buffer without changing writeback ordering
+- * constraints of metadata buffers.
++ * Mark the buffer as ordered for this transaction. This means that the contents
++ * of the buffer are not recorded in the transaction but it is tracked in the
++ * AIL as though it was. This allows us to record logical changes in
++ * transactions rather than the physical changes we make to the buffer without
++ * changing writeback ordering constraints of metadata buffers.
+  */
+-void
++bool
+ xfs_trans_ordered_buf(
+ 	struct xfs_trans	*tp,
+ 	struct xfs_buf		*bp)
+@@ -719,8 +735,18 @@ xfs_trans_ordered_buf(
+ 	ASSERT(bip != NULL);
+ 	ASSERT(atomic_read(&bip->bli_refcount) > 0);
+ 
++	if (xfs_buf_item_dirty_format(bip))
++		return false;
++
+ 	bip->bli_flags |= XFS_BLI_ORDERED;
+ 	trace_xfs_buf_item_ordered(bip);
++
++	/*
++	 * We don't log a dirty range of an ordered buffer but it still needs
++	 * to be marked dirty and that it has been logged.
++	 */
++	xfs_trans_dirty_buf(tp, bp);
++	return true;
+ }
+ 
+ /*
+diff --git a/fs/xfs/xfs_trans_priv.h b/fs/xfs/xfs_trans_priv.h
+index 49931b72da8a..b317a3644c00 100644
+--- a/fs/xfs/xfs_trans_priv.h
++++ b/fs/xfs/xfs_trans_priv.h
+@@ -106,18 +106,9 @@ xfs_trans_ail_update(
+ 	xfs_trans_ail_update_bulk(ailp, NULL, &lip, 1, lsn);
+ }
+ 
+-void	xfs_trans_ail_delete_bulk(struct xfs_ail *ailp,
+-				struct xfs_log_item **log_items, int nr_items,
+-				int shutdown_type)
+-				__releases(ailp->xa_lock);
+-static inline void
+-xfs_trans_ail_delete(
+-	struct xfs_ail	*ailp,
+-	xfs_log_item_t	*lip,
+-	int		shutdown_type) __releases(ailp->xa_lock)
+-{
+-	xfs_trans_ail_delete_bulk(ailp, &lip, 1, shutdown_type);
+-}
++bool xfs_ail_delete_one(struct xfs_ail *ailp, struct xfs_log_item *lip);
++void xfs_trans_ail_delete(struct xfs_ail *ailp, struct xfs_log_item *lip,
++		int shutdown_type) __releases(ailp->xa_lock);
+ 
+ static inline void
+ xfs_trans_ail_remove(
+@@ -173,4 +164,35 @@ xfs_trans_ail_copy_lsn(
+ 	*dst = *src;
+ }
+ #endif
++
++static inline void
++xfs_clear_li_failed(
++	struct xfs_log_item	*lip)
++{
++	struct xfs_buf	*bp = lip->li_buf;
++
++	ASSERT(lip->li_flags & XFS_LI_IN_AIL);
++	lockdep_assert_held(&lip->li_ailp->xa_lock);
++
++	if (lip->li_flags & XFS_LI_FAILED) {
++		lip->li_flags &= ~XFS_LI_FAILED;
++		lip->li_buf = NULL;
++		xfs_buf_rele(bp);
++	}
++}
++
++static inline void
++xfs_set_li_failed(
++	struct xfs_log_item	*lip,
++	struct xfs_buf		*bp)
++{
++	lockdep_assert_held(&lip->li_ailp->xa_lock);
++
++	if (!(lip->li_flags & XFS_LI_FAILED)) {
++		xfs_buf_hold(bp);
++		lip->li_flags |= XFS_LI_FAILED;
++		lip->li_buf = bp;
++	}
++}
++
+ #endif	/* __XFS_TRANS_PRIV_H__ */
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index dd88ded27fc8..d705ae084edd 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2760,6 +2760,7 @@ static inline void lockdep_annotate_inode_mutex_key(struct inode *inode) { };
+ #endif
+ extern void unlock_new_inode(struct inode *);
+ extern unsigned int get_next_ino(void);
++extern void evict_inodes(struct super_block *sb);
+ 
+ extern void __iget(struct inode * inode);
+ extern void iget_failed(struct inode *);
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 780e7171f548..23db1ae37464 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3901,6 +3901,8 @@ struct net_device *netdev_all_upper_get_next_dev_rcu(struct net_device *dev,
+ 	     updev; \
+ 	     updev = netdev_all_upper_get_next_dev_rcu(dev, &(iter)))
+ 
++bool netdev_has_any_upper_dev(struct net_device *dev);
++
+ void *netdev_lower_get_next_private(struct net_device *dev,
+ 				    struct list_head **iter);
+ void *netdev_lower_get_next_private_rcu(struct net_device *dev,
+diff --git a/include/net/inet_frag.h b/include/net/inet_frag.h
+index 909972aa3acd..634d19203e7d 100644
+--- a/include/net/inet_frag.h
++++ b/include/net/inet_frag.h
+@@ -1,14 +1,9 @@
+ #ifndef __NET_FRAG_H__
+ #define __NET_FRAG_H__
+ 
+-#include <linux/percpu_counter.h>
+-
+ struct netns_frags {
+-	/* The percpu_counter "mem" need to be cacheline aligned.
+-	 *  mem.count must not share cacheline with other writers
+-	 */
+-	struct percpu_counter   mem ____cacheline_aligned_in_smp;
+-
++	/* Keep atomic mem on separate cachelines in structs that include it */
++	atomic_t		mem ____cacheline_aligned_in_smp;
+ 	/* sysctls */
+ 	int			timeout;
+ 	int			high_thresh;
+@@ -108,15 +103,10 @@ struct inet_frags {
+ int inet_frags_init(struct inet_frags *);
+ void inet_frags_fini(struct inet_frags *);
+ 
+-static inline int inet_frags_init_net(struct netns_frags *nf)
+-{
+-	return percpu_counter_init(&nf->mem, 0, GFP_KERNEL);
+-}
+-static inline void inet_frags_uninit_net(struct netns_frags *nf)
++static inline void inet_frags_init_net(struct netns_frags *nf)
+ {
+-	percpu_counter_destroy(&nf->mem);
++	atomic_set(&nf->mem, 0);
+ }
+-
+ void inet_frags_exit_net(struct netns_frags *nf, struct inet_frags *f);
+ 
+ void inet_frag_kill(struct inet_frag_queue *q, struct inet_frags *f);
+@@ -140,37 +130,24 @@ static inline bool inet_frag_evicting(struct inet_frag_queue *q)
+ 
+ /* Memory Tracking Functions. */
+ 
+-/* The default percpu_counter batch size is not big enough to scale to
+- * fragmentation mem acct sizes.
+- * The mem size of a 64K fragment is approx:
+- *  (44 fragments * 2944 truesize) + frag_queue struct(200) = 129736 bytes
+- */
+-static unsigned int frag_percpu_counter_batch = 130000;
+-
+ static inline int frag_mem_limit(struct netns_frags *nf)
+ {
+-	return percpu_counter_read(&nf->mem);
++	return atomic_read(&nf->mem);
+ }
+ 
+ static inline void sub_frag_mem_limit(struct netns_frags *nf, int i)
+ {
+-	__percpu_counter_add(&nf->mem, -i, frag_percpu_counter_batch);
++	atomic_sub(i, &nf->mem);
+ }
+ 
+ static inline void add_frag_mem_limit(struct netns_frags *nf, int i)
+ {
+-	__percpu_counter_add(&nf->mem, i, frag_percpu_counter_batch);
++	atomic_add(i, &nf->mem);
+ }
+ 
+-static inline unsigned int sum_frag_mem_limit(struct netns_frags *nf)
++static inline int sum_frag_mem_limit(struct netns_frags *nf)
+ {
+-	unsigned int res;
+-
+-	local_bh_disable();
+-	res = percpu_counter_sum_positive(&nf->mem);
+-	local_bh_enable();
+-
+-	return res;
++	return atomic_read(&nf->mem);
+ }
+ 
+ /* RFC 3168 support :
+diff --git a/include/net/ip6_fib.h b/include/net/ip6_fib.h
+index a74e2aa40ef4..a6bcb18ac4c3 100644
+--- a/include/net/ip6_fib.h
++++ b/include/net/ip6_fib.h
+@@ -68,6 +68,7 @@ struct fib6_node {
+ 	__u16			fn_flags;
+ 	int			fn_sernum;
+ 	struct rt6_info		*rr_ptr;
++	struct rcu_head		rcu;
+ };
+ 
+ #ifndef CONFIG_IPV6_SUBTREES
+@@ -102,7 +103,7 @@ struct rt6_info {
+ 	 * the same cache line.
+ 	 */
+ 	struct fib6_table		*rt6i_table;
+-	struct fib6_node		*rt6i_node;
++	struct fib6_node __rcu		*rt6i_node;
+ 
+ 	struct in6_addr			rt6i_gateway;
+ 
+@@ -165,13 +166,40 @@ static inline void rt6_update_expires(struct rt6_info *rt0, int timeout)
+ 	rt0->rt6i_flags |= RTF_EXPIRES;
+ }
+ 
++/* Function to safely get fn->sernum for passed in rt
++ * and store result in passed in cookie.
++ * Return true if we can get cookie safely
++ * Return false if not
++ */
++static inline bool rt6_get_cookie_safe(const struct rt6_info *rt,
++				       u32 *cookie)
++{
++	struct fib6_node *fn;
++	bool status = false;
++
++	rcu_read_lock();
++	fn = rcu_dereference(rt->rt6i_node);
++
++	if (fn) {
++		*cookie = fn->fn_sernum;
++		status = true;
++	}
++
++	rcu_read_unlock();
++	return status;
++}
++
+ static inline u32 rt6_get_cookie(const struct rt6_info *rt)
+ {
++	u32 cookie = 0;
++
+ 	if (rt->rt6i_flags & RTF_PCPU ||
+ 	    (unlikely(rt->dst.flags & DST_NOCACHE) && rt->dst.from))
+ 		rt = (struct rt6_info *)(rt->dst.from);
+ 
+-	return rt->rt6i_node ? rt->rt6i_node->fn_sernum : 0;
++	rt6_get_cookie_safe(rt, &cookie);
++
++	return cookie;
+ }
+ 
+ static inline void ip6_rt_put(struct rt6_info *rt)
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index 89a687f3c0a3..5f5e28f210e0 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -53,6 +53,9 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	brstats->tx_bytes += skb->len;
+ 	u64_stats_update_end(&brstats->syncp);
+ 
++#ifdef CONFIG_NET_SWITCHDEV
++	skb->offload_fwd_mark = 0;
++#endif
+ 	BR_INPUT_SKB_CB(skb)->brdev = dev;
+ 
+ 	skb_reset_mac_header(skb);
+diff --git a/net/core/datagram.c b/net/core/datagram.c
+index 58dfa23d12ca..4fa4011feec1 100644
+--- a/net/core/datagram.c
++++ b/net/core/datagram.c
+@@ -351,7 +351,7 @@ int skb_kill_datagram(struct sock *sk, struct sk_buff *skb, unsigned int flags)
+ 	if (flags & MSG_PEEK) {
+ 		err = -ENOENT;
+ 		spin_lock_bh(&sk->sk_receive_queue.lock);
+-		if (skb == skb_peek(&sk->sk_receive_queue)) {
++		if (skb->next) {
+ 			__skb_unlink(skb, &sk->sk_receive_queue);
+ 			atomic_dec(&skb->users);
+ 			err = 0;
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 1d0a7369d5a2..ba7b8121a414 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5337,12 +5337,13 @@ EXPORT_SYMBOL(netdev_has_upper_dev);
+  * Find out if a device is linked to an upper device and return true in case
+  * it is. The caller must hold the RTNL lock.
+  */
+-static bool netdev_has_any_upper_dev(struct net_device *dev)
++bool netdev_has_any_upper_dev(struct net_device *dev)
+ {
+ 	ASSERT_RTNL();
+ 
+ 	return !list_empty(&dev->all_adj_list.upper);
+ }
++EXPORT_SYMBOL(netdev_has_any_upper_dev);
+ 
+ /**
+  * netdev_master_upper_dev_get - Get master upper device
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index 30d875dff6b5..f85b08baff16 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -580,19 +580,14 @@ static int __net_init lowpan_frags_init_net(struct net *net)
+ {
+ 	struct netns_ieee802154_lowpan *ieee802154_lowpan =
+ 		net_ieee802154_lowpan(net);
+-	int res;
+ 
+ 	ieee802154_lowpan->frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
+ 	ieee802154_lowpan->frags.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	ieee802154_lowpan->frags.timeout = IPV6_FRAG_TIMEOUT;
+ 
+-	res = inet_frags_init_net(&ieee802154_lowpan->frags);
+-	if (res)
+-		return res;
+-	res = lowpan_frags_ns_sysctl_register(net);
+-	if (res)
+-		inet_frags_uninit_net(&ieee802154_lowpan->frags);
+-	return res;
++	inet_frags_init_net(&ieee802154_lowpan->frags);
++
++	return lowpan_frags_ns_sysctl_register(net);
+ }
+ 
+ static void __net_exit lowpan_frags_exit_net(struct net *net)
+diff --git a/net/ipv4/inet_fragment.c b/net/ipv4/inet_fragment.c
+index b5e9317eaf9e..631c0d0d7cf8 100644
+--- a/net/ipv4/inet_fragment.c
++++ b/net/ipv4/inet_fragment.c
+@@ -234,10 +234,8 @@ void inet_frags_exit_net(struct netns_frags *nf, struct inet_frags *f)
+ 	cond_resched();
+ 
+ 	if (read_seqretry(&f->rnd_seqlock, seq) ||
+-	    percpu_counter_sum(&nf->mem))
++	    sum_frag_mem_limit(nf))
+ 		goto evict_again;
+-
+-	percpu_counter_destroy(&nf->mem);
+ }
+ EXPORT_SYMBOL(inet_frags_exit_net);
+ 
+diff --git a/net/ipv4/ip_fragment.c b/net/ipv4/ip_fragment.c
+index bbe7f72db9c1..453db950dc9f 100644
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@ -835,8 +835,6 @@ static void __init ip4_frags_ctl_register(void)
+ 
+ static int __net_init ipv4_frags_init_net(struct net *net)
+ {
+-	int res;
+-
+ 	/* Fragment cache limits.
+ 	 *
+ 	 * The fragment memory accounting code, (tries to) account for
+@@ -862,13 +860,9 @@ static int __net_init ipv4_frags_init_net(struct net *net)
+ 
+ 	net->ipv4.frags.max_dist = 64;
+ 
+-	res = inet_frags_init_net(&net->ipv4.frags);
+-	if (res)
+-		return res;
+-	res = ip4_frags_ns_ctl_register(net);
+-	if (res)
+-		inet_frags_uninit_net(&net->ipv4.frags);
+-	return res;
++	inet_frags_init_net(&net->ipv4.frags);
++
++	return ip4_frags_ns_ctl_register(net);
+ }
+ 
+ static void __net_exit ipv4_frags_exit_net(struct net *net)
+diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
+index 5719d6ba0824..bd7f1836bb70 100644
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -609,8 +609,8 @@ void ip_md_tunnel_xmit(struct sk_buff *skb, struct net_device *dev, u8 proto)
+ 		ip_rt_put(rt);
+ 		goto tx_dropped;
+ 	}
+-	iptunnel_xmit(NULL, rt, skb, fl4.saddr, fl4.daddr, proto, key->tos,
+-		      key->ttl, df, !net_eq(tunnel->net, dev_net(dev)));
++	iptunnel_xmit(NULL, rt, skb, fl4.saddr, fl4.daddr, proto, tos, ttl,
++		      df, !net_eq(tunnel->net, dev_net(dev)));
+ 	return;
+ tx_error:
+ 	dev->stats.tx_errors++;
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 1a4db27f5833..6b3d27e50317 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -2297,6 +2297,10 @@ int tcp_disconnect(struct sock *sk, int flags)
+ 	tcp_set_ca_state(sk, TCP_CA_Open);
+ 	tcp_clear_retrans(tp);
+ 	inet_csk_delack_init(sk);
++	/* Initialize rcv_mss to TCP_MIN_MSS to avoid division by 0
++	 * issue in __tcp_select_window()
++	 */
++	icsk->icsk_ack.rcv_mss = TCP_MIN_MSS;
+ 	tcp_init_send_head(sk);
+ 	memset(&tp->rx_opt, 0, sizeof(tp->rx_opt));
+ 	__sk_dst_reset(sk);
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index b2cabda72320..cc101b1be903 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -5443,7 +5443,7 @@ static void __ipv6_ifa_notify(int event, struct inet6_ifaddr *ifp)
+ 		 * our DAD process, so we don't need
+ 		 * to do it again
+ 		 */
+-		if (!(ifp->rt->rt6i_node))
++		if (!rcu_access_pointer(ifp->rt->rt6i_node))
+ 			ip6_ins_rt(ifp->rt);
+ 		if (ifp->idev->cnf.forwarding)
+ 			addrconf_join_anycast(ifp);
+diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
+index ff389591a340..5da864997495 100644
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -148,11 +148,23 @@ static struct fib6_node *node_alloc(void)
+ 	return fn;
+ }
+ 
+-static void node_free(struct fib6_node *fn)
++static void node_free_immediate(struct fib6_node *fn)
++{
++	kmem_cache_free(fib6_node_kmem, fn);
++}
++
++static void node_free_rcu(struct rcu_head *head)
+ {
++	struct fib6_node *fn = container_of(head, struct fib6_node, rcu);
++
+ 	kmem_cache_free(fib6_node_kmem, fn);
+ }
+ 
++static void node_free(struct fib6_node *fn)
++{
++	call_rcu(&fn->rcu, node_free_rcu);
++}
++
+ static void rt6_rcu_free(struct rt6_info *rt)
+ {
+ 	call_rcu(&rt->dst.rcu_head, dst_rcu_free);
+@@ -189,6 +201,12 @@ static void rt6_release(struct rt6_info *rt)
+ 	}
+ }
+ 
++static void fib6_free_table(struct fib6_table *table)
++{
++	inetpeer_invalidate_tree(&table->tb6_peers);
++	kfree(table);
++}
++
+ static void fib6_link_table(struct net *net, struct fib6_table *tb)
+ {
+ 	unsigned int h;
+@@ -589,9 +607,9 @@ static struct fib6_node *fib6_add_1(struct fib6_node *root,
+ 
+ 		if (!in || !ln) {
+ 			if (in)
+-				node_free(in);
++				node_free_immediate(in);
+ 			if (ln)
+-				node_free(ln);
++				node_free_immediate(ln);
+ 			return ERR_PTR(-ENOMEM);
+ 		}
+ 
+@@ -862,7 +880,7 @@ static int fib6_add_rt2node(struct fib6_node *fn, struct rt6_info *rt,
+ 
+ 		rt->dst.rt6_next = iter;
+ 		*ins = rt;
+-		rt->rt6i_node = fn;
++		rcu_assign_pointer(rt->rt6i_node, fn);
+ 		atomic_inc(&rt->rt6i_ref);
+ 		inet6_rt_notify(RTM_NEWROUTE, rt, info, nlflags);
+ 		info->nl_net->ipv6.rt6_stats->fib_rt_entries++;
+@@ -887,7 +905,7 @@ static int fib6_add_rt2node(struct fib6_node *fn, struct rt6_info *rt,
+ 			return err;
+ 
+ 		*ins = rt;
+-		rt->rt6i_node = fn;
++		rcu_assign_pointer(rt->rt6i_node, fn);
+ 		rt->dst.rt6_next = iter->dst.rt6_next;
+ 		atomic_inc(&rt->rt6i_ref);
+ 		inet6_rt_notify(RTM_NEWROUTE, rt, info, NLM_F_REPLACE);
+@@ -1020,7 +1038,7 @@ int fib6_add(struct fib6_node *root, struct rt6_info *rt,
+ 				   root, and then (in failure) stale node
+ 				   in main tree.
+ 				 */
+-				node_free(sfn);
++				node_free_immediate(sfn);
+ 				err = PTR_ERR(sn);
+ 				goto failure;
+ 			}
+@@ -1447,8 +1465,9 @@ static void fib6_del_route(struct fib6_node *fn, struct rt6_info **rtp,
+ 
+ int fib6_del(struct rt6_info *rt, struct nl_info *info)
+ {
++	struct fib6_node *fn = rcu_dereference_protected(rt->rt6i_node,
++				    lockdep_is_held(&rt->rt6i_table->tb6_lock));
+ 	struct net *net = info->nl_net;
+-	struct fib6_node *fn = rt->rt6i_node;
+ 	struct rt6_info **rtp;
+ 
+ #if RT6_DEBUG >= 2
+@@ -1637,7 +1656,9 @@ static int fib6_clean_node(struct fib6_walker *w)
+ 			if (res) {
+ #if RT6_DEBUG >= 2
+ 				pr_debug("%s: del failed: rt=%p@%p err=%d\n",
+-					 __func__, rt, rt->rt6i_node, res);
++					 __func__, rt,
++					 rcu_access_pointer(rt->rt6i_node),
++					 res);
+ #endif
+ 				continue;
+ 			}
+@@ -1878,15 +1899,22 @@ static int __net_init fib6_net_init(struct net *net)
+ 
+ static void fib6_net_exit(struct net *net)
+ {
++	unsigned int i;
++
+ 	rt6_ifdown(net, NULL);
+ 	del_timer_sync(&net->ipv6.ip6_fib_timer);
+ 
+-#ifdef CONFIG_IPV6_MULTIPLE_TABLES
+-	inetpeer_invalidate_tree(&net->ipv6.fib6_local_tbl->tb6_peers);
+-	kfree(net->ipv6.fib6_local_tbl);
+-#endif
+-	inetpeer_invalidate_tree(&net->ipv6.fib6_main_tbl->tb6_peers);
+-	kfree(net->ipv6.fib6_main_tbl);
++	for (i = 0; i < FIB6_TABLE_HASHSZ; i++) {
++		struct hlist_head *head = &net->ipv6.fib_table_hash[i];
++		struct hlist_node *tmp;
++		struct fib6_table *tb;
++
++		hlist_for_each_entry_safe(tb, tmp, head, tb6_hlist) {
++			hlist_del(&tb->tb6_hlist);
++			fib6_free_table(tb);
++		}
++	}
++
+ 	kfree(net->ipv6.fib_table_hash);
+ 	kfree(net->ipv6.rt6_stats);
+ }
+diff --git a/net/ipv6/ip6_gre.c b/net/ipv6/ip6_gre.c
+index d2844ee469cb..f78afe43bdff 100644
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@ -432,7 +432,9 @@ static void ip6gre_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+ 		}
+ 		break;
+ 	case ICMPV6_PKT_TOOBIG:
+-		mtu = be32_to_cpu(info) - offset;
++		mtu = be32_to_cpu(info) - offset - t->tun_hlen;
++		if (t->dev->type == ARPHRD_ETHER)
++			mtu -= ETH_HLEN;
+ 		if (mtu < IPV6_MIN_MTU)
+ 			mtu = IPV6_MIN_MTU;
+ 		t->dev->mtu = mtu;
+diff --git a/net/ipv6/netfilter/nf_conntrack_reasm.c b/net/ipv6/netfilter/nf_conntrack_reasm.c
+index 986d4ca38832..b263bf3a19f7 100644
+--- a/net/ipv6/netfilter/nf_conntrack_reasm.c
++++ b/net/ipv6/netfilter/nf_conntrack_reasm.c
+@@ -622,18 +622,12 @@ EXPORT_SYMBOL_GPL(nf_ct_frag6_gather);
+ 
+ static int nf_ct_net_init(struct net *net)
+ {
+-	int res;
+-
+ 	net->nf_frag.frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
+ 	net->nf_frag.frags.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	net->nf_frag.frags.timeout = IPV6_FRAG_TIMEOUT;
+-	res = inet_frags_init_net(&net->nf_frag.frags);
+-	if (res)
+-		return res;
+-	res = nf_ct_frag6_sysctl_register(net);
+-	if (res)
+-		inet_frags_uninit_net(&net->nf_frag.frags);
+-	return res;
++	inet_frags_init_net(&net->nf_frag.frags);
++
++	return nf_ct_frag6_sysctl_register(net);
+ }
+ 
+ static void nf_ct_net_exit(struct net *net)
+diff --git a/net/ipv6/output_core.c b/net/ipv6/output_core.c
+index abb2c307fbe8..a338bbc33cf3 100644
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@ -86,7 +86,6 @@ int ip6_find_1stfragopt(struct sk_buff *skb, u8 **nexthdr)
+ 
+ 	while (offset <= packet_len) {
+ 		struct ipv6_opt_hdr *exthdr;
+-		unsigned int len;
+ 
+ 		switch (**nexthdr) {
+ 
+@@ -112,10 +111,9 @@ int ip6_find_1stfragopt(struct sk_buff *skb, u8 **nexthdr)
+ 
+ 		exthdr = (struct ipv6_opt_hdr *)(skb_network_header(skb) +
+ 						 offset);
+-		len = ipv6_optlen(exthdr);
+-		if (len + offset >= IPV6_MAXPLEN)
++		offset += ipv6_optlen(exthdr);
++		if (offset > IPV6_MAXPLEN)
+ 			return -EINVAL;
+-		offset += len;
+ 		*nexthdr = &exthdr->nexthdr;
+ 	}
+ 
+diff --git a/net/ipv6/reassembly.c b/net/ipv6/reassembly.c
+index 3815e8505ed2..e585c0a2591c 100644
+--- a/net/ipv6/reassembly.c
++++ b/net/ipv6/reassembly.c
+@@ -709,19 +709,13 @@ static void ip6_frags_sysctl_unregister(void)
+ 
+ static int __net_init ipv6_frags_init_net(struct net *net)
+ {
+-	int res;
+-
+ 	net->ipv6.frags.high_thresh = IPV6_FRAG_HIGH_THRESH;
+ 	net->ipv6.frags.low_thresh = IPV6_FRAG_LOW_THRESH;
+ 	net->ipv6.frags.timeout = IPV6_FRAG_TIMEOUT;
+ 
+-	res = inet_frags_init_net(&net->ipv6.frags);
+-	if (res)
+-		return res;
+-	res = ip6_frags_ns_sysctl_register(net);
+-	if (res)
+-		inet_frags_uninit_net(&net->ipv6.frags);
+-	return res;
++	inet_frags_init_net(&net->ipv6.frags);
++
++	return ip6_frags_ns_sysctl_register(net);
+ }
+ 
+ static void __net_exit ipv6_frags_exit_net(struct net *net)
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 5764a84465f8..61729641e027 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1267,7 +1267,9 @@ static void rt6_dst_from_metrics_check(struct rt6_info *rt)
+ 
+ static struct dst_entry *rt6_check(struct rt6_info *rt, u32 cookie)
+ {
+-	if (!rt->rt6i_node || (rt->rt6i_node->fn_sernum != cookie))
++	u32 rt_cookie = 0;
++
++	if (!rt6_get_cookie_safe(rt, &rt_cookie) || rt_cookie != cookie)
+ 		return NULL;
+ 
+ 	if (rt6_check_expired(rt))
+@@ -1335,8 +1337,14 @@ static void ip6_link_failure(struct sk_buff *skb)
+ 		if (rt->rt6i_flags & RTF_CACHE) {
+ 			dst_hold(&rt->dst);
+ 			ip6_del_rt(rt);
+-		} else if (rt->rt6i_node && (rt->rt6i_flags & RTF_DEFAULT)) {
+-			rt->rt6i_node->fn_sernum = -1;
++		} else {
++			struct fib6_node *fn;
++
++			rcu_read_lock();
++			fn = rcu_dereference(rt->rt6i_node);
++			if (fn && (rt->rt6i_flags & RTF_DEFAULT))
++				fn->fn_sernum = -1;
++			rcu_read_unlock();
+ 		}
+ 	}
+ }
+@@ -1353,7 +1361,8 @@ static void rt6_do_update_pmtu(struct rt6_info *rt, u32 mtu)
+ static bool rt6_cache_allowed_for_pmtu(const struct rt6_info *rt)
+ {
+ 	return !(rt->rt6i_flags & RTF_CACHE) &&
+-		(rt->rt6i_flags & RTF_PCPU || rt->rt6i_node);
++		(rt->rt6i_flags & RTF_PCPU ||
++		 rcu_access_pointer(rt->rt6i_node));
+ }
+ 
+ static void __ip6_rt_update_pmtu(struct dst_entry *dst, const struct sock *sk,
+diff --git a/net/kcm/kcmsock.c b/net/kcm/kcmsock.c
+index fecad1098cf8..7eb0e8fe3ca8 100644
+--- a/net/kcm/kcmsock.c
++++ b/net/kcm/kcmsock.c
+@@ -1381,6 +1381,10 @@ static int kcm_attach(struct socket *sock, struct socket *csock,
+ 	if (!csk)
+ 		return -EINVAL;
+ 
++	/* We must prevent loops or risk deadlock ! */
++	if (csk->sk_family == PF_KCM)
++		return -EOPNOTSUPP;
++
+ 	psock = kmem_cache_zalloc(kcm_psockp, GFP_KERNEL);
+ 	if (!psock)
+ 		return -ENOMEM;
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index ae7bfd26cd91..35ba4b60d927 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -2151,6 +2151,7 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+ 	struct timespec ts;
+ 	__u32 ts_status;
+ 	bool is_drop_n_account = false;
++	bool do_vnet = false;
+ 
+ 	/* struct tpacket{2,3}_hdr is aligned to a multiple of TPACKET_ALIGNMENT.
+ 	 * We may add members to them until current aligned size without forcing
+@@ -2201,8 +2202,10 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+ 		netoff = TPACKET_ALIGN(po->tp_hdrlen +
+ 				       (maclen < 16 ? 16 : maclen)) +
+ 				       po->tp_reserve;
+-		if (po->has_vnet_hdr)
++		if (po->has_vnet_hdr) {
+ 			netoff += sizeof(struct virtio_net_hdr);
++			do_vnet = true;
++		}
+ 		macoff = netoff - maclen;
+ 	}
+ 	if (po->tp_version <= TPACKET_V2) {
+@@ -2219,8 +2222,10 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+ 					skb_set_owner_r(copy_skb, sk);
+ 			}
+ 			snaplen = po->rx_ring.frame_size - macoff;
+-			if ((int)snaplen < 0)
++			if ((int)snaplen < 0) {
+ 				snaplen = 0;
++				do_vnet = false;
++			}
+ 		}
+ 	} else if (unlikely(macoff + snaplen >
+ 			    GET_PBDQC_FROM_RB(&po->rx_ring)->max_frame_len)) {
+@@ -2233,6 +2238,7 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+ 		if (unlikely((int)snaplen < 0)) {
+ 			snaplen = 0;
+ 			macoff = GET_PBDQC_FROM_RB(&po->rx_ring)->max_frame_len;
++			do_vnet = false;
+ 		}
+ 	}
+ 	spin_lock(&sk->sk_receive_queue.lock);
+@@ -2258,7 +2264,7 @@ static int tpacket_rcv(struct sk_buff *skb, struct net_device *dev,
+ 	}
+ 	spin_unlock(&sk->sk_receive_queue.lock);
+ 
+-	if (po->has_vnet_hdr) {
++	if (do_vnet) {
+ 		if (__packet_rcv_vnet(skb, h.raw + macoff -
+ 					   sizeof(struct virtio_net_hdr))) {
+ 			spin_lock(&sk->sk_receive_queue.lock);
+diff --git a/net/sctp/sctp_diag.c b/net/sctp/sctp_diag.c
+index 048954eee984..e8f56b7c5afb 100644
+--- a/net/sctp/sctp_diag.c
++++ b/net/sctp/sctp_diag.c
+@@ -70,7 +70,8 @@ static int inet_diag_msg_sctpladdrs_fill(struct sk_buff *skb,
+ 
+ 	info = nla_data(attr);
+ 	list_for_each_entry_rcu(laddr, address_list, list) {
+-		memcpy(info, &laddr->a, addrlen);
++		memcpy(info, &laddr->a, sizeof(laddr->a));
++		memset(info + sizeof(laddr->a), 0, addrlen - sizeof(laddr->a));
+ 		info += addrlen;
+ 	}
+ 
+@@ -93,7 +94,9 @@ static int inet_diag_msg_sctpaddrs_fill(struct sk_buff *skb,
+ 	info = nla_data(attr);
+ 	list_for_each_entry(from, &asoc->peer.transport_addr_list,
+ 			    transports) {
+-		memcpy(info, &from->ipaddr, addrlen);
++		memcpy(info, &from->ipaddr, sizeof(from->ipaddr));
++		memset(info + sizeof(from->ipaddr), 0,
++		       addrlen - sizeof(from->ipaddr));
+ 		info += addrlen;
+ 	}
+ 
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 9647e314d4fc..3ef725229449 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -4373,8 +4373,7 @@ int sctp_get_sctp_info(struct sock *sk, struct sctp_association *asoc,
+ 	info->sctpi_ictrlchunks = asoc->stats.ictrlchunks;
+ 
+ 	prim = asoc->peer.primary_path;
+-	memcpy(&info->sctpi_p_address, &prim->ipaddr,
+-	       sizeof(struct sockaddr_storage));
++	memcpy(&info->sctpi_p_address, &prim->ipaddr, sizeof(prim->ipaddr));
+ 	info->sctpi_p_state = prim->state;
+ 	info->sctpi_p_cwnd = prim->cwnd;
+ 	info->sctpi_p_srtt = prim->srtt;
+diff --git a/net/sctp/ulpqueue.c b/net/sctp/ulpqueue.c
+index 84d0fdaf7de9..d3cfbf2f407d 100644
+--- a/net/sctp/ulpqueue.c
++++ b/net/sctp/ulpqueue.c
+@@ -265,7 +265,8 @@ int sctp_ulpq_tail_event(struct sctp_ulpq *ulpq, struct sctp_ulpevent *event)
+ 		sctp_ulpq_clear_pd(ulpq);
+ 
+ 	if (queue == &sk->sk_receive_queue && !sp->data_ready_signalled) {
+-		sp->data_ready_signalled = 1;
++		if (!sock_owned_by_user(sk))
++			sp->data_ready_signalled = 1;
+ 		sk->sk_data_ready(sk);
+ 	}
+ 	return 1;
