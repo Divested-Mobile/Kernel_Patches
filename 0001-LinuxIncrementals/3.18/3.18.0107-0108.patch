@@ -1,0 +1,737 @@
+diff --git a/Makefile b/Makefile
+index bc07a9ec9682..a562ebf4d500 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 107
++SUBLEVEL = 108
+ EXTRAVERSION =
+ NAME = Diseased Newt
+ 
+diff --git a/drivers/char/virtio_console.c b/drivers/char/virtio_console.c
+index 5480deb4b895..a6f1ba7f511f 100644
+--- a/drivers/char/virtio_console.c
++++ b/drivers/char/virtio_console.c
+@@ -1398,7 +1398,6 @@ static int add_port(struct ports_device *portdev, u32 id)
+ {
+ 	char debugfs_name[16];
+ 	struct port *port;
+-	struct port_buffer *buf;
+ 	dev_t devt;
+ 	unsigned int nr_added_bufs;
+ 	int err;
+@@ -1509,8 +1508,6 @@ static int add_port(struct ports_device *portdev, u32 id)
+ 	return 0;
+ 
+ free_inbufs:
+-	while ((buf = virtqueue_detach_unused_buf(port->in_vq)))
+-		free_buf(buf, true);
+ free_device:
+ 	device_destroy(pdrvdata.class, port->dev->devt);
+ free_cdev:
+@@ -1535,34 +1532,14 @@ static void remove_port(struct kref *kref)
+ 
+ static void remove_port_data(struct port *port)
+ {
+-	struct port_buffer *buf;
+-
+ 	spin_lock_irq(&port->inbuf_lock);
+ 	/* Remove unused data this port might have received. */
+ 	discard_port_data(port);
+ 	spin_unlock_irq(&port->inbuf_lock);
+ 
+-	/* Remove buffers we queued up for the Host to send us data in. */
+-	do {
+-		spin_lock_irq(&port->inbuf_lock);
+-		buf = virtqueue_detach_unused_buf(port->in_vq);
+-		spin_unlock_irq(&port->inbuf_lock);
+-		if (buf)
+-			free_buf(buf, true);
+-	} while (buf);
+-
+ 	spin_lock_irq(&port->outvq_lock);
+ 	reclaim_consumed_buffers(port);
+ 	spin_unlock_irq(&port->outvq_lock);
+-
+-	/* Free pending buffers from the out-queue. */
+-	do {
+-		spin_lock_irq(&port->outvq_lock);
+-		buf = virtqueue_detach_unused_buf(port->out_vq);
+-		spin_unlock_irq(&port->outvq_lock);
+-		if (buf)
+-			free_buf(buf, true);
+-	} while (buf);
+ }
+ 
+ /*
+@@ -1783,13 +1760,24 @@ static void control_work_handler(struct work_struct *work)
+ 	spin_unlock(&portdev->c_ivq_lock);
+ }
+ 
++static void flush_bufs(struct virtqueue *vq, bool can_sleep)
++{
++	struct port_buffer *buf;
++	unsigned int len;
++
++	while ((buf = virtqueue_get_buf(vq, &len)))
++		free_buf(buf, can_sleep);
++}
++
+ static void out_intr(struct virtqueue *vq)
+ {
+ 	struct port *port;
+ 
+ 	port = find_port_by_vq(vq->vdev->priv, vq);
+-	if (!port)
++	if (!port) {
++		flush_bufs(vq, false);
+ 		return;
++	}
+ 
+ 	wake_up_interruptible(&port->waitqueue);
+ }
+@@ -1800,8 +1788,10 @@ static void in_intr(struct virtqueue *vq)
+ 	unsigned long flags;
+ 
+ 	port = find_port_by_vq(vq->vdev->priv, vq);
+-	if (!port)
++	if (!port) {
++		flush_bufs(vq, false);
+ 		return;
++	}
+ 
+ 	spin_lock_irqsave(&port->inbuf_lock, flags);
+ 	port->inbuf = get_inbuf(port);
+@@ -1976,6 +1966,15 @@ static const struct file_operations portdev_fops = {
+ 
+ static void remove_vqs(struct ports_device *portdev)
+ {
++	struct virtqueue *vq;
++
++	virtio_device_for_each_vq(portdev->vdev, vq) {
++		struct port_buffer *buf;
++
++		flush_bufs(vq, true);
++		while ((buf = virtqueue_detach_unused_buf(vq)))
++			free_buf(buf, true);
++	}
+ 	portdev->vdev->config->del_vqs(portdev->vdev);
+ 	kfree(portdev->in_vqs);
+ 	kfree(portdev->out_vqs);
+diff --git a/drivers/mtd/chips/cfi_cmdset_0001.c b/drivers/mtd/chips/cfi_cmdset_0001.c
+index 3096f3ded3ad..8e2a7d077b16 100644
+--- a/drivers/mtd/chips/cfi_cmdset_0001.c
++++ b/drivers/mtd/chips/cfi_cmdset_0001.c
+@@ -45,6 +45,7 @@
+ #define I82802AB	0x00ad
+ #define I82802AC	0x00ac
+ #define PF38F4476	0x881c
++#define M28F00AP30	0x8963
+ /* STMicroelectronics chips */
+ #define M50LPW080       0x002F
+ #define M50FLW080A	0x0080
+@@ -375,6 +376,17 @@ static void cfi_fixup_major_minor(struct cfi_private *cfi,
+ 		extp->MinorVersion = '1';
+ }
+ 
++static int cfi_is_micron_28F00AP30(struct cfi_private *cfi, struct flchip *chip)
++{
++	/*
++	 * Micron(was Numonyx) 1Gbit bottom boot are buggy w.r.t
++	 * Erase Supend for their small Erase Blocks(0x8000)
++	 */
++	if (cfi->mfr == CFI_MFR_INTEL && cfi->id == M28F00AP30)
++		return 1;
++	return 0;
++}
++
+ static inline struct cfi_pri_intelext *
+ read_pri_intelext(struct map_info *map, __u16 adr)
+ {
+@@ -825,21 +837,30 @@ static int chip_ready (struct map_info *map, struct flchip *chip, unsigned long
+ 		     (mode == FL_WRITING && (cfip->SuspendCmdSupport & 1))))
+ 			goto sleep;
+ 
++		/* Do not allow suspend iff read/write to EB address */
++		if ((adr & chip->in_progress_block_mask) ==
++		    chip->in_progress_block_addr)
++			goto sleep;
++
++		/* do not suspend small EBs, buggy Micron Chips */
++		if (cfi_is_micron_28F00AP30(cfi, chip) &&
++		    (chip->in_progress_block_mask == ~(0x8000-1)))
++			goto sleep;
+ 
+ 		/* Erase suspend */
+-		map_write(map, CMD(0xB0), adr);
++		map_write(map, CMD(0xB0), chip->in_progress_block_addr);
+ 
+ 		/* If the flash has finished erasing, then 'erase suspend'
+ 		 * appears to make some (28F320) flash devices switch to
+ 		 * 'read' mode.  Make sure that we switch to 'read status'
+ 		 * mode so we get the right data. --rmk
+ 		 */
+-		map_write(map, CMD(0x70), adr);
++		map_write(map, CMD(0x70), chip->in_progress_block_addr);
+ 		chip->oldstate = FL_ERASING;
+ 		chip->state = FL_ERASE_SUSPENDING;
+ 		chip->erase_suspended = 1;
+ 		for (;;) {
+-			status = map_read(map, adr);
++			status = map_read(map, chip->in_progress_block_addr);
+ 			if (map_word_andequal(map, status, status_OK, status_OK))
+ 			        break;
+ 
+@@ -1035,8 +1056,8 @@ static void put_chip(struct map_info *map, struct flchip *chip, unsigned long ad
+ 		   sending the 0x70 (Read Status) command to an erasing
+ 		   chip and expecting it to be ignored, that's what we
+ 		   do. */
+-		map_write(map, CMD(0xd0), adr);
+-		map_write(map, CMD(0x70), adr);
++		map_write(map, CMD(0xd0), chip->in_progress_block_addr);
++		map_write(map, CMD(0x70), chip->in_progress_block_addr);
+ 		chip->oldstate = FL_READY;
+ 		chip->state = FL_ERASING;
+ 		break;
+@@ -1927,6 +1948,8 @@ static int __xipram do_erase_oneblock(struct map_info *map, struct flchip *chip,
+ 	map_write(map, CMD(0xD0), adr);
+ 	chip->state = FL_ERASING;
+ 	chip->erase_suspended = 0;
++	chip->in_progress_block_addr = adr;
++	chip->in_progress_block_mask = ~(len - 1);
+ 
+ 	ret = INVAL_CACHE_AND_WAIT(map, chip, adr,
+ 				   adr, len,
+diff --git a/drivers/mtd/chips/cfi_cmdset_0002.c b/drivers/mtd/chips/cfi_cmdset_0002.c
+index c50d8cf0f60d..16faa97ac3f2 100644
+--- a/drivers/mtd/chips/cfi_cmdset_0002.c
++++ b/drivers/mtd/chips/cfi_cmdset_0002.c
+@@ -814,9 +814,10 @@ static int get_chip(struct map_info *map, struct flchip *chip, unsigned long adr
+ 		    (mode == FL_WRITING && (cfip->EraseSuspend & 0x2))))
+ 			goto sleep;
+ 
+-		/* We could check to see if we're trying to access the sector
+-		 * that is currently being erased. However, no user will try
+-		 * anything like that so we just wait for the timeout. */
++		/* Do not allow suspend iff read/write to EB address */
++		if ((adr & chip->in_progress_block_mask) ==
++		    chip->in_progress_block_addr)
++			goto sleep;
+ 
+ 		/* Erase suspend */
+ 		/* It's harmless to issue the Erase-Suspend and Erase-Resume
+@@ -2265,6 +2266,7 @@ static int __xipram do_erase_chip(struct map_info *map, struct flchip *chip)
+ 	chip->state = FL_ERASING;
+ 	chip->erase_suspended = 0;
+ 	chip->in_progress_block_addr = adr;
++	chip->in_progress_block_mask = ~(map->size - 1);
+ 
+ 	INVALIDATE_CACHE_UDELAY(map, chip,
+ 				adr, map->size,
+@@ -2354,6 +2356,7 @@ static int __xipram do_erase_oneblock(struct map_info *map, struct flchip *chip,
+ 	chip->state = FL_ERASING;
+ 	chip->erase_suspended = 0;
+ 	chip->in_progress_block_addr = adr;
++	chip->in_progress_block_mask = ~(len - 1);
+ 
+ 	INVALIDATE_CACHE_UDELAY(map, chip,
+ 				adr, len,
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index d52af6a89d4c..145413a53caa 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -1848,6 +1848,8 @@ sd_spinup_disk(struct scsi_disk *sdkp)
+ 				break;	/* standby */
+ 			if (sshdr.asc == 4 && sshdr.ascq == 0xc)
+ 				break;	/* unavailable */
++			if (sshdr.asc == 4 && sshdr.ascq == 0x1b)
++				break;	/* sanitize in progress */
+ 			/*
+ 			 * Issue command to spin up drive when not ready
+ 			 */
+diff --git a/drivers/tty/n_gsm.c b/drivers/tty/n_gsm.c
+index 450a8ca16351..0b9f2550973f 100644
+--- a/drivers/tty/n_gsm.c
++++ b/drivers/tty/n_gsm.c
+@@ -137,6 +137,9 @@ struct gsm_dlci {
+ 	struct mutex mutex;
+ 
+ 	/* Link layer */
++	int mode;
++#define DLCI_MODE_ABM		0	/* Normal Asynchronous Balanced Mode */
++#define DLCI_MODE_ADM		1	/* Asynchronous Disconnected Mode */
+ 	spinlock_t lock;	/* Protects the internal state */
+ 	struct timer_list t1;	/* Retransmit timer for SABM and UA */
+ 	int retries;
+@@ -1380,7 +1383,13 @@ retry:
+ 	ctrl->data = data;
+ 	ctrl->len = clen;
+ 	gsm->pending_cmd = ctrl;
+-	gsm->cretries = gsm->n2;
++
++	/* If DLCI0 is in ADM mode skip retries, it won't respond */
++	if (gsm->dlci[0]->mode == DLCI_MODE_ADM)
++		gsm->cretries = 1;
++	else
++		gsm->cretries = gsm->n2;
++
+ 	mod_timer(&gsm->t2_timer, jiffies + gsm->t2 * HZ / 100);
+ 	gsm_control_transmit(gsm, ctrl);
+ 	spin_unlock_irqrestore(&gsm->control_lock, flags);
+@@ -1488,6 +1497,7 @@ static void gsm_dlci_t1(unsigned long data)
+ 			if (debug & 8)
+ 				pr_info("DLCI %d opening in ADM mode.\n",
+ 					dlci->addr);
++			dlci->mode = DLCI_MODE_ADM;
+ 			gsm_dlci_open(dlci);
+ 		} else {
+ 			gsm_dlci_close(dlci);
+@@ -2882,11 +2892,22 @@ static int gsmtty_modem_update(struct gsm_dlci *dlci, u8 brk)
+ static int gsm_carrier_raised(struct tty_port *port)
+ {
+ 	struct gsm_dlci *dlci = container_of(port, struct gsm_dlci, port);
++	struct gsm_mux *gsm = dlci->gsm;
++
+ 	/* Not yet open so no carrier info */
+ 	if (dlci->state != DLCI_OPEN)
+ 		return 0;
+ 	if (debug & 2)
+ 		return 1;
++
++	/*
++	 * Basic mode with control channel in ADM mode may not respond
++	 * to CMD_MSC at all and modem_rx is empty.
++	 */
++	if (gsm->encoding == 0 && gsm->dlci[0]->mode == DLCI_MODE_ADM &&
++	    !dlci->modem_rx)
++		return 1;
++
+ 	return dlci->modem_rx & TIOCM_CD;
+ }
+ 
+diff --git a/drivers/tty/tty_ldisc.c b/drivers/tty/tty_ldisc.c
+index 2bf08366cd5b..6572db5a1c79 100644
+--- a/drivers/tty/tty_ldisc.c
++++ b/drivers/tty/tty_ldisc.c
+@@ -171,12 +171,11 @@ static struct tty_ldisc *tty_ldisc_get(struct tty_struct *tty, int disc)
+ 			return ERR_CAST(ldops);
+ 	}
+ 
+-	ld = kmalloc(sizeof(struct tty_ldisc), GFP_KERNEL);
+-	if (ld == NULL) {
+-		put_ldops(ldops);
+-		return ERR_PTR(-ENOMEM);
+-	}
+-
++	/*
++	 * There is no way to handle allocation failure of only 16 bytes.
++	 * Let's simplify error handling and save more memory.
++	 */
++	ld = kmalloc(sizeof(struct tty_ldisc), GFP_KERNEL | __GFP_NOFAIL);
+ 	ld->ops = ldops;
+ 	ld->tty = tty;
+ 
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index d7203fd67f2a..e802ac83580a 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -2289,6 +2289,7 @@ void usb_hcd_resume_root_hub (struct usb_hcd *hcd)
+ 
+ 	spin_lock_irqsave (&hcd_root_hub_lock, flags);
+ 	if (hcd->rh_registered) {
++		pm_wakeup_event(&hcd->self.root_hub->dev, 0);
+ 		set_bit(HCD_FLAG_WAKEUP_PENDING, &hcd->flags);
+ 		queue_work(pm_wq, &hcd->wakeup_work);
+ 	}
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 24a3d0f8e38e..ab1507c9c2b3 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -633,12 +633,17 @@ void usb_wakeup_notification(struct usb_device *hdev,
+ 		unsigned int portnum)
+ {
+ 	struct usb_hub *hub;
++	struct usb_port *port_dev;
+ 
+ 	if (!hdev)
+ 		return;
+ 
+ 	hub = usb_hub_to_struct_hub(hdev);
+ 	if (hub) {
++		port_dev = hub->ports[portnum - 1];
++		if (port_dev && port_dev->child)
++			pm_wakeup_event(&port_dev->child->dev, 0);
++
+ 		set_bit(portnum, hub->wakeup_bits);
+ 		kick_hub_wq(hub);
+ 	}
+@@ -3363,8 +3368,11 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
+ 
+ 	/* Skip the initial Clear-Suspend step for a remote wakeup */
+ 	status = hub_port_status(hub, port1, &portstatus, &portchange);
+-	if (status == 0 && !port_is_suspended(hub, portstatus))
++	if (status == 0 && !port_is_suspended(hub, portstatus)) {
++		if (portchange & USB_PORT_STAT_C_SUSPEND)
++			pm_wakeup_event(&udev->dev, 0);
+ 		goto SuspendCleared;
++	}
+ 
+ 	/* see 7.1.7.7; affects power usage, but not budgeting */
+ 	if (hub_is_superspeed(hub->hdev))
+diff --git a/drivers/usb/core/quirks.c b/drivers/usb/core/quirks.c
+index 786bfe9be897..4de235bbf751 100644
+--- a/drivers/usb/core/quirks.c
++++ b/drivers/usb/core/quirks.c
+@@ -41,6 +41,9 @@ static const struct usb_device_id usb_quirk_list[] = {
+ 	{ USB_DEVICE(0x03f0, 0x0701), .driver_info =
+ 			USB_QUIRK_STRING_FETCH_255 },
+ 
++	/* HP v222w 16GB Mini USB Drive */
++	{ USB_DEVICE(0x03f0, 0x3f40), .driver_info = USB_QUIRK_DELAY_INIT },
++
+ 	/* Creative SB Audigy 2 NX */
+ 	{ USB_DEVICE(0x041e, 0x3020), .driver_info = USB_QUIRK_RESET_RESUME },
+ 
+diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
+index d896dc0ffca4..a69494c51646 100644
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@ -207,6 +207,7 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x3195, 0xF190) }, /* Link Instruments MSO-19 */
+ 	{ USB_DEVICE(0x3195, 0xF280) }, /* Link Instruments MSO-28 */
+ 	{ USB_DEVICE(0x3195, 0xF281) }, /* Link Instruments MSO-28 */
++	{ USB_DEVICE(0x3923, 0x7A0B) }, /* National Instruments USB Serial Console */
+ 	{ USB_DEVICE(0x413C, 0x9500) }, /* DW700 GPS USB interface */
+ 	{ } /* Terminating Entry */
+ };
+diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
+index b56d3498f39d..567a952ecb95 100644
+--- a/drivers/usb/serial/ftdi_sio.c
++++ b/drivers/usb/serial/ftdi_sio.c
+@@ -1908,7 +1908,8 @@ static int ftdi_8u2232c_probe(struct usb_serial *serial)
+ 		return ftdi_jtag_probe(serial);
+ 
+ 	if (udev->product &&
+-		(!strcmp(udev->product, "BeagleBone/XDS100V2") ||
++		(!strcmp(udev->product, "Arrow USB Blaster") ||
++		 !strcmp(udev->product, "BeagleBone/XDS100V2") ||
+ 		 !strcmp(udev->product, "SNAP Connect E10")))
+ 		return ftdi_jtag_probe(serial);
+ 
+diff --git a/drivers/usb/usbip/stub_main.c b/drivers/usb/usbip/stub_main.c
+index 325b4c05acdd..f761e02e75c9 100644
+--- a/drivers/usb/usbip/stub_main.c
++++ b/drivers/usb/usbip/stub_main.c
+@@ -201,7 +201,12 @@ static ssize_t rebind_store(struct device_driver *dev, const char *buf,
+ 	if (!bid)
+ 		return -ENODEV;
+ 
++	/* device_attach() callers should hold parent lock for USB */
++	if (bid->udev->dev.parent)
++		device_lock(bid->udev->dev.parent);
+ 	ret = device_attach(&bid->udev->dev);
++	if (bid->udev->dev.parent)
++		device_unlock(bid->udev->dev.parent);
+ 	if (ret < 0) {
+ 		dev_err(&bid->udev->dev, "rebind failed\n");
+ 		return ret;
+diff --git a/drivers/usb/usbip/usbip_common.h b/drivers/usb/usbip/usbip_common.h
+index f875ccaa55f9..0fc5ace57c0e 100644
+--- a/drivers/usb/usbip/usbip_common.h
++++ b/drivers/usb/usbip/usbip_common.h
+@@ -248,7 +248,7 @@ enum usbip_side {
+ #define	SDEV_EVENT_ERROR_SUBMIT	(USBIP_EH_SHUTDOWN | USBIP_EH_RESET)
+ #define	SDEV_EVENT_ERROR_MALLOC	(USBIP_EH_SHUTDOWN | USBIP_EH_UNUSABLE)
+ 
+-#define	VDEV_EVENT_REMOVED	(USBIP_EH_SHUTDOWN | USBIP_EH_BYE)
++#define	VDEV_EVENT_REMOVED (USBIP_EH_SHUTDOWN | USBIP_EH_RESET | USBIP_EH_BYE)
+ #define	VDEV_EVENT_DOWN		(USBIP_EH_SHUTDOWN | USBIP_EH_RESET)
+ #define	VDEV_EVENT_ERROR_TCP	(USBIP_EH_SHUTDOWN | USBIP_EH_RESET)
+ #define	VDEV_EVENT_ERROR_MALLOC	(USBIP_EH_SHUTDOWN | USBIP_EH_UNUSABLE)
+diff --git a/fs/ext4/balloc.c b/fs/ext4/balloc.c
+index 0a46c50f1bdc..e19719ecff69 100644
+--- a/fs/ext4/balloc.c
++++ b/fs/ext4/balloc.c
+@@ -321,6 +321,7 @@ static ext4_fsblk_t ext4_valid_block_bitmap(struct super_block *sb,
+ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	ext4_grpblk_t offset;
+ 	ext4_grpblk_t next_zero_bit;
++	ext4_grpblk_t max_bit = EXT4_CLUSTERS_PER_GROUP(sb);
+ 	ext4_fsblk_t blk;
+ 	ext4_fsblk_t group_first_block;
+ 
+@@ -338,20 +339,25 @@ static ext4_fsblk_t ext4_valid_block_bitmap(struct super_block *sb,
+ 	/* check whether block bitmap block number is set */
+ 	blk = ext4_block_bitmap(sb, desc);
+ 	offset = blk - group_first_block;
+-	if (!ext4_test_bit(EXT4_B2C(sbi, offset), bh->b_data))
++	if (offset < 0 || EXT4_B2C(sbi, offset) >= max_bit ||
++	    !ext4_test_bit(EXT4_B2C(sbi, offset), bh->b_data))
+ 		/* bad block bitmap */
+ 		return blk;
+ 
+ 	/* check whether the inode bitmap block number is set */
+ 	blk = ext4_inode_bitmap(sb, desc);
+ 	offset = blk - group_first_block;
+-	if (!ext4_test_bit(EXT4_B2C(sbi, offset), bh->b_data))
++	if (offset < 0 || EXT4_B2C(sbi, offset) >= max_bit ||
++	    !ext4_test_bit(EXT4_B2C(sbi, offset), bh->b_data))
+ 		/* bad block bitmap */
+ 		return blk;
+ 
+ 	/* check whether the inode table block number is set */
+ 	blk = ext4_inode_table(sb, desc);
+ 	offset = blk - group_first_block;
++	if (offset < 0 || EXT4_B2C(sbi, offset) >= max_bit ||
++	    EXT4_B2C(sbi, offset + sbi->s_itb_per_group) >= max_bit)
++		return blk;
+ 	next_zero_bit = ext4_find_next_zero_bit(bh->b_data,
+ 			EXT4_B2C(sbi, offset + EXT4_SB(sb)->s_itb_per_group),
+ 			EXT4_B2C(sbi, offset));
+@@ -414,6 +420,7 @@ struct buffer_head *
+ ext4_read_block_bitmap_nowait(struct super_block *sb, ext4_group_t block_group)
+ {
+ 	struct ext4_group_desc *desc;
++	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	struct buffer_head *bh;
+ 	ext4_fsblk_t bitmap_blk;
+ 
+@@ -421,6 +428,12 @@ ext4_read_block_bitmap_nowait(struct super_block *sb, ext4_group_t block_group)
+ 	if (!desc)
+ 		return NULL;
+ 	bitmap_blk = ext4_block_bitmap(sb, desc);
++	if ((bitmap_blk <= le32_to_cpu(sbi->s_es->s_first_data_block)) ||
++	    (bitmap_blk >= ext4_blocks_count(sbi->s_es))) {
++		ext4_error(sb, "Invalid block bitmap block %llu in "
++			   "block_group %u", bitmap_blk, block_group);
++		return ERR_PTR(-EUCLEAN);
++	}
+ 	bh = sb_getblk(sb, bitmap_blk);
+ 	if (unlikely(!bh)) {
+ 		ext4_error(sb, "Cannot get buffer for block bitmap - "
+diff --git a/fs/ext4/ialloc.c b/fs/ext4/ialloc.c
+index 49b1e2cb0a2b..28aaf640745f 100644
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@ -84,16 +84,22 @@ static struct buffer_head *
+ ext4_read_inode_bitmap(struct super_block *sb, ext4_group_t block_group)
+ {
+ 	struct ext4_group_desc *desc;
++	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 	struct buffer_head *bh = NULL;
+ 	ext4_fsblk_t bitmap_blk;
+ 	struct ext4_group_info *grp;
+-	struct ext4_sb_info *sbi = EXT4_SB(sb);
+ 
+ 	desc = ext4_get_group_desc(sb, block_group, NULL);
+ 	if (!desc)
+ 		return NULL;
+ 
+ 	bitmap_blk = ext4_inode_bitmap(sb, desc);
++	if ((bitmap_blk <= le32_to_cpu(sbi->s_es->s_first_data_block)) ||
++	    (bitmap_blk >= ext4_blocks_count(sbi->s_es))) {
++		ext4_error(sb, "Invalid inode bitmap blk %llu in "
++			   "block_group %u", bitmap_blk, block_group);
++		return ERR_PTR(-EUCLEAN);
++	}
+ 	bh = sb_getblk(sb, bitmap_blk);
+ 	if (unlikely(!bh)) {
+ 		ext4_error(sb, "Cannot read inode bitmap - "
+diff --git a/fs/jbd2/transaction.c b/fs/jbd2/transaction.c
+index 2abbb2babcae..f3818e7cfa60 100644
+--- a/fs/jbd2/transaction.c
++++ b/fs/jbd2/transaction.c
+@@ -515,6 +515,7 @@ int jbd2_journal_start_reserved(handle_t *handle, unsigned int type,
+ 	 */
+ 	ret = start_this_handle(journal, handle, GFP_NOFS);
+ 	if (ret < 0) {
++		handle->h_journal = journal;
+ 		jbd2_journal_free_reserved(handle);
+ 		return ret;
+ 	}
+diff --git a/include/linux/mtd/flashchip.h b/include/linux/mtd/flashchip.h
+index b63fa457febd..3529683f691e 100644
+--- a/include/linux/mtd/flashchip.h
++++ b/include/linux/mtd/flashchip.h
+@@ -85,6 +85,7 @@ struct flchip {
+ 	unsigned int write_suspended:1;
+ 	unsigned int erase_suspended:1;
+ 	unsigned long in_progress_block_addr;
++	unsigned long in_progress_block_mask;
+ 
+ 	struct mutex mutex;
+ 	wait_queue_head_t wq; /* Wait on here when we're waiting for the chip
+diff --git a/include/linux/virtio.h b/include/linux/virtio.h
+index 65261a7244fc..8ffec6d9c240 100644
+--- a/include/linux/virtio.h
++++ b/include/linux/virtio.h
+@@ -122,6 +122,9 @@ int virtio_device_freeze(struct virtio_device *dev);
+ int virtio_device_restore(struct virtio_device *dev);
+ #endif
+ 
++#define virtio_device_for_each_vq(vdev, vq) \
++	list_for_each_entry(vq, &vdev->vqs, list)
++
+ /**
+  * virtio_driver - operations for a virtio I/O driver
+  * @driver: underlying device driver (populate name and owner).
+diff --git a/lib/kobject.c b/lib/kobject.c
+index 58751bb80a7c..69acdbc3b43c 100644
+--- a/lib/kobject.c
++++ b/lib/kobject.c
+@@ -234,14 +234,12 @@ static int kobject_add_internal(struct kobject *kobj)
+ 
+ 		/* be noisy on error issues */
+ 		if (error == -EEXIST)
+-			WARN(1, "%s failed for %s with "
+-			     "-EEXIST, don't try to register things with "
+-			     "the same name in the same directory.\n",
+-			     __func__, kobject_name(kobj));
++			pr_err("%s failed for %s with -EEXIST, don't try to register things with the same name in the same directory.\n",
++			       __func__, kobject_name(kobj));
+ 		else
+-			WARN(1, "%s failed for %s (error: %d parent: %s)\n",
+-			     __func__, kobject_name(kobj), error,
+-			     parent ? kobject_name(parent) : "'none'");
++			pr_err("%s failed for %s (error: %d parent: %s)\n",
++			       __func__, kobject_name(kobj), error,
++			       parent ? kobject_name(parent) : "'none'");
+ 	} else
+ 		kobj->state_in_sysfs = 1;
+ 
+diff --git a/net/ceph/messenger.c b/net/ceph/messenger.c
+index 0861598c2465..2dc4e064bea3 100644
+--- a/net/ceph/messenger.c
++++ b/net/ceph/messenger.c
+@@ -2449,6 +2449,11 @@ static int try_write(struct ceph_connection *con)
+ 	int ret = 1;
+ 
+ 	dout("try_write start %p state %lu\n", con, con->state);
++	if (con->state != CON_STATE_PREOPEN &&
++	    con->state != CON_STATE_CONNECTING &&
++	    con->state != CON_STATE_NEGOTIATING &&
++	    con->state != CON_STATE_OPEN)
++		return 0;
+ 
+ more:
+ 	dout("try_write out_kvec_bytes %d\n", con->out_kvec_bytes);
+@@ -2474,6 +2479,8 @@ more:
+ 	}
+ 
+ more_kvec:
++	BUG_ON(!con->sock);
++
+ 	/* kvec data queued? */
+ 	if (con->out_skip) {
+ 		ret = write_partial_skip(con);
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index a4bae2ce4a0c..e2d78f8af2ab 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -2695,6 +2695,7 @@ static int snd_pcm_sync_ptr(struct snd_pcm_substream *substream,
+ 	sync_ptr.s.status.hw_ptr = status->hw_ptr;
+ 	sync_ptr.s.status.tstamp = status->tstamp;
+ 	sync_ptr.s.status.suspended_state = status->suspended_state;
++	sync_ptr.s.status.audio_tstamp = status->audio_tstamp;
+ 	snd_pcm_stream_unlock_irq(substream);
+ 	if (copy_to_user(_sync_ptr, &sync_ptr, sizeof(sync_ptr)))
+ 		return -EFAULT;
+diff --git a/sound/core/seq/oss/seq_oss_synth.c b/sound/core/seq/oss/seq_oss_synth.c
+index ac3d7d2125e9..760b34092110 100644
+--- a/sound/core/seq/oss/seq_oss_synth.c
++++ b/sound/core/seq/oss/seq_oss_synth.c
+@@ -363,10 +363,14 @@ get_synthdev(struct seq_oss_devinfo *dp, int dev)
+ 		return NULL;
+ 	if (! dp->synths[dev].opened)
+ 		return NULL;
+-	if (dp->synths[dev].is_midi)
+-		return &midi_synth_dev;
+-	if ((rec = get_sdev(dev)) == NULL)
+-		return NULL;
++	if (dp->synths[dev].is_midi) {
++		rec = &midi_synth_dev;
++		snd_use_lock_use(&rec->use_lock);
++	} else {
++		rec = get_sdev(dev);
++		if (!rec)
++			return NULL;
++	}
+ 	if (! rec->opened) {
+ 		snd_use_lock_free(&rec->use_lock);
+ 		return NULL;
+diff --git a/sound/soc/fsl/fsl_esai.c b/sound/soc/fsl/fsl_esai.c
+index a645e296199e..ebfa6a72c9f9 100644
+--- a/sound/soc/fsl/fsl_esai.c
++++ b/sound/soc/fsl/fsl_esai.c
+@@ -143,6 +143,13 @@ static int fsl_esai_divisor_cal(struct snd_soc_dai *dai, bool tx, u32 ratio,
+ 
+ 	psr = ratio <= 256 * maxfp ? ESAI_xCCR_xPSR_BYPASS : ESAI_xCCR_xPSR_DIV8;
+ 
++	/* Do not loop-search if PM (1 ~ 256) alone can serve the ratio */
++	if (ratio <= 256) {
++		pm = ratio;
++		fp = 1;
++		goto out;
++	}
++
+ 	/* Set the max fluctuation -- 0.1% of the max devisor */
+ 	savesub = (psr ? 1 : 8)  * 256 * maxfp / 1000;
+ 
+diff --git a/sound/usb/mixer_maps.c b/sound/usb/mixer_maps.c
+index c758638df9f7..2f075cd27344 100644
+--- a/sound/usb/mixer_maps.c
++++ b/sound/usb/mixer_maps.c
+@@ -353,8 +353,11 @@ static struct usbmix_name_map dragonfly_1_2_map[] = {
+ /*
+  * Dell usb dock with ALC4020 codec had a firmware problem where it got
+  * screwed up when zero volume is passed; just skip it as a workaround
++ *
++ * Also the extension unit gives an access error, so skip it as well.
+  */
+ static const struct usbmix_name_map dell_alc4020_map[] = {
++	{ 4, NULL },	/* extension unit */
+ 	{ 16, NULL },
+ 	{ 19, NULL },
+ 	{ 0 }
+diff --git a/tools/perf/tests/code-reading.c b/tools/perf/tests/code-reading.c
+index 28dfd1f7f776..67f2d6323558 100644
+--- a/tools/perf/tests/code-reading.c
++++ b/tools/perf/tests/code-reading.c
+@@ -141,8 +141,6 @@ static int read_object_code(u64 addr, size_t len, u8 cpumode,
+ 	unsigned char buf2[BUFSZ];
+ 	size_t ret_len;
+ 	u64 objdump_addr;
+-	const char *objdump_name;
+-	char decomp_name[KMOD_DECOMP_LEN];
+ 	int ret;
+ 
+ 	pr_debug("Reading object code for memory address: %#"PRIx64"\n", addr);
+@@ -204,25 +202,9 @@ static int read_object_code(u64 addr, size_t len, u8 cpumode,
+ 		state->done[state->done_cnt++] = al.map->start;
+ 	}
+ 
+-	objdump_name = al.map->dso->long_name;
+-	if (dso__needs_decompress(al.map->dso)) {
+-		if (dso__decompress_kmodule_path(al.map->dso, objdump_name,
+-						 decomp_name,
+-						 sizeof(decomp_name)) < 0) {
+-			pr_debug("decompression failed\n");
+-			return -1;
+-		}
+-
+-		objdump_name = decomp_name;
+-	}
+-
+ 	/* Read the object code using objdump */
+ 	objdump_addr = map__rip_2objdump(al.map, al.addr);
+-	ret = read_via_objdump(objdump_name, objdump_addr, buf2, len);
+-
+-	if (dso__needs_decompress(al.map->dso))
+-		unlink(objdump_name);
+-
++	ret = read_via_objdump(al.map->dso->long_name, objdump_addr, buf2, len);
+ 	if (ret > 0) {
+ 		/*
+ 		 * The kernel maps are inaccurate - assume objdump is right in
