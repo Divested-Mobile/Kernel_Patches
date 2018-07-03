@@ -1,0 +1,221 @@
+From f64e9815f0488a7b37e4e1395a1457d1dfefda66 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Dhanotiya <adhanoti@codeaurora.org>
+Date: Mon, 8 May 2017 11:01:58 +0530
+Subject: qcacld-3.0: Race condition while using pkt log buffer
+
+There can be a race condition if the pktlog_buf inside pktlog APIs,
+is accessed simultanously from two threads.
+
+To prevent this use mutex in the caller functions of pktlog APIs.
+
+Change-Id: Ie5ebba1c427742c312acf5f11f1cc0e494d2e44f
+CRs-Fixed: 2043277
+---
+ core/utils/pktlog/include/pktlog_ac_api.h |  1 +
+ core/utils/pktlog/linux_ac.c              | 37 ++++++++++++----
+ core/utils/pktlog/pktlog_ac.c             | 70 ++++++++++++++++++++++++++++++-
+ 3 files changed, 99 insertions(+), 9 deletions(-)
+
+diff --git a/core/utils/pktlog/include/pktlog_ac_api.h b/core/utils/pktlog/include/pktlog_ac_api.h
+index e067c45..4674c5f 100644
+--- a/core/utils/pktlog/include/pktlog_ac_api.h
++++ b/core/utils/pktlog/include/pktlog_ac_api.h
+@@ -100,6 +100,7 @@ struct ath_pktlog_info {
+ 	/* Size of buffer in bytes */
+ 	int32_t buf_size;
+ 	spinlock_t log_lock;
++	struct mutex pktlog_mutex;
+ 
+ 	/* Threshold of TCP SACK packets for triggered stop */
+ 	int sack_thr;
+diff --git a/core/utils/pktlog/linux_ac.c b/core/utils/pktlog/linux_ac.c
+index eb0943f..cf82215 100644
+--- a/core/utils/pktlog/linux_ac.c
++++ b/core/utils/pktlog/linux_ac.c
+@@ -127,6 +127,7 @@ int pktlog_alloc_buf(struct hif_opaque_softc *scn)
+ 	unsigned long vaddr;
+ 	struct page *vpg;
+ 	struct ath_pktlog_info *pl_info;
++	struct ath_pktlog_buf *buffer;
+ 	ol_txrx_pdev_handle pdev_txrx_handle;
+ 	pdev_txrx_handle = cds_get_context(QDF_MODULE_ID_TXRX);
+ 
+@@ -142,25 +143,39 @@ int pktlog_alloc_buf(struct hif_opaque_softc *scn)
+ 
+ 	page_cnt = (sizeof(*(pl_info->buf)) + pl_info->buf_size) / PAGE_SIZE;
+ 
+-	pl_info->buf = vmalloc((page_cnt + 2) * PAGE_SIZE);
+-	if (pl_info->buf == NULL) {
++	spin_lock_bh(&pl_info->log_lock);
++	if (pl_info->buf != NULL) {
++		printk(PKTLOG_TAG "Buffer is already in use\n");
++		spin_unlock_bh(&pl_info->log_lock);
++		return -EINVAL;
++	}
++	spin_unlock_bh(&pl_info->log_lock);
++
++	buffer = vmalloc((page_cnt + 2) * PAGE_SIZE);
++	if (buffer == NULL) {
+ 		printk(PKTLOG_TAG
+ 		       "%s: Unable to allocate buffer "
+ 		       "(%d pages)\n", __func__, page_cnt);
+ 		return -ENOMEM;
+ 	}
+ 
+-	pl_info->buf = (struct ath_pktlog_buf *)
+-		       (((unsigned long)(pl_info->buf) + PAGE_SIZE - 1)
++	buffer = (struct ath_pktlog_buf *)
++		       (((unsigned long)(buffer) + PAGE_SIZE - 1)
+ 			& PAGE_MASK);
+ 
+-	for (vaddr = (unsigned long)(pl_info->buf);
+-	     vaddr < ((unsigned long)(pl_info->buf) + (page_cnt * PAGE_SIZE));
++	for (vaddr = (unsigned long)(buffer);
++	     vaddr < ((unsigned long)(buffer) + (page_cnt * PAGE_SIZE));
+ 	     vaddr += PAGE_SIZE) {
+ 		vpg = vmalloc_to_page((const void *)vaddr);
+ 		SetPageReserved(vpg);
+ 	}
+ 
++	spin_lock_bh(&pl_info->log_lock);
++	if (pl_info->buf != NULL)
++		pktlog_release_buf(scn);
++
++	pl_info->buf =  buffer;
++	spin_unlock_bh(&pl_info->log_lock);
+ 	return 0;
+ }
+ 
+@@ -201,6 +216,7 @@ static void pktlog_cleanup(struct ath_pktlog_info *pl_info)
+ {
+ 	pl_info->log_state = 0;
+ 	PKTLOG_LOCK_DESTROY(pl_info);
++	mutex_destroy(&pl_info->pktlog_mutex);
+ }
+ 
+ /* sysctl procfs handler to enable pktlog */
+@@ -986,11 +1002,18 @@ static ssize_t
+ pktlog_read(struct file *file, char *buf, size_t nbytes, loff_t *ppos)
+ {
+ 	int ret;
++	struct ath_pktlog_info *pl_info;
++
++	pl_info = (struct ath_pktlog_info *)
++					PDE_DATA(file->f_path.dentry->d_inode);
++	if (!pl_info)
++		return 0;
+ 
+ 	cds_ssr_protect(__func__);
++	mutex_lock(&pl_info->pktlog_mutex);
+ 	ret = __pktlog_read(file, buf, nbytes, ppos);
++	mutex_unlock(&pl_info->pktlog_mutex);
+ 	cds_ssr_unprotect(__func__);
+-
+ 	return ret;
+ }
+ 
+diff --git a/core/utils/pktlog/pktlog_ac.c b/core/utils/pktlog/pktlog_ac.c
+index 524591b..a3966c3 100644
+--- a/core/utils/pktlog/pktlog_ac.c
++++ b/core/utils/pktlog/pktlog_ac.c
+@@ -362,6 +362,7 @@ void pktlog_init(struct hif_opaque_softc *scn)
+ 
+ 	OS_MEMZERO(pl_info, sizeof(*pl_info));
+ 	PKTLOG_LOCK_INIT(pl_info);
++	mutex_init(&pl_info->pktlog_mutex);
+ 
+ 	pl_info->buf_size = PKTLOG_DEFAULT_BUFSIZE;
+ 	pl_info->buf = NULL;
+@@ -387,7 +388,7 @@ void pktlog_init(struct hif_opaque_softc *scn)
+ 	PKTLOG_SW_EVENT_SUBSCRIBER.callback = pktlog_callback;
+ }
+ 
+-int pktlog_enable(struct hif_opaque_softc *scn, int32_t log_state,
++static int __pktlog_enable(struct hif_opaque_softc *scn, int32_t log_state,
+ 		 bool ini_triggered, uint8_t user_triggered,
+ 		 uint32_t is_iwpriv_command)
+ {
+@@ -505,7 +506,49 @@ int pktlog_enable(struct hif_opaque_softc *scn, int32_t log_state,
+ 	return 0;
+ }
+ 
+-int pktlog_setsize(struct hif_opaque_softc *scn, int32_t size)
++int pktlog_enable(struct hif_opaque_softc *scn, int32_t log_state,
++		 bool ini_triggered, uint8_t user_triggered,
++		 uint32_t is_iwpriv_command)
++{
++	struct ol_pktlog_dev_t *pl_dev;
++	struct ath_pktlog_info *pl_info;
++	struct ol_txrx_pdev_t *txrx_pdev;
++	int error;
++
++	if (!scn) {
++		printk("%s: Invalid scn context\n", __func__);
++		ASSERT(0);
++		return -EINVAL;
++	}
++
++	txrx_pdev = cds_get_context(QDF_MODULE_ID_TXRX);
++	if (!txrx_pdev) {
++		printk("%s: Invalid txrx_pdev context\n", __func__);
++		ASSERT(0);
++		return -EINVAL;
++	}
++
++	pl_dev = txrx_pdev->pl_dev;
++	if (!pl_dev) {
++		printk("%s: Invalid pktlog context\n", __func__);
++		ASSERT(0);
++		return -EINVAL;
++	}
++
++	pl_info = pl_dev->pl_info;
++
++	if (!pl_info)
++		return 0;
++
++
++	mutex_lock(&pl_info->pktlog_mutex);
++	error = __pktlog_enable(scn, log_state, ini_triggered,
++				user_triggered, is_iwpriv_command);
++	mutex_unlock(&pl_info->pktlog_mutex);
++	return error;
++}
++
++static int __pktlog_setsize(struct hif_opaque_softc *scn, int32_t size)
+ {
+ 	ol_txrx_pdev_handle pdev_txrx_handle =
+ 		cds_get_context(QDF_MODULE_ID_TXRX);
+@@ -568,6 +611,29 @@ int pktlog_setsize(struct hif_opaque_softc *scn, int32_t size)
+ 	return 0;
+ }
+ 
++int pktlog_setsize(struct hif_opaque_softc *scn, int32_t size)
++{
++	int status;
++	ol_txrx_pdev_handle pdev_txrx_handle =
++		cds_get_context(QDF_MODULE_ID_TXRX);
++	struct ol_pktlog_dev_t *pl_dev;
++	struct ath_pktlog_info *pl_info;
++
++	if (pdev_txrx_handle == NULL ||
++			pdev_txrx_handle->pl_dev == NULL ||
++			pdev_txrx_handle->pl_dev->pl_info == NULL)
++		return -EFAULT;
++
++	pl_dev = pdev_txrx_handle->pl_dev;
++	pl_info = pl_dev->pl_info;
++
++	mutex_lock(&pl_info->pktlog_mutex);
++	status = __pktlog_setsize(scn, size);
++	mutex_unlock(&pl_info->pktlog_mutex);
++
++	return status;
++}
++
+ int pktlog_clearbuff(struct hif_opaque_softc *scn, bool clear_buff)
+ {
+ 	ol_txrx_pdev_handle pdev_txrx_handle =
+-- 
+cgit v1.1
+
