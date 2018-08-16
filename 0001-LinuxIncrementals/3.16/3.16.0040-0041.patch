@@ -1,0 +1,579 @@
+diff --git a/Documentation/sysctl/fs.txt b/Documentation/sysctl/fs.txt
+index 302b5ed616a6..35e17f748ca7 100644
+--- a/Documentation/sysctl/fs.txt
++++ b/Documentation/sysctl/fs.txt
+@@ -265,6 +265,13 @@ aio-nr can grow to.
+ 
+ ==============================================================
+ 
++mount-max:
++
++This denotes the maximum number of mounts that may exist
++in a mount namespace.
++
++==============================================================
++
+ 
+ 2. /proc/sys/fs/binfmt_misc
+ ----------------------------------------------------------
+diff --git a/Makefile b/Makefile
+index c814b3e2172c..1edbcba47f75 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 16
+-SUBLEVEL = 40
++SUBLEVEL = 41
+ EXTRAVERSION =
+ NAME = Museum of Fishiegoodies
+ 
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index f0b7bce7e0ba..35f8884817fa 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -744,6 +744,20 @@ static int segmented_read_std(struct x86_emulate_ctxt *ctxt,
+ 	return ctxt->ops->read_std(ctxt, linear, data, size, &ctxt->exception);
+ }
+ 
++static int segmented_write_std(struct x86_emulate_ctxt *ctxt,
++			       struct segmented_address addr,
++			       void *data,
++			       unsigned int size)
++{
++	int rc;
++	ulong linear;
++
++	rc = linearize(ctxt, addr, size, true, &linear);
++	if (rc != X86EMUL_CONTINUE)
++		return rc;
++	return ctxt->ops->write_std(ctxt, linear, data, size, &ctxt->exception);
++}
++
+ /*
+  * Fetch the next byte of the instruction being emulated which is pointed to
+  * by ctxt->_eip, then increment ctxt->_eip.
+@@ -1439,7 +1453,6 @@ static int write_segment_descriptor(struct x86_emulate_ctxt *ctxt,
+ 				    &ctxt->exception);
+ }
+ 
+-/* Does not support long mode */
+ static int __load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
+ 				     u16 selector, int seg, u8 cpl,
+ 				     bool in_task_switch,
+@@ -1475,20 +1488,34 @@ static int __load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
+ 
+ 	rpl = selector & 3;
+ 
+-	/* NULL selector is not valid for TR, CS and SS (except for long mode) */
+-	if ((seg == VCPU_SREG_CS
+-	     || (seg == VCPU_SREG_SS
+-		 && (ctxt->mode != X86EMUL_MODE_PROT64 || rpl != cpl))
+-	     || seg == VCPU_SREG_TR)
+-	    && null_selector)
+-		goto exception;
+-
+ 	/* TR should be in GDT only */
+ 	if (seg == VCPU_SREG_TR && (selector & (1 << 2)))
+ 		goto exception;
+ 
+-	if (null_selector) /* for NULL selector skip all following checks */
++	/* NULL selector is not valid for TR, CS and (except for long mode) SS */
++	if (null_selector) {
++		if (seg == VCPU_SREG_CS || seg == VCPU_SREG_TR)
++			goto exception;
++
++		if (seg == VCPU_SREG_SS) {
++			if (ctxt->mode != X86EMUL_MODE_PROT64 || rpl != cpl)
++				goto exception;
++
++			/*
++			 * ctxt->ops->set_segment expects the CPL to be in
++			 * SS.DPL, so fake an expand-up 32-bit data segment.
++			 */
++			seg_desc.type = 3;
++			seg_desc.p = 1;
++			seg_desc.s = 1;
++			seg_desc.dpl = cpl;
++			seg_desc.d = 1;
++			seg_desc.g = 1;
++		}
++
++		/* Skip all following checks */
+ 		goto load;
++	}
+ 
+ 	ret = read_segment_descriptor(ctxt, selector, &seg_desc, &desc_addr);
+ 	if (ret != X86EMUL_CONTINUE)
+@@ -1584,6 +1611,21 @@ static int load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
+ 				   u16 selector, int seg)
+ {
+ 	u8 cpl = ctxt->ops->cpl(ctxt);
++
++	/*
++	 * None of MOV, POP and LSS can load a NULL selector in CPL=3, but
++	 * they can load it at CPL<3 (Intel's manual says only LSS can,
++	 * but it's wrong).
++	 *
++	 * However, the Intel manual says that putting IST=1/DPL=3 in
++	 * an interrupt gate will result in SS=3 (the AMD manual instead
++	 * says it doesn't), so allow SS=3 in __load_segment_descriptor
++	 * and only forbid it here.
++	 */
++	if (seg == VCPU_SREG_SS && selector == 3 &&
++	    ctxt->mode == X86EMUL_MODE_PROT64)
++		return emulate_exception(ctxt, GP_VECTOR, 0, true);
++
+ 	return __load_segment_descriptor(ctxt, selector, seg, cpl, false, NULL);
+ }
+ 
+@@ -3240,8 +3282,8 @@ static int emulate_store_desc_ptr(struct x86_emulate_ctxt *ctxt,
+ 	}
+ 	/* Disable writeback. */
+ 	ctxt->dst.type = OP_NONE;
+-	return segmented_write(ctxt, ctxt->dst.addr.mem,
+-			       &desc_ptr, 2 + ctxt->op_bytes);
++	return segmented_write_std(ctxt, ctxt->dst.addr.mem,
++				   &desc_ptr, 2 + ctxt->op_bytes);
+ }
+ 
+ static int em_sgdt(struct x86_emulate_ctxt *ctxt)
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 413fbb087718..7b16666d6ed4 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -1073,10 +1073,10 @@ static inline int nested_cpu_has_ept(struct vmcs12 *vmcs12)
+ 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENABLE_EPT);
+ }
+ 
+-static inline bool is_exception(u32 intr_info)
++static inline bool is_nmi(u32 intr_info)
+ {
+ 	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
+-		== (INTR_TYPE_HARD_EXCEPTION | INTR_INFO_VALID_MASK);
++		== (INTR_TYPE_NMI_INTR | INTR_INFO_VALID_MASK);
+ }
+ 
+ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+@@ -4838,7 +4838,7 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+ 	if (is_machine_check(intr_info))
+ 		return handle_machine_check(vcpu);
+ 
+-	if ((intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR)
++	if (is_nmi(intr_info))
+ 		return 1;  /* already handled by vmx_vcpu_run() */
+ 
+ 	if (is_no_device(intr_info)) {
+@@ -6888,7 +6888,7 @@ static bool nested_vmx_exit_handled(struct kvm_vcpu *vcpu)
+ 
+ 	switch (exit_reason) {
+ 	case EXIT_REASON_EXCEPTION_NMI:
+-		if (!is_exception(intr_info))
++		if (is_nmi(intr_info))
+ 			return 0;
+ 		else if (is_page_fault(intr_info))
+ 			return enable_ept;
+@@ -7185,8 +7185,7 @@ static void vmx_complete_atomic_exit(struct vcpu_vmx *vmx)
+ 		kvm_machine_check();
+ 
+ 	/* We need to handle NMIs before interrupts are enabled */
+-	if ((exit_intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR &&
+-	    (exit_intr_info & INTR_INFO_VALID_MASK)) {
++	if (is_nmi(exit_intr_info)) {
+ 		kvm_before_handle_nmi(&vmx->vcpu);
+ 		asm("int $2");
+ 		kvm_after_handle_nmi(&vmx->vcpu);
+diff --git a/drivers/usb/serial/kl5kusb105.c b/drivers/usb/serial/kl5kusb105.c
+index d7440b7557af..ca843033170c 100644
+--- a/drivers/usb/serial/kl5kusb105.c
++++ b/drivers/usb/serial/kl5kusb105.c
+@@ -195,10 +195,11 @@ static int klsi_105_get_line_state(struct usb_serial_port *port,
+ 			     status_buf, KLSI_STATUSBUF_LEN,
+ 			     10000
+ 			     );
+-	if (rc < 0)
+-		dev_err(&port->dev, "Reading line status failed (error = %d)\n",
+-			rc);
+-	else {
++	if (rc != KLSI_STATUSBUF_LEN) {
++		dev_err(&port->dev, "reading line status failed: %d\n", rc);
++		if (rc >= 0)
++			rc = -EIO;
++	} else {
+ 		status = get_unaligned_le16(status_buf);
+ 
+ 		dev_info(&port->serial->dev->dev, "read status %x %x\n",
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index a1fed6689db2..13a33c3047f4 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -3905,6 +3905,15 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ 			(EXT4_MAX_BLOCK_FILE_PHYS / EXT4_BLOCKS_PER_GROUP(sb)));
+ 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
+ 		   EXT4_DESC_PER_BLOCK(sb);
++	if (EXT4_HAS_INCOMPAT_FEATURE(sb,EXT4_FEATURE_INCOMPAT_META_BG)) {
++		if (le32_to_cpu(es->s_first_meta_bg) >= db_count) {
++			ext4_msg(sb, KERN_WARNING,
++				 "first meta block group too large: %u "
++				 "(group descriptor block count %u)",
++				 le32_to_cpu(es->s_first_meta_bg), db_count);
++			goto failed_mount;
++		}
++	}
+ 	sbi->s_group_desc = ext4_kvmalloc(db_count *
+ 					  sizeof(struct buffer_head *),
+ 					  GFP_KERNEL);
+diff --git a/fs/mount.h b/fs/mount.h
+index d55297f2fa05..662041fe5b39 100644
+--- a/fs/mount.h
++++ b/fs/mount.h
+@@ -11,6 +11,8 @@ struct mnt_namespace {
+ 	u64			seq;	/* Sequence number to prevent loops */
+ 	wait_queue_head_t poll;
+ 	u64 event;
++	unsigned int		mounts; /* # of mounts in the namespace */
++	unsigned int		pending_mounts;
+ };
+ 
+ struct mnt_pcp {
+diff --git a/fs/namespace.c b/fs/namespace.c
+index c957d044b13f..c2eb7ec1bb08 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -27,6 +27,9 @@
+ #include "pnode.h"
+ #include "internal.h"
+ 
++/* Maximum number of mounts in a mount namespace */
++unsigned int sysctl_mount_max __read_mostly = 100000;
++
+ static unsigned int m_hash_mask __read_mostly;
+ static unsigned int m_hash_shift __read_mostly;
+ static unsigned int mp_hash_mask __read_mostly;
+@@ -811,6 +814,9 @@ static void commit_tree(struct mount *mnt, struct mount *shadows)
+ 
+ 	list_splice(&head, n->list.prev);
+ 
++	n->mounts += n->pending_mounts;
++	n->pending_mounts = 0;
++
+ 	attach_shadowed(mnt, parent, shadows);
+ 	touch_mnt_namespace(n);
+ }
+@@ -1284,9 +1290,14 @@ static void umount_tree(struct mount *mnt, enum umount_tree_flags how)
+ 		propagate_umount(&tmp_list);
+ 
+ 	hlist_for_each_entry(p, &tmp_list, mnt_hash) {
++		struct mnt_namespace *ns;
+ 		list_del_init(&p->mnt_expire);
+ 		list_del_init(&p->mnt_list);
+-		__touch_mnt_namespace(p->mnt_ns);
++		ns = p->mnt_ns;
++		if (ns) {
++			ns->mounts--;
++			__touch_mnt_namespace(ns);
++		}
+ 		p->mnt_ns = NULL;
+ 		if (how & UMOUNT_SYNC)
+ 			p->mnt.mnt_flags |= MNT_SYNC_UMOUNT;
+@@ -1641,6 +1652,28 @@ static int invent_group_ids(struct mount *mnt, bool recurse)
+ 	return 0;
+ }
+ 
++int count_mounts(struct mnt_namespace *ns, struct mount *mnt)
++{
++	unsigned int max = ACCESS_ONCE(sysctl_mount_max);
++	unsigned int mounts = 0, old, pending, sum;
++	struct mount *p;
++
++	for (p = mnt; p; p = next_mnt(p, mnt))
++		mounts++;
++
++	old = ns->mounts;
++	pending = ns->pending_mounts;
++	sum = old + pending;
++	if ((old > sum) ||
++	    (pending > sum) ||
++	    (max < sum) ||
++	    (mounts > (max - sum)))
++		return -ENOSPC;
++
++	ns->pending_mounts = pending + mounts;
++	return 0;
++}
++
+ /*
+  *  @source_mnt : mount tree to be attached
+  *  @nd         : place the mount tree @source_mnt is attached
+@@ -1710,10 +1743,18 @@ static int attach_recursive_mnt(struct mount *source_mnt,
+ 			struct path *parent_path)
+ {
+ 	HLIST_HEAD(tree_list);
++	struct mnt_namespace *ns = dest_mnt->mnt_ns;
+ 	struct mount *child, *p;
+ 	struct hlist_node *n;
+ 	int err;
+ 
++	/* Is there space to add these mounts to the mount namespace? */
++	if (!parent_path) {
++		err = count_mounts(ns, source_mnt);
++		if (err)
++			goto out;
++	}
++
+ 	if (IS_MNT_SHARED(dest_mnt)) {
+ 		err = invent_group_ids(source_mnt, true);
+ 		if (err)
+@@ -1750,11 +1791,13 @@ static int attach_recursive_mnt(struct mount *source_mnt,
+  out_cleanup_ids:
+ 	while (!hlist_empty(&tree_list)) {
+ 		child = hlist_entry(tree_list.first, struct mount, mnt_hash);
++		child->mnt_parent->mnt_ns->pending_mounts = 0;
+ 		umount_tree(child, UMOUNT_SYNC);
+ 	}
+ 	unlock_mount_hash();
+ 	cleanup_group_ids(source_mnt, NULL);
+  out:
++	ns->pending_mounts = 0;
+ 	return err;
+ }
+ 
+@@ -2586,6 +2629,8 @@ static struct mnt_namespace *alloc_mnt_ns(struct user_namespace *user_ns)
+ 	init_waitqueue_head(&new_ns->poll);
+ 	new_ns->event = 0;
+ 	new_ns->user_ns = get_user_ns(user_ns);
++	new_ns->mounts = 0;
++	new_ns->pending_mounts = 0;
+ 	return new_ns;
+ }
+ 
+@@ -2635,6 +2680,7 @@ struct mnt_namespace *copy_mnt_ns(unsigned long flags, struct mnt_namespace *ns,
+ 	q = new;
+ 	while (p) {
+ 		q->mnt_ns = new_ns;
++		new_ns->mounts++;
+ 		if (new_fs) {
+ 			if (&p->mnt == new_fs->root.mnt) {
+ 				new_fs->root.mnt = mntget(&q->mnt);
+@@ -2673,6 +2719,7 @@ static struct mnt_namespace *create_mnt_ns(struct vfsmount *m)
+ 		struct mount *mnt = real_mount(m);
+ 		mnt->mnt_ns = new_ns;
+ 		new_ns->root = mnt;
++		new_ns->mounts++;
+ 		list_add(&mnt->mnt_list, &new_ns->list);
+ 	} else {
+ 		mntput(m);
+diff --git a/fs/pnode.c b/fs/pnode.c
+index 18e56fc4a88c..52e7506782cb 100644
+--- a/fs/pnode.c
++++ b/fs/pnode.c
+@@ -258,7 +258,7 @@ static int propagate_one(struct mount *m)
+ 		read_sequnlock_excl(&mount_lock);
+ 	}
+ 	hlist_add_head(&child->mnt_hash, list);
+-	return 0;
++	return count_mounts(m->mnt_ns, child);
+ }
+ 
+ /*
+diff --git a/fs/pnode.h b/fs/pnode.h
+index 16afc3d6d2f2..f5b2dc239ba0 100644
+--- a/fs/pnode.h
++++ b/fs/pnode.h
+@@ -50,4 +50,5 @@ void mnt_set_mountpoint(struct mount *, struct mountpoint *,
+ struct mount *copy_tree(struct mount *, struct dentry *, int);
+ bool is_path_reachable(struct mount *, struct dentry *,
+ 			 const struct path *root);
++int count_mounts(struct mnt_namespace *ns, struct mount *mnt);
+ #endif /* _LINUX_PNODE_H */
+diff --git a/fs/posix_acl.c b/fs/posix_acl.c
+index a767c594f17a..59dfaeb0ce5f 100644
+--- a/fs/posix_acl.c
++++ b/fs/posix_acl.c
+@@ -904,11 +904,10 @@ int simple_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ 	int error;
+ 
+ 	if (type == ACL_TYPE_ACCESS) {
+-		error = posix_acl_equiv_mode(acl, &inode->i_mode);
+-		if (error < 0)
+-			return 0;
+-		if (error == 0)
+-			acl = NULL;
++		error = posix_acl_update_mode(inode,
++				&inode->i_mode, &acl);
++		if (error)
++			return error;
+ 	}
+ 
+ 	inode->i_ctime = CURRENT_TIME;
+diff --git a/include/linux/mount.h b/include/linux/mount.h
+index b0c1e6574e7f..000583fa7ca3 100644
+--- a/include/linux/mount.h
++++ b/include/linux/mount.h
+@@ -91,4 +91,6 @@ extern void mark_mounts_for_expiry(struct list_head *mounts);
+ 
+ extern dev_t name_to_dev_t(char *name);
+ 
++extern unsigned int sysctl_mount_max;
++
+ #endif /* _LINUX_MOUNT_H */
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index bd5a8cf2d0f6..f9293694b52a 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -63,6 +63,7 @@
+ #include <linux/binfmts.h>
+ #include <linux/sched/sysctl.h>
+ #include <linux/kexec.h>
++#include <linux/mount.h>
+ 
+ #include <asm/uaccess.h>
+ #include <asm/processor.h>
+@@ -1685,6 +1686,14 @@ static struct ctl_table fs_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+ 	},
++	{
++		.procname	= "mount-max",
++		.data		= &sysctl_mount_max,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= &one,
++	},
+ 	{ }
+ };
+ 
+diff --git a/net/dccp/input.c b/net/dccp/input.c
+index 3c8ec7d4a34e..700440e4fa3b 100644
+--- a/net/dccp/input.c
++++ b/net/dccp/input.c
+@@ -606,7 +606,8 @@ int dccp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+ 			if (inet_csk(sk)->icsk_af_ops->conn_request(sk,
+ 								    skb) < 0)
+ 				return 1;
+-			goto discard;
++			consume_skb(skb);
++			return 0;
+ 		}
+ 		if (dh->dccph_type == DCCP_PKT_RESET)
+ 			goto discard;
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index cf377702852d..ecb2b00b6ad3 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -1082,7 +1082,14 @@ void ipv4_pktinfo_prepare(const struct sock *sk, struct sk_buff *skb)
+ 		pktinfo->ipi_ifindex = 0;
+ 		pktinfo->ipi_spec_dst.s_addr = 0;
+ 	}
+-	skb_dst_drop(skb);
++	/* We need to keep the dst for __ip_options_echo()
++	 * We could restrict the test to opt.ts_needtime || opt.srr,
++	 * but the following is good enough as IP options are not often used.
++	 */
++	if (unlikely(IPCB(skb)->opt.optlen))
++		skb_dst_force(skb);
++	else
++		skb_dst_drop(skb);
+ }
+ 
+ int ip_setsockopt(struct sock *sk, int level,
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 9ee5a4bbb289..068ffa698318 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -765,6 +765,12 @@ ssize_t tcp_splice_read(struct socket *sock, loff_t *ppos,
+ 				ret = -EAGAIN;
+ 				break;
+ 			}
++			/* if __tcp_splice_read() got nothing while we have
++			 * an skb in receive queue, we do not want to loop.
++			 * This might happen with URG data.
++			 */
++			if (!skb_queue_empty(&sk->sk_receive_queue))
++				break;
+ 			sk_wait_data(sk, &timeo);
+ 			if (signal_pending(current)) {
+ 				ret = sock_intr_errno(timeo);
+diff --git a/net/ipv6/ip6_gre.c b/net/ipv6/ip6_gre.c
+index 473bb5031af2..42dd7c0c4283 100644
+--- a/net/ipv6/ip6_gre.c
++++ b/net/ipv6/ip6_gre.c
+@@ -55,6 +55,7 @@
+ #include <net/ip6_fib.h>
+ #include <net/ip6_route.h>
+ #include <net/ip6_tunnel.h>
++#include <net/gre.h>
+ 
+ 
+ static bool log_ecn_error = true;
+@@ -364,35 +365,37 @@ static void ip6gre_tunnel_uninit(struct net_device *dev)
+ 
+ 
+ static void ip6gre_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+-		u8 type, u8 code, int offset, __be32 info)
++		       u8 type, u8 code, int offset, __be32 info)
+ {
+-	const struct ipv6hdr *ipv6h = (const struct ipv6hdr *)skb->data;
+-	__be16 *p = (__be16 *)(skb->data + offset);
+-	int grehlen = offset + 4;
++	const struct gre_base_hdr *greh;
++	const struct ipv6hdr *ipv6h;
++	int grehlen = sizeof(*greh);
+ 	struct ip6_tnl *t;
++	int key_off = 0;
+ 	__be16 flags;
++	__be32 key;
+ 
+-	flags = p[0];
+-	if (flags&(GRE_CSUM|GRE_KEY|GRE_SEQ|GRE_ROUTING|GRE_VERSION)) {
+-		if (flags&(GRE_VERSION|GRE_ROUTING))
+-			return;
+-		if (flags&GRE_KEY) {
+-			grehlen += 4;
+-			if (flags&GRE_CSUM)
+-				grehlen += 4;
+-		}
++	if (!pskb_may_pull(skb, offset + grehlen))
++		return;
++	greh = (const struct gre_base_hdr *)(skb->data + offset);
++	flags = greh->flags;
++	if (flags & (GRE_VERSION | GRE_ROUTING))
++		return;
++	if (flags & GRE_CSUM)
++		grehlen += 4;
++	if (flags & GRE_KEY) {
++		key_off = grehlen + offset;
++		grehlen += 4;
+ 	}
+ 
+-	/* If only 8 bytes returned, keyed message will be dropped here */
+-	if (!pskb_may_pull(skb, grehlen))
++	if (!pskb_may_pull(skb, offset + grehlen))
+ 		return;
+ 	ipv6h = (const struct ipv6hdr *)skb->data;
+-	p = (__be16 *)(skb->data + offset);
++	greh = (const struct gre_base_hdr *)(skb->data + offset);
++	key = key_off ? *(__be32 *)(skb->data + key_off) : 0;
+ 
+ 	t = ip6gre_tunnel_lookup(skb->dev, &ipv6h->daddr, &ipv6h->saddr,
+-				flags & GRE_KEY ?
+-				*(((__be32 *)p) + (grehlen / 4) - 1) : 0,
+-				p[1]);
++				 key, greh->protocol);
+ 	if (t == NULL)
+ 		return;
+ 
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index af2d5124f99c..85a74e299412 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -5546,7 +5546,7 @@ static int selinux_setprocattr(struct task_struct *p,
+ 		return error;
+ 
+ 	/* Obtain a SID for the context, if one was specified. */
+-	if (size && str[1] && str[1] != '\n') {
++	if (size && str[0] && str[0] != '\n') {
+ 		if (str[size-1] == '\n') {
+ 			str[size-1] = 0;
+ 			size--;

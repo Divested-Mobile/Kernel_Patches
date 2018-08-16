@@ -1,0 +1,577 @@
+diff --git a/Makefile b/Makefile
+index 01f9df1af256..75d89dc2b94a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 14
+-SUBLEVEL = 1
++SUBLEVEL = 2
+ EXTRAVERSION =
+ NAME = Petit Gorille
+ 
+diff --git a/block/bio.c b/block/bio.c
+index 101c2a9b5481..33fa6b4af312 100644
+--- a/block/bio.c
++++ b/block/bio.c
+@@ -597,6 +597,7 @@ void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
+ 	 * so we don't set nor calculate new physical/hw segment counts here
+ 	 */
+ 	bio->bi_disk = bio_src->bi_disk;
++	bio->bi_partno = bio_src->bi_partno;
+ 	bio_set_flag(bio, BIO_CLONED);
+ 	bio->bi_opf = bio_src->bi_opf;
+ 	bio->bi_write_hint = bio_src->bi_write_hint;
+diff --git a/drivers/char/ipmi/ipmi_msghandler.c b/drivers/char/ipmi/ipmi_msghandler.c
+index 810b138f5897..c82d9fd2f05a 100644
+--- a/drivers/char/ipmi/ipmi_msghandler.c
++++ b/drivers/char/ipmi/ipmi_msghandler.c
+@@ -4030,7 +4030,8 @@ smi_from_recv_msg(ipmi_smi_t intf, struct ipmi_recv_msg *recv_msg,
+ }
+ 
+ static void check_msg_timeout(ipmi_smi_t intf, struct seq_table *ent,
+-			      struct list_head *timeouts, long timeout_period,
++			      struct list_head *timeouts,
++			      unsigned long timeout_period,
+ 			      int slot, unsigned long *flags,
+ 			      unsigned int *waiting_msgs)
+ {
+@@ -4043,8 +4044,8 @@ static void check_msg_timeout(ipmi_smi_t intf, struct seq_table *ent,
+ 	if (!ent->inuse)
+ 		return;
+ 
+-	ent->timeout -= timeout_period;
+-	if (ent->timeout > 0) {
++	if (timeout_period < ent->timeout) {
++		ent->timeout -= timeout_period;
+ 		(*waiting_msgs)++;
+ 		return;
+ 	}
+@@ -4110,7 +4111,8 @@ static void check_msg_timeout(ipmi_smi_t intf, struct seq_table *ent,
+ 	}
+ }
+ 
+-static unsigned int ipmi_timeout_handler(ipmi_smi_t intf, long timeout_period)
++static unsigned int ipmi_timeout_handler(ipmi_smi_t intf,
++					 unsigned long timeout_period)
+ {
+ 	struct list_head     timeouts;
+ 	struct ipmi_recv_msg *msg, *msg2;
+diff --git a/drivers/char/ipmi/ipmi_si_intf.c b/drivers/char/ipmi/ipmi_si_intf.c
+index 36f47e8d06a3..bc3984ffe867 100644
+--- a/drivers/char/ipmi/ipmi_si_intf.c
++++ b/drivers/char/ipmi/ipmi_si_intf.c
+@@ -3424,7 +3424,7 @@ static inline void wait_for_timer_and_thread(struct smi_info *smi_info)
+ 		del_timer_sync(&smi_info->si_timer);
+ }
+ 
+-static int is_new_interface(struct smi_info *info)
++static struct smi_info *find_dup_si(struct smi_info *info)
+ {
+ 	struct smi_info *e;
+ 
+@@ -3439,24 +3439,36 @@ static int is_new_interface(struct smi_info *info)
+ 			 */
+ 			if (info->slave_addr && !e->slave_addr)
+ 				e->slave_addr = info->slave_addr;
+-			return 0;
++			return e;
+ 		}
+ 	}
+ 
+-	return 1;
++	return NULL;
+ }
+ 
+ static int add_smi(struct smi_info *new_smi)
+ {
+ 	int rv = 0;
++	struct smi_info *dup;
+ 
+ 	mutex_lock(&smi_infos_lock);
+-	if (!is_new_interface(new_smi)) {
+-		pr_info(PFX "%s-specified %s state machine: duplicate\n",
+-			ipmi_addr_src_to_str(new_smi->addr_source),
+-			si_to_str[new_smi->si_type]);
+-		rv = -EBUSY;
+-		goto out_err;
++	dup = find_dup_si(new_smi);
++	if (dup) {
++		if (new_smi->addr_source == SI_ACPI &&
++		    dup->addr_source == SI_SMBIOS) {
++			/* We prefer ACPI over SMBIOS. */
++			dev_info(dup->dev,
++				 "Removing SMBIOS-specified %s state machine in favor of ACPI\n",
++				 si_to_str[new_smi->si_type]);
++			cleanup_one_si(dup);
++		} else {
++			dev_info(new_smi->dev,
++				 "%s-specified %s state machine: duplicate\n",
++				 ipmi_addr_src_to_str(new_smi->addr_source),
++				 si_to_str[new_smi->si_type]);
++			rv = -EBUSY;
++			goto out_err;
++		}
+ 	}
+ 
+ 	pr_info(PFX "Adding %s-specified %s state machine\n",
+@@ -3865,7 +3877,8 @@ static void cleanup_one_si(struct smi_info *to_clean)
+ 		poll(to_clean);
+ 		schedule_timeout_uninterruptible(1);
+ 	}
+-	disable_si_irq(to_clean, false);
++	if (to_clean->handlers)
++		disable_si_irq(to_clean, false);
+ 	while (to_clean->curr_msg || (to_clean->si_state != SI_NORMAL)) {
+ 		poll(to_clean);
+ 		schedule_timeout_uninterruptible(1);
+diff --git a/drivers/char/tpm/tpm-dev-common.c b/drivers/char/tpm/tpm-dev-common.c
+index 610638a80383..461bf0b8a094 100644
+--- a/drivers/char/tpm/tpm-dev-common.c
++++ b/drivers/char/tpm/tpm-dev-common.c
+@@ -110,6 +110,12 @@ ssize_t tpm_common_write(struct file *file, const char __user *buf,
+ 		return -EFAULT;
+ 	}
+ 
++	if (in_size < 6 ||
++	    in_size < be32_to_cpu(*((__be32 *) (priv->data_buffer + 2)))) {
++		mutex_unlock(&priv->buffer_mutex);
++		return -EINVAL;
++	}
++
+ 	/* atomic tpm command send and result receive. We only hold the ops
+ 	 * lock during this period so that the tpm can be unregistered even if
+ 	 * the char dev is held open.
+diff --git a/drivers/net/ethernet/fealnx.c b/drivers/net/ethernet/fealnx.c
+index e92859dab7ae..e191c4ebeaf4 100644
+--- a/drivers/net/ethernet/fealnx.c
++++ b/drivers/net/ethernet/fealnx.c
+@@ -257,8 +257,8 @@ enum rx_desc_status_bits {
+ 	RXFSD = 0x00000800,	/* first descriptor */
+ 	RXLSD = 0x00000400,	/* last descriptor */
+ 	ErrorSummary = 0x80,	/* error summary */
+-	RUNT = 0x40,		/* runt packet received */
+-	LONG = 0x20,		/* long packet received */
++	RUNTPKT = 0x40,		/* runt packet received */
++	LONGPKT = 0x20,		/* long packet received */
+ 	FAE = 0x10,		/* frame align error */
+ 	CRC = 0x08,		/* crc error */
+ 	RXER = 0x04,		/* receive error */
+@@ -1632,7 +1632,7 @@ static int netdev_rx(struct net_device *dev)
+ 					       dev->name, rx_status);
+ 
+ 				dev->stats.rx_errors++;	/* end of a packet. */
+-				if (rx_status & (LONG | RUNT))
++				if (rx_status & (LONGPKT | RUNTPKT))
+ 					dev->stats.rx_length_errors++;
+ 				if (rx_status & RXER)
+ 					dev->stats.rx_frame_errors++;
+diff --git a/drivers/net/usb/cdc_ncm.c b/drivers/net/usb/cdc_ncm.c
+index 47cab1bde065..9e1b74590682 100644
+--- a/drivers/net/usb/cdc_ncm.c
++++ b/drivers/net/usb/cdc_ncm.c
+@@ -771,7 +771,7 @@ int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_
+ 	int err;
+ 	u8 iface_no;
+ 	struct usb_cdc_parsed_header hdr;
+-	u16 curr_ntb_format;
++	__le16 curr_ntb_format;
+ 
+ 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
+ 	if (!ctx)
+@@ -889,7 +889,7 @@ int cdc_ncm_bind_common(struct usbnet *dev, struct usb_interface *intf, u8 data_
+ 			goto error2;
+ 		}
+ 
+-		if (curr_ntb_format == USB_CDC_NCM_NTB32_FORMAT) {
++		if (curr_ntb_format == cpu_to_le16(USB_CDC_NCM_NTB32_FORMAT)) {
+ 			dev_info(&intf->dev, "resetting NTB format to 16-bit");
+ 			err = usbnet_write_cmd(dev, USB_CDC_SET_NTB_FORMAT,
+ 					       USB_TYPE_CLASS | USB_DIR_OUT
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index d7c49cf1d5e9..a2f4e52fadb5 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -1623,26 +1623,19 @@ static struct sk_buff *vxlan_na_create(struct sk_buff *request,
+ static int neigh_reduce(struct net_device *dev, struct sk_buff *skb, __be32 vni)
+ {
+ 	struct vxlan_dev *vxlan = netdev_priv(dev);
+-	struct nd_msg *msg;
+-	const struct ipv6hdr *iphdr;
+ 	const struct in6_addr *daddr;
+-	struct neighbour *n;
++	const struct ipv6hdr *iphdr;
+ 	struct inet6_dev *in6_dev;
++	struct neighbour *n;
++	struct nd_msg *msg;
+ 
+ 	in6_dev = __in6_dev_get(dev);
+ 	if (!in6_dev)
+ 		goto out;
+ 
+-	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr) + sizeof(struct nd_msg)))
+-		goto out;
+-
+ 	iphdr = ipv6_hdr(skb);
+ 	daddr = &iphdr->daddr;
+-
+ 	msg = (struct nd_msg *)(iphdr + 1);
+-	if (msg->icmph.icmp6_code != 0 ||
+-	    msg->icmph.icmp6_type != NDISC_NEIGHBOUR_SOLICITATION)
+-		goto out;
+ 
+ 	if (ipv6_addr_loopback(daddr) ||
+ 	    ipv6_addr_is_multicast(&msg->target))
+@@ -2240,11 +2233,11 @@ static void vxlan_xmit_one(struct sk_buff *skb, struct net_device *dev,
+ static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
+ 	struct vxlan_dev *vxlan = netdev_priv(dev);
++	struct vxlan_rdst *rdst, *fdst = NULL;
+ 	const struct ip_tunnel_info *info;
+-	struct ethhdr *eth;
+ 	bool did_rsc = false;
+-	struct vxlan_rdst *rdst, *fdst = NULL;
+ 	struct vxlan_fdb *f;
++	struct ethhdr *eth;
+ 	__be32 vni = 0;
+ 
+ 	info = skb_tunnel_info(skb);
+@@ -2269,12 +2262,14 @@ static netdev_tx_t vxlan_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		if (ntohs(eth->h_proto) == ETH_P_ARP)
+ 			return arp_reduce(dev, skb, vni);
+ #if IS_ENABLED(CONFIG_IPV6)
+-		else if (ntohs(eth->h_proto) == ETH_P_IPV6) {
+-			struct ipv6hdr *hdr, _hdr;
+-			if ((hdr = skb_header_pointer(skb,
+-						      skb_network_offset(skb),
+-						      sizeof(_hdr), &_hdr)) &&
+-			    hdr->nexthdr == IPPROTO_ICMPV6)
++		else if (ntohs(eth->h_proto) == ETH_P_IPV6 &&
++			 pskb_may_pull(skb, sizeof(struct ipv6hdr) +
++					    sizeof(struct nd_msg)) &&
++			 ipv6_hdr(skb)->nexthdr == IPPROTO_ICMPV6) {
++			struct nd_msg *m = (struct nd_msg *)(ipv6_hdr(skb) + 1);
++
++			if (m->icmph.icmp6_code == 0 &&
++			    m->icmph.icmp6_type == NDISC_NEIGHBOUR_SOLICITATION)
+ 				return neigh_reduce(dev, skb, vni);
+ 		}
+ #endif
+diff --git a/drivers/tty/serial/8250/8250_fintek.c b/drivers/tty/serial/8250/8250_fintek.c
+index e500f7dd2470..4bd376c08b59 100644
+--- a/drivers/tty/serial/8250/8250_fintek.c
++++ b/drivers/tty/serial/8250/8250_fintek.c
+@@ -118,6 +118,9 @@ static int fintek_8250_enter_key(u16 base_port, u8 key)
+ 	if (!request_muxed_region(base_port, 2, "8250_fintek"))
+ 		return -EBUSY;
+ 
++	/* Force to deactive all SuperIO in this base_port */
++	outb(EXIT_KEY, base_port + ADDR_PORT);
++
+ 	outb(key, base_port + ADDR_PORT);
+ 	outb(key, base_port + ADDR_PORT);
+ 	return 0;
+diff --git a/drivers/tty/serial/omap-serial.c b/drivers/tty/serial/omap-serial.c
+index 7754053deeda..26a22b100df1 100644
+--- a/drivers/tty/serial/omap-serial.c
++++ b/drivers/tty/serial/omap-serial.c
+@@ -693,7 +693,7 @@ static void serial_omap_set_mctrl(struct uart_port *port, unsigned int mctrl)
+ 	if ((mctrl & TIOCM_RTS) && (port->status & UPSTAT_AUTORTS))
+ 		up->efr |= UART_EFR_RTS;
+ 	else
+-		up->efr &= UART_EFR_RTS;
++		up->efr &= ~UART_EFR_RTS;
+ 	serial_out(up, UART_EFR, up->efr);
+ 	serial_out(up, UART_LCR, lcr);
+ 
+diff --git a/fs/coda/upcall.c b/fs/coda/upcall.c
+index a37f003530d7..1175a1722411 100644
+--- a/fs/coda/upcall.c
++++ b/fs/coda/upcall.c
+@@ -447,8 +447,7 @@ int venus_fsync(struct super_block *sb, struct CodaFid *fid)
+ 	UPARG(CODA_FSYNC);
+ 
+ 	inp->coda_fsync.VFid = *fid;
+-	error = coda_upcall(coda_vcp(sb), sizeof(union inputArgs),
+-			    &outsize, inp);
++	error = coda_upcall(coda_vcp(sb), insize, &outsize, inp);
+ 
+ 	CODA_FREE(inp, insize);
+ 	return error;
+diff --git a/fs/ocfs2/dlm/dlmrecovery.c b/fs/ocfs2/dlm/dlmrecovery.c
+index 74407c6dd592..ec8f75813beb 100644
+--- a/fs/ocfs2/dlm/dlmrecovery.c
++++ b/fs/ocfs2/dlm/dlmrecovery.c
+@@ -2419,6 +2419,7 @@ static void dlm_do_local_recovery_cleanup(struct dlm_ctxt *dlm, u8 dead_node)
+ 					dlm_lockres_put(res);
+ 					continue;
+ 				}
++				dlm_move_lockres_to_recovery_list(dlm, res);
+ 			} else if (res->owner == dlm->node_num) {
+ 				dlm_free_dead_locks(dlm, res, dead_node);
+ 				__dlm_lockres_calc_usage(dlm, res);
+diff --git a/fs/ocfs2/file.c b/fs/ocfs2/file.c
+index 6e41fc8fabbe..dc455d45a66a 100644
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@ -1161,6 +1161,13 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
+ 	}
+ 	size_change = S_ISREG(inode->i_mode) && attr->ia_valid & ATTR_SIZE;
+ 	if (size_change) {
++		/*
++		 * Here we should wait dio to finish before inode lock
++		 * to avoid a deadlock between ocfs2_setattr() and
++		 * ocfs2_dio_end_io_write()
++		 */
++		inode_dio_wait(inode);
++
+ 		status = ocfs2_rw_lock(inode, 1);
+ 		if (status < 0) {
+ 			mlog_errno(status);
+@@ -1200,8 +1207,6 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
+ 		if (status)
+ 			goto bail_unlock;
+ 
+-		inode_dio_wait(inode);
+-
+ 		if (i_size_read(inode) >= attr->ia_size) {
+ 			if (ocfs2_should_order_data(inode)) {
+ 				status = ocfs2_begin_ordered_truncate(inode,
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index c9c4a81b9767..18b06983131a 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -700,7 +700,8 @@ typedef struct pglist_data {
+ 	 * is the first PFN that needs to be initialised.
+ 	 */
+ 	unsigned long first_deferred_pfn;
+-	unsigned long static_init_size;
++	/* Number of non-deferred pages */
++	unsigned long static_init_pgcnt;
+ #endif /* CONFIG_DEFERRED_STRUCT_PAGE_INIT */
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index e012b9be777e..fed95fa941e6 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -1507,7 +1507,7 @@ static void rcu_prepare_for_idle(void)
+ 	rdtp->last_accelerate = jiffies;
+ 	for_each_rcu_flavor(rsp) {
+ 		rdp = this_cpu_ptr(rsp->rda);
+-		if (rcu_segcblist_pend_cbs(&rdp->cblist))
++		if (!rcu_segcblist_pend_cbs(&rdp->cblist))
+ 			continue;
+ 		rnp = rdp->mynode;
+ 		raw_spin_lock_rcu_node(rnp); /* irqs already disabled. */
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 77e4d3c5c57b..82a6270c9743 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -290,28 +290,37 @@ EXPORT_SYMBOL(nr_online_nodes);
+ int page_group_by_mobility_disabled __read_mostly;
+ 
+ #ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
++
++/*
++ * Determine how many pages need to be initialized durig early boot
++ * (non-deferred initialization).
++ * The value of first_deferred_pfn will be set later, once non-deferred pages
++ * are initialized, but for now set it ULONG_MAX.
++ */
+ static inline void reset_deferred_meminit(pg_data_t *pgdat)
+ {
+-	unsigned long max_initialise;
+-	unsigned long reserved_lowmem;
++	phys_addr_t start_addr, end_addr;
++	unsigned long max_pgcnt;
++	unsigned long reserved;
+ 
+ 	/*
+ 	 * Initialise at least 2G of a node but also take into account that
+ 	 * two large system hashes that can take up 1GB for 0.25TB/node.
+ 	 */
+-	max_initialise = max(2UL << (30 - PAGE_SHIFT),
+-		(pgdat->node_spanned_pages >> 8));
++	max_pgcnt = max(2UL << (30 - PAGE_SHIFT),
++			(pgdat->node_spanned_pages >> 8));
+ 
+ 	/*
+ 	 * Compensate the all the memblock reservations (e.g. crash kernel)
+ 	 * from the initial estimation to make sure we will initialize enough
+ 	 * memory to boot.
+ 	 */
+-	reserved_lowmem = memblock_reserved_memory_within(pgdat->node_start_pfn,
+-			pgdat->node_start_pfn + max_initialise);
+-	max_initialise += reserved_lowmem;
++	start_addr = PFN_PHYS(pgdat->node_start_pfn);
++	end_addr = PFN_PHYS(pgdat->node_start_pfn + max_pgcnt);
++	reserved = memblock_reserved_memory_within(start_addr, end_addr);
++	max_pgcnt += PHYS_PFN(reserved);
+ 
+-	pgdat->static_init_size = min(max_initialise, pgdat->node_spanned_pages);
++	pgdat->static_init_pgcnt = min(max_pgcnt, pgdat->node_spanned_pages);
+ 	pgdat->first_deferred_pfn = ULONG_MAX;
+ }
+ 
+@@ -338,7 +347,7 @@ static inline bool update_defer_init(pg_data_t *pgdat,
+ 	if (zone_end < pgdat_end_pfn(pgdat))
+ 		return true;
+ 	(*nr_initialised)++;
+-	if ((*nr_initialised > pgdat->static_init_size) &&
++	if ((*nr_initialised > pgdat->static_init_pgcnt) &&
+ 	    (pfn & (PAGES_PER_SECTION - 1)) == 0) {
+ 		pgdat->first_deferred_pfn = pfn;
+ 		return false;
+diff --git a/mm/page_ext.c b/mm/page_ext.c
+index 4f0367d472c4..2c16216c29b6 100644
+--- a/mm/page_ext.c
++++ b/mm/page_ext.c
+@@ -125,7 +125,6 @@ struct page_ext *lookup_page_ext(struct page *page)
+ 	struct page_ext *base;
+ 
+ 	base = NODE_DATA(page_to_nid(page))->node_page_ext;
+-#if defined(CONFIG_DEBUG_VM)
+ 	/*
+ 	 * The sanity checks the page allocator does upon freeing a
+ 	 * page can reach here before the page_ext arrays are
+@@ -134,7 +133,6 @@ struct page_ext *lookup_page_ext(struct page *page)
+ 	 */
+ 	if (unlikely(!base))
+ 		return NULL;
+-#endif
+ 	index = pfn - round_down(node_start_pfn(page_to_nid(page)),
+ 					MAX_ORDER_NR_PAGES);
+ 	return get_entry(base, index);
+@@ -199,7 +197,6 @@ struct page_ext *lookup_page_ext(struct page *page)
+ {
+ 	unsigned long pfn = page_to_pfn(page);
+ 	struct mem_section *section = __pfn_to_section(pfn);
+-#if defined(CONFIG_DEBUG_VM)
+ 	/*
+ 	 * The sanity checks the page allocator does upon freeing a
+ 	 * page can reach here before the page_ext arrays are
+@@ -208,7 +205,6 @@ struct page_ext *lookup_page_ext(struct page *page)
+ 	 */
+ 	if (!section->page_ext)
+ 		return NULL;
+-#endif
+ 	return get_entry(section->page_ext, pfn);
+ }
+ 
+diff --git a/mm/pagewalk.c b/mm/pagewalk.c
+index 8bd4afa83cb8..23a3e415ac2c 100644
+--- a/mm/pagewalk.c
++++ b/mm/pagewalk.c
+@@ -188,8 +188,12 @@ static int walk_hugetlb_range(unsigned long addr, unsigned long end,
+ 	do {
+ 		next = hugetlb_entry_end(h, addr, end);
+ 		pte = huge_pte_offset(walk->mm, addr & hmask, sz);
+-		if (pte && walk->hugetlb_entry)
++
++		if (pte)
+ 			err = walk->hugetlb_entry(pte, hmask, addr, next, walk);
++		else if (walk->pte_hole)
++			err = walk->pte_hole(addr, next, walk);
++
+ 		if (err)
+ 			break;
+ 	} while (addr = next, addr != end);
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index b93148e8e9fb..15c99dfa3d72 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -2136,7 +2136,7 @@ static int netlink_dump(struct sock *sk)
+ 	struct sk_buff *skb = NULL;
+ 	struct nlmsghdr *nlh;
+ 	struct module *module;
+-	int len, err = -ENOBUFS;
++	int err = -ENOBUFS;
+ 	int alloc_min_size;
+ 	int alloc_size;
+ 
+@@ -2183,9 +2183,11 @@ static int netlink_dump(struct sock *sk)
+ 	skb_reserve(skb, skb_tailroom(skb) - alloc_size);
+ 	netlink_skb_set_owner_r(skb, sk);
+ 
+-	len = cb->dump(skb, cb);
++	if (nlk->dump_done_errno > 0)
++		nlk->dump_done_errno = cb->dump(skb, cb);
+ 
+-	if (len > 0) {
++	if (nlk->dump_done_errno > 0 ||
++	    skb_tailroom(skb) < nlmsg_total_size(sizeof(nlk->dump_done_errno))) {
+ 		mutex_unlock(nlk->cb_mutex);
+ 
+ 		if (sk_filter(sk, skb))
+@@ -2195,13 +2197,15 @@ static int netlink_dump(struct sock *sk)
+ 		return 0;
+ 	}
+ 
+-	nlh = nlmsg_put_answer(skb, cb, NLMSG_DONE, sizeof(len), NLM_F_MULTI);
+-	if (!nlh)
++	nlh = nlmsg_put_answer(skb, cb, NLMSG_DONE,
++			       sizeof(nlk->dump_done_errno), NLM_F_MULTI);
++	if (WARN_ON(!nlh))
+ 		goto errout_skb;
+ 
+ 	nl_dump_check_consistent(cb, nlh);
+ 
+-	memcpy(nlmsg_data(nlh), &len, sizeof(len));
++	memcpy(nlmsg_data(nlh), &nlk->dump_done_errno,
++	       sizeof(nlk->dump_done_errno));
+ 
+ 	if (sk_filter(sk, skb))
+ 		kfree_skb(skb);
+@@ -2273,6 +2277,7 @@ int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
+ 	}
+ 
+ 	nlk->cb_running = true;
++	nlk->dump_done_errno = INT_MAX;
+ 
+ 	mutex_unlock(nlk->cb_mutex);
+ 
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index 028188597eaa..962de7b3c023 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -34,6 +34,7 @@ struct netlink_sock {
+ 	wait_queue_head_t	wait;
+ 	bool			bound;
+ 	bool			cb_running;
++	int			dump_done_errno;
+ 	struct netlink_callback	cb;
+ 	struct mutex		*cb_mutex;
+ 	struct mutex		cb_def_mutex;
+diff --git a/net/sctp/ipv6.c b/net/sctp/ipv6.c
+index a6dfa86c0201..3b18085e3b10 100644
+--- a/net/sctp/ipv6.c
++++ b/net/sctp/ipv6.c
+@@ -807,9 +807,10 @@ static void sctp_inet6_skb_msgname(struct sk_buff *skb, char *msgname,
+ 		addr->v6.sin6_flowinfo = 0;
+ 		addr->v6.sin6_port = sh->source;
+ 		addr->v6.sin6_addr = ipv6_hdr(skb)->saddr;
+-		if (ipv6_addr_type(&addr->v6.sin6_addr) & IPV6_ADDR_LINKLOCAL) {
++		if (ipv6_addr_type(&addr->v6.sin6_addr) & IPV6_ADDR_LINKLOCAL)
+ 			addr->v6.sin6_scope_id = sctp_v6_skb_iif(skb);
+-		}
++		else
++			addr->v6.sin6_scope_id = 0;
+ 	}
+ 
+ 	*addr_len = sctp_v6_addr_to_user(sctp_sk(skb->sk), addr);
+diff --git a/security/integrity/ima/ima_appraise.c b/security/integrity/ima/ima_appraise.c
+index 809ba70fbbbf..7d769b948de8 100644
+--- a/security/integrity/ima/ima_appraise.c
++++ b/security/integrity/ima/ima_appraise.c
+@@ -320,6 +320,9 @@ void ima_update_xattr(struct integrity_iint_cache *iint, struct file *file)
+ 	if (iint->flags & IMA_DIGSIG)
+ 		return;
+ 
++	if (iint->ima_file_status != INTEGRITY_PASS)
++		return;
++
+ 	rc = ima_collect_measurement(iint, file, NULL, 0, ima_hash_algo);
+ 	if (rc < 0)
+ 		return;

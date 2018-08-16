@@ -1,0 +1,514 @@
+diff --git a/Makefile b/Makefile
+index 655887067dc7..20f7d4de0f1c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 14
+-SUBLEVEL = 11
++SUBLEVEL = 12
+ EXTRAVERSION =
+ NAME = Petit Gorille
+ 
+diff --git a/arch/x86/entry/entry_64_compat.S b/arch/x86/entry/entry_64_compat.S
+index 40f17009ec20..98d5358e4041 100644
+--- a/arch/x86/entry/entry_64_compat.S
++++ b/arch/x86/entry/entry_64_compat.S
+@@ -190,8 +190,13 @@ ENTRY(entry_SYSCALL_compat)
+ 	/* Interrupts are off on entry. */
+ 	swapgs
+ 
+-	/* Stash user ESP and switch to the kernel stack. */
++	/* Stash user ESP */
+ 	movl	%esp, %r8d
++
++	/* Use %rsp as scratch reg. User ESP is stashed in r8 */
++	SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp
++
++	/* Switch to the kernel stack */
+ 	movq	PER_CPU_VAR(cpu_current_top_of_stack), %rsp
+ 
+ 	/* Construct struct pt_regs on stack */
+@@ -219,12 +224,6 @@ GLOBAL(entry_SYSCALL_compat_after_hwframe)
+ 	pushq   $0			/* pt_regs->r14 = 0 */
+ 	pushq   $0			/* pt_regs->r15 = 0 */
+ 
+-	/*
+-	 * We just saved %rdi so it is safe to clobber.  It is not
+-	 * preserved during the C calls inside TRACE_IRQS_OFF anyway.
+-	 */
+-	SWITCH_TO_KERNEL_CR3 scratch_reg=%rdi
+-
+ 	/*
+ 	 * User mode is traced as though IRQs are on, and SYSENTER
+ 	 * turned them off.
+diff --git a/arch/x86/include/asm/unwind.h b/arch/x86/include/asm/unwind.h
+index c1688c2d0a12..1f86e1b0a5cd 100644
+--- a/arch/x86/include/asm/unwind.h
++++ b/arch/x86/include/asm/unwind.h
+@@ -56,18 +56,27 @@ void unwind_start(struct unwind_state *state, struct task_struct *task,
+ 
+ #if defined(CONFIG_UNWINDER_ORC) || defined(CONFIG_UNWINDER_FRAME_POINTER)
+ /*
+- * WARNING: The entire pt_regs may not be safe to dereference.  In some cases,
+- * only the iret frame registers are accessible.  Use with caution!
++ * If 'partial' returns true, only the iret frame registers are valid.
+  */
+-static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state)
++static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state,
++						    bool *partial)
+ {
+ 	if (unwind_done(state))
+ 		return NULL;
+ 
++	if (partial) {
++#ifdef CONFIG_UNWINDER_ORC
++		*partial = !state->full_regs;
++#else
++		*partial = false;
++#endif
++	}
++
+ 	return state->regs;
+ }
+ #else
+-static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state)
++static inline struct pt_regs *unwind_get_entry_regs(struct unwind_state *state,
++						    bool *partial)
+ {
+ 	return NULL;
+ }
+diff --git a/arch/x86/kernel/cpu/common.c b/arch/x86/kernel/cpu/common.c
+index f2a94dfb434e..b1be494ab4e8 100644
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@ -899,8 +899,8 @@ static void __init early_identify_cpu(struct cpuinfo_x86 *c)
+ 
+ 	setup_force_cpu_cap(X86_FEATURE_ALWAYS);
+ 
+-	/* Assume for now that ALL x86 CPUs are insecure */
+-	setup_force_cpu_bug(X86_BUG_CPU_INSECURE);
++	if (c->x86_vendor != X86_VENDOR_AMD)
++		setup_force_cpu_bug(X86_BUG_CPU_INSECURE);
+ 
+ 	fpu__init_system(c);
+ 
+diff --git a/arch/x86/kernel/dumpstack.c b/arch/x86/kernel/dumpstack.c
+index 5fa110699ed2..afbecff161d1 100644
+--- a/arch/x86/kernel/dumpstack.c
++++ b/arch/x86/kernel/dumpstack.c
+@@ -76,12 +76,23 @@ void show_iret_regs(struct pt_regs *regs)
+ 		regs->sp, regs->flags);
+ }
+ 
+-static void show_regs_safe(struct stack_info *info, struct pt_regs *regs)
++static void show_regs_if_on_stack(struct stack_info *info, struct pt_regs *regs,
++				  bool partial)
+ {
+-	if (on_stack(info, regs, sizeof(*regs)))
++	/*
++	 * These on_stack() checks aren't strictly necessary: the unwind code
++	 * has already validated the 'regs' pointer.  The checks are done for
++	 * ordering reasons: if the registers are on the next stack, we don't
++	 * want to print them out yet.  Otherwise they'll be shown as part of
++	 * the wrong stack.  Later, when show_trace_log_lvl() switches to the
++	 * next stack, this function will be called again with the same regs so
++	 * they can be printed in the right context.
++	 */
++	if (!partial && on_stack(info, regs, sizeof(*regs))) {
+ 		__show_regs(regs, 0);
+-	else if (on_stack(info, (void *)regs + IRET_FRAME_OFFSET,
+-			  IRET_FRAME_SIZE)) {
++
++	} else if (partial && on_stack(info, (void *)regs + IRET_FRAME_OFFSET,
++				       IRET_FRAME_SIZE)) {
+ 		/*
+ 		 * When an interrupt or exception occurs in entry code, the
+ 		 * full pt_regs might not have been saved yet.  In that case
+@@ -98,11 +109,13 @@ void show_trace_log_lvl(struct task_struct *task, struct pt_regs *regs,
+ 	struct stack_info stack_info = {0};
+ 	unsigned long visit_mask = 0;
+ 	int graph_idx = 0;
++	bool partial;
+ 
+ 	printk("%sCall Trace:\n", log_lvl);
+ 
+ 	unwind_start(&state, task, regs, stack);
+ 	stack = stack ? : get_stack_pointer(task, regs);
++	regs = unwind_get_entry_regs(&state, &partial);
+ 
+ 	/*
+ 	 * Iterate through the stacks, starting with the current stack pointer.
+@@ -120,7 +133,7 @@ void show_trace_log_lvl(struct task_struct *task, struct pt_regs *regs,
+ 	 * - hardirq stack
+ 	 * - entry stack
+ 	 */
+-	for (regs = NULL; stack; stack = PTR_ALIGN(stack_info.next_sp, sizeof(long))) {
++	for ( ; stack; stack = PTR_ALIGN(stack_info.next_sp, sizeof(long))) {
+ 		const char *stack_name;
+ 
+ 		if (get_stack_info(stack, task, &stack_info, &visit_mask)) {
+@@ -140,7 +153,7 @@ void show_trace_log_lvl(struct task_struct *task, struct pt_regs *regs,
+ 			printk("%s <%s>\n", log_lvl, stack_name);
+ 
+ 		if (regs)
+-			show_regs_safe(&stack_info, regs);
++			show_regs_if_on_stack(&stack_info, regs, partial);
+ 
+ 		/*
+ 		 * Scan the stack, printing any text addresses we find.  At the
+@@ -164,7 +177,7 @@ void show_trace_log_lvl(struct task_struct *task, struct pt_regs *regs,
+ 
+ 			/*
+ 			 * Don't print regs->ip again if it was already printed
+-			 * by show_regs_safe() below.
++			 * by show_regs_if_on_stack().
+ 			 */
+ 			if (regs && stack == &regs->ip)
+ 				goto next;
+@@ -199,9 +212,9 @@ void show_trace_log_lvl(struct task_struct *task, struct pt_regs *regs,
+ 			unwind_next_frame(&state);
+ 
+ 			/* if the frame has entry regs, print them */
+-			regs = unwind_get_entry_regs(&state);
++			regs = unwind_get_entry_regs(&state, &partial);
+ 			if (regs)
+-				show_regs_safe(&stack_info, regs);
++				show_regs_if_on_stack(&stack_info, regs, partial);
+ 		}
+ 
+ 		if (stack_name)
+diff --git a/arch/x86/kernel/process.c b/arch/x86/kernel/process.c
+index 517415978409..3cb2486c47e4 100644
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@ -47,7 +47,7 @@
+  * section. Since TSS's are completely CPU-local, we want them
+  * on exact cacheline boundaries, to eliminate cacheline ping-pong.
+  */
+-__visible DEFINE_PER_CPU_SHARED_ALIGNED(struct tss_struct, cpu_tss_rw) = {
++__visible DEFINE_PER_CPU_PAGE_ALIGNED(struct tss_struct, cpu_tss_rw) = {
+ 	.x86_tss = {
+ 		/*
+ 		 * .sp0 is only used when entering ring 0 from a lower
+diff --git a/arch/x86/kernel/stacktrace.c b/arch/x86/kernel/stacktrace.c
+index 8dabd7bf1673..60244bfaf88f 100644
+--- a/arch/x86/kernel/stacktrace.c
++++ b/arch/x86/kernel/stacktrace.c
+@@ -98,7 +98,7 @@ static int __save_stack_trace_reliable(struct stack_trace *trace,
+ 	for (unwind_start(&state, task, NULL, NULL); !unwind_done(&state);
+ 	     unwind_next_frame(&state)) {
+ 
+-		regs = unwind_get_entry_regs(&state);
++		regs = unwind_get_entry_regs(&state, NULL);
+ 		if (regs) {
+ 			/*
+ 			 * Kernel mode registers on the stack indicate an
+diff --git a/arch/x86/mm/pti.c b/arch/x86/mm/pti.c
+index bce8aea65606..2da28ba97508 100644
+--- a/arch/x86/mm/pti.c
++++ b/arch/x86/mm/pti.c
+@@ -367,7 +367,8 @@ static void __init pti_setup_espfix64(void)
+ static void __init pti_clone_entry_text(void)
+ {
+ 	pti_clone_pmds((unsigned long) __entry_text_start,
+-			(unsigned long) __irqentry_text_end, _PAGE_RW);
++			(unsigned long) __irqentry_text_end,
++		       _PAGE_RW | _PAGE_GLOBAL);
+ }
+ 
+ /*
+diff --git a/drivers/rtc/rtc-m41t80.c b/drivers/rtc/rtc-m41t80.c
+index f4c070ea8384..c90fba3ed861 100644
+--- a/drivers/rtc/rtc-m41t80.c
++++ b/drivers/rtc/rtc-m41t80.c
+@@ -154,6 +154,8 @@ struct m41t80_data {
+ 	struct rtc_device *rtc;
+ #ifdef CONFIG_COMMON_CLK
+ 	struct clk_hw sqw;
++	unsigned long freq;
++	unsigned int sqwe;
+ #endif
+ };
+ 
+@@ -443,43 +445,40 @@ static SIMPLE_DEV_PM_OPS(m41t80_pm, m41t80_suspend, m41t80_resume);
+ #ifdef CONFIG_COMMON_CLK
+ #define sqw_to_m41t80_data(_hw) container_of(_hw, struct m41t80_data, sqw)
+ 
+-static unsigned long m41t80_sqw_recalc_rate(struct clk_hw *hw,
+-					    unsigned long parent_rate)
++static unsigned long m41t80_decode_freq(int setting)
++{
++	return (setting == 0) ? 0 : (setting == 1) ? M41T80_SQW_MAX_FREQ :
++		M41T80_SQW_MAX_FREQ >> setting;
++}
++
++static unsigned long m41t80_get_freq(struct m41t80_data *m41t80)
+ {
+-	struct m41t80_data *m41t80 = sqw_to_m41t80_data(hw);
+ 	struct i2c_client *client = m41t80->client;
+ 	int reg_sqw = (m41t80->features & M41T80_FEATURE_SQ_ALT) ?
+ 		M41T80_REG_WDAY : M41T80_REG_SQW;
+ 	int ret = i2c_smbus_read_byte_data(client, reg_sqw);
+-	unsigned long val = M41T80_SQW_MAX_FREQ;
+ 
+ 	if (ret < 0)
+ 		return 0;
++	return m41t80_decode_freq(ret >> 4);
++}
+ 
+-	ret >>= 4;
+-	if (ret == 0)
+-		val = 0;
+-	else if (ret > 1)
+-		val = val / (1 << ret);
+-
+-	return val;
++static unsigned long m41t80_sqw_recalc_rate(struct clk_hw *hw,
++					    unsigned long parent_rate)
++{
++	return sqw_to_m41t80_data(hw)->freq;
+ }
+ 
+ static long m41t80_sqw_round_rate(struct clk_hw *hw, unsigned long rate,
+ 				  unsigned long *prate)
+ {
+-	int i, freq = M41T80_SQW_MAX_FREQ;
+-
+-	if (freq <= rate)
+-		return freq;
+-
+-	for (i = 2; i <= ilog2(M41T80_SQW_MAX_FREQ); i++) {
+-		freq /= 1 << i;
+-		if (freq <= rate)
+-			return freq;
+-	}
+-
+-	return 0;
++	if (rate >= M41T80_SQW_MAX_FREQ)
++		return M41T80_SQW_MAX_FREQ;
++	if (rate >= M41T80_SQW_MAX_FREQ / 4)
++		return M41T80_SQW_MAX_FREQ / 4;
++	if (!rate)
++		return 0;
++	return 1 << ilog2(rate);
+ }
+ 
+ static int m41t80_sqw_set_rate(struct clk_hw *hw, unsigned long rate,
+@@ -491,17 +490,12 @@ static int m41t80_sqw_set_rate(struct clk_hw *hw, unsigned long rate,
+ 		M41T80_REG_WDAY : M41T80_REG_SQW;
+ 	int reg, ret, val = 0;
+ 
+-	if (rate) {
+-		if (!is_power_of_2(rate))
+-			return -EINVAL;
+-		val = ilog2(rate);
+-		if (val == ilog2(M41T80_SQW_MAX_FREQ))
+-			val = 1;
+-		else if (val < (ilog2(M41T80_SQW_MAX_FREQ) - 1))
+-			val = ilog2(M41T80_SQW_MAX_FREQ) - val;
+-		else
+-			return -EINVAL;
+-	}
++	if (rate >= M41T80_SQW_MAX_FREQ)
++		val = 1;
++	else if (rate >= M41T80_SQW_MAX_FREQ / 4)
++		val = 2;
++	else if (rate)
++		val = 15 - ilog2(rate);
+ 
+ 	reg = i2c_smbus_read_byte_data(client, reg_sqw);
+ 	if (reg < 0)
+@@ -510,10 +504,9 @@ static int m41t80_sqw_set_rate(struct clk_hw *hw, unsigned long rate,
+ 	reg = (reg & 0x0f) | (val << 4);
+ 
+ 	ret = i2c_smbus_write_byte_data(client, reg_sqw, reg);
+-	if (ret < 0)
+-		return ret;
+-
+-	return -EINVAL;
++	if (!ret)
++		m41t80->freq = m41t80_decode_freq(val);
++	return ret;
+ }
+ 
+ static int m41t80_sqw_control(struct clk_hw *hw, bool enable)
+@@ -530,7 +523,10 @@ static int m41t80_sqw_control(struct clk_hw *hw, bool enable)
+ 	else
+ 		ret &= ~M41T80_ALMON_SQWE;
+ 
+-	return i2c_smbus_write_byte_data(client, M41T80_REG_ALARM_MON, ret);
++	ret = i2c_smbus_write_byte_data(client, M41T80_REG_ALARM_MON, ret);
++	if (!ret)
++		m41t80->sqwe = enable;
++	return ret;
+ }
+ 
+ static int m41t80_sqw_prepare(struct clk_hw *hw)
+@@ -545,14 +541,7 @@ static void m41t80_sqw_unprepare(struct clk_hw *hw)
+ 
+ static int m41t80_sqw_is_prepared(struct clk_hw *hw)
+ {
+-	struct m41t80_data *m41t80 = sqw_to_m41t80_data(hw);
+-	struct i2c_client *client = m41t80->client;
+-	int ret = i2c_smbus_read_byte_data(client, M41T80_REG_ALARM_MON);
+-
+-	if (ret < 0)
+-		return ret;
+-
+-	return !!(ret & M41T80_ALMON_SQWE);
++	return sqw_to_m41t80_data(hw)->sqwe;
+ }
+ 
+ static const struct clk_ops m41t80_sqw_ops = {
+@@ -587,6 +576,7 @@ static struct clk *m41t80_sqw_register_clk(struct m41t80_data *m41t80)
+ 	init.parent_names = NULL;
+ 	init.num_parents = 0;
+ 	m41t80->sqw.init = &init;
++	m41t80->freq = m41t80_get_freq(m41t80);
+ 
+ 	/* optional override of the clockname */
+ 	of_property_read_string(node, "clock-output-names", &init.name);
+diff --git a/fs/exec.c b/fs/exec.c
+index 3e14ba25f678..acec119fcc31 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1350,9 +1350,14 @@ void setup_new_exec(struct linux_binprm * bprm)
+ 
+ 	current->sas_ss_sp = current->sas_ss_size = 0;
+ 
+-	/* Figure out dumpability. */
++	/*
++	 * Figure out dumpability. Note that this checking only of current
++	 * is wrong, but userspace depends on it. This should be testing
++	 * bprm->secureexec instead.
++	 */
+ 	if (bprm->interp_flags & BINPRM_FLAGS_ENFORCE_NONDUMP ||
+-	    bprm->secureexec)
++	    !(uid_eq(current_euid(), current_uid()) &&
++	      gid_eq(current_egid(), current_gid())))
+ 		set_dumpable(current->mm, suid_dumpable);
+ 	else
+ 		set_dumpable(current->mm, SUID_DUMP_USER);
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index 2a6093840e7e..6bc16bb61b55 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -1362,29 +1362,36 @@ xfrm_tmpl_resolve_one(struct xfrm_policy *policy, const struct flowi *fl,
+ 	struct net *net = xp_net(policy);
+ 	int nx;
+ 	int i, error;
++	xfrm_address_t *daddr = xfrm_flowi_daddr(fl, family);
++	xfrm_address_t *saddr = xfrm_flowi_saddr(fl, family);
+ 	xfrm_address_t tmp;
+ 
+ 	for (nx = 0, i = 0; i < policy->xfrm_nr; i++) {
+ 		struct xfrm_state *x;
+-		xfrm_address_t *local;
+-		xfrm_address_t *remote;
++		xfrm_address_t *remote = daddr;
++		xfrm_address_t *local  = saddr;
+ 		struct xfrm_tmpl *tmpl = &policy->xfrm_vec[i];
+ 
+-		remote = &tmpl->id.daddr;
+-		local = &tmpl->saddr;
+-		if (xfrm_addr_any(local, tmpl->encap_family)) {
+-			error = xfrm_get_saddr(net, fl->flowi_oif,
+-					       &tmp, remote,
+-					       tmpl->encap_family, 0);
+-			if (error)
+-				goto fail;
+-			local = &tmp;
++		if (tmpl->mode == XFRM_MODE_TUNNEL ||
++		    tmpl->mode == XFRM_MODE_BEET) {
++			remote = &tmpl->id.daddr;
++			local = &tmpl->saddr;
++			if (xfrm_addr_any(local, tmpl->encap_family)) {
++				error = xfrm_get_saddr(net, fl->flowi_oif,
++						       &tmp, remote,
++						       tmpl->encap_family, 0);
++				if (error)
++					goto fail;
++				local = &tmp;
++			}
+ 		}
+ 
+ 		x = xfrm_state_find(remote, local, fl, tmpl, policy, &error, family);
+ 
+ 		if (x && x->km.state == XFRM_STATE_VALID) {
+ 			xfrm[nx++] = x;
++			daddr = remote;
++			saddr = local;
+ 			continue;
+ 		}
+ 		if (x) {
+diff --git a/security/commoncap.c b/security/commoncap.c
+index fc46f5b85251..7b01431d1e19 100644
+--- a/security/commoncap.c
++++ b/security/commoncap.c
+@@ -348,21 +348,18 @@ static __u32 sansflags(__u32 m)
+ 	return m & ~VFS_CAP_FLAGS_EFFECTIVE;
+ }
+ 
+-static bool is_v2header(size_t size, __le32 magic)
++static bool is_v2header(size_t size, const struct vfs_cap_data *cap)
+ {
+-	__u32 m = le32_to_cpu(magic);
+ 	if (size != XATTR_CAPS_SZ_2)
+ 		return false;
+-	return sansflags(m) == VFS_CAP_REVISION_2;
++	return sansflags(le32_to_cpu(cap->magic_etc)) == VFS_CAP_REVISION_2;
+ }
+ 
+-static bool is_v3header(size_t size, __le32 magic)
++static bool is_v3header(size_t size, const struct vfs_cap_data *cap)
+ {
+-	__u32 m = le32_to_cpu(magic);
+-
+ 	if (size != XATTR_CAPS_SZ_3)
+ 		return false;
+-	return sansflags(m) == VFS_CAP_REVISION_3;
++	return sansflags(le32_to_cpu(cap->magic_etc)) == VFS_CAP_REVISION_3;
+ }
+ 
+ /*
+@@ -405,7 +402,7 @@ int cap_inode_getsecurity(struct inode *inode, const char *name, void **buffer,
+ 
+ 	fs_ns = inode->i_sb->s_user_ns;
+ 	cap = (struct vfs_cap_data *) tmpbuf;
+-	if (is_v2header((size_t) ret, cap->magic_etc)) {
++	if (is_v2header((size_t) ret, cap)) {
+ 		/* If this is sizeof(vfs_cap_data) then we're ok with the
+ 		 * on-disk value, so return that.  */
+ 		if (alloc)
+@@ -413,7 +410,7 @@ int cap_inode_getsecurity(struct inode *inode, const char *name, void **buffer,
+ 		else
+ 			kfree(tmpbuf);
+ 		return ret;
+-	} else if (!is_v3header((size_t) ret, cap->magic_etc)) {
++	} else if (!is_v3header((size_t) ret, cap)) {
+ 		kfree(tmpbuf);
+ 		return -EINVAL;
+ 	}
+@@ -470,9 +467,9 @@ static kuid_t rootid_from_xattr(const void *value, size_t size,
+ 	return make_kuid(task_ns, rootid);
+ }
+ 
+-static bool validheader(size_t size, __le32 magic)
++static bool validheader(size_t size, const struct vfs_cap_data *cap)
+ {
+-	return is_v2header(size, magic) || is_v3header(size, magic);
++	return is_v2header(size, cap) || is_v3header(size, cap);
+ }
+ 
+ /*
+@@ -495,7 +492,7 @@ int cap_convert_nscap(struct dentry *dentry, void **ivalue, size_t size)
+ 
+ 	if (!*ivalue)
+ 		return -EINVAL;
+-	if (!validheader(size, cap->magic_etc))
++	if (!validheader(size, cap))
+ 		return -EINVAL;
+ 	if (!capable_wrt_inode_uidgid(inode, CAP_SETFCAP))
+ 		return -EPERM;
