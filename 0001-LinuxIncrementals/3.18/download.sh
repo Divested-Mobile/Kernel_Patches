@@ -118,3 +118,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.116-117.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.117-118.xz -O - | xz -d > 3.18.0117-0118.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.118-119.xz -O - | xz -d > 3.18.0118-0119.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.119-120.xz -O - | xz -d > 3.18.0119-0120.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.120-121.xz -O - | xz -d > 3.18.0120-0121.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.121-122.xz -O - | xz -d > 3.18.0121-0122.patch
