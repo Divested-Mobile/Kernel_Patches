@@ -1,0 +1,284 @@
+From 62454ea794c426a4358e1a994263d90713ebde53 Mon Sep 17 00:00:00 2001
+From: Lena Salman <esalman@codeaurora.org>
+Date: Wed, 3 Apr 2013 13:11:42 +0300
+Subject: [PATCH] usb: gadget: Fix race condition in connect/disconnect
+
+This commit fixes race condition in fast connect/disconnect
+of USB cable. This race condition can also be reproduced in
+USB composition change. Thus this commit also adds support
+for USB composition change for BAMtoBAM compositions.
+
+CRs-fixed: 463705
+
+Change-Id: I93c14bd27dc5e49a3b7f1724c1273bd1c843e9c9
+Signed-off-by: Lena Salman <esalman@codeaurora.org>
+---
+ arch/arm/mach-msm/include/mach/usb_bam.h |   14 ++++++++++++--
+ drivers/platform/msm/usb_bam.c           |   26 ++++++++++++++++++++++++--
+ drivers/usb/gadget/f_mbim.c              |    1 +
+ drivers/usb/gadget/f_qc_ecm.c            |    1 +
+ drivers/usb/gadget/f_qc_rndis.c          |    8 +++++---
+ drivers/usb/gadget/u_bam.c               |    3 ++-
+ drivers/usb/gadget/u_bam_data.c          |   25 ++++++++++++++++++++++++-
+ 7 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm/mach-msm/include/mach/usb_bam.h b/arch/arm/mach-msm/include/mach/usb_bam.h
+index 405cfaa..9efff5c 100644
+--- a/arch/arm/mach-msm/include/mach/usb_bam.h
++++ b/arch/arm/mach-msm/include/mach/usb_bam.h
+@@ -152,7 +152,7 @@ void get_bam2bam_connection_info(u8 conn_idx, enum usb_bam_pipe_dir pipe_dir,
+  * Resets the entire USB BAM.
+  *
+  */
+-int usb_bam_reset(void);
++int usb_bam_reset(bool to_reconnect);
+ 
+ /**
+  * Indicates if the client of the USB BAM is ready to start
+@@ -162,6 +162,12 @@ int usb_bam_reset(void);
+  *
+  */
+ int usb_bam_client_ready(bool ready);
++/**
++* Returns upon reset completion if reset is in progress
++* immediately otherwise.
++*
++*/
++void usb_bam_reset_complete(void);
+ 
+ #else
+ static inline int usb_bam_connect(u8 idx, u32 *src_pipe_idx, u32 *dst_pipe_idx)
+@@ -206,7 +212,7 @@ static inline void get_bam2bam_connection_info(u8 conn_idx,
+ 	return;
+ }
+ 
+-static inline int usb_bam_reset(void)
++static inline int usb_bam_reset(bool to_reconnect)
+ {
+ 	return -ENODEV;
+ }
+@@ -216,5 +222,9 @@ static inline int usb_bam_client_ready(bool ready)
+ 	return -ENODEV;
+ }
+ 
++static inline void usb_bam_reset_complete(void)
++{
++	return;
++}
+ #endif
+ #endif				/* _USB_BAM_H_ */
+diff --git a/drivers/platform/msm/usb_bam.c b/drivers/platform/msm/usb_bam.c
+index 68683d9..3ecf37e 100644
+--- a/drivers/platform/msm/usb_bam.c
++++ b/drivers/platform/msm/usb_bam.c
+@@ -79,6 +79,7 @@ void __iomem *qscratch_ram1_reg;
+ struct clk *mem_clk;
+ struct clk *mem_iface_clk;
+ struct usb_bam_peer_handhskae_info peer_handhskae_info;
++static struct completion reset_done;
+ 
+ static int connect_pipe(u8 conn_idx, enum usb_bam_pipe_dir pipe_dir,
+ 						u32 *usb_pipe_idx)
+@@ -487,6 +488,10 @@ int usb_bam_client_ready(bool ready)
+ 	}
+ 
+ 	peer_handhskae_info.client_ready = ready;
++	if (peer_handhskae_info.state == USB_BAM_SM_PLUG_ACKED && !ready) {
++			pr_debug("Starting reset sequence");
++			INIT_COMPLETION(reset_done);
++	}
+ 
+ 	spin_unlock(&usb_bam_lock);
+ 	if (!queue_work(usb_bam_wq, &peer_handhskae_info.reset_event.event_w)) {
+@@ -540,6 +545,7 @@ static void usb_bam_sm_work(struct work_struct *w)
+ 	case USB_BAM_SM_PLUG_ACKED:
+ 		if (!peer_handhskae_info.client_ready) {
+ 			spin_unlock(&usb_bam_lock);
++			pr_debug("Starting A2 reset sequence");
+ 			smsm_change_state(SMSM_APPS_STATE,
+ 				SMSM_USB_PLUG_UNPLUG, 0);
+ 			spin_lock(&usb_bam_lock);
+@@ -552,6 +558,8 @@ static void usb_bam_sm_work(struct work_struct *w)
+ 			peer_handhskae_info.reset_event.
+ 				callback(peer_handhskae_info.reset_event.param);
+ 			spin_lock(&usb_bam_lock);
++			complete_all(&reset_done);
++			pr_debug("Finished reset sequence");
+ 			peer_handhskae_info.state = USB_BAM_SM_INIT;
+ 			peer_handhskae_info.ack_received = 0;
+ 		}
+@@ -745,7 +753,16 @@ int usb_bam_disconnect_ipa(u8 idx,
+ 
+ }
+ 
+-int usb_bam_reset(void)
++void usb_bam_reset_complete(void)
++{
++	pr_debug("Waiting for reset compelte");
++	if (wait_for_completion_interruptible_timeout(&reset_done, 10*HZ) <= 0)
++		pr_warn("Timeout while waiting for reset");
++
++	pr_debug("Finished Waiting for reset complete");
++}
++
++int usb_bam_reset(bool to_reconnect)
+ {
+ 	struct usb_bam_connect_info *connection;
+ 	int i;
+@@ -775,6 +792,9 @@ int usb_bam_reset(void)
+ 	if (sps_device_reset(h_bam))
+ 		pr_err("%s: BAM reset failed\n", __func__);
+ 
++	if (!to_reconnect)
++		return ret;
++
+ 	/* Reconnect all pipes */
+ 	for (i = 0; i < CONNECTIONS_NUM; i++) {
+ 		connection = &usb_bam_connections[i];
+@@ -1164,7 +1184,9 @@ static int usb_bam_probe(struct platform_device *pdev)
+ 
+ 	spin_lock_init(&usb_bam_lock);
+ 	INIT_WORK(&peer_handhskae_info.reset_event.event_w, usb_bam_sm_work);
+-
++	init_completion(&reset_done);
++	complete(&reset_done);
++	
+ 	mem_clk = devm_clk_get(&pdev->dev, "mem_clk");
+ 	if (IS_ERR(mem_clk))
+ 		dev_dbg(&pdev->dev, "failed to get mem_clock\n");
+diff --git a/drivers/usb/gadget/f_mbim.c b/drivers/usb/gadget/f_mbim.c
+index 174199f..be9cd11 100644
+--- a/drivers/usb/gadget/f_mbim.c
++++ b/drivers/usb/gadget/f_mbim.c
+@@ -1576,6 +1576,7 @@ static void mbim_unbind(struct usb_configuration *c, struct usb_function *f)
+ {
+ 	struct f_mbim	*mbim = func_to_mbim(f);
+ 
++	bam_data_destroy(mbim->port_num);
+ 	if (gadget_is_dualspeed(c->cdev->gadget))
+ 		usb_free_descriptors(f->hs_descriptors);
+ 	usb_free_descriptors(f->descriptors);
+diff --git a/drivers/usb/gadget/f_qc_ecm.c b/drivers/usb/gadget/f_qc_ecm.c
+index 433acc8..a697e69c 100644
+--- a/drivers/usb/gadget/f_qc_ecm.c
++++ b/drivers/usb/gadget/f_qc_ecm.c
+@@ -778,6 +778,7 @@ ecm_qc_unbind(struct usb_configuration *c, struct usb_function *f)
+ 
+ 	DBG(c->cdev, "ecm unbind\n");
+ 
++	bam_data_destroy(0);
+ 	if (gadget_is_dualspeed(c->cdev->gadget))
+ 		usb_free_descriptors(f->hs_descriptors);
+ 	usb_free_descriptors(f->descriptors);
+diff --git a/drivers/usb/gadget/f_qc_rndis.c b/drivers/usb/gadget/f_qc_rndis.c
+index d9746d0..616af63 100644
+--- a/drivers/usb/gadget/f_qc_rndis.c
++++ b/drivers/usb/gadget/f_qc_rndis.c
+@@ -635,14 +635,14 @@ static int rndis_qc_set_alt(struct usb_function *f, unsigned intf, unsigned alt)
+ 		 */
+ 		rndis->port.cdc_filter = 0;
+ 
++		if (rndis_qc_bam_connect(rndis))
++			goto fail;
++
+ 		DBG(cdev, "RNDIS RX/TX early activation ...\n");
+ 		net = gether_qc_connect_name(&rndis->port, "rndis0");
+ 		if (IS_ERR(net))
+ 			return PTR_ERR(net);
+ 
+-		if (rndis_qc_bam_connect(rndis))
+-			goto fail;
+-
+ 		rndis_set_param_dev(rndis->config, net,
+ 				&rndis->port.cdc_filter);
+ 	} else
+@@ -855,6 +855,8 @@ rndis_qc_unbind(struct usb_configuration *c, struct usb_function *f)
+ {
+ 	struct f_rndis_qc		*rndis = func_to_rndis_qc(f);
+ 
++	pr_debug("rndis_qc_unbind: free");
++	bam_data_destroy(0);
+ 	rndis_deregister(rndis->config);
+ 	rndis_exit();
+ 
+diff --git a/drivers/usb/gadget/u_bam.c b/drivers/usb/gadget/u_bam.c
+index b325934..1a2fd9c 100644
+--- a/drivers/usb/gadget/u_bam.c
++++ b/drivers/usb/gadget/u_bam.c
+@@ -705,6 +705,7 @@ static void gbam2bam_connect_work(struct work_struct *w)
+ 	int ret;
+ 
+ 	if (d->trans == USB_GADGET_XPORT_BAM2BAM) {
++		usb_bam_reset_complete();
+ 		ret = usb_bam_connect(d->connection_idx, &d->src_pipe_idx,
+ 							  &d->dst_pipe_idx);
+ 		if (ret) {
+@@ -810,7 +811,7 @@ static int gbam_peer_reset_cb(void *param)
+ 	msm_hw_bam_disable(1);
+ 
+ 	/* Reset BAM */
+-	ret = usb_bam_reset();
++	ret = usb_bam_reset(0);
+ 	if (ret) {
+ 		pr_err("%s: BAM reset failed %d\n", __func__, ret);
+ 		goto reenable_eps;
+diff --git a/drivers/usb/gadget/u_bam_data.c b/drivers/usb/gadget/u_bam_data.c
+index 70c71d4..5489a79 100644
+--- a/drivers/usb/gadget/u_bam_data.c
++++ b/drivers/usb/gadget/u_bam_data.c
+@@ -136,7 +136,7 @@ static int bam_data_peer_reset_cb(void *param)
+ 	msm_hw_bam_disable(1);
+ 
+ 	/* Reset BAM */
+-	ret = usb_bam_reset();
++	ret = usb_bam_reset(0);
+ 	if (ret) {
+ 		pr_err("%s: BAM reset failed %d\n", __func__, ret);
+ 		goto reenable_eps;
+@@ -184,6 +184,7 @@ static void bam2bam_data_connect_work(struct work_struct *w)
+ 	int ret;
+ 
+ 	pr_debug("%s: Connect workqueue started", __func__);
++	usb_bam_reset_complete();
+ 
+ 	ret = usb_bam_connect(d->connection_idx, &d->src_pipe_idx,
+ 						  &d->dst_pipe_idx);
+@@ -354,6 +355,23 @@ int bam_data_connect(struct data_port *gr, u8 port_num,
+ 	return 0;
+ }
+ 
++int bam_data_destroy(unsigned int no_bam2bam_port)
++{
++	struct bam_data_ch_info	*d;
++	struct bam_data_port	*port;
++
++	port = bam2bam_data_ports[no_bam2bam_port];
++	d = &port->data_ch;
++
++	pr_debug("bam_data_destroy: Freeing ports\n");
++	bam2bam_data_port_free(no_bam2bam_port);
++	if (bam_data_wq)
++		destroy_workqueue(bam_data_wq);
++	bam_data_wq = NULL;
++
++	return 0;
++}
++
+ int bam_data_setup(unsigned int no_bam2bam_port)
+ {
+ 	int	i;
+@@ -366,6 +384,11 @@ int bam_data_setup(unsigned int no_bam2bam_port)
+ 		return -EINVAL;
+ 	}
+ 
++	if (bam_data_wq) {
++		pr_debug("bam_data is already setup");
++		return 0;
++	}
++
+ 	bam_data_wq = alloc_workqueue("k_bam_data",
+ 				      WQ_UNBOUND | WQ_MEM_RECLAIM, 1);
+ 	if (!bam_data_wq) {
+-- 
+1.7.5.4
+
