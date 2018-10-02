@@ -125,3 +125,6 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.123-124.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.124-125.xz -O - | xz -d > 4.9.0124-0125.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.125-126.xz -O - | xz -d > 4.9.0125-0126.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.126-127.xz -O - | xz -d > 4.9.0126-0127.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.127-128.xz -O - | xz -d > 4.9.0127-0128.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.128-129.xz -O - | xz -d > 4.9.0128-0129.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.129-130.xz -O - | xz -d > 4.9.0129-0130.patch
