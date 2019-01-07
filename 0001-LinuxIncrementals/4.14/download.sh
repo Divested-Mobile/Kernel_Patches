@@ -87,3 +87,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.85-86.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.86-87.xz -O - | xz -d > 4.14.0086-0087.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.87-88.xz -O - | xz -d > 4.14.0087-0088.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.88-89.xz -O - | xz -d > 4.14.0088-0089.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.89-90.xz -O - | xz -d > 4.14.0089-0090.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.90-91.xz -O - | xz -d > 4.14.0090-0091.patch

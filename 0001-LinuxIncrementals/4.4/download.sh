@@ -166,3 +166,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.164-165.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.165-166.xz -O - | xz -d > 4.4.0165-0166.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.166-167.xz -O - | xz -d > 4.4.0166-0167.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.167-168.xz -O - | xz -d > 4.4.0167-0168.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.168-169.xz -O - | xz -d > 4.4.0168-0169.patch

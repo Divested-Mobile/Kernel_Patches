@@ -144,3 +144,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.142-143.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.143-144.xz -O - | xz -d > 4.9.0143-0144.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.144-145.xz -O - | xz -d > 4.9.0144-0145.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.145-146.xz -O - | xz -d > 4.9.0145-0146.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.146-147.xz -O - | xz -d > 4.9.0146-0147.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.147-148.xz -O - | xz -d > 4.9.0147-0148.patch
