@@ -129,3 +129,7 @@ wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.127-128.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.128-129.xz -O - | xz -d > 3.18.0128-0129.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.129-130.xz -O - | xz -d > 3.18.0129-0130.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.130-131.xz -O - | xz -d > 3.18.0130-0131.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.131-132.xz -O - | xz -d > 3.18.0131-0132.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.132-133.xz -O - | xz -d > 3.18.0132-0133.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.133-134.xz -O - | xz -d > 3.18.0133-0134.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.18.134-135.xz -O - | xz -d > 3.18.0134-0135.patch
