@@ -173,3 +173,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.171-172.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.172-173.xz -O - | xz -d > 4.4.0172-0173.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.173-174.xz -O - | xz -d > 4.4.0173-0174.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.174-175.xz -O - | xz -d > 4.4.0174-0175.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.175-176.xz -O - | xz -d > 4.4.0175-0176.patch
