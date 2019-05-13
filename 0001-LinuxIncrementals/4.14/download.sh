@@ -114,3 +114,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.112-113.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.113-114.xz -O - | xz -d > 4.14.0113-0114.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.114-115.xz -O - | xz -d > 4.14.0114-0115.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.115-116.xz -O - | xz -d > 4.14.0115-0116.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.116-117.xz -O - | xz -d > 4.14.0116-0117.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.117-118.xz -O - | xz -d > 4.14.0117-0118.patch

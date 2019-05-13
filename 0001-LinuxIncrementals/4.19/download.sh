@@ -38,3 +38,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.36-37.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.37-38.xz -O - | xz -d > 4.19.0037-0038.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.38-39.xz -O - | xz -d > 4.19.0038-0039.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.39-40.xz -O - | xz -d > 4.19.0039-0040.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.40-41.xz -O - | xz -d > 4.19.0040-0041.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.41-42.xz -O - | xz -d > 4.19.0041-0042.patch

@@ -64,3 +64,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.62-63.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.63-64.xz -O - | xz -d > 3.16.0063-0064.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.64-65.xz -O - | xz -d > 3.16.0064-0065.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.65-66.xz -O - | xz -d > 3.16.0065-0066.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.66-67.xz -O - | xz -d > 3.16.0066-0067.patch
