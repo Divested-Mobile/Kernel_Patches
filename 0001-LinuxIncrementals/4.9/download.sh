@@ -173,3 +173,8 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.171-172.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.172-173.xz -O - | xz -d > 4.9.0172-0173.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.173-174.xz -O - | xz -d > 4.9.0173-0174.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.174-175.xz -O - | xz -d > 4.9.0174-0175.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.175-176.xz -O - | xz -d > 4.9.0175-0176.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.176-177.xz -O - | xz -d > 4.9.0176-0177.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.177-178.xz -O - | xz -d > 4.9.0177-0178.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.178-179.xz -O - | xz -d > 4.9.0178-0179.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.179-180.xz -O - | xz -d > 4.9.0179-0180.patch
