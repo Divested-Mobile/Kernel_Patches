@@ -180,3 +180,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.178-179.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.179-180.xz -O - | xz -d > 4.9.0179-0180.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.180-181.xz -O - | xz -d > 4.9.0180-0181.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.181-182.xz -O - | xz -d > 4.9.0181-0182.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.182-183.xz -O - | xz -d > 4.9.0182-0183.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.183-184.xz -O - | xz -d > 4.9.0183-0184.patch
