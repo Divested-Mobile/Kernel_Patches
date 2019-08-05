@@ -54,3 +54,11 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.52-53.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.53-54.xz -O - | xz -d > 4.19.0053-0054.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.54-55.xz -O - | xz -d > 4.19.0054-0055.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.55-56.xz -O - | xz -d > 4.19.0055-0056.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.56-57.xz -O - | xz -d > 4.19.0056-0057.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.57-58.xz -O - | xz -d > 4.19.0057-0058.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.58-59.xz -O - | xz -d > 4.19.0058-0059.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.59-60.xz -O - | xz -d > 4.19.0059-0060.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.60-61.xz -O - | xz -d > 4.19.0060-0061.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.61-62.xz -O - | xz -d > 4.19.0061-0062.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.62-63.xz -O - | xz -d > 4.19.0062-0063.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.63-64.xz -O - | xz -d > 4.19.0063-0064.patch
