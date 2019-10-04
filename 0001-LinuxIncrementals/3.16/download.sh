@@ -71,3 +71,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.69-70.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.70-71.xz -O - | xz -d > 3.16.0070-0071.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.71-72.xz -O - | xz -d > 3.16.0071-0072.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.72-73.xz -O - | xz -d > 3.16.0072-0073.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v3.x/incr/patch-3.16.73-74.xz -O - | xz -d > 3.16.0073-0074.patch
