@@ -189,3 +189,7 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.187-188.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.188-189.xz -O - | xz -d > 4.14.0188-0189.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.189-190.xz -O - | xz -d > 4.14.0189-0190.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.190-191.xz -O - | xz -d > 4.14.0190-0191.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.191-192.xz -O - | xz -d > 4.14.0191-0192.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.192-193.xz -O - | xz -d > 4.14.0192-0193.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.193-194.xz -O - | xz -d > 4.14.0193-0194.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.194-195.xz -O - | xz -d > 4.14.0194-0195.patch
