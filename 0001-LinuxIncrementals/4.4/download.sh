@@ -232,3 +232,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.230-231.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.231-232.xz -O - | xz -d > 4.4.0231-0232.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.232-233.xz -O - | xz -d > 4.4.0232-0233.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.233-234.xz -O - | xz -d > 4.4.0233-0234.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.4.234-235.xz -O - | xz -d > 4.4.0234-0235.patch
