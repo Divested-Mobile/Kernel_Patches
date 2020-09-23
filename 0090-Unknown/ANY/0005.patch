@@ -1,0 +1,76 @@
+From 9ea0a46ca2c318fcc449c1e6b62a7230a17888f1 Mon Sep 17 00:00:00 2001
+From: Al Viro <viro@zeniv.linux.org.uk>
+Date: Thu, 9 Aug 2018 17:21:17 -0400
+Subject: fix mntput/mntput race
+
+mntput_no_expire() does the calculation of total refcount under mount_lock;
+unfortunately, the decrement (as well as all increments) are done outside
+of it, leading to false positives in the "are we dropping the last reference"
+test.  Consider the following situation:
+	* mnt is a lazy-umounted mount, kept alive by two opened files.  One
+of those files gets closed.  Total refcount of mnt is 2.  On CPU 42
+mntput(mnt) (called from __fput()) drops one reference, decrementing component
+	* After it has looked at component #0, the process on CPU 0 does
+mntget(), incrementing component #0, gets preempted and gets to run again -
+on CPU 69.  There it does mntput(), which drops the reference (component #69)
+and proceeds to spin on mount_lock.
+	* On CPU 42 our first mntput() finishes counting.  It observes the
+decrement of component #69, but not the increment of component #0.  As the
+result, the total it gets is not 1 as it should've been - it's 0.  At which
+point we decide that vfsmount needs to be killed and proceed to free it and
+shut the filesystem down.  However, there's still another opened file
+on that filesystem, with reference to (now freed) vfsmount, etc. and we are
+screwed.
+
+It's not a wide race, but it can be reproduced with artificial slowdown of
+the mnt_get_count() loop, and it should be easier to hit on SMP KVM setups.
+
+Fix consists of moving the refcount decrement under mount_lock; the tricky
+part is that we want (and can) keep the fast case (i.e. mount that still
+has non-NULL ->mnt_ns) entirely out of mount_lock.  All places that zero
+mnt->mnt_ns are dropping some reference to mnt and they call synchronize_rcu()
+before that mntput().  IOW, if mntput() observes (under rcu_read_lock())
+a non-NULL ->mnt_ns, it is guaranteed that there is another reference yet to
+be dropped.
+
+Reported-by: Jann Horn <jannh@google.com>
+Tested-by: Jann Horn <jannh@google.com>
+Fixes: 48a066e72d97 ("RCU'd vsfmounts")
+Cc: stable@vger.kernel.org
+Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+---
+ fs/namespace.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 8ddd14806799d..d46a951bd5411 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1195,12 +1195,22 @@ static DECLARE_DELAYED_WORK(delayed_mntput_work, delayed_mntput);
+ static void mntput_no_expire(struct mount *mnt)
+ {
+ 	rcu_read_lock();
+-	mnt_add_count(mnt, -1);
+-	if (likely(mnt->mnt_ns)) { /* shouldn't be the last one */
++	if (likely(READ_ONCE(mnt->mnt_ns))) {
++		/*
++		 * Since we don't do lock_mount_hash() here,
++		 * ->mnt_ns can change under us.  However, if it's
++		 * non-NULL, then there's a reference that won't
++		 * be dropped until after an RCU delay done after
++		 * turning ->mnt_ns NULL.  So if we observe it
++		 * non-NULL under rcu_read_lock(), the reference
++		 * we are dropping is not the final one.
++		 */
++		mnt_add_count(mnt, -1);
+ 		rcu_read_unlock();
+ 		return;
+ 	}
+ 	lock_mount_hash();
++	mnt_add_count(mnt, -1);
+ 	if (mnt_get_count(mnt)) {
+ 		rcu_read_unlock();
+ 		unlock_mount_hash();
+-- 
+cgit 1.2.3-1.el7
+
