@@ -141,3 +141,9 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.139-140.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.140-141.xz -O - | xz -d > 4.19.0140-0141.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.141-142.xz -O - | xz -d > 4.19.0141-0142.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.142-143.xz -O - | xz -d > 4.19.0142-0143.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.143-144.xz -O - | xz -d > 4.19.0143-0144.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.144-145.xz -O - | xz -d > 4.19.0144-0145.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.145-146.xz -O - | xz -d > 4.19.0145-0146.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.146-147.xz -O - | xz -d > 4.19.0146-0147.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.147-148.xz -O - | xz -d > 4.19.0147-0148.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.148-149.xz -O - | xz -d > 4.19.0148-0149.patch
