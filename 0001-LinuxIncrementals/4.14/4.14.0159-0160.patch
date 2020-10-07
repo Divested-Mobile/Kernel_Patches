@@ -1,16 +1,1883 @@
-diff --git a/Makefile b/Makefile
-index e14ad8f064ec..f011cb69545f 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- # SPDX-License-Identifier: GPL-2.0
- VERSION = 4
- PATCHLEVEL = 14
--SUBLEVEL = 159
-+SUBLEVEL = 160
- EXTRAVERSION =
- NAME = Petit Gorille
+From 8edc9ddadb63bbfe9653b7f0b387acffc63ffb0c Mon Sep 17 00:00:00 2001
+From: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+Date: Tue, 3 Dec 2019 16:48:06 +0200
+Subject: [PATCH 01/37] net: bridge: deny dev_set_mac_address() when
+ unregistering
+
+[ Upstream commit c4b4c421857dc7b1cf0dccbd738472360ff2cd70 ]
+
+We have an interesting memory leak in the bridge when it is being
+unregistered and is a slave to a master device which would change the
+mac of its slaves on unregister (e.g. bond, team). This is a very
+unusual setup but we do end up leaking 1 fdb entry because
+dev_set_mac_address() would cause the bridge to insert the new mac address
+into its table after all fdbs are flushed, i.e. after dellink() on the
+bridge has finished and we call NETDEV_UNREGISTER the bond/team would
+release it and will call dev_set_mac_address() to restore its original
+address and that in turn will add an fdb in the bridge.
+One fix is to check for the bridge dev's reg_state in its
+ndo_set_mac_address callback and return an error if the bridge is not in
+NETREG_REGISTERED.
+
+Easy steps to reproduce:
+ 1. add bond in mode != A/B
+ 2. add any slave to the bond
+ 3. add bridge dev as a slave to the bond
+ 4. destroy the bridge device
+
+Trace:
+ unreferenced object 0xffff888035c4d080 (size 128):
+   comm "ip", pid 4068, jiffies 4296209429 (age 1413.753s)
+   hex dump (first 32 bytes):
+     41 1d c9 36 80 88 ff ff 00 00 00 00 00 00 00 00  A..6............
+     d2 19 c9 5e 3f d7 00 00 00 00 00 00 00 00 00 00  ...^?...........
+   backtrace:
+     [<00000000ddb525dc>] kmem_cache_alloc+0x155/0x26f
+     [<00000000633ff1e0>] fdb_create+0x21/0x486 [bridge]
+     [<0000000092b17e9c>] fdb_insert+0x91/0xdc [bridge]
+     [<00000000f2a0f0ff>] br_fdb_change_mac_address+0xb3/0x175 [bridge]
+     [<000000001de02dbd>] br_stp_change_bridge_id+0xf/0xff [bridge]
+     [<00000000ac0e32b1>] br_set_mac_address+0x76/0x99 [bridge]
+     [<000000006846a77f>] dev_set_mac_address+0x63/0x9b
+     [<00000000d30738fc>] __bond_release_one+0x3f6/0x455 [bonding]
+     [<00000000fc7ec01d>] bond_netdev_event+0x2f2/0x400 [bonding]
+     [<00000000305d7795>] notifier_call_chain+0x38/0x56
+     [<0000000028885d4a>] call_netdevice_notifiers+0x1e/0x23
+     [<000000008279477b>] rollback_registered_many+0x353/0x6a4
+     [<0000000018ef753a>] unregister_netdevice_many+0x17/0x6f
+     [<00000000ba854b7a>] rtnl_delete_link+0x3c/0x43
+     [<00000000adf8618d>] rtnl_dellink+0x1dc/0x20a
+     [<000000009b6395fd>] rtnetlink_rcv_msg+0x23d/0x268
+
+Fixes: 43598813386f ("bridge: add local MAC address to forwarding table (v2)")
+Reported-by: syzbot+2add91c08eb181fea1bf@syzkaller.appspotmail.com
+Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/bridge/br_device.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index f6b6a92f1c48..b7cc322acdc8 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -217,6 +217,12 @@ static int br_set_mac_address(struct net_device *dev, void *p)
+ 	if (!is_valid_ether_addr(addr->sa_data))
+ 		return -EADDRNOTAVAIL;
  
++	/* dev_set_mac_addr() can be called by a master device on bridge's
++	 * NETDEV_UNREGISTER, but since it's being destroyed do nothing
++	 */
++	if (dev->reg_state != NETREG_REGISTERED)
++		return -EBUSY;
++
+ 	spin_lock_bh(&br->lock);
+ 	if (!ether_addr_equal(dev->dev_addr, addr->sa_data)) {
+ 		/* Mac address will be changed in br_stp_change_bridge_id(). */
+-- 
+2.28.0
+
+
+From dd93daea8132b9c95e35f211a008e9f3ad2e4b87 Mon Sep 17 00:00:00 2001
+From: Alexander Lobakin <alobakin@dlink.ru>
+Date: Thu, 5 Dec 2019 13:02:35 +0300
+Subject: [PATCH 02/37] net: dsa: fix flow dissection on Tx path
+
+[ Upstream commit 8bef0af09a5415df761b04fa487a6c34acae74bc ]
+
+Commit 43e665287f93 ("net-next: dsa: fix flow dissection") added an
+ability to override protocol and network offset during flow dissection
+for DSA-enabled devices (i.e. controllers shipped as switch CPU ports)
+in order to fix skb hashing for RPS on Rx path.
+
+However, skb_hash() and added part of code can be invoked not only on
+Rx, but also on Tx path if we have a multi-queued device and:
+ - kernel is running on UP system or
+ - XPS is not configured.
+
+The call stack in this two cases will be like: dev_queue_xmit() ->
+__dev_queue_xmit() -> netdev_core_pick_tx() -> netdev_pick_tx() ->
+skb_tx_hash() -> skb_get_hash().
+
+The problem is that skbs queued for Tx have both network offset and
+correct protocol already set up even after inserting a CPU tag by DSA
+tagger, so calling tag_ops->flow_dissect() on this path actually only
+breaks flow dissection and hashing.
+
+This can be observed by adding debug prints just before and right after
+tag_ops->flow_dissect() call to the related block of code:
+
+Before the patch:
+
+Rx path (RPS):
+
+[   19.240001] Rx: proto: 0x00f8, nhoff: 0	/* ETH_P_XDSA */
+[   19.244271] tag_ops->flow_dissect()
+[   19.247811] Rx: proto: 0x0800, nhoff: 8	/* ETH_P_IP */
+
+[   19.215435] Rx: proto: 0x00f8, nhoff: 0	/* ETH_P_XDSA */
+[   19.219746] tag_ops->flow_dissect()
+[   19.223241] Rx: proto: 0x0806, nhoff: 8	/* ETH_P_ARP */
+
+[   18.654057] Rx: proto: 0x00f8, nhoff: 0	/* ETH_P_XDSA */
+[   18.658332] tag_ops->flow_dissect()
+[   18.661826] Rx: proto: 0x8100, nhoff: 8	/* ETH_P_8021Q */
+
+Tx path (UP system):
+
+[   18.759560] Tx: proto: 0x0800, nhoff: 26	/* ETH_P_IP */
+[   18.763933] tag_ops->flow_dissect()
+[   18.767485] Tx: proto: 0x920b, nhoff: 34	/* junk */
+
+[   22.800020] Tx: proto: 0x0806, nhoff: 26	/* ETH_P_ARP */
+[   22.804392] tag_ops->flow_dissect()
+[   22.807921] Tx: proto: 0x920b, nhoff: 34	/* junk */
+
+[   16.898342] Tx: proto: 0x86dd, nhoff: 26	/* ETH_P_IPV6 */
+[   16.902705] tag_ops->flow_dissect()
+[   16.906227] Tx: proto: 0x920b, nhoff: 34	/* junk */
+
+After:
+
+Rx path (RPS):
+
+[   16.520993] Rx: proto: 0x00f8, nhoff: 0	/* ETH_P_XDSA */
+[   16.525260] tag_ops->flow_dissect()
+[   16.528808] Rx: proto: 0x0800, nhoff: 8	/* ETH_P_IP */
+
+[   15.484807] Rx: proto: 0x00f8, nhoff: 0	/* ETH_P_XDSA */
+[   15.490417] tag_ops->flow_dissect()
+[   15.495223] Rx: proto: 0x0806, nhoff: 8	/* ETH_P_ARP */
+
+[   17.134621] Rx: proto: 0x00f8, nhoff: 0	/* ETH_P_XDSA */
+[   17.138895] tag_ops->flow_dissect()
+[   17.142388] Rx: proto: 0x8100, nhoff: 8	/* ETH_P_8021Q */
+
+Tx path (UP system):
+
+[   15.499558] Tx: proto: 0x0800, nhoff: 26	/* ETH_P_IP */
+
+[   20.664689] Tx: proto: 0x0806, nhoff: 26	/* ETH_P_ARP */
+
+[   18.565782] Tx: proto: 0x86dd, nhoff: 26	/* ETH_P_IPV6 */
+
+In order to fix that we can add the check 'proto == htons(ETH_P_XDSA)'
+to prevent code from calling tag_ops->flow_dissect() on Tx.
+I also decided to initialize 'offset' variable so tagger callbacks can
+now safely leave it untouched without provoking a chaos.
+
+Fixes: 43e665287f93 ("net-next: dsa: fix flow dissection")
+Signed-off-by: Alexander Lobakin <alobakin@dlink.ru>
+Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/flow_dissector.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/net/core/flow_dissector.c b/net/core/flow_dissector.c
+index 7be5c20a93a5..071de3013364 100644
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@ -450,9 +450,10 @@ bool __skb_flow_dissect(const struct sk_buff *skb,
+ 		nhoff = skb_network_offset(skb);
+ 		hlen = skb_headlen(skb);
+ #if IS_ENABLED(CONFIG_NET_DSA)
+-		if (unlikely(skb->dev && netdev_uses_dsa(skb->dev))) {
++		if (unlikely(skb->dev && netdev_uses_dsa(skb->dev) &&
++			     proto == htons(ETH_P_XDSA))) {
+ 			const struct dsa_device_ops *ops;
+-			int offset;
++			int offset = 0;
+ 
+ 			ops = skb->dev->dsa_ptr->tag_ops;
+ 			if (ops->flow_dissect &&
+-- 
+2.28.0
+
+
+From 84d9373c385e882fc018fac60b4495712c3e5556 Mon Sep 17 00:00:00 2001
+From: Grygorii Strashko <grygorii.strashko@ti.com>
+Date: Fri, 6 Dec 2019 14:28:20 +0200
+Subject: [PATCH 03/37] net: ethernet: ti: cpsw: fix extra rx interrupt
+
+[ Upstream commit 51302f77bedab8768b761ed1899c08f89af9e4e2 ]
+
+Now RX interrupt is triggered twice every time, because in
+cpsw_rx_interrupt() it is asked first and then disabled. So there will be
+pending interrupt always, when RX interrupt is enabled again in NAPI
+handler.
+
+Fix it by first disabling IRQ and then do ask.
+
+Fixes: 870915feabdc ("drivers: net: cpsw: remove disable_irq/enable_irq as irq can be masked from cpsw itself")
+Signed-off-by: Grygorii Strashko <grygorii.strashko@ti.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/ti/cpsw.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/ti/cpsw.c b/drivers/net/ethernet/ti/cpsw.c
+index a44838aac97d..3189afcd5888 100644
+--- a/drivers/net/ethernet/ti/cpsw.c
++++ b/drivers/net/ethernet/ti/cpsw.c
+@@ -862,8 +862,8 @@ static irqreturn_t cpsw_rx_interrupt(int irq, void *dev_id)
+ {
+ 	struct cpsw_common *cpsw = dev_id;
+ 
+-	cpdma_ctlr_eoi(cpsw->dma, CPDMA_EOI_RX);
+ 	writel(0, &cpsw->wr_regs->rx_en);
++	cpdma_ctlr_eoi(cpsw->dma, CPDMA_EOI_RX);
+ 
+ 	if (cpsw->quirk_irq) {
+ 		disable_irq_nosync(cpsw->irqs_table[0]);
+-- 
+2.28.0
+
+
+From 0f68a211193afdf1f770ac203ff5b31fa83d1ac5 Mon Sep 17 00:00:00 2001
+From: Mian Yousaf Kaukab <ykaukab@suse.de>
+Date: Thu, 5 Dec 2019 10:41:16 +0100
+Subject: [PATCH 04/37] net: thunderx: start phy before starting
+ autonegotiation
+
+[ Upstream commit a350d2e7adbb57181d33e3aa6f0565632747feaa ]
+
+Since commit 2b3e88ea6528 ("net: phy: improve phy state checking")
+phy_start_aneg() expects phy state to be >= PHY_UP. Call phy_start()
+before calling phy_start_aneg() during probe so that autonegotiation
+is initiated.
+
+As phy_start() takes care of calling phy_start_aneg(), drop the explicit
+call to phy_start_aneg().
+
+Network fails without this patch on Octeon TX.
+
+Fixes: 2b3e88ea6528 ("net: phy: improve phy state checking")
+Signed-off-by: Mian Yousaf Kaukab <ykaukab@suse.de>
+Reviewed-by: Andrew Lunn <andrew@lunn.ch>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/cavium/thunder/thunder_bgx.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/cavium/thunder/thunder_bgx.c b/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
+index 5e5c4d7796b8..586e35593310 100644
+--- a/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
++++ b/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
+@@ -915,7 +915,7 @@ static int bgx_lmac_enable(struct bgx *bgx, u8 lmacid)
+ 				       phy_interface_mode(lmac->lmac_type)))
+ 			return -ENODEV;
+ 
+-		phy_start_aneg(lmac->phydev);
++		phy_start(lmac->phydev);
+ 		return 0;
+ 	}
+ 
+-- 
+2.28.0
+
+
+From 22f73f807e3dce32313ae7c87d81c95d4d8e7b66 Mon Sep 17 00:00:00 2001
+From: Aaron Conole <aconole@redhat.com>
+Date: Tue, 3 Dec 2019 16:34:13 -0500
+Subject: [PATCH 05/37] openvswitch: support asymmetric conntrack
+
+[ Upstream commit 5d50aa83e2c8e91ced2cca77c198b468ca9210f4 ]
+
+The openvswitch module shares a common conntrack and NAT infrastructure
+exposed via netfilter.  It's possible that a packet needs both SNAT and
+DNAT manipulation, due to e.g. tuple collision.  Netfilter can support
+this because it runs through the NAT table twice - once on ingress and
+again after egress.  The openvswitch module doesn't have such capability.
+
+Like netfilter hook infrastructure, we should run through NAT twice to
+keep the symmetry.
+
+Fixes: 05752523e565 ("openvswitch: Interface with NAT.")
+Signed-off-by: Aaron Conole <aconole@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/openvswitch/conntrack.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/net/openvswitch/conntrack.c b/net/openvswitch/conntrack.c
+index 48d81857961c..737e37b28d93 100644
+--- a/net/openvswitch/conntrack.c
++++ b/net/openvswitch/conntrack.c
+@@ -879,6 +879,17 @@ static int ovs_ct_nat(struct net *net, struct sw_flow_key *key,
+ 	}
+ 	err = ovs_ct_nat_execute(skb, ct, ctinfo, &info->range, maniptype);
+ 
++	if (err == NF_ACCEPT &&
++	    ct->status & IPS_SRC_NAT && ct->status & IPS_DST_NAT) {
++		if (maniptype == NF_NAT_MANIP_SRC)
++			maniptype = NF_NAT_MANIP_DST;
++		else
++			maniptype = NF_NAT_MANIP_SRC;
++
++		err = ovs_ct_nat_execute(skb, ct, ctinfo, &info->range,
++					 maniptype);
++	}
++
+ 	/* Mark NAT done if successful and update the flow key. */
+ 	if (err == NF_ACCEPT)
+ 		ovs_nat_update_key(key, skb, maniptype);
+-- 
+2.28.0
+
+
+From 3485dc1441b8037945a29217ab745f456f96450e Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 5 Dec 2019 10:10:15 -0800
+Subject: [PATCH 06/37] tcp: md5: fix potential overestimation of TCP option
+ space
+
+[ Upstream commit 9424e2e7ad93ffffa88f882c9bc5023570904b55 ]
+
+Back in 2008, Adam Langley fixed the corner case of packets for flows
+having all of the following options : MD5 TS SACK
+
+Since MD5 needs 20 bytes, and TS needs 12 bytes, no sack block
+can be cooked from the remaining 8 bytes.
+
+tcp_established_options() correctly sets opts->num_sack_blocks
+to zero, but returns 36 instead of 32.
+
+This means TCP cooks packets with 4 extra bytes at the end
+of options, containing unitialized bytes.
+
+Fixes: 33ad798c924b ("tcp: options clean up")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: syzbot <syzkaller@googlegroups.com>
+Acked-by: Neal Cardwell <ncardwell@google.com>
+Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/tcp_output.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 6025cc509d97..e3b28140c10b 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -708,8 +708,9 @@ static unsigned int tcp_established_options(struct sock *sk, struct sk_buff *skb
+ 			min_t(unsigned int, eff_sacks,
+ 			      (remaining - TCPOLEN_SACK_BASE_ALIGNED) /
+ 			      TCPOLEN_SACK_PERBLOCK);
+-		size += TCPOLEN_SACK_BASE_ALIGNED +
+-			opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
++		if (likely(opts->num_sack_blocks))
++			size += TCPOLEN_SACK_BASE_ALIGNED +
++				opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
+ 	}
+ 
+ 	return size;
+-- 
+2.28.0
+
+
+From 9fe54cf41836fe761cbc5d154dda0d45d98d784c Mon Sep 17 00:00:00 2001
+From: Taehee Yoo <ap420073@gmail.com>
+Date: Fri, 6 Dec 2019 05:25:48 +0000
+Subject: [PATCH 07/37] tipc: fix ordering of tipc module init and exit routine
+
+[ Upstream commit 9cf1cd8ee3ee09ef2859017df2058e2f53c5347f ]
+
+In order to set/get/dump, the tipc uses the generic netlink
+infrastructure. So, when tipc module is inserted, init function
+calls genl_register_family().
+After genl_register_family(), set/get/dump commands are immediately
+allowed and these callbacks internally use the net_generic.
+net_generic is allocated by register_pernet_device() but this
+is called after genl_register_family() in the __init function.
+So, these callbacks would use un-initialized net_generic.
+
+Test commands:
+    #SHELL1
+    while :
+    do
+        modprobe tipc
+        modprobe -rv tipc
+    done
+
+    #SHELL2
+    while :
+    do
+        tipc link list
+    done
+
+Splat looks like:
+[   59.616322][ T2788] kasan: CONFIG_KASAN_INLINE enabled
+[   59.617234][ T2788] kasan: GPF could be caused by NULL-ptr deref or user memory access
+[   59.618398][ T2788] general protection fault: 0000 [#1] SMP DEBUG_PAGEALLOC KASAN PTI
+[   59.619389][ T2788] CPU: 3 PID: 2788 Comm: tipc Not tainted 5.4.0+ #194
+[   59.620231][ T2788] Hardware name: innotek GmbH VirtualBox/VirtualBox, BIOS VirtualBox 12/01/2006
+[   59.621428][ T2788] RIP: 0010:tipc_bcast_get_broadcast_mode+0x131/0x310 [tipc]
+[   59.622379][ T2788] Code: c7 c6 ef 8b 38 c0 65 ff 0d 84 83 c9 3f e8 d7 a5 f2 e3 48 8d bb 38 11 00 00 48 b8 00 00 00 00
+[   59.622550][ T2780] NET: Registered protocol family 30
+[   59.624627][ T2788] RSP: 0018:ffff88804b09f578 EFLAGS: 00010202
+[   59.624630][ T2788] RAX: dffffc0000000000 RBX: 0000000000000011 RCX: 000000008bc66907
+[   59.624631][ T2788] RDX: 0000000000000229 RSI: 000000004b3cf4cc RDI: 0000000000001149
+[   59.624633][ T2788] RBP: ffff88804b09f588 R08: 0000000000000003 R09: fffffbfff4fb3df1
+[   59.624635][ T2788] R10: fffffbfff50318f8 R11: ffff888066cadc18 R12: ffffffffa6cc2f40
+[   59.624637][ T2788] R13: 1ffff11009613eba R14: ffff8880662e9328 R15: ffff8880662e9328
+[   59.624639][ T2788] FS:  00007f57d8f7b740(0000) GS:ffff88806cc00000(0000) knlGS:0000000000000000
+[   59.624645][ T2788] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[   59.625875][ T2780] tipc: Started in single node mode
+[   59.626128][ T2788] CR2: 00007f57d887a8c0 CR3: 000000004b140002 CR4: 00000000000606e0
+[   59.633991][ T2788] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[   59.635195][ T2788] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+[   59.636478][ T2788] Call Trace:
+[   59.637025][ T2788]  tipc_nl_add_bc_link+0x179/0x1470 [tipc]
+[   59.638219][ T2788]  ? lock_downgrade+0x6e0/0x6e0
+[   59.638923][ T2788]  ? __tipc_nl_add_link+0xf90/0xf90 [tipc]
+[   59.639533][ T2788]  ? tipc_nl_node_dump_link+0x318/0xa50 [tipc]
+[   59.640160][ T2788]  ? mutex_lock_io_nested+0x1380/0x1380
+[   59.640746][ T2788]  tipc_nl_node_dump_link+0x4fd/0xa50 [tipc]
+[   59.641356][ T2788]  ? tipc_nl_node_reset_link_stats+0x340/0x340 [tipc]
+[   59.642088][ T2788]  ? __skb_ext_del+0x270/0x270
+[   59.642594][ T2788]  genl_lock_dumpit+0x85/0xb0
+[   59.643050][ T2788]  netlink_dump+0x49c/0xed0
+[   59.643529][ T2788]  ? __netlink_sendskb+0xc0/0xc0
+[   59.644044][ T2788]  ? __netlink_dump_start+0x190/0x800
+[   59.644617][ T2788]  ? __mutex_unlock_slowpath+0xd0/0x670
+[   59.645177][ T2788]  __netlink_dump_start+0x5a0/0x800
+[   59.645692][ T2788]  genl_rcv_msg+0xa75/0xe90
+[   59.646144][ T2788]  ? __lock_acquire+0xdfe/0x3de0
+[   59.646692][ T2788]  ? genl_family_rcv_msg_attrs_parse+0x320/0x320
+[   59.647340][ T2788]  ? genl_lock_dumpit+0xb0/0xb0
+[   59.647821][ T2788]  ? genl_unlock+0x20/0x20
+[   59.648290][ T2788]  ? genl_parallel_done+0xe0/0xe0
+[   59.648787][ T2788]  ? find_held_lock+0x39/0x1d0
+[   59.649276][ T2788]  ? genl_rcv+0x15/0x40
+[   59.649722][ T2788]  ? lock_contended+0xcd0/0xcd0
+[   59.650296][ T2788]  netlink_rcv_skb+0x121/0x350
+[   59.650828][ T2788]  ? genl_family_rcv_msg_attrs_parse+0x320/0x320
+[   59.651491][ T2788]  ? netlink_ack+0x940/0x940
+[   59.651953][ T2788]  ? lock_acquire+0x164/0x3b0
+[   59.652449][ T2788]  genl_rcv+0x24/0x40
+[   59.652841][ T2788]  netlink_unicast+0x421/0x600
+[ ... ]
+
+Fixes: 7e4369057806 ("tipc: fix a slab object leak")
+Fixes: a62fbccecd62 ("tipc: make subscriber server support net namespace")
+Signed-off-by: Taehee Yoo <ap420073@gmail.com>
+Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/tipc/core.c | 29 +++++++++++++++--------------
+ 1 file changed, 15 insertions(+), 14 deletions(-)
+
+diff --git a/net/tipc/core.c b/net/tipc/core.c
+index 67ac10434ba2..35f162ece2b7 100644
+--- a/net/tipc/core.c
++++ b/net/tipc/core.c
+@@ -116,14 +116,6 @@ static int __init tipc_init(void)
+ 	sysctl_tipc_rmem[1] = RCVBUF_DEF;
+ 	sysctl_tipc_rmem[2] = RCVBUF_MAX;
+ 
+-	err = tipc_netlink_start();
+-	if (err)
+-		goto out_netlink;
+-
+-	err = tipc_netlink_compat_start();
+-	if (err)
+-		goto out_netlink_compat;
+-
+ 	err = tipc_register_sysctl();
+ 	if (err)
+ 		goto out_sysctl;
+@@ -144,8 +136,21 @@ static int __init tipc_init(void)
+ 	if (err)
+ 		goto out_bearer;
+ 
++	err = tipc_netlink_start();
++	if (err)
++		goto out_netlink;
++
++	err = tipc_netlink_compat_start();
++	if (err)
++		goto out_netlink_compat;
++
+ 	pr_info("Started in single node mode\n");
+ 	return 0;
++
++out_netlink_compat:
++	tipc_netlink_stop();
++out_netlink:
++	tipc_bearer_cleanup();
+ out_bearer:
+ 	unregister_pernet_device(&tipc_topsrv_net_ops);
+ out_pernet_topsrv:
+@@ -155,22 +160,18 @@ static int __init tipc_init(void)
+ out_pernet:
+ 	tipc_unregister_sysctl();
+ out_sysctl:
+-	tipc_netlink_compat_stop();
+-out_netlink_compat:
+-	tipc_netlink_stop();
+-out_netlink:
+ 	pr_err("Unable to start in single node mode\n");
+ 	return err;
+ }
+ 
+ static void __exit tipc_exit(void)
+ {
++	tipc_netlink_compat_stop();
++	tipc_netlink_stop();
+ 	tipc_bearer_cleanup();
+ 	unregister_pernet_device(&tipc_topsrv_net_ops);
+ 	tipc_socket_stop();
+ 	unregister_pernet_device(&tipc_net_ops);
+-	tipc_netlink_stop();
+-	tipc_netlink_compat_stop();
+ 	tipc_unregister_sysctl();
+ 
+ 	pr_info("Deactivated\n");
+-- 
+2.28.0
+
+
+From 9a8f9033dde9094f069af6d1b4e0c753b40b5dc4 Mon Sep 17 00:00:00 2001
+From: Guillaume Nault <gnault@redhat.com>
+Date: Fri, 6 Dec 2019 12:38:36 +0100
+Subject: [PATCH 08/37] tcp: fix rejected syncookies due to stale timestamps
+
+[ Upstream commit 04d26e7b159a396372646a480f4caa166d1b6720 ]
+
+If no synflood happens for a long enough period of time, then the
+synflood timestamp isn't refreshed and jiffies can advance so much
+that time_after32() can't accurately compare them any more.
+
+Therefore, we can end up in a situation where time_after32(now,
+last_overflow + HZ) returns false, just because these two values are
+too far apart. In that case, the synflood timestamp isn't updated as
+it should be, which can trick tcp_synq_no_recent_overflow() into
+rejecting valid syncookies.
+
+For example, let's consider the following scenario on a system
+with HZ=1000:
+
+  * The synflood timestamp is 0, either because that's the timestamp
+    of the last synflood or, more commonly, because we're working with
+    a freshly created socket.
+
+  * We receive a new SYN, which triggers synflood protection. Let's say
+    that this happens when jiffies == 2147484649 (that is,
+    'synflood timestamp' + HZ + 2^31 + 1).
+
+  * Then tcp_synq_overflow() doesn't update the synflood timestamp,
+    because time_after32(2147484649, 1000) returns false.
+    With:
+      - 2147484649: the value of jiffies, aka. 'now'.
+      - 1000: the value of 'last_overflow' + HZ.
+
+  * A bit later, we receive the ACK completing the 3WHS. But
+    cookie_v[46]_check() rejects it because tcp_synq_no_recent_overflow()
+    says that we're not under synflood. That's because
+    time_after32(2147484649, 120000) returns false.
+    With:
+      - 2147484649: the value of jiffies, aka. 'now'.
+      - 120000: the value of 'last_overflow' + TCP_SYNCOOKIE_VALID.
+
+    Of course, in reality jiffies would have increased a bit, but this
+    condition will last for the next 119 seconds, which is far enough
+    to accommodate for jiffie's growth.
+
+Fix this by updating the overflow timestamp whenever jiffies isn't
+within the [last_overflow, last_overflow + HZ] range. That shouldn't
+have any performance impact since the update still happens at most once
+per second.
+
+Now we're guaranteed to have fresh timestamps while under synflood, so
+tcp_synq_no_recent_overflow() can safely use it with time_after32() in
+such situations.
+
+Stale timestamps can still make tcp_synq_no_recent_overflow() return
+the wrong verdict when not under synflood. This will be handled in the
+next patch.
+
+For 64 bits architectures, the problem was introduced with the
+conversion of ->tw_ts_recent_stamp to 32 bits integer by commit
+cca9bab1b72c ("tcp: use monotonic timestamps for PAWS").
+The problem has always been there on 32 bits architectures.
+
+Fixes: cca9bab1b72c ("tcp: use monotonic timestamps for PAWS")
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Guillaume Nault <gnault@redhat.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/time.h | 13 +++++++++++++
+ include/net/tcp.h    |  2 +-
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/time.h b/include/linux/time.h
+index 87c36cf1cec2..21086c5143d9 100644
+--- a/include/linux/time.h
++++ b/include/linux/time.h
+@@ -301,4 +301,17 @@ static inline bool itimerspec64_valid(const struct itimerspec64 *its)
+  */
+ #define time_after32(a, b)	((s32)((u32)(b) - (u32)(a)) < 0)
+ #define time_before32(b, a)	time_after32(a, b)
++
++/**
++ * time_between32 - check if a 32-bit timestamp is within a given time range
++ * @t:	the time which may be within [l,h]
++ * @l:	the lower bound of the range
++ * @h:	the higher bound of the range
++ *
++ * time_before32(t, l, h) returns true if @l <= @t <= @h. All operands are
++ * treated as 32-bit integers.
++ *
++ * Equivalent to !(time_before32(@t, @l) || time_after32(@t, @h)).
++ */
++#define time_between32(t, l, h) ((u32)(h) - (u32)(l) >= (u32)(t) - (u32)(l))
+ #endif
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 785c4ef4e1bf..2424026a6530 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -503,7 +503,7 @@ static inline void tcp_synq_overflow(const struct sock *sk)
+ 	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
+ 	unsigned long now = jiffies;
+ 
+-	if (time_after(now, last_overflow + HZ))
++	if (!time_between32(now, last_overflow, last_overflow + HZ))
+ 		tcp_sk(sk)->rx_opt.ts_recent_stamp = now;
+ }
+ 
+-- 
+2.28.0
+
+
+From 12f1107bd7fdb15f144575ce391e7571db8098bf Mon Sep 17 00:00:00 2001
+From: Guillaume Nault <gnault@redhat.com>
+Date: Fri, 6 Dec 2019 12:38:43 +0100
+Subject: [PATCH 09/37] tcp: tighten acceptance of ACKs not matching a child
+ socket
+
+[ Upstream commit cb44a08f8647fd2e8db5cc9ac27cd8355fa392d8 ]
+
+When no synflood occurs, the synflood timestamp isn't updated.
+Therefore it can be so old that time_after32() can consider it to be
+in the future.
+
+That's a problem for tcp_synq_no_recent_overflow() as it may report
+that a recent overflow occurred while, in fact, it's just that jiffies
+has grown past 'last_overflow' + TCP_SYNCOOKIE_VALID + 2^31.
+
+Spurious detection of recent overflows lead to extra syncookie
+verification in cookie_v[46]_check(). At that point, the verification
+should fail and the packet dropped. But we should have dropped the
+packet earlier as we didn't even send a syncookie.
+
+Let's refine tcp_synq_no_recent_overflow() to report a recent overflow
+only if jiffies is within the
+[last_overflow, last_overflow + TCP_SYNCOOKIE_VALID] interval. This
+way, no spurious recent overflow is reported when jiffies wraps and
+'last_overflow' becomes in the future from the point of view of
+time_after32().
+
+However, if jiffies wraps and enters the
+[last_overflow, last_overflow + TCP_SYNCOOKIE_VALID] interval (with
+'last_overflow' being a stale synflood timestamp), then
+tcp_synq_no_recent_overflow() still erroneously reports an
+overflow. In such cases, we have to rely on syncookie verification
+to drop the packet. We unfortunately have no way to differentiate
+between a fresh and a stale syncookie timestamp.
+
+In practice, using last_overflow as lower bound is problematic.
+If the synflood timestamp is concurrently updated between the time
+we read jiffies and the moment we store the timestamp in
+'last_overflow', then 'now' becomes smaller than 'last_overflow' and
+tcp_synq_no_recent_overflow() returns true, potentially dropping a
+valid syncookie.
+
+Reading jiffies after loading the timestamp could fix the problem,
+but that'd require a memory barrier. Let's just accommodate for
+potential timestamp growth instead and extend the interval using
+'last_overflow - HZ' as lower bound.
+
+Signed-off-by: Guillaume Nault <gnault@redhat.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/tcp.h | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 2424026a6530..2c47947eac07 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -512,7 +512,15 @@ static inline bool tcp_synq_no_recent_overflow(const struct sock *sk)
+ {
+ 	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
+ 
+-	return time_after(jiffies, last_overflow + TCP_SYNCOOKIE_VALID);
++	/* If last_overflow <= jiffies <= last_overflow + TCP_SYNCOOKIE_VALID,
++	 * then we're under synflood. However, we have to use
++	 * 'last_overflow - HZ' as lower bound. That's because a concurrent
++	 * tcp_synq_overflow() could update .ts_recent_stamp after we read
++	 * jiffies but before we store .ts_recent_stamp into last_overflow,
++	 * which could lead to rejecting a valid syncookie.
++	 */
++	return !time_between32(jiffies, last_overflow - HZ,
++			       last_overflow + TCP_SYNCOOKIE_VALID);
+ }
+ 
+ static inline u32 tcp_cookie_time(void)
+-- 
+2.28.0
+
+
+From b8a30668954f72174bb5cd007be9351bbe31f726 Mon Sep 17 00:00:00 2001
+From: Guillaume Nault <gnault@redhat.com>
+Date: Fri, 6 Dec 2019 12:38:49 +0100
+Subject: [PATCH 10/37] tcp: Protect accesses to .ts_recent_stamp with
+ {READ,WRITE}_ONCE()
+
+[ Upstream commit 721c8dafad26ccfa90ff659ee19755e3377b829d ]
+
+Syncookies borrow the ->rx_opt.ts_recent_stamp field to store the
+timestamp of the last synflood. Protect them with READ_ONCE() and
+WRITE_ONCE() since reads and writes aren't serialised.
+
+Use of .rx_opt.ts_recent_stamp for storing the synflood timestamp was
+introduced by a0f82f64e269 ("syncookies: remove last_synq_overflow from
+struct tcp_sock"). But unprotected accesses were already there when
+timestamp was stored in .last_synq_overflow.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Guillaume Nault <gnault@redhat.com>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/tcp.h | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 2c47947eac07..00d10f0e1194 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -500,17 +500,17 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb);
+  */
+ static inline void tcp_synq_overflow(const struct sock *sk)
+ {
+-	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
++	unsigned long last_overflow = READ_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp);
+ 	unsigned long now = jiffies;
+ 
+ 	if (!time_between32(now, last_overflow, last_overflow + HZ))
+-		tcp_sk(sk)->rx_opt.ts_recent_stamp = now;
++		WRITE_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp, now);
+ }
+ 
+ /* syncookies: no recent synqueue overflow on this listening socket? */
+ static inline bool tcp_synq_no_recent_overflow(const struct sock *sk)
+ {
+-	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
++	unsigned long last_overflow = READ_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp);
+ 
+ 	/* If last_overflow <= jiffies <= last_overflow + TCP_SYNCOOKIE_VALID,
+ 	 * then we're under synflood. However, we have to use
+-- 
+2.28.0
+
+
+From 7272e8e3bfa354a4f2c829a80180f01dc66d4861 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 5 Dec 2019 20:43:46 -0800
+Subject: [PATCH 11/37] inet: protect against too small mtu values.
+
+[ Upstream commit 501a90c945103e8627406763dac418f20f3837b2 ]
+
+syzbot was once again able to crash a host by setting a very small mtu
+on loopback device.
+
+Let's make inetdev_valid_mtu() available in include/net/ip.h,
+and use it in ip_setup_cork(), so that we protect both ip_append_page()
+and __ip_append_data()
+
+Also add a READ_ONCE() when the device mtu is read.
+
+Pairs this lockless read with one WRITE_ONCE() in __dev_set_mtu(),
+even if other code paths might write over this field.
+
+Add a big comment in include/linux/netdevice.h about dev->mtu
+needing READ_ONCE()/WRITE_ONCE() annotations.
+
+Hopefully we will add the missing ones in followup patches.
+
+[1]
+
+refcount_t: saturated; leaking memory.
+WARNING: CPU: 0 PID: 9464 at lib/refcount.c:22 refcount_warn_saturate+0x138/0x1f0 lib/refcount.c:22
+Kernel panic - not syncing: panic_on_warn set ...
+CPU: 0 PID: 9464 Comm: syz-executor850 Not tainted 5.4.0-syzkaller #0
+Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+Call Trace:
+ __dump_stack lib/dump_stack.c:77 [inline]
+ dump_stack+0x197/0x210 lib/dump_stack.c:118
+ panic+0x2e3/0x75c kernel/panic.c:221
+ __warn.cold+0x2f/0x3e kernel/panic.c:582
+ report_bug+0x289/0x300 lib/bug.c:195
+ fixup_bug arch/x86/kernel/traps.c:174 [inline]
+ fixup_bug arch/x86/kernel/traps.c:169 [inline]
+ do_error_trap+0x11b/0x200 arch/x86/kernel/traps.c:267
+ do_invalid_op+0x37/0x50 arch/x86/kernel/traps.c:286
+ invalid_op+0x23/0x30 arch/x86/entry/entry_64.S:1027
+RIP: 0010:refcount_warn_saturate+0x138/0x1f0 lib/refcount.c:22
+Code: 06 31 ff 89 de e8 c8 f5 e6 fd 84 db 0f 85 6f ff ff ff e8 7b f4 e6 fd 48 c7 c7 e0 71 4f 88 c6 05 56 a6 a4 06 01 e8 c7 a8 b7 fd <0f> 0b e9 50 ff ff ff e8 5c f4 e6 fd 0f b6 1d 3d a6 a4 06 31 ff 89
+RSP: 0018:ffff88809689f550 EFLAGS: 00010286
+RAX: 0000000000000000 RBX: 0000000000000000 RCX: 0000000000000000
+RDX: 0000000000000000 RSI: ffffffff815e4336 RDI: ffffed1012d13e9c
+RBP: ffff88809689f560 R08: ffff88809c50a3c0 R09: fffffbfff15d31b1
+R10: fffffbfff15d31b0 R11: ffffffff8ae98d87 R12: 0000000000000001
+R13: 0000000000040100 R14: ffff888099041104 R15: ffff888218d96e40
+ refcount_add include/linux/refcount.h:193 [inline]
+ skb_set_owner_w+0x2b6/0x410 net/core/sock.c:1999
+ sock_wmalloc+0xf1/0x120 net/core/sock.c:2096
+ ip_append_page+0x7ef/0x1190 net/ipv4/ip_output.c:1383
+ udp_sendpage+0x1c7/0x480 net/ipv4/udp.c:1276
+ inet_sendpage+0xdb/0x150 net/ipv4/af_inet.c:821
+ kernel_sendpage+0x92/0xf0 net/socket.c:3794
+ sock_sendpage+0x8b/0xc0 net/socket.c:936
+ pipe_to_sendpage+0x2da/0x3c0 fs/splice.c:458
+ splice_from_pipe_feed fs/splice.c:512 [inline]
+ __splice_from_pipe+0x3ee/0x7c0 fs/splice.c:636
+ splice_from_pipe+0x108/0x170 fs/splice.c:671
+ generic_splice_sendpage+0x3c/0x50 fs/splice.c:842
+ do_splice_from fs/splice.c:861 [inline]
+ direct_splice_actor+0x123/0x190 fs/splice.c:1035
+ splice_direct_to_actor+0x3b4/0xa30 fs/splice.c:990
+ do_splice_direct+0x1da/0x2a0 fs/splice.c:1078
+ do_sendfile+0x597/0xd00 fs/read_write.c:1464
+ __do_sys_sendfile64 fs/read_write.c:1525 [inline]
+ __se_sys_sendfile64 fs/read_write.c:1511 [inline]
+ __x64_sys_sendfile64+0x1dd/0x220 fs/read_write.c:1511
+ do_syscall_64+0xfa/0x790 arch/x86/entry/common.c:294
+ entry_SYSCALL_64_after_hwframe+0x49/0xbe
+RIP: 0033:0x441409
+Code: e8 ac e8 ff ff 48 83 c4 18 c3 0f 1f 80 00 00 00 00 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 0f 83 eb 08 fc ff c3 66 2e 0f 1f 84 00 00 00 00
+RSP: 002b:00007fffb64c4f78 EFLAGS: 00000246 ORIG_RAX: 0000000000000028
+RAX: ffffffffffffffda RBX: 0000000000000000 RCX: 0000000000441409
+RDX: 0000000000000000 RSI: 0000000000000006 RDI: 0000000000000005
+RBP: 0000000000073b8a R08: 0000000000000010 R09: 0000000000000010
+R10: 0000000000010001 R11: 0000000000000246 R12: 0000000000402180
+R13: 0000000000402210 R14: 0000000000000000 R15: 0000000000000000
+Kernel Offset: disabled
+Rebooting in 86400 seconds..
+
+Fixes: 1470ddf7f8ce ("inet: Remove explicit write references to sk/inet in ip_append_data")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: syzbot <syzkaller@googlegroups.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/netdevice.h |  5 +++++
+ include/net/ip.h          |  5 +++++
+ net/core/dev.c            |  3 ++-
+ net/ipv4/devinet.c        |  5 -----
+ net/ipv4/ip_output.c      | 14 +++++++++-----
+ 5 files changed, 21 insertions(+), 11 deletions(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 4725a9d9597f..8818291815bc 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1718,6 +1718,11 @@ struct net_device {
+ 	unsigned char		if_port;
+ 	unsigned char		dma;
+ 
++	/* Note : dev->mtu is often read without holding a lock.
++	 * Writers usually hold RTNL.
++	 * It is recommended to use READ_ONCE() to annotate the reads,
++	 * and to use WRITE_ONCE() to annotate the writes.
++	 */
+ 	unsigned int		mtu;
+ 	unsigned int		min_mtu;
+ 	unsigned int		max_mtu;
+diff --git a/include/net/ip.h b/include/net/ip.h
+index b8ebee43941f..666d89ca4e2e 100644
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@ -644,4 +644,9 @@ extern int sysctl_icmp_msgs_burst;
+ int ip_misc_proc_init(void);
+ #endif
+ 
++static inline bool inetdev_valid_mtu(unsigned int mtu)
++{
++	return likely(mtu >= IPV4_MIN_MTU);
++}
++
+ #endif	/* _IP_H */
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 3ce68484ed5a..f9f05b3df460 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6876,7 +6876,8 @@ int __dev_set_mtu(struct net_device *dev, int new_mtu)
+ 	if (ops->ndo_change_mtu)
+ 		return ops->ndo_change_mtu(dev, new_mtu);
+ 
+-	dev->mtu = new_mtu;
++	/* Pairs with all the lockless reads of dev->mtu in the stack */
++	WRITE_ONCE(dev->mtu, new_mtu);
+ 	return 0;
+ }
+ EXPORT_SYMBOL(__dev_set_mtu);
+diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
+index 5264510c9983..5f020c051af9 100644
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@ -1426,11 +1426,6 @@ static void inetdev_changename(struct net_device *dev, struct in_device *in_dev)
+ 	}
+ }
+ 
+-static bool inetdev_valid_mtu(unsigned int mtu)
+-{
+-	return mtu >= IPV4_MIN_MTU;
+-}
+-
+ static void inetdev_send_gratuitous_arp(struct net_device *dev,
+ 					struct in_device *in_dev)
+ 
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 34d49f76d1a7..73cd64c7692f 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -1123,13 +1123,17 @@ static int ip_setup_cork(struct sock *sk, struct inet_cork *cork,
+ 	rt = *rtp;
+ 	if (unlikely(!rt))
+ 		return -EFAULT;
+-	/*
+-	 * We steal reference to this route, caller should not release it
+-	 */
+-	*rtp = NULL;
++
+ 	cork->fragsize = ip_sk_use_pmtu(sk) ?
+-			 dst_mtu(&rt->dst) : rt->dst.dev->mtu;
++			 dst_mtu(&rt->dst) : READ_ONCE(rt->dst.dev->mtu);
++
++	if (!inetdev_valid_mtu(cork->fragsize))
++		return -ENETUNREACH;
++
+ 	cork->dst = &rt->dst;
++	/* We stole this route, caller should not release it. */
++	*rtp = NULL;
++
+ 	cork->length = 0;
+ 	cork->ttl = ipc->ttl;
+ 	cork->tos = ipc->tos;
+-- 
+2.28.0
+
+
+From b6cdbf0f7cda1121bd92bdfd8523cfacddbe8097 Mon Sep 17 00:00:00 2001
+From: Ivan Bornyakov <brnkv.i1@gmail.com>
+Date: Wed, 23 May 2018 17:56:11 +0300
+Subject: [PATCH 12/37] nvme: host: core: fix precedence of ternary operator
+
+commit e9a9853c23c13a37546397b61b270999fd0fb759 upstream.
+
+Ternary operator have lower precedence then bitwise or, so 'cdw10' was
+calculated wrong.
+
+Signed-off-by: Ivan Bornyakov <brnkv.i1@gmail.com>
+Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+Signed-off-by: Keith Busch <keith.busch@intel.com>
+Cc: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/nvme/host/core.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 768ac752a6e3..f543b9932c83 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -1331,7 +1331,7 @@ static int nvme_pr_reserve(struct block_device *bdev, u64 key,
+ static int nvme_pr_preempt(struct block_device *bdev, u64 old, u64 new,
+ 		enum pr_type type, bool abort)
+ {
+-	u32 cdw10 = nvme_pr_type(type) << 8 | abort ? 2 : 1;
++	u32 cdw10 = nvme_pr_type(type) << 8 | (abort ? 2 : 1);
+ 	return nvme_pr_command(bdev, cdw10, old, new, nvme_cmd_resv_acquire);
+ }
+ 
+@@ -1343,7 +1343,7 @@ static int nvme_pr_clear(struct block_device *bdev, u64 key)
+ 
+ static int nvme_pr_release(struct block_device *bdev, u64 key, enum pr_type type)
+ {
+-	u32 cdw10 = nvme_pr_type(type) << 8 | key ? 1 << 3 : 0;
++	u32 cdw10 = nvme_pr_type(type) << 8 | (key ? 1 << 3 : 0);
+ 	return nvme_pr_command(bdev, cdw10, key, 0, nvme_cmd_resv_release);
+ }
+ 
+-- 
+2.28.0
+
+
+From 350a0cba90e1bd40b1fe5b396923d2f3a61d1056 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Wed, 18 Dec 2019 15:10:24 +0100
+Subject: [PATCH 13/37] Revert "regulator: Defer init completion for a while
+ after late_initcall"
+
+This reverts commit d7ce17fba6c8e316ca9a554a87edddce6f862435 which is
+commit 55576cf1853798e86f620766e23b604c9224c19c upstream.
+
+It's causing "odd" interactions with older kernels, so it probably isn't
+a good idea to cause timing changes there.  This has been reported to
+cause oopses on Pixel devices.
+
+Reported-by: Siddharth Kapoor <ksiddharth@google.com>
+Cc: Mark Brown <broonie@kernel.org>
+Cc: Lee Jones <lee.jones@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/regulator/core.c | 42 +++++++++++-----------------------------
+ 1 file changed, 11 insertions(+), 31 deletions(-)
+
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index d2428c262b7c..b2cb4f497ef6 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -4503,7 +4503,7 @@ static int __init regulator_init(void)
+ /* init early to allow our consumers to complete system booting */
+ core_initcall(regulator_init);
+ 
+-static int regulator_late_cleanup(struct device *dev, void *data)
++static int __init regulator_late_cleanup(struct device *dev, void *data)
+ {
+ 	struct regulator_dev *rdev = dev_to_rdev(dev);
+ 	const struct regulator_ops *ops = rdev->desc->ops;
+@@ -4552,8 +4552,17 @@ static int regulator_late_cleanup(struct device *dev, void *data)
+ 	return 0;
+ }
+ 
+-static void regulator_init_complete_work_function(struct work_struct *work)
++static int __init regulator_init_complete(void)
+ {
++	/*
++	 * Since DT doesn't provide an idiomatic mechanism for
++	 * enabling full constraints and since it's much more natural
++	 * with DT to provide them just assume that a DT enabled
++	 * system has full constraints.
++	 */
++	if (of_have_populated_dt())
++		has_full_constraints = true;
++
+ 	/*
+ 	 * Regulators may had failed to resolve their input supplies
+ 	 * when were registered, either because the input supply was
+@@ -4571,35 +4580,6 @@ static void regulator_init_complete_work_function(struct work_struct *work)
+ 	 */
+ 	class_for_each_device(&regulator_class, NULL, NULL,
+ 			      regulator_late_cleanup);
+-}
+-
+-static DECLARE_DELAYED_WORK(regulator_init_complete_work,
+-			    regulator_init_complete_work_function);
+-
+-static int __init regulator_init_complete(void)
+-{
+-	/*
+-	 * Since DT doesn't provide an idiomatic mechanism for
+-	 * enabling full constraints and since it's much more natural
+-	 * with DT to provide them just assume that a DT enabled
+-	 * system has full constraints.
+-	 */
+-	if (of_have_populated_dt())
+-		has_full_constraints = true;
+-
+-	/*
+-	 * We punt completion for an arbitrary amount of time since
+-	 * systems like distros will load many drivers from userspace
+-	 * so consumers might not always be ready yet, this is
+-	 * particularly an issue with laptops where this might bounce
+-	 * the display off then on.  Ideally we'd get a notification
+-	 * from userspace when this happens but we don't so just wait
+-	 * a bit and hope we waited long enough.  It'd be better if
+-	 * we'd only do this on systems that need it, and a kernel
+-	 * command line option might be useful.
+-	 */
+-	schedule_delayed_work(&regulator_init_complete_work,
+-			      msecs_to_jiffies(30000));
+ 
+ 	return 0;
+ }
+-- 
+2.28.0
+
+
+From 6ab2e14ba709957cf43ec9fa4b36dd4dfbbc65b2 Mon Sep 17 00:00:00 2001
+From: Dexuan Cui <decui@microsoft.com>
+Date: Wed, 14 Aug 2019 01:06:55 +0000
+Subject: [PATCH 14/37] PCI/PM: Always return devices to D0 when thawing
+
+commit f2c33ccacb2d4bbeae2a255a7ca0cbfd03017b7c upstream.
+
+pci_pm_thaw_noirq() is supposed to return the device to D0 and restore its
+configuration registers, but previously it only did that for devices whose
+drivers implemented the new power management ops.
+
+Hibernation, e.g., via "echo disk > /sys/power/state", involves freezing
+devices, creating a hibernation image, thawing devices, writing the image,
+and powering off.  The fact that thawing did not return devices with legacy
+power management to D0 caused errors, e.g., in this path:
+
+  pci_pm_thaw_noirq
+    if (pci_has_legacy_pm_support(pci_dev)) # true for Mellanox VF driver
+      return pci_legacy_resume_early(dev)   # ... legacy PM skips the rest
+    pci_set_power_state(pci_dev, PCI_D0)
+    pci_restore_state(pci_dev)
+  pci_pm_thaw
+    if (pci_has_legacy_pm_support(pci_dev))
+      pci_legacy_resume
+	drv->resume
+	  mlx4_resume
+	    ...
+	      pci_enable_msix_range
+	        ...
+		  if (dev->current_state != PCI_D0)  # <---
+		    return -EINVAL;
+
+which caused these warnings:
+
+  mlx4_core a6d1:00:02.0: INTx is not supported in multi-function mode, aborting
+  PM: dpm_run_callback(): pci_pm_thaw+0x0/0xd7 returns -95
+  PM: Device a6d1:00:02.0 failed to thaw: error -95
+
+Return devices to D0 and restore config registers for all devices, not just
+those whose drivers support new power management.
+
+[bhelgaas: also call pci_restore_state() before pci_legacy_resume_early(),
+update comment, add stable tag, commit log]
+Link: https://lore.kernel.org/r/KU1P153MB016637CAEAD346F0AA8E3801BFAD0@KU1P153MB0166.APCP153.PROD.OUTLOOK.COM
+Signed-off-by: Dexuan Cui <decui@microsoft.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Cc: stable@vger.kernel.org	# v4.13+
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/pci/pci-driver.c | 17 +++++++++++------
+ 1 file changed, 11 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
+index 7e4bec75fcde..522e59274b5d 100644
+--- a/drivers/pci/pci-driver.c
++++ b/drivers/pci/pci-driver.c
+@@ -967,17 +967,22 @@ static int pci_pm_thaw_noirq(struct device *dev)
+ 			return error;
+ 	}
+ 
+-	if (pci_has_legacy_pm_support(pci_dev))
+-		return pci_legacy_resume_early(dev);
+-
+ 	/*
+-	 * pci_restore_state() requires the device to be in D0 (because of MSI
+-	 * restoration among other things), so force it into D0 in case the
+-	 * driver's "freeze" callbacks put it into a low-power state directly.
++	 * Both the legacy ->resume_early() and the new pm->thaw_noirq()
++	 * callbacks assume the device has been returned to D0 and its
++	 * config state has been restored.
++	 *
++	 * In addition, pci_restore_state() restores MSI-X state in MMIO
++	 * space, which requires the device to be in D0, so return it to D0
++	 * in case the driver's "freeze" callbacks put it into a low-power
++	 * state.
+ 	 */
+ 	pci_set_power_state(pci_dev, PCI_D0);
+ 	pci_restore_state(pci_dev);
+ 
++	if (pci_has_legacy_pm_support(pci_dev))
++		return pci_legacy_resume_early(dev);
++
+ 	if (drv && drv->pm && drv->pm->thaw_noirq)
+ 		error = drv->pm->thaw_noirq(dev);
+ 
+-- 
+2.28.0
+
+
+From 4ac3b0f14a70c16c734998dffca6ce260cfa51e9 Mon Sep 17 00:00:00 2001
+From: Steffen Liebergeld <steffen.liebergeld@kernkonzept.com>
+Date: Wed, 18 Sep 2019 15:16:52 +0200
+Subject: [PATCH 15/37] PCI: Fix Intel ACS quirk UPDCR register address
+
+commit d8558ac8c93d429d65d7490b512a3a67e559d0d4 upstream.
+
+According to documentation [0] the correct offset for the Upstream Peer
+Decode Configuration Register (UPDCR) is 0x1014.  It was previously defined
+as 0x1114.
+
+d99321b63b1f ("PCI: Enable quirks for PCIe ACS on Intel PCH root ports")
+intended to enforce isolation between PCI devices allowing them to be put
+into separate IOMMU groups.  Due to the wrong register offset the intended
+isolation was not fully enforced.  This is fixed with this patch.
+
+Please note that I did not test this patch because I have no hardware that
+implements this register.
+
+[0] https://www.intel.com/content/dam/www/public/us/en/documents/datasheets/4th-gen-core-family-mobile-i-o-datasheet.pdf (page 325)
+Fixes: d99321b63b1f ("PCI: Enable quirks for PCIe ACS on Intel PCH root ports")
+Link: https://lore.kernel.org/r/7a3505df-79ba-8a28-464c-88b83eefffa6@kernkonzept.com
+Signed-off-by: Steffen Liebergeld <steffen.liebergeld@kernkonzept.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-by: Andrew Murray <andrew.murray@arm.com>
+Acked-by: Ashok Raj <ashok.raj@intel.com>
+Cc: stable@vger.kernel.org	# v3.15+
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/pci/quirks.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 45c3fbd38f50..70c70da4624e 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -4600,7 +4600,7 @@ int pci_dev_specific_acs_enabled(struct pci_dev *dev, u16 acs_flags)
+ #define INTEL_BSPR_REG_BPPD  (1 << 9)
+ 
+ /* Upstream Peer Decode Configuration Register */
+-#define INTEL_UPDCR_REG 0x1114
++#define INTEL_UPDCR_REG 0x1014
+ /* 5:0 Peer Decode Enable bits */
+ #define INTEL_UPDCR_REG_MASK 0x3f
+ 
+-- 
+2.28.0
+
+
+From fa5da49c4f93c505e12d410cc2a13beb004ff97b Mon Sep 17 00:00:00 2001
+From: Jian-Hong Pan <jian-hong@endlessm.com>
+Date: Tue, 8 Oct 2019 11:42:39 +0800
+Subject: [PATCH 16/37] PCI/MSI: Fix incorrect MSI-X masking on resume
+
+commit e045fa29e89383c717e308609edd19d2fd29e1be upstream.
+
+When a driver enables MSI-X, msix_program_entries() reads the MSI-X Vector
+Control register for each vector and saves it in desc->masked.  Each
+register is 32 bits and bit 0 is the actual Mask bit.
+
+When we restored these registers during resume, we previously set the Mask
+bit if *any* bit in desc->masked was set instead of when the Mask bit
+itself was set:
+
+  pci_restore_state
+    pci_restore_msi_state
+      __pci_restore_msix_state
+        for_each_pci_msi_entry
+          msix_mask_irq(entry, entry->masked)   <-- entire u32 word
+            __pci_msix_desc_mask_irq(desc, flag)
+              mask_bits = desc->masked & ~PCI_MSIX_ENTRY_CTRL_MASKBIT
+              if (flag)       <-- testing entire u32, not just bit 0
+                mask_bits |= PCI_MSIX_ENTRY_CTRL_MASKBIT
+              writel(mask_bits, desc_addr + PCI_MSIX_ENTRY_VECTOR_CTRL)
+
+This means that after resume, MSI-X vectors were masked when they shouldn't
+be, which leads to timeouts like this:
+
+  nvme nvme0: I/O 978 QID 3 timeout, completion polled
+
+On resume, set the Mask bit only when the saved Mask bit from suspend was
+set.
+
+This should remove the need for 19ea025e1d28 ("nvme: Add quirk for Kingston
+NVME SSD running FW E8FK11.T").
+
+[bhelgaas: commit log, move fix to __pci_msix_desc_mask_irq()]
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=204887
+Link: https://lore.kernel.org/r/20191008034238.2503-1-jian-hong@endlessm.com
+Fixes: f2440d9acbe8 ("PCI MSI: Refactor interrupt masking code")
+Signed-off-by: Jian-Hong Pan <jian-hong@endlessm.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/pci/msi.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
+index d66ef88e13cf..2a203055b16e 100644
+--- a/drivers/pci/msi.c
++++ b/drivers/pci/msi.c
+@@ -211,7 +211,7 @@ u32 __pci_msix_desc_mask_irq(struct msi_desc *desc, u32 flag)
+ 		return 0;
+ 
+ 	mask_bits &= ~PCI_MSIX_ENTRY_CTRL_MASKBIT;
+-	if (flag)
++	if (flag & PCI_MSIX_ENTRY_CTRL_MASKBIT)
+ 		mask_bits |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
+ 	writel(mask_bits, pci_msix_desc_addr(desc) + PCI_MSIX_ENTRY_VECTOR_CTRL);
+ 
+-- 
+2.28.0
+
+
+From 2da0e66be5f906e0ffc13f8af80d78de9cde5988 Mon Sep 17 00:00:00 2001
+From: George Cherian <george.cherian@marvell.com>
+Date: Mon, 11 Nov 2019 02:43:03 +0000
+Subject: [PATCH 17/37] PCI: Apply Cavium ACS quirk to ThunderX2 and ThunderX3
+
+commit f338bb9f0179cb959977b74e8331b312264d720b upstream.
+
+Enhance the ACS quirk for Cavium Processors. Add the root port vendor IDs
+for ThunderX2 and ThunderX3 series of processors.
+
+[bhelgaas: add Fixes: and stable tag]
+Fixes: f2ddaf8dfd4a ("PCI: Apply Cavium ThunderX ACS quirk to more Root Ports")
+Link: https://lore.kernel.org/r/20191111024243.GA11408@dc5-eodlnx05.marvell.com
+Signed-off-by: George Cherian <george.cherian@marvell.com>
+Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+Reviewed-by: Robert Richter <rrichter@marvell.com>
+Cc: stable@vger.kernel.org	# v4.12+
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/pci/quirks.c | 20 +++++++++++++-------
+ 1 file changed, 13 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index 70c70da4624e..90df085e9f92 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -4252,15 +4252,21 @@ static int pci_quirk_amd_sb_acs(struct pci_dev *dev, u16 acs_flags)
+ 
+ static bool pci_quirk_cavium_acs_match(struct pci_dev *dev)
+ {
++	if (!pci_is_pcie(dev) || pci_pcie_type(dev) != PCI_EXP_TYPE_ROOT_PORT)
++		return false;
++
++	switch (dev->device) {
+ 	/*
+-	 * Effectively selects all downstream ports for whole ThunderX 1
+-	 * family by 0xf800 mask (which represents 8 SoCs), while the lower
+-	 * bits of device ID are used to indicate which subdevice is used
+-	 * within the SoC.
++	 * Effectively selects all downstream ports for whole ThunderX1
++	 * (which represents 8 SoCs).
+ 	 */
+-	return (pci_is_pcie(dev) &&
+-		(pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT) &&
+-		((dev->device & 0xf800) == 0xa000));
++	case 0xa000 ... 0xa7ff: /* ThunderX1 */
++	case 0xaf84:  /* ThunderX2 */
++	case 0xb884:  /* ThunderX3 */
++		return true;
++	default:
++		return false;
++	}
+ }
+ 
+ static int pci_quirk_cavium_acs(struct pci_dev *dev, u16 acs_flags)
+-- 
+2.28.0
+
+
+From 9d9ee2b7b643c5fa208cc4094cbbe27bee93d5bb Mon Sep 17 00:00:00 2001
+From: Max Filippov <jcmvbkbc@gmail.com>
+Date: Wed, 13 Nov 2019 13:18:31 -0800
+Subject: [PATCH 18/37] xtensa: fix TLB sanity checker
+
+commit 36de10c4788efc6efe6ff9aa10d38cb7eea4c818 upstream.
+
+Virtual and translated addresses retrieved by the xtensa TLB sanity
+checker must be consistent, i.e. correspond to the same state of the
+checked TLB entry. KASAN shadow memory is mapped dynamically using
+auto-refill TLB entries and thus may change TLB state between the
+virtual and translated address retrieval, resulting in false TLB
+insanity report.
+Move read_xtlb_translation close to read_xtlb_virtual to make sure that
+read values are consistent.
+
+Cc: stable@vger.kernel.org
+Fixes: a99e07ee5e88 ("xtensa: check TLB sanity on return to userspace")
+Signed-off-by: Max Filippov <jcmvbkbc@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/xtensa/mm/tlb.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/xtensa/mm/tlb.c b/arch/xtensa/mm/tlb.c
+index 35c822286bbe..3ce5ccdb054d 100644
+--- a/arch/xtensa/mm/tlb.c
++++ b/arch/xtensa/mm/tlb.c
+@@ -218,6 +218,8 @@ static int check_tlb_entry(unsigned w, unsigned e, bool dtlb)
+ 	unsigned tlbidx = w | (e << PAGE_SHIFT);
+ 	unsigned r0 = dtlb ?
+ 		read_dtlb_virtual(tlbidx) : read_itlb_virtual(tlbidx);
++	unsigned r1 = dtlb ?
++		read_dtlb_translation(tlbidx) : read_itlb_translation(tlbidx);
+ 	unsigned vpn = (r0 & PAGE_MASK) | (e << PAGE_SHIFT);
+ 	unsigned pte = get_pte_for_vaddr(vpn);
+ 	unsigned mm_asid = (get_rasid_register() >> 8) & ASID_MASK;
+@@ -233,8 +235,6 @@ static int check_tlb_entry(unsigned w, unsigned e, bool dtlb)
+ 	}
+ 
+ 	if (tlb_asid == mm_asid) {
+-		unsigned r1 = dtlb ? read_dtlb_translation(tlbidx) :
+-			read_itlb_translation(tlbidx);
+ 		if ((pte ^ r1) & PAGE_MASK) {
+ 			pr_err("%cTLB: way: %u, entry: %u, mapping: %08x->%08x, PTE: %08x\n",
+ 					dtlb ? 'D' : 'I', w, e, r0, r1, pte);
+-- 
+2.28.0
+
+
+From cb622fd2aba07c1f8cdb0d67ec80c1cf3759f2d0 Mon Sep 17 00:00:00 2001
+From: Chris Lew <clew@codeaurora.org>
+Date: Wed, 27 Jun 2018 18:19:57 -0700
+Subject: [PATCH 19/37] rpmsg: glink: Set tail pointer to 0 at end of FIFO
+
+commit 4623e8bf1de0b86e23a56cdb39a72f054e89c3bd upstream.
+
+When wrapping around the FIFO, the remote expects the tail pointer to
+be reset to 0 on the edge case where the tail equals the FIFO length.
+
+Fixes: caf989c350e8 ("rpmsg: glink: Introduce glink smem based transport")
+Cc: stable@vger.kernel.org
+Signed-off-by: Chris Lew <clew@codeaurora.org>
+Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/rpmsg/qcom_glink_smem.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/rpmsg/qcom_glink_smem.c b/drivers/rpmsg/qcom_glink_smem.c
+index 5cdaa5f8fb61..53b3a43160f4 100644
+--- a/drivers/rpmsg/qcom_glink_smem.c
++++ b/drivers/rpmsg/qcom_glink_smem.c
+@@ -119,7 +119,7 @@ static void glink_smem_rx_advance(struct qcom_glink_pipe *np,
+ 	tail = le32_to_cpu(*pipe->tail);
+ 
+ 	tail += count;
+-	if (tail > pipe->native.length)
++	if (tail >= pipe->native.length)
+ 		tail -= pipe->native.length;
+ 
+ 	*pipe->tail = cpu_to_le32(tail);
+-- 
+2.28.0
+
+
+From e4fbe58ca403f028ce2868d5ce9979443bb61950 Mon Sep 17 00:00:00 2001
+From: Arun Kumar Neelakantam <aneela@codeaurora.org>
+Date: Fri, 4 Oct 2019 15:26:57 -0700
+Subject: [PATCH 20/37] rpmsg: glink: Fix reuse intents memory leak issue
+
+commit b85f6b601407347f5425c4c058d1b7871f5bf4f0 upstream.
+
+Memory allocated for re-usable intents are not freed during channel
+cleanup which causes memory leak in system.
+
+Check and free all re-usable memory to avoid memory leak.
+
+Fixes: 933b45da5d1d ("rpmsg: glink: Add support for TX intents")
+Cc: stable@vger.kernel.org
+Acked-By: Chris Lew <clew@codeaurora.org>
+Tested-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Signed-off-by: Arun Kumar Neelakantam <aneela@codeaurora.org>
+Reported-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/rpmsg/qcom_glink_native.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index e8e12c2b1d0e..32b8ac9a3fdc 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -243,10 +243,19 @@ static void qcom_glink_channel_release(struct kref *ref)
+ {
+ 	struct glink_channel *channel = container_of(ref, struct glink_channel,
+ 						     refcount);
++	struct glink_core_rx_intent *tmp;
+ 	unsigned long flags;
++	int iid;
+ 
+ 	spin_lock_irqsave(&channel->intent_lock, flags);
++	idr_for_each_entry(&channel->liids, tmp, iid) {
++		kfree(tmp->data);
++		kfree(tmp);
++	}
+ 	idr_destroy(&channel->liids);
++
++	idr_for_each_entry(&channel->riids, tmp, iid)
++		kfree(tmp);
+ 	idr_destroy(&channel->riids);
+ 	spin_unlock_irqrestore(&channel->intent_lock, flags);
+ 
+-- 
+2.28.0
+
+
+From ec9bacb6ca32610b89c3ac4b2646271239219920 Mon Sep 17 00:00:00 2001
+From: Arun Kumar Neelakantam <aneela@codeaurora.org>
+Date: Fri, 4 Oct 2019 15:26:58 -0700
+Subject: [PATCH 21/37] rpmsg: glink: Fix use after free in open_ack TIMEOUT
+ case
+
+commit ac74ea01860170699fb3b6ea80c0476774c8e94f upstream.
+
+Extra channel reference put when remote sending OPEN_ACK after timeout
+causes use-after-free while handling next remote CLOSE command.
+
+Remove extra reference put in timeout case to avoid use-after-free.
+
+Fixes: b4f8e52b89f6 ("rpmsg: Introduce Qualcomm RPM glink driver")
+Cc: stable@vger.kernel.org
+Tested-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Signed-off-by: Arun Kumar Neelakantam <aneela@codeaurora.org>
+Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/rpmsg/qcom_glink_native.c | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index 32b8ac9a3fdc..575203dfd676 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -1104,13 +1104,12 @@ static int qcom_glink_create_remote(struct qcom_glink *glink,
+ close_link:
+ 	/*
+ 	 * Send a close request to "undo" our open-ack. The close-ack will
+-	 * release the last reference.
++	 * release qcom_glink_send_open_req() reference and the last reference
++	 * will be relesed after receiving remote_close or transport unregister
++	 * by calling qcom_glink_native_remove().
+ 	 */
+ 	qcom_glink_send_close_req(glink, channel);
+ 
+-	/* Release qcom_glink_send_open_req() reference */
+-	kref_put(&channel->refcount, qcom_glink_channel_release);
+-
+ 	return ret;
+ }
+ 
+-- 
+2.28.0
+
+
+From 907f2c940db052b5a5f371a7be456bac6d0b267c Mon Sep 17 00:00:00 2001
+From: Chris Lew <clew@codeaurora.org>
+Date: Fri, 4 Oct 2019 15:26:59 -0700
+Subject: [PATCH 22/37] rpmsg: glink: Put an extra reference during cleanup
+
+commit b646293e272816dd0719529dcebbd659de0722f7 upstream.
+
+In a remote processor crash scenario, there is no guarantee the remote
+processor sent close requests before it went into a bad state. Remove
+the reference that is normally handled by the close command in the
+so channel resources can be released.
+
+Fixes: b4f8e52b89f6 ("rpmsg: Introduce Qualcomm RPM glink driver")
+Cc: stable@vger.kernel.org
+Tested-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Signed-off-by: Chris Lew <clew@codeaurora.org>
+Reported-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/rpmsg/qcom_glink_native.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index 575203dfd676..aef24a4c9826 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -1613,6 +1613,10 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
+ 	idr_for_each_entry(&glink->lcids, channel, cid)
+ 		kref_put(&channel->refcount, qcom_glink_channel_release);
+ 
++	/* Release any defunct local channels, waiting for close-req */
++	idr_for_each_entry(&glink->rcids, channel, cid)
++		kref_put(&channel->refcount, qcom_glink_channel_release);
++
+ 	idr_destroy(&glink->lcids);
+ 	idr_destroy(&glink->rcids);
+ 	spin_unlock_irqrestore(&glink->idr_lock, flags);
+-- 
+2.28.0
+
+
+From 90be4d4327fc5560b77693dd63922bcc331fa4d8 Mon Sep 17 00:00:00 2001
+From: Chris Lew <clew@codeaurora.org>
+Date: Fri, 4 Oct 2019 15:27:00 -0700
+Subject: [PATCH 23/37] rpmsg: glink: Fix rpmsg_register_device err handling
+
+commit f7e714988edaffe6ac578318e99501149b067ba0 upstream.
+
+The device release function is set before registering with rpmsg. If
+rpmsg registration fails, the framework will call device_put(), which
+invokes the release function. The channel create logic does not need to
+free rpdev if rpmsg_register_device() fails and release is called.
+
+Fixes: b4f8e52b89f6 ("rpmsg: Introduce Qualcomm RPM glink driver")
+Cc: stable@vger.kernel.org
+Tested-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Signed-off-by: Chris Lew <clew@codeaurora.org>
+Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/rpmsg/qcom_glink_native.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index aef24a4c9826..306b3cc6ab13 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -1400,15 +1400,13 @@ static int qcom_glink_rx_open(struct qcom_glink *glink, unsigned int rcid,
+ 
+ 		ret = rpmsg_register_device(rpdev);
+ 		if (ret)
+-			goto free_rpdev;
++			goto rcid_remove;
+ 
+ 		channel->rpdev = rpdev;
+ 	}
+ 
+ 	return 0;
+ 
+-free_rpdev:
+-	kfree(rpdev);
+ rcid_remove:
+ 	spin_lock_irqsave(&glink->idr_lock, flags);
+ 	idr_remove(&glink->rcids, channel->rcid);
+-- 
+2.28.0
+
+
+From 29166ff96dad3e6b95aa30bcf2aeda6e3e69b791 Mon Sep 17 00:00:00 2001
+From: Bjorn Andersson <bjorn.andersson@linaro.org>
+Date: Fri, 4 Oct 2019 15:27:01 -0700
+Subject: [PATCH 24/37] rpmsg: glink: Don't send pending rx_done during remove
+
+commit c3dadc19b7564c732598b30d637c6f275c3b77b6 upstream.
+
+Attempting to transmit rx_done messages after the GLINK instance is
+being torn down will cause use after free and memory leaks. So cancel
+the intent_work and free up the pending intents.
+
+With this there are no concurrent accessors of the channel left during
+qcom_glink_native_remove() and there is therefor no need to hold the
+spinlock during this operation - which would prohibit the use of
+cancel_work_sync() in the release function. So remove this.
+
+Fixes: 1d2ea36eead9 ("rpmsg: glink: Add rx done command")
+Cc: stable@vger.kernel.org
+Acked-by: Chris Lew <clew@codeaurora.org>
+Tested-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/rpmsg/qcom_glink_native.c | 15 ++++++++++++---
+ 1 file changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index 306b3cc6ab13..57a5d394d650 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -243,11 +243,23 @@ static void qcom_glink_channel_release(struct kref *ref)
+ {
+ 	struct glink_channel *channel = container_of(ref, struct glink_channel,
+ 						     refcount);
++	struct glink_core_rx_intent *intent;
+ 	struct glink_core_rx_intent *tmp;
+ 	unsigned long flags;
+ 	int iid;
+ 
++	/* cancel pending rx_done work */
++	cancel_work_sync(&channel->intent_work);
++
+ 	spin_lock_irqsave(&channel->intent_lock, flags);
++	/* Free all non-reuse intents pending rx_done work */
++	list_for_each_entry_safe(intent, tmp, &channel->done_intents, node) {
++		if (!intent->reuse) {
++			kfree(intent->data);
++			kfree(intent);
++		}
++	}
++
+ 	idr_for_each_entry(&channel->liids, tmp, iid) {
+ 		kfree(tmp->data);
+ 		kfree(tmp);
+@@ -1597,7 +1609,6 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
+ 	struct glink_channel *channel;
+ 	int cid;
+ 	int ret;
+-	unsigned long flags;
+ 
+ 	disable_irq(glink->irq);
+ 	cancel_work_sync(&glink->rx_work);
+@@ -1606,7 +1617,6 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
+ 	if (ret)
+ 		dev_warn(glink->dev, "Can't remove GLINK devices: %d\n", ret);
+ 
+-	spin_lock_irqsave(&glink->idr_lock, flags);
+ 	/* Release any defunct local channels, waiting for close-ack */
+ 	idr_for_each_entry(&glink->lcids, channel, cid)
+ 		kref_put(&channel->refcount, qcom_glink_channel_release);
+@@ -1617,7 +1627,6 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
+ 
+ 	idr_destroy(&glink->lcids);
+ 	idr_destroy(&glink->rcids);
+-	spin_unlock_irqrestore(&glink->idr_lock, flags);
+ 	mbox_free_channel(glink->mbox_chan);
+ }
+ EXPORT_SYMBOL_GPL(qcom_glink_native_remove);
+-- 
+2.28.0
+
+
+From 50736a155f0f4953ee802699431b3f1eff9d8e6b Mon Sep 17 00:00:00 2001
+From: Bjorn Andersson <bjorn.andersson@linaro.org>
+Date: Fri, 4 Oct 2019 15:27:02 -0700
+Subject: [PATCH 25/37] rpmsg: glink: Free pending deferred work on remove
+
+commit 278bcb7300f61785dba63840bd2a8cf79f14554c upstream.
+
+By just cancelling the deferred rx worker during GLINK instance teardown
+any pending deferred commands are leaked, so free them.
+
+Fixes: b4f8e52b89f6 ("rpmsg: Introduce Qualcomm RPM glink driver")
+Cc: stable@vger.kernel.org
+Acked-by: Chris Lew <clew@codeaurora.org>
+Tested-by: Srinivas Kandagatla <srinivas.kandagatla@linaro.org>
+Signed-off-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/rpmsg/qcom_glink_native.c | 14 +++++++++++++-
+ 1 file changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
+index 57a5d394d650..1e6253f1e070 100644
+--- a/drivers/rpmsg/qcom_glink_native.c
++++ b/drivers/rpmsg/qcom_glink_native.c
+@@ -1539,6 +1539,18 @@ static void qcom_glink_work(struct work_struct *work)
+ 	}
+ }
+ 
++static void qcom_glink_cancel_rx_work(struct qcom_glink *glink)
++{
++	struct glink_defer_cmd *dcmd;
++	struct glink_defer_cmd *tmp;
++
++	/* cancel any pending deferred rx_work */
++	cancel_work_sync(&glink->rx_work);
++
++	list_for_each_entry_safe(dcmd, tmp, &glink->rx_queue, node)
++		kfree(dcmd);
++}
++
+ struct qcom_glink *qcom_glink_native_probe(struct device *dev,
+ 					   unsigned long features,
+ 					   struct qcom_glink_pipe *rx,
+@@ -1611,7 +1623,7 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
+ 	int ret;
+ 
+ 	disable_irq(glink->irq);
+-	cancel_work_sync(&glink->rx_work);
++	qcom_glink_cancel_rx_work(glink);
+ 
+ 	ret = device_for_each_child(glink->dev, NULL, qcom_glink_remove_device);
+ 	if (ret)
+-- 
+2.28.0
+
+
+From bf368c1377981c89cf08037322412cf421809733 Mon Sep 17 00:00:00 2001
+From: Pavel Shilovsky <pshilov@microsoft.com>
+Date: Tue, 12 Nov 2019 17:16:35 -0800
+Subject: [PATCH 26/37] CIFS: Respect O_SYNC and O_DIRECT flags during
+ reconnect
+
+commit 44805b0e62f15e90d233485420e1847133716bdc upstream.
+
+Currently the client translates O_SYNC and O_DIRECT flags
+into corresponding SMB create options when openning a file.
+The problem is that on reconnect when the file is being
+re-opened the client doesn't set those flags and it causes
+a server to reject re-open requests because create options
+don't match. The latter means that any subsequent system
+call against that open file fail until a share is re-mounted.
+
+Fix this by properly setting SMB create options when
+re-openning files after reconnects.
+
+Fixes: 1013e760d10e6: ("SMB3: Don't ignore O_SYNC/O_DSYNC and O_DIRECT flags")
+Cc: Stable <stable@vger.kernel.org>
+Signed-off-by: Pavel Shilovsky <pshilov@microsoft.com>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/cifs/file.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index 6dc0e092b0fc..5e75c5f77f4c 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -722,6 +722,13 @@ cifs_reopen_file(struct cifsFileInfo *cfile, bool can_flush)
+ 	if (backup_cred(cifs_sb))
+ 		create_options |= CREATE_OPEN_BACKUP_INTENT;
+ 
++	/* O_SYNC also has bit for O_DSYNC so following check picks up either */
++	if (cfile->f_flags & O_SYNC)
++		create_options |= CREATE_WRITE_THROUGH;
++
++	if (cfile->f_flags & O_DIRECT)
++		create_options |= CREATE_NO_BUFFER;
++
+ 	if (server->ops->get_lease_key)
+ 		server->ops->get_lease_key(inode, &cfile->fid);
+ 
+-- 
+2.28.0
+
+
+From e1674fd49a9e70ae170d56efc38ee8856907ab63 Mon Sep 17 00:00:00 2001
+From: Lihua Yao <ylhuajnu@outlook.com>
+Date: Tue, 10 Sep 2019 13:22:28 +0000
+Subject: [PATCH 27/37] ARM: dts: s3c64xx: Fix init order of clock providers
+
+commit d60d0cff4ab01255b25375425745c3cff69558ad upstream.
+
+fin_pll is the parent of clock-controller@7e00f000, specify
+the dependency to ensure proper initialization order of clock
+providers.
+
+without this patch:
+[    0.000000] S3C6410 clocks: apll = 0, mpll = 0
+[    0.000000]  epll = 0, arm_clk = 0
+
+with this patch:
+[    0.000000] S3C6410 clocks: apll = 532000000, mpll = 532000000
+[    0.000000]  epll = 24000000, arm_clk = 532000000
+
+Cc: <stable@vger.kernel.org>
+Fixes: 3f6d439f2022 ("clk: reverse default clk provider initialization order in of_clk_init()")
+Signed-off-by: Lihua Yao <ylhuajnu@outlook.com>
+Reviewed-by: Sylwester Nawrocki <s.nawrocki@samsung.com>
+Signed-off-by: Krzysztof Kozlowski <krzk@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/boot/dts/s3c6410-mini6410.dts | 4 ++++
+ arch/arm/boot/dts/s3c6410-smdk6410.dts | 4 ++++
+ 2 files changed, 8 insertions(+)
+
 diff --git a/arch/arm/boot/dts/s3c6410-mini6410.dts b/arch/arm/boot/dts/s3c6410-mini6410.dts
 index f4afda3594f8..de04d8764b0f 100644
 --- a/arch/arm/boot/dts/s3c6410-mini6410.dts
@@ -41,6 +1908,30 @@ index ecf35ec466f7..7ade1a0686d2 100644
  &sdhci0 {
  	pinctrl-names = "default";
  	pinctrl-0 = <&sd0_clk>, <&sd0_cmd>, <&sd0_cd>, <&sd0_bus4>;
+-- 
+2.28.0
+
+
+From f6338f8a42529e6353ba8b0aaebe69fc3e8601f8 Mon Sep 17 00:00:00 2001
+From: Dmitry Osipenko <digetx@gmail.com>
+Date: Tue, 30 Jul 2019 20:23:39 +0300
+Subject: [PATCH 28/37] ARM: tegra: Fix FLOW_CTLR_HALT register clobbering by
+ tegra_resume()
+
+commit d70f7d31a9e2088e8a507194354d41ea10062994 upstream.
+
+There is an unfortunate typo in the code that results in writing to
+FLOW_CTLR_HALT instead of FLOW_CTLR_CSR.
+
+Cc: <stable@vger.kernel.org>
+Acked-by: Peter De Schrijver <pdeschrijver@nvidia.com>
+Signed-off-by: Dmitry Osipenko <digetx@gmail.com>
+Signed-off-by: Thierry Reding <treding@nvidia.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/mach-tegra/reset-handler.S | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
 diff --git a/arch/arm/mach-tegra/reset-handler.S b/arch/arm/mach-tegra/reset-handler.S
 index 805f306fa6f7..e31f167a8199 100644
 --- a/arch/arm/mach-tegra/reset-handler.S
@@ -65,28 +1956,89 @@ index 805f306fa6f7..e31f167a8199 100644
  1:
  
  	mov32	r9, 0xc09
-diff --git a/arch/xtensa/mm/tlb.c b/arch/xtensa/mm/tlb.c
-index 35c822286bbe..3ce5ccdb054d 100644
---- a/arch/xtensa/mm/tlb.c
-+++ b/arch/xtensa/mm/tlb.c
-@@ -218,6 +218,8 @@ static int check_tlb_entry(unsigned w, unsigned e, bool dtlb)
- 	unsigned tlbidx = w | (e << PAGE_SHIFT);
- 	unsigned r0 = dtlb ?
- 		read_dtlb_virtual(tlbidx) : read_itlb_virtual(tlbidx);
-+	unsigned r1 = dtlb ?
-+		read_dtlb_translation(tlbidx) : read_itlb_translation(tlbidx);
- 	unsigned vpn = (r0 & PAGE_MASK) | (e << PAGE_SHIFT);
- 	unsigned pte = get_pte_for_vaddr(vpn);
- 	unsigned mm_asid = (get_rasid_register() >> 8) & ASID_MASK;
-@@ -233,8 +235,6 @@ static int check_tlb_entry(unsigned w, unsigned e, bool dtlb)
- 	}
+-- 
+2.28.0
+
+
+From 05d1ce97c6df4ed9886669611999b33036937a36 Mon Sep 17 00:00:00 2001
+From: Jiang Yi <giangyi@amazon.com>
+Date: Wed, 27 Nov 2019 17:49:10 +0100
+Subject: [PATCH 29/37] vfio/pci: call irq_bypass_unregister_producer() before
+ freeing irq
+
+commit d567fb8819162099035e546b11a736e29c2af0ea upstream.
+
+Since irq_bypass_register_producer() is called after request_irq(), we
+should do tear-down in reverse order: irq_bypass_unregister_producer()
+then free_irq().
+
+Specifically free_irq() may release resources required by the
+irqbypass del_producer() callback.  Notably an example provided by
+Marc Zyngier on arm64 with GICv4 that he indicates has the potential
+to wedge the hardware:
+
+ free_irq(irq)
+   __free_irq(irq)
+     irq_domain_deactivate_irq(irq)
+       its_irq_domain_deactivate()
+         [unmap the VLPI from the ITS]
+
+ kvm_arch_irq_bypass_del_producer(cons, prod)
+   kvm_vgic_v4_unset_forwarding(kvm, irq, ...)
+     its_unmap_vlpi(irq)
+       [Unmap the VLPI from the ITS (again), remap the original LPI]
+
+Signed-off-by: Jiang Yi <giangyi@amazon.com>
+Cc: stable@vger.kernel.org # v4.4+
+Fixes: 6d7425f109d26 ("vfio: Register/unregister irq_bypass_producer")
+Link: https://lore.kernel.org/kvm/20191127164910.15888-1-giangyi@amazon.com
+Reviewed-by: Marc Zyngier <maz@kernel.org>
+Reviewed-by: Eric Auger <eric.auger@redhat.com>
+[aw: commit log]
+Signed-off-by: Alex Williamson <alex.williamson@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/vfio/pci/vfio_pci_intrs.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/vfio/pci/vfio_pci_intrs.c b/drivers/vfio/pci/vfio_pci_intrs.c
+index 1c46045b0e7f..94594dc63c41 100644
+--- a/drivers/vfio/pci/vfio_pci_intrs.c
++++ b/drivers/vfio/pci/vfio_pci_intrs.c
+@@ -297,8 +297,8 @@ static int vfio_msi_set_vector_signal(struct vfio_pci_device *vdev,
+ 	irq = pci_irq_vector(pdev, vector);
  
- 	if (tlb_asid == mm_asid) {
--		unsigned r1 = dtlb ? read_dtlb_translation(tlbidx) :
--			read_itlb_translation(tlbidx);
- 		if ((pte ^ r1) & PAGE_MASK) {
- 			pr_err("%cTLB: way: %u, entry: %u, mapping: %08x->%08x, PTE: %08x\n",
- 					dtlb ? 'D' : 'I', w, e, r0, r1, pte);
+ 	if (vdev->ctx[vector].trigger) {
+-		free_irq(irq, vdev->ctx[vector].trigger);
+ 		irq_bypass_unregister_producer(&vdev->ctx[vector].producer);
++		free_irq(irq, vdev->ctx[vector].trigger);
+ 		kfree(vdev->ctx[vector].name);
+ 		eventfd_ctx_put(vdev->ctx[vector].trigger);
+ 		vdev->ctx[vector].trigger = NULL;
+-- 
+2.28.0
+
+
+From 490d242d6c725ab5e3bb45d507eb81c5dd5b418a Mon Sep 17 00:00:00 2001
+From: Navid Emamdoost <navid.emamdoost@gmail.com>
+Date: Fri, 22 Nov 2019 16:09:55 -0600
+Subject: [PATCH 30/37] dma-buf: Fix memory leak in sync_file_merge()
+
+commit 6645d42d79d33e8a9fe262660a75d5f4556bbea9 upstream.
+
+In the implementation of sync_file_merge() the allocated sync_file is
+leaked if number of fences overflows. Release sync_file by goto err.
+
+Fixes: a02b9dc90d84 ("dma-buf/sync_file: refactor fence storage in struct sync_file")
+Signed-off-by: Navid Emamdoost <navid.emamdoost@gmail.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Link: https://patchwork.freedesktop.org/patch/msgid/20191122220957.30427-1-navid.emamdoost@gmail.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/dma-buf/sync_file.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
 diff --git a/drivers/dma-buf/sync_file.c b/drivers/dma-buf/sync_file.c
 index 03830634e141..bf65e634590b 100644
 --- a/drivers/dma-buf/sync_file.c
@@ -100,6 +2052,227 @@ index 03830634e141..bf65e634590b 100644
  
  	num_fences = a_num_fences + b_num_fences;
  
+-- 
+2.28.0
+
+
+From 94b8b2453d2ba64a506173dbb510934d810b861e Mon Sep 17 00:00:00 2001
+From: Hou Tao <houtao1@huawei.com>
+Date: Tue, 3 Dec 2019 19:42:58 +0800
+Subject: [PATCH 31/37] dm btree: increase rebalance threshold in
+ __rebalance2()
+
+commit 474e559567fa631dea8fb8407ab1b6090c903755 upstream.
+
+We got the following warnings from thin_check during thin-pool setup:
+
+  $ thin_check /dev/vdb
+  examining superblock
+  examining devices tree
+    missing devices: [1, 84]
+      too few entries in btree_node: 41, expected at least 42 (block 138, max_entries = 126)
+  examining mapping tree
+
+The phenomenon is the number of entries in one node of details_info tree is
+less than (max_entries / 3). And it can be easily reproduced by the following
+procedures:
+
+  $ new a thin pool
+  $ presume the max entries of details_info tree is 126
+  $ new 127 thin devices (e.g. 1~127) to make the root node being full
+    and then split
+  $ remove the first 43 (e.g. 1~43) thin devices to make the children
+    reblance repeatedly
+  $ stop the thin pool
+  $ thin_check
+
+The root cause is that the B-tree removal procedure in __rebalance2()
+doesn't guarantee the invariance: the minimal number of entries in
+non-root node should be >= (max_entries / 3).
+
+Simply fix the problem by increasing the rebalance threshold to
+make sure the number of entries in each child will be greater
+than or equal to (max_entries / 3 + 1), so no matter which
+child is used for removal, the number will still be valid.
+
+Cc: stable@vger.kernel.org
+Signed-off-by: Hou Tao <houtao1@huawei.com>
+Acked-by: Joe Thornber <ejt@redhat.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/persistent-data/dm-btree-remove.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/persistent-data/dm-btree-remove.c b/drivers/md/persistent-data/dm-btree-remove.c
+index 21ea537bd55e..eff04fa23dfa 100644
+--- a/drivers/md/persistent-data/dm-btree-remove.c
++++ b/drivers/md/persistent-data/dm-btree-remove.c
+@@ -203,7 +203,13 @@ static void __rebalance2(struct dm_btree_info *info, struct btree_node *parent,
+ 	struct btree_node *right = r->n;
+ 	uint32_t nr_left = le32_to_cpu(left->header.nr_entries);
+ 	uint32_t nr_right = le32_to_cpu(right->header.nr_entries);
+-	unsigned threshold = 2 * merge_threshold(left) + 1;
++	/*
++	 * Ensure the number of entries in each child will be greater
++	 * than or equal to (max_entries / 3 + 1), so no matter which
++	 * child is used for removal, the number will still be not
++	 * less than (max_entries / 3).
++	 */
++	unsigned int threshold = 2 * (merge_threshold(left) + 1);
+ 
+ 	if (nr_left + nr_right < threshold) {
+ 		/*
+-- 
+2.28.0
+
+
+From 7009b5bf234a61321e3ad7cba6ffb99c30117e1f Mon Sep 17 00:00:00 2001
+From: Bart Van Assche <bvanassche@acm.org>
+Date: Mon, 9 Dec 2019 09:34:57 -0800
+Subject: [PATCH 32/37] scsi: iscsi: Fix a potential deadlock in the timeout
+ handler
+
+commit 5480e299b5ae57956af01d4839c9fc88a465eeab upstream.
+
+Some time ago the block layer was modified such that timeout handlers are
+called from thread context instead of interrupt context. Make it safe to
+run the iSCSI timeout handler in thread context. This patch fixes the
+following lockdep complaint:
+
+================================
+WARNING: inconsistent lock state
+5.5.1-dbg+ #11 Not tainted
+--------------------------------
+inconsistent {IN-SOFTIRQ-W} -> {SOFTIRQ-ON-W} usage.
+kworker/7:1H/206 [HC0[0]:SC0[0]:HE1:SE1] takes:
+ffff88802d9827e8 (&(&session->frwd_lock)->rlock){+.?.}, at: iscsi_eh_cmd_timed_out+0xa6/0x6d0 [libiscsi]
+{IN-SOFTIRQ-W} state was registered at:
+  lock_acquire+0x106/0x240
+  _raw_spin_lock+0x38/0x50
+  iscsi_check_transport_timeouts+0x3e/0x210 [libiscsi]
+  call_timer_fn+0x132/0x470
+  __run_timers.part.0+0x39f/0x5b0
+  run_timer_softirq+0x63/0xc0
+  __do_softirq+0x12d/0x5fd
+  irq_exit+0xb3/0x110
+  smp_apic_timer_interrupt+0x131/0x3d0
+  apic_timer_interrupt+0xf/0x20
+  default_idle+0x31/0x230
+  arch_cpu_idle+0x13/0x20
+  default_idle_call+0x53/0x60
+  do_idle+0x38a/0x3f0
+  cpu_startup_entry+0x24/0x30
+  start_secondary+0x222/0x290
+  secondary_startup_64+0xa4/0xb0
+irq event stamp: 1383705
+hardirqs last  enabled at (1383705): [<ffffffff81aace5c>] _raw_spin_unlock_irq+0x2c/0x50
+hardirqs last disabled at (1383704): [<ffffffff81aacb98>] _raw_spin_lock_irq+0x18/0x50
+softirqs last  enabled at (1383690): [<ffffffffa0e2efea>] iscsi_queuecommand+0x76a/0xa20 [libiscsi]
+softirqs last disabled at (1383682): [<ffffffffa0e2e998>] iscsi_queuecommand+0x118/0xa20 [libiscsi]
+
+other info that might help us debug this:
+ Possible unsafe locking scenario:
+
+       CPU0
+       ----
+  lock(&(&session->frwd_lock)->rlock);
+  <Interrupt>
+    lock(&(&session->frwd_lock)->rlock);
+
+ *** DEADLOCK ***
+
+2 locks held by kworker/7:1H/206:
+ #0: ffff8880d57bf928 ((wq_completion)kblockd){+.+.}, at: process_one_work+0x472/0xab0
+ #1: ffff88802b9c7de8 ((work_completion)(&q->timeout_work)){+.+.}, at: process_one_work+0x476/0xab0
+
+stack backtrace:
+CPU: 7 PID: 206 Comm: kworker/7:1H Not tainted 5.5.1-dbg+ #11
+Hardware name: Bochs Bochs, BIOS Bochs 01/01/2011
+Workqueue: kblockd blk_mq_timeout_work
+Call Trace:
+ dump_stack+0xa5/0xe6
+ print_usage_bug.cold+0x232/0x23b
+ mark_lock+0x8dc/0xa70
+ __lock_acquire+0xcea/0x2af0
+ lock_acquire+0x106/0x240
+ _raw_spin_lock+0x38/0x50
+ iscsi_eh_cmd_timed_out+0xa6/0x6d0 [libiscsi]
+ scsi_times_out+0xf4/0x440 [scsi_mod]
+ scsi_timeout+0x1d/0x20 [scsi_mod]
+ blk_mq_check_expired+0x365/0x3a0
+ bt_iter+0xd6/0xf0
+ blk_mq_queue_tag_busy_iter+0x3de/0x650
+ blk_mq_timeout_work+0x1af/0x380
+ process_one_work+0x56d/0xab0
+ worker_thread+0x7a/0x5d0
+ kthread+0x1bc/0x210
+ ret_from_fork+0x24/0x30
+
+Fixes: 287922eb0b18 ("block: defer timeouts to a workqueue")
+Cc: Christoph Hellwig <hch@lst.de>
+Cc: Keith Busch <keith.busch@intel.com>
+Cc: Lee Duncan <lduncan@suse.com>
+Cc: Chris Leech <cleech@redhat.com>
+Cc: <stable@vger.kernel.org>
+Link: https://lore.kernel.org/r/20191209173457.187370-1-bvanassche@acm.org
+Signed-off-by: Bart Van Assche <bvanassche@acm.org>
+Reviewed-by: Lee Duncan <lduncan@suse.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/scsi/libiscsi.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/scsi/libiscsi.c b/drivers/scsi/libiscsi.c
+index 5ea5d42bac76..662df16b07a4 100644
+--- a/drivers/scsi/libiscsi.c
++++ b/drivers/scsi/libiscsi.c
+@@ -1983,7 +1983,7 @@ enum blk_eh_timer_return iscsi_eh_cmd_timed_out(struct scsi_cmnd *sc)
+ 
+ 	ISCSI_DBG_EH(session, "scsi cmd %p timedout\n", sc);
+ 
+-	spin_lock(&session->frwd_lock);
++	spin_lock_bh(&session->frwd_lock);
+ 	task = (struct iscsi_task *)sc->SCp.ptr;
+ 	if (!task) {
+ 		/*
+@@ -2110,7 +2110,7 @@ enum blk_eh_timer_return iscsi_eh_cmd_timed_out(struct scsi_cmnd *sc)
+ done:
+ 	if (task)
+ 		task->last_timeout = jiffies;
+-	spin_unlock(&session->frwd_lock);
++	spin_unlock_bh(&session->frwd_lock);
+ 	ISCSI_DBG_EH(session, "return %s\n", rc == BLK_EH_RESET_TIMER ?
+ 		     "timer reset" : "shutdown or nh");
+ 	return rc;
+-- 
+2.28.0
+
+
+From a54bf706197be89fa2d431951cfe59b70ab8304d Mon Sep 17 00:00:00 2001
+From: Alex Deucher <alexander.deucher@amd.com>
+Date: Tue, 26 Nov 2019 09:41:46 -0500
+Subject: [PATCH 33/37] drm/radeon: fix r1xx/r2xx register checker for POT
+ textures
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 008037d4d972c9c47b273e40e52ae34f9d9e33e7 upstream.
+
+Shift and mask were reversed.  Noticed by chance.
+
+Tested-by: Meelis Roos <mroos@linux.ee>
+Reviewed-by: Michel Dänzer <mdaenzer@redhat.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/radeon/r100.c | 4 ++--
+ drivers/gpu/drm/radeon/r200.c | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
 diff --git a/drivers/gpu/drm/radeon/r100.c b/drivers/gpu/drm/radeon/r100.c
 index c31e660e35db..a4929372090d 100644
 --- a/drivers/gpu/drm/radeon/r100.c
@@ -130,38 +2303,152 @@ index c22321cc5a41..c2b506c707a2 100644
  		}
  		if (idx_value & R200_TXFORMAT_LOOKUP_DISABLE)
  			track->textures[i].lookup_disable = true;
-diff --git a/drivers/md/persistent-data/dm-btree-remove.c b/drivers/md/persistent-data/dm-btree-remove.c
-index 21ea537bd55e..eff04fa23dfa 100644
---- a/drivers/md/persistent-data/dm-btree-remove.c
-+++ b/drivers/md/persistent-data/dm-btree-remove.c
-@@ -203,7 +203,13 @@ static void __rebalance2(struct dm_btree_info *info, struct btree_node *parent,
- 	struct btree_node *right = r->n;
- 	uint32_t nr_left = le32_to_cpu(left->header.nr_entries);
- 	uint32_t nr_right = le32_to_cpu(right->header.nr_entries);
--	unsigned threshold = 2 * merge_threshold(left) + 1;
-+	/*
-+	 * Ensure the number of entries in each child will be greater
-+	 * than or equal to (max_entries / 3 + 1), so no matter which
-+	 * child is used for removal, the number will still be not
-+	 * less than (max_entries / 3).
-+	 */
-+	unsigned int threshold = 2 * (merge_threshold(left) + 1);
- 
- 	if (nr_left + nr_right < threshold) {
- 		/*
-diff --git a/drivers/net/ethernet/cavium/thunder/thunder_bgx.c b/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
-index 5e5c4d7796b8..586e35593310 100644
---- a/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
-+++ b/drivers/net/ethernet/cavium/thunder/thunder_bgx.c
-@@ -915,7 +915,7 @@ static int bgx_lmac_enable(struct bgx *bgx, u8 lmacid)
- 				       phy_interface_mode(lmac->lmac_type)))
- 			return -ENODEV;
- 
--		phy_start_aneg(lmac->phydev);
-+		phy_start(lmac->phydev);
- 		return 0;
+-- 
+2.28.0
+
+
+From da2bee90f5e7591aa1f949c26bf35569501d80ba Mon Sep 17 00:00:00 2001
+From: Mathias Nyman <mathias.nyman@linux.intel.com>
+Date: Wed, 11 Dec 2019 16:20:03 +0200
+Subject: [PATCH 34/37] xhci: fix USB3 device initiated resume race with
+ roothub autosuspend
+
+commit 057d476fff778f1d3b9f861fdb5437ea1a3cfc99 upstream.
+
+A race in xhci USB3 remote wake handling may force device back to suspend
+after it initiated resume siganaling, causing a missed resume event or warm
+reset of device.
+
+When a USB3 link completes resume signaling and goes to enabled (UO)
+state a interrupt is issued and the interrupt handler will clear the
+bus_state->port_remote_wakeup resume flag, allowing bus suspend.
+
+If the USB3 roothub thread just finished reading port status before
+the interrupt, finding ports still in suspended (U3) state, but hasn't
+yet started suspending the hub, then the xhci interrupt handler will clear
+the flag that prevented roothub suspend and allow bus to suspend, forcing
+all port links back to suspended (U3) state.
+
+Example case:
+usb_runtime_suspend() # because all ports still show suspended U3
+  usb_suspend_both()
+    hub_suspend();   # successful as hub->wakeup_bits not set yet
+==> INTERRUPT
+xhci_irq()
+  handle_port_status()
+    clear bus_state->port_remote_wakeup
+    usb_wakeup_notification()
+      sets hub->wakeup_bits;
+        kick_hub_wq()
+<== END INTERRUPT
+      hcd_bus_suspend()
+        xhci_bus_suspend() # success as port_remote_wakeup bits cleared
+
+Fix this by increasing roothub usage count during port resume to prevent
+roothub autosuspend, and by making sure bus_state->port_remote_wakeup
+flag is only cleared after resume completion is visible, i.e.
+after xhci roothub returned U0 or other non-U3 link state link on a
+get port status request.
+
+Issue rootcaused by Chiasheng Lee
+
+Cc: <stable@vger.kernel.org>
+Cc: Lee, Hou-hsun <hou-hsun.lee@intel.com>
+Reported-by: Lee, Chiasheng <chiasheng.lee@intel.com>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20191211142007.8847-3-mathias.nyman@linux.intel.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/host/xhci-hub.c  | 8 ++++++++
+ drivers/usb/host/xhci-ring.c | 6 +-----
+ 2 files changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
+index 95503bb9b067..d1363f3fabfa 100644
+--- a/drivers/usb/host/xhci-hub.c
++++ b/drivers/usb/host/xhci-hub.c
+@@ -887,6 +887,14 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd,
+ 			status |= USB_PORT_STAT_C_BH_RESET << 16;
+ 		if ((raw_port_status & PORT_CEC))
+ 			status |= USB_PORT_STAT_C_CONFIG_ERROR << 16;
++
++		/* USB3 remote wake resume signaling completed */
++		if (bus_state->port_remote_wakeup & (1 << wIndex) &&
++		    (raw_port_status & PORT_PLS_MASK) != XDEV_RESUME &&
++		    (raw_port_status & PORT_PLS_MASK) != XDEV_RECOVERY) {
++			bus_state->port_remote_wakeup &= ~(1 << wIndex);
++			usb_hcd_end_port_resume(&hcd->self, wIndex);
++		}
  	}
  
+ 	if (hcd->speed < HCD_USB3) {
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 89af395cd89c..61fa3007a74a 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1679,9 +1679,6 @@ static void handle_port_status(struct xhci_hcd *xhci,
+ 		usb_hcd_resume_root_hub(hcd);
+ 	}
+ 
+-	if (hcd->speed >= HCD_USB3 && (portsc & PORT_PLS_MASK) == XDEV_INACTIVE)
+-		bus_state->port_remote_wakeup &= ~(1 << faked_port_index);
+-
+ 	if ((portsc & PORT_PLC) && (portsc & PORT_PLS_MASK) == XDEV_RESUME) {
+ 		xhci_dbg(xhci, "port resume event for port %d\n", port_id);
+ 
+@@ -1700,6 +1697,7 @@ static void handle_port_status(struct xhci_hcd *xhci,
+ 			bus_state->port_remote_wakeup |= 1 << faked_port_index;
+ 			xhci_test_and_clear_bit(xhci, port_array,
+ 					faked_port_index, PORT_PLC);
++			usb_hcd_start_port_resume(&hcd->self, faked_port_index);
+ 			xhci_set_link_state(xhci, port_array, faked_port_index,
+ 						XDEV_U0);
+ 			/* Need to wait until the next link state change
+@@ -1737,8 +1735,6 @@ static void handle_port_status(struct xhci_hcd *xhci,
+ 		if (slot_id && xhci->devs[slot_id])
+ 			xhci_ring_device(xhci, slot_id);
+ 		if (bus_state->port_remote_wakeup & (1 << faked_port_index)) {
+-			bus_state->port_remote_wakeup &=
+-				~(1 << faked_port_index);
+ 			xhci_test_and_clear_bit(xhci, port_array,
+ 					faked_port_index, PORT_PLC);
+ 			usb_wakeup_notification(hcd->self.root_hub,
+-- 
+2.28.0
+
+
+From 8ebb2441b69a7f35a5131ab9cc77459f61ec4acd Mon Sep 17 00:00:00 2001
+From: Aaro Koskinen <aaro.koskinen@nokia.com>
+Date: Wed, 27 Mar 2019 22:35:35 +0200
+Subject: [PATCH 35/37] net: stmmac: use correct DMA buffer size in the RX
+ descriptor
+
+commit 583e6361414903c5206258a30e5bd88cb03c0254 upstream.
+
+We always program the maximum DMA buffer size into the receive descriptor,
+although the allocated size may be less. E.g. with the default MTU size
+we allocate only 1536 bytes. If somebody sends us a bigger frame, then
+memory may get corrupted.
+
+Fix by using exact buffer sizes.
+
+Signed-off-by: Aaro Koskinen <aaro.koskinen@nokia.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[acj: backport v4.14 -stable
+- adjust context
+- skipped the section modifying non-existent functions in dwxgmac2_descs.c and
+hwif.h ]
+Signed-off-by: Aviraj CJ <acj@cisco.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/stmicro/stmmac/common.h  |  2 +-
+ .../net/ethernet/stmicro/stmmac/descs_com.h   | 22 ++++++++++++-------
+ .../ethernet/stmicro/stmmac/dwmac4_descs.c    |  2 +-
+ .../net/ethernet/stmicro/stmmac/enh_desc.c    | 10 ++++++---
+ .../net/ethernet/stmicro/stmmac/norm_desc.c   | 10 ++++++---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c |  8 ++++---
+ 6 files changed, 35 insertions(+), 19 deletions(-)
+
 diff --git a/drivers/net/ethernet/stmicro/stmmac/common.h b/drivers/net/ethernet/stmicro/stmmac/common.h
 index d824bf942a8f..efc4a1a8343a 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/common.h
@@ -221,7 +2508,7 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c b/drivers/net/et
 index 37b77e7da132..2896ec100c75 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac4_descs.c
-@@ -293,7 +293,7 @@ exit:
+@@ -293,7 +293,7 @@ static int dwmac4_wrback_get_rx_timestamp_status(void *desc, void *next_desc,
  }
  
  static void dwmac4_rd_init_rx_desc(struct dma_desc *p, int disable_rx_ic,
@@ -285,7 +2572,7 @@ index 66c17bab5997..44a4666290da 100644
  	if (disable_rx_ic)
  		p->des1 |= cpu_to_le32(RDES1_DISABLE_IC);
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 612773b94ae3..e6d16c48ffef 100644
+index 612773b94ae3..da5b5fc99c04 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 @@ -1072,11 +1072,13 @@ static void stmmac_clear_rx_descriptors(struct stmmac_priv *priv, u32 queue)
@@ -313,7 +2600,41 @@ index 612773b94ae3..e6d16c48ffef 100644
  		else
  			priv->hw->desc->set_rx_owner(p);
  
-@@ -3321,9 +3323,8 @@ static inline void stmmac_rx_refill(struct stmmac_priv *priv, u32 queue)
+-- 
+2.28.0
+
+
+From 27e96cbce648e04dd78ae0cd0f4f34b03314dea7 Mon Sep 17 00:00:00 2001
+From: Aaro Koskinen <aaro.koskinen@nokia.com>
+Date: Wed, 27 Mar 2019 22:35:37 +0200
+Subject: [PATCH 36/37] net: stmmac: don't stop NAPI processing when dropping a
+ packet
+
+commit 07b3975352374c3f5ebb4a42ef0b253fe370542d upstream.
+
+Currently, if we drop a packet, we exit from NAPI loop before the budget
+is consumed. In some situations this will make the RX processing stall
+e.g. when flood pinging the system with oversized packets, as the
+errorneous packets are not dropped efficiently.
+
+If we drop a packet, we should just continue to the next one as long as
+the budget allows.
+
+Signed-off-by: Aaro Koskinen <aaro.koskinen@nokia.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[acj: backport v4.14 -stable
+- adjust context]
+Signed-off-by: Aviraj CJ <acj@cisco.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index da5b5fc99c04..e6d16c48ffef 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -3323,9 +3323,8 @@ static inline void stmmac_rx_refill(struct stmmac_priv *priv, u32 queue)
  static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  {
  	struct stmmac_rx_queue *rx_q = &priv->rx_queue[queue];
@@ -324,7 +2645,7 @@ index 612773b94ae3..e6d16c48ffef 100644
  	unsigned int count = 0;
  
  	if (netif_msg_rx_status(priv)) {
-@@ -3338,10 +3339,12 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -3340,10 +3339,12 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  		priv->hw->desc->display_ring(rx_head, DMA_RX_SIZE, true);
  	}
  	while (count < limit) {
@@ -338,7 +2659,7 @@ index 612773b94ae3..e6d16c48ffef 100644
  		if (priv->extend_desc)
  			p = (struct dma_desc *)(rx_q->dma_erx + entry);
  		else
-@@ -3408,7 +3411,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -3410,7 +3411,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  						   "len %d larger than size (%d)\n",
  						   frame_len, priv->dma_buf_sz);
  				priv->dev->stats.rx_length_errors++;
@@ -347,7 +2668,7 @@ index 612773b94ae3..e6d16c48ffef 100644
  			}
  
  			/* ACS is set; GMAC core strips PAD/FCS for IEEE 802.3
-@@ -3444,7 +3447,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -3446,7 +3447,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  						dev_warn(priv->device,
  							 "packet dropped\n");
  					priv->dev->stats.rx_dropped++;
@@ -356,7 +2677,7 @@ index 612773b94ae3..e6d16c48ffef 100644
  				}
  
  				dma_sync_single_for_cpu(priv->device,
-@@ -3469,7 +3472,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -3471,7 +3472,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  							   "%s: Inconsistent Rx chain\n",
  							   priv->dev->name);
  					priv->dev->stats.rx_dropped++;
@@ -365,7 +2686,7 @@ index 612773b94ae3..e6d16c48ffef 100644
  				}
  				prefetch(skb->data - NET_IP_ALIGN);
  				rx_q->rx_skbuff[entry] = NULL;
-@@ -3504,7 +3507,6 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -3506,7 +3507,6 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  			priv->dev->stats.rx_packets++;
  			priv->dev->stats.rx_bytes += frame_len;
  		}
@@ -373,714 +2694,32 @@ index 612773b94ae3..e6d16c48ffef 100644
  	}
  
  	stmmac_rx_refill(priv, queue);
-diff --git a/drivers/net/ethernet/ti/cpsw.c b/drivers/net/ethernet/ti/cpsw.c
-index a44838aac97d..3189afcd5888 100644
---- a/drivers/net/ethernet/ti/cpsw.c
-+++ b/drivers/net/ethernet/ti/cpsw.c
-@@ -862,8 +862,8 @@ static irqreturn_t cpsw_rx_interrupt(int irq, void *dev_id)
- {
- 	struct cpsw_common *cpsw = dev_id;
+-- 
+2.28.0
+
+
+From e1f7d50ae3a3ec342e87a9b1ce6787bfb8b3c08b Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Sat, 21 Dec 2019 10:47:56 +0100
+Subject: [PATCH 37/37] Linux 4.14.160
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index e14ad8f064ec..f011cb69545f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 14
+-SUBLEVEL = 159
++SUBLEVEL = 160
+ EXTRAVERSION =
+ NAME = Petit Gorille
  
--	cpdma_ctlr_eoi(cpsw->dma, CPDMA_EOI_RX);
- 	writel(0, &cpsw->wr_regs->rx_en);
-+	cpdma_ctlr_eoi(cpsw->dma, CPDMA_EOI_RX);
- 
- 	if (cpsw->quirk_irq) {
- 		disable_irq_nosync(cpsw->irqs_table[0]);
-diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
-index 768ac752a6e3..f543b9932c83 100644
---- a/drivers/nvme/host/core.c
-+++ b/drivers/nvme/host/core.c
-@@ -1331,7 +1331,7 @@ static int nvme_pr_reserve(struct block_device *bdev, u64 key,
- static int nvme_pr_preempt(struct block_device *bdev, u64 old, u64 new,
- 		enum pr_type type, bool abort)
- {
--	u32 cdw10 = nvme_pr_type(type) << 8 | abort ? 2 : 1;
-+	u32 cdw10 = nvme_pr_type(type) << 8 | (abort ? 2 : 1);
- 	return nvme_pr_command(bdev, cdw10, old, new, nvme_cmd_resv_acquire);
- }
- 
-@@ -1343,7 +1343,7 @@ static int nvme_pr_clear(struct block_device *bdev, u64 key)
- 
- static int nvme_pr_release(struct block_device *bdev, u64 key, enum pr_type type)
- {
--	u32 cdw10 = nvme_pr_type(type) << 8 | key ? 1 << 3 : 0;
-+	u32 cdw10 = nvme_pr_type(type) << 8 | (key ? 1 << 3 : 0);
- 	return nvme_pr_command(bdev, cdw10, key, 0, nvme_cmd_resv_release);
- }
- 
-diff --git a/drivers/pci/msi.c b/drivers/pci/msi.c
-index d66ef88e13cf..2a203055b16e 100644
---- a/drivers/pci/msi.c
-+++ b/drivers/pci/msi.c
-@@ -211,7 +211,7 @@ u32 __pci_msix_desc_mask_irq(struct msi_desc *desc, u32 flag)
- 		return 0;
- 
- 	mask_bits &= ~PCI_MSIX_ENTRY_CTRL_MASKBIT;
--	if (flag)
-+	if (flag & PCI_MSIX_ENTRY_CTRL_MASKBIT)
- 		mask_bits |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
- 	writel(mask_bits, pci_msix_desc_addr(desc) + PCI_MSIX_ENTRY_VECTOR_CTRL);
- 
-diff --git a/drivers/pci/pci-driver.c b/drivers/pci/pci-driver.c
-index 7e4bec75fcde..522e59274b5d 100644
---- a/drivers/pci/pci-driver.c
-+++ b/drivers/pci/pci-driver.c
-@@ -967,17 +967,22 @@ static int pci_pm_thaw_noirq(struct device *dev)
- 			return error;
- 	}
- 
--	if (pci_has_legacy_pm_support(pci_dev))
--		return pci_legacy_resume_early(dev);
--
- 	/*
--	 * pci_restore_state() requires the device to be in D0 (because of MSI
--	 * restoration among other things), so force it into D0 in case the
--	 * driver's "freeze" callbacks put it into a low-power state directly.
-+	 * Both the legacy ->resume_early() and the new pm->thaw_noirq()
-+	 * callbacks assume the device has been returned to D0 and its
-+	 * config state has been restored.
-+	 *
-+	 * In addition, pci_restore_state() restores MSI-X state in MMIO
-+	 * space, which requires the device to be in D0, so return it to D0
-+	 * in case the driver's "freeze" callbacks put it into a low-power
-+	 * state.
- 	 */
- 	pci_set_power_state(pci_dev, PCI_D0);
- 	pci_restore_state(pci_dev);
- 
-+	if (pci_has_legacy_pm_support(pci_dev))
-+		return pci_legacy_resume_early(dev);
-+
- 	if (drv && drv->pm && drv->pm->thaw_noirq)
- 		error = drv->pm->thaw_noirq(dev);
- 
-diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
-index 45c3fbd38f50..90df085e9f92 100644
---- a/drivers/pci/quirks.c
-+++ b/drivers/pci/quirks.c
-@@ -4252,15 +4252,21 @@ static int pci_quirk_amd_sb_acs(struct pci_dev *dev, u16 acs_flags)
- 
- static bool pci_quirk_cavium_acs_match(struct pci_dev *dev)
- {
-+	if (!pci_is_pcie(dev) || pci_pcie_type(dev) != PCI_EXP_TYPE_ROOT_PORT)
-+		return false;
-+
-+	switch (dev->device) {
- 	/*
--	 * Effectively selects all downstream ports for whole ThunderX 1
--	 * family by 0xf800 mask (which represents 8 SoCs), while the lower
--	 * bits of device ID are used to indicate which subdevice is used
--	 * within the SoC.
-+	 * Effectively selects all downstream ports for whole ThunderX1
-+	 * (which represents 8 SoCs).
- 	 */
--	return (pci_is_pcie(dev) &&
--		(pci_pcie_type(dev) == PCI_EXP_TYPE_ROOT_PORT) &&
--		((dev->device & 0xf800) == 0xa000));
-+	case 0xa000 ... 0xa7ff: /* ThunderX1 */
-+	case 0xaf84:  /* ThunderX2 */
-+	case 0xb884:  /* ThunderX3 */
-+		return true;
-+	default:
-+		return false;
-+	}
- }
- 
- static int pci_quirk_cavium_acs(struct pci_dev *dev, u16 acs_flags)
-@@ -4600,7 +4606,7 @@ int pci_dev_specific_acs_enabled(struct pci_dev *dev, u16 acs_flags)
- #define INTEL_BSPR_REG_BPPD  (1 << 9)
- 
- /* Upstream Peer Decode Configuration Register */
--#define INTEL_UPDCR_REG 0x1114
-+#define INTEL_UPDCR_REG 0x1014
- /* 5:0 Peer Decode Enable bits */
- #define INTEL_UPDCR_REG_MASK 0x3f
- 
-diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
-index d2428c262b7c..b2cb4f497ef6 100644
---- a/drivers/regulator/core.c
-+++ b/drivers/regulator/core.c
-@@ -4503,7 +4503,7 @@ static int __init regulator_init(void)
- /* init early to allow our consumers to complete system booting */
- core_initcall(regulator_init);
- 
--static int regulator_late_cleanup(struct device *dev, void *data)
-+static int __init regulator_late_cleanup(struct device *dev, void *data)
- {
- 	struct regulator_dev *rdev = dev_to_rdev(dev);
- 	const struct regulator_ops *ops = rdev->desc->ops;
-@@ -4552,8 +4552,17 @@ unlock:
- 	return 0;
- }
- 
--static void regulator_init_complete_work_function(struct work_struct *work)
-+static int __init regulator_init_complete(void)
- {
-+	/*
-+	 * Since DT doesn't provide an idiomatic mechanism for
-+	 * enabling full constraints and since it's much more natural
-+	 * with DT to provide them just assume that a DT enabled
-+	 * system has full constraints.
-+	 */
-+	if (of_have_populated_dt())
-+		has_full_constraints = true;
-+
- 	/*
- 	 * Regulators may had failed to resolve their input supplies
- 	 * when were registered, either because the input supply was
-@@ -4571,35 +4580,6 @@ static void regulator_init_complete_work_function(struct work_struct *work)
- 	 */
- 	class_for_each_device(&regulator_class, NULL, NULL,
- 			      regulator_late_cleanup);
--}
--
--static DECLARE_DELAYED_WORK(regulator_init_complete_work,
--			    regulator_init_complete_work_function);
--
--static int __init regulator_init_complete(void)
--{
--	/*
--	 * Since DT doesn't provide an idiomatic mechanism for
--	 * enabling full constraints and since it's much more natural
--	 * with DT to provide them just assume that a DT enabled
--	 * system has full constraints.
--	 */
--	if (of_have_populated_dt())
--		has_full_constraints = true;
--
--	/*
--	 * We punt completion for an arbitrary amount of time since
--	 * systems like distros will load many drivers from userspace
--	 * so consumers might not always be ready yet, this is
--	 * particularly an issue with laptops where this might bounce
--	 * the display off then on.  Ideally we'd get a notification
--	 * from userspace when this happens but we don't so just wait
--	 * a bit and hope we waited long enough.  It'd be better if
--	 * we'd only do this on systems that need it, and a kernel
--	 * command line option might be useful.
--	 */
--	schedule_delayed_work(&regulator_init_complete_work,
--			      msecs_to_jiffies(30000));
- 
- 	return 0;
- }
-diff --git a/drivers/rpmsg/qcom_glink_native.c b/drivers/rpmsg/qcom_glink_native.c
-index e8e12c2b1d0e..1e6253f1e070 100644
---- a/drivers/rpmsg/qcom_glink_native.c
-+++ b/drivers/rpmsg/qcom_glink_native.c
-@@ -243,10 +243,31 @@ static void qcom_glink_channel_release(struct kref *ref)
- {
- 	struct glink_channel *channel = container_of(ref, struct glink_channel,
- 						     refcount);
-+	struct glink_core_rx_intent *intent;
-+	struct glink_core_rx_intent *tmp;
- 	unsigned long flags;
-+	int iid;
-+
-+	/* cancel pending rx_done work */
-+	cancel_work_sync(&channel->intent_work);
- 
- 	spin_lock_irqsave(&channel->intent_lock, flags);
-+	/* Free all non-reuse intents pending rx_done work */
-+	list_for_each_entry_safe(intent, tmp, &channel->done_intents, node) {
-+		if (!intent->reuse) {
-+			kfree(intent->data);
-+			kfree(intent);
-+		}
-+	}
-+
-+	idr_for_each_entry(&channel->liids, tmp, iid) {
-+		kfree(tmp->data);
-+		kfree(tmp);
-+	}
- 	idr_destroy(&channel->liids);
-+
-+	idr_for_each_entry(&channel->riids, tmp, iid)
-+		kfree(tmp);
- 	idr_destroy(&channel->riids);
- 	spin_unlock_irqrestore(&channel->intent_lock, flags);
- 
-@@ -1095,13 +1116,12 @@ static int qcom_glink_create_remote(struct qcom_glink *glink,
- close_link:
- 	/*
- 	 * Send a close request to "undo" our open-ack. The close-ack will
--	 * release the last reference.
-+	 * release qcom_glink_send_open_req() reference and the last reference
-+	 * will be relesed after receiving remote_close or transport unregister
-+	 * by calling qcom_glink_native_remove().
- 	 */
- 	qcom_glink_send_close_req(glink, channel);
- 
--	/* Release qcom_glink_send_open_req() reference */
--	kref_put(&channel->refcount, qcom_glink_channel_release);
--
- 	return ret;
- }
- 
-@@ -1392,15 +1412,13 @@ static int qcom_glink_rx_open(struct qcom_glink *glink, unsigned int rcid,
- 
- 		ret = rpmsg_register_device(rpdev);
- 		if (ret)
--			goto free_rpdev;
-+			goto rcid_remove;
- 
- 		channel->rpdev = rpdev;
- 	}
- 
- 	return 0;
- 
--free_rpdev:
--	kfree(rpdev);
- rcid_remove:
- 	spin_lock_irqsave(&glink->idr_lock, flags);
- 	idr_remove(&glink->rcids, channel->rcid);
-@@ -1521,6 +1539,18 @@ static void qcom_glink_work(struct work_struct *work)
- 	}
- }
- 
-+static void qcom_glink_cancel_rx_work(struct qcom_glink *glink)
-+{
-+	struct glink_defer_cmd *dcmd;
-+	struct glink_defer_cmd *tmp;
-+
-+	/* cancel any pending deferred rx_work */
-+	cancel_work_sync(&glink->rx_work);
-+
-+	list_for_each_entry_safe(dcmd, tmp, &glink->rx_queue, node)
-+		kfree(dcmd);
-+}
-+
- struct qcom_glink *qcom_glink_native_probe(struct device *dev,
- 					   unsigned long features,
- 					   struct qcom_glink_pipe *rx,
-@@ -1591,23 +1621,24 @@ void qcom_glink_native_remove(struct qcom_glink *glink)
- 	struct glink_channel *channel;
- 	int cid;
- 	int ret;
--	unsigned long flags;
- 
- 	disable_irq(glink->irq);
--	cancel_work_sync(&glink->rx_work);
-+	qcom_glink_cancel_rx_work(glink);
- 
- 	ret = device_for_each_child(glink->dev, NULL, qcom_glink_remove_device);
- 	if (ret)
- 		dev_warn(glink->dev, "Can't remove GLINK devices: %d\n", ret);
- 
--	spin_lock_irqsave(&glink->idr_lock, flags);
- 	/* Release any defunct local channels, waiting for close-ack */
- 	idr_for_each_entry(&glink->lcids, channel, cid)
- 		kref_put(&channel->refcount, qcom_glink_channel_release);
- 
-+	/* Release any defunct local channels, waiting for close-req */
-+	idr_for_each_entry(&glink->rcids, channel, cid)
-+		kref_put(&channel->refcount, qcom_glink_channel_release);
-+
- 	idr_destroy(&glink->lcids);
- 	idr_destroy(&glink->rcids);
--	spin_unlock_irqrestore(&glink->idr_lock, flags);
- 	mbox_free_channel(glink->mbox_chan);
- }
- EXPORT_SYMBOL_GPL(qcom_glink_native_remove);
-diff --git a/drivers/rpmsg/qcom_glink_smem.c b/drivers/rpmsg/qcom_glink_smem.c
-index 5cdaa5f8fb61..53b3a43160f4 100644
---- a/drivers/rpmsg/qcom_glink_smem.c
-+++ b/drivers/rpmsg/qcom_glink_smem.c
-@@ -119,7 +119,7 @@ static void glink_smem_rx_advance(struct qcom_glink_pipe *np,
- 	tail = le32_to_cpu(*pipe->tail);
- 
- 	tail += count;
--	if (tail > pipe->native.length)
-+	if (tail >= pipe->native.length)
- 		tail -= pipe->native.length;
- 
- 	*pipe->tail = cpu_to_le32(tail);
-diff --git a/drivers/scsi/libiscsi.c b/drivers/scsi/libiscsi.c
-index 5ea5d42bac76..662df16b07a4 100644
---- a/drivers/scsi/libiscsi.c
-+++ b/drivers/scsi/libiscsi.c
-@@ -1983,7 +1983,7 @@ enum blk_eh_timer_return iscsi_eh_cmd_timed_out(struct scsi_cmnd *sc)
- 
- 	ISCSI_DBG_EH(session, "scsi cmd %p timedout\n", sc);
- 
--	spin_lock(&session->frwd_lock);
-+	spin_lock_bh(&session->frwd_lock);
- 	task = (struct iscsi_task *)sc->SCp.ptr;
- 	if (!task) {
- 		/*
-@@ -2110,7 +2110,7 @@ enum blk_eh_timer_return iscsi_eh_cmd_timed_out(struct scsi_cmnd *sc)
- done:
- 	if (task)
- 		task->last_timeout = jiffies;
--	spin_unlock(&session->frwd_lock);
-+	spin_unlock_bh(&session->frwd_lock);
- 	ISCSI_DBG_EH(session, "return %s\n", rc == BLK_EH_RESET_TIMER ?
- 		     "timer reset" : "shutdown or nh");
- 	return rc;
-diff --git a/drivers/usb/host/xhci-hub.c b/drivers/usb/host/xhci-hub.c
-index 95503bb9b067..d1363f3fabfa 100644
---- a/drivers/usb/host/xhci-hub.c
-+++ b/drivers/usb/host/xhci-hub.c
-@@ -887,6 +887,14 @@ static u32 xhci_get_port_status(struct usb_hcd *hcd,
- 			status |= USB_PORT_STAT_C_BH_RESET << 16;
- 		if ((raw_port_status & PORT_CEC))
- 			status |= USB_PORT_STAT_C_CONFIG_ERROR << 16;
-+
-+		/* USB3 remote wake resume signaling completed */
-+		if (bus_state->port_remote_wakeup & (1 << wIndex) &&
-+		    (raw_port_status & PORT_PLS_MASK) != XDEV_RESUME &&
-+		    (raw_port_status & PORT_PLS_MASK) != XDEV_RECOVERY) {
-+			bus_state->port_remote_wakeup &= ~(1 << wIndex);
-+			usb_hcd_end_port_resume(&hcd->self, wIndex);
-+		}
- 	}
- 
- 	if (hcd->speed < HCD_USB3) {
-diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
-index 89af395cd89c..61fa3007a74a 100644
---- a/drivers/usb/host/xhci-ring.c
-+++ b/drivers/usb/host/xhci-ring.c
-@@ -1679,9 +1679,6 @@ static void handle_port_status(struct xhci_hcd *xhci,
- 		usb_hcd_resume_root_hub(hcd);
- 	}
- 
--	if (hcd->speed >= HCD_USB3 && (portsc & PORT_PLS_MASK) == XDEV_INACTIVE)
--		bus_state->port_remote_wakeup &= ~(1 << faked_port_index);
--
- 	if ((portsc & PORT_PLC) && (portsc & PORT_PLS_MASK) == XDEV_RESUME) {
- 		xhci_dbg(xhci, "port resume event for port %d\n", port_id);
- 
-@@ -1700,6 +1697,7 @@ static void handle_port_status(struct xhci_hcd *xhci,
- 			bus_state->port_remote_wakeup |= 1 << faked_port_index;
- 			xhci_test_and_clear_bit(xhci, port_array,
- 					faked_port_index, PORT_PLC);
-+			usb_hcd_start_port_resume(&hcd->self, faked_port_index);
- 			xhci_set_link_state(xhci, port_array, faked_port_index,
- 						XDEV_U0);
- 			/* Need to wait until the next link state change
-@@ -1737,8 +1735,6 @@ static void handle_port_status(struct xhci_hcd *xhci,
- 		if (slot_id && xhci->devs[slot_id])
- 			xhci_ring_device(xhci, slot_id);
- 		if (bus_state->port_remote_wakeup & (1 << faked_port_index)) {
--			bus_state->port_remote_wakeup &=
--				~(1 << faked_port_index);
- 			xhci_test_and_clear_bit(xhci, port_array,
- 					faked_port_index, PORT_PLC);
- 			usb_wakeup_notification(hcd->self.root_hub,
-diff --git a/drivers/vfio/pci/vfio_pci_intrs.c b/drivers/vfio/pci/vfio_pci_intrs.c
-index 1c46045b0e7f..94594dc63c41 100644
---- a/drivers/vfio/pci/vfio_pci_intrs.c
-+++ b/drivers/vfio/pci/vfio_pci_intrs.c
-@@ -297,8 +297,8 @@ static int vfio_msi_set_vector_signal(struct vfio_pci_device *vdev,
- 	irq = pci_irq_vector(pdev, vector);
- 
- 	if (vdev->ctx[vector].trigger) {
--		free_irq(irq, vdev->ctx[vector].trigger);
- 		irq_bypass_unregister_producer(&vdev->ctx[vector].producer);
-+		free_irq(irq, vdev->ctx[vector].trigger);
- 		kfree(vdev->ctx[vector].name);
- 		eventfd_ctx_put(vdev->ctx[vector].trigger);
- 		vdev->ctx[vector].trigger = NULL;
-diff --git a/fs/cifs/file.c b/fs/cifs/file.c
-index 6dc0e092b0fc..5e75c5f77f4c 100644
---- a/fs/cifs/file.c
-+++ b/fs/cifs/file.c
-@@ -722,6 +722,13 @@ cifs_reopen_file(struct cifsFileInfo *cfile, bool can_flush)
- 	if (backup_cred(cifs_sb))
- 		create_options |= CREATE_OPEN_BACKUP_INTENT;
- 
-+	/* O_SYNC also has bit for O_DSYNC so following check picks up either */
-+	if (cfile->f_flags & O_SYNC)
-+		create_options |= CREATE_WRITE_THROUGH;
-+
-+	if (cfile->f_flags & O_DIRECT)
-+		create_options |= CREATE_NO_BUFFER;
-+
- 	if (server->ops->get_lease_key)
- 		server->ops->get_lease_key(inode, &cfile->fid);
- 
-diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
-index 4725a9d9597f..8818291815bc 100644
---- a/include/linux/netdevice.h
-+++ b/include/linux/netdevice.h
-@@ -1718,6 +1718,11 @@ struct net_device {
- 	unsigned char		if_port;
- 	unsigned char		dma;
- 
-+	/* Note : dev->mtu is often read without holding a lock.
-+	 * Writers usually hold RTNL.
-+	 * It is recommended to use READ_ONCE() to annotate the reads,
-+	 * and to use WRITE_ONCE() to annotate the writes.
-+	 */
- 	unsigned int		mtu;
- 	unsigned int		min_mtu;
- 	unsigned int		max_mtu;
-diff --git a/include/linux/time.h b/include/linux/time.h
-index 87c36cf1cec2..21086c5143d9 100644
---- a/include/linux/time.h
-+++ b/include/linux/time.h
-@@ -301,4 +301,17 @@ static inline bool itimerspec64_valid(const struct itimerspec64 *its)
-  */
- #define time_after32(a, b)	((s32)((u32)(b) - (u32)(a)) < 0)
- #define time_before32(b, a)	time_after32(a, b)
-+
-+/**
-+ * time_between32 - check if a 32-bit timestamp is within a given time range
-+ * @t:	the time which may be within [l,h]
-+ * @l:	the lower bound of the range
-+ * @h:	the higher bound of the range
-+ *
-+ * time_before32(t, l, h) returns true if @l <= @t <= @h. All operands are
-+ * treated as 32-bit integers.
-+ *
-+ * Equivalent to !(time_before32(@t, @l) || time_after32(@t, @h)).
-+ */
-+#define time_between32(t, l, h) ((u32)(h) - (u32)(l) >= (u32)(t) - (u32)(l))
- #endif
-diff --git a/include/net/ip.h b/include/net/ip.h
-index b8ebee43941f..666d89ca4e2e 100644
---- a/include/net/ip.h
-+++ b/include/net/ip.h
-@@ -644,4 +644,9 @@ extern int sysctl_icmp_msgs_burst;
- int ip_misc_proc_init(void);
- #endif
- 
-+static inline bool inetdev_valid_mtu(unsigned int mtu)
-+{
-+	return likely(mtu >= IPV4_MIN_MTU);
-+}
-+
- #endif	/* _IP_H */
-diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 785c4ef4e1bf..00d10f0e1194 100644
---- a/include/net/tcp.h
-+++ b/include/net/tcp.h
-@@ -500,19 +500,27 @@ struct sock *cookie_v4_check(struct sock *sk, struct sk_buff *skb);
-  */
- static inline void tcp_synq_overflow(const struct sock *sk)
- {
--	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
-+	unsigned long last_overflow = READ_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp);
- 	unsigned long now = jiffies;
- 
--	if (time_after(now, last_overflow + HZ))
--		tcp_sk(sk)->rx_opt.ts_recent_stamp = now;
-+	if (!time_between32(now, last_overflow, last_overflow + HZ))
-+		WRITE_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp, now);
- }
- 
- /* syncookies: no recent synqueue overflow on this listening socket? */
- static inline bool tcp_synq_no_recent_overflow(const struct sock *sk)
- {
--	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
-+	unsigned long last_overflow = READ_ONCE(tcp_sk(sk)->rx_opt.ts_recent_stamp);
- 
--	return time_after(jiffies, last_overflow + TCP_SYNCOOKIE_VALID);
-+	/* If last_overflow <= jiffies <= last_overflow + TCP_SYNCOOKIE_VALID,
-+	 * then we're under synflood. However, we have to use
-+	 * 'last_overflow - HZ' as lower bound. That's because a concurrent
-+	 * tcp_synq_overflow() could update .ts_recent_stamp after we read
-+	 * jiffies but before we store .ts_recent_stamp into last_overflow,
-+	 * which could lead to rejecting a valid syncookie.
-+	 */
-+	return !time_between32(jiffies, last_overflow - HZ,
-+			       last_overflow + TCP_SYNCOOKIE_VALID);
- }
- 
- static inline u32 tcp_cookie_time(void)
-diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
-index f6b6a92f1c48..b7cc322acdc8 100644
---- a/net/bridge/br_device.c
-+++ b/net/bridge/br_device.c
-@@ -217,6 +217,12 @@ static int br_set_mac_address(struct net_device *dev, void *p)
- 	if (!is_valid_ether_addr(addr->sa_data))
- 		return -EADDRNOTAVAIL;
- 
-+	/* dev_set_mac_addr() can be called by a master device on bridge's
-+	 * NETDEV_UNREGISTER, but since it's being destroyed do nothing
-+	 */
-+	if (dev->reg_state != NETREG_REGISTERED)
-+		return -EBUSY;
-+
- 	spin_lock_bh(&br->lock);
- 	if (!ether_addr_equal(dev->dev_addr, addr->sa_data)) {
- 		/* Mac address will be changed in br_stp_change_bridge_id(). */
-diff --git a/net/core/dev.c b/net/core/dev.c
-index 3ce68484ed5a..f9f05b3df460 100644
---- a/net/core/dev.c
-+++ b/net/core/dev.c
-@@ -6876,7 +6876,8 @@ int __dev_set_mtu(struct net_device *dev, int new_mtu)
- 	if (ops->ndo_change_mtu)
- 		return ops->ndo_change_mtu(dev, new_mtu);
- 
--	dev->mtu = new_mtu;
-+	/* Pairs with all the lockless reads of dev->mtu in the stack */
-+	WRITE_ONCE(dev->mtu, new_mtu);
- 	return 0;
- }
- EXPORT_SYMBOL(__dev_set_mtu);
-diff --git a/net/core/flow_dissector.c b/net/core/flow_dissector.c
-index 7be5c20a93a5..071de3013364 100644
---- a/net/core/flow_dissector.c
-+++ b/net/core/flow_dissector.c
-@@ -450,9 +450,10 @@ bool __skb_flow_dissect(const struct sk_buff *skb,
- 		nhoff = skb_network_offset(skb);
- 		hlen = skb_headlen(skb);
- #if IS_ENABLED(CONFIG_NET_DSA)
--		if (unlikely(skb->dev && netdev_uses_dsa(skb->dev))) {
-+		if (unlikely(skb->dev && netdev_uses_dsa(skb->dev) &&
-+			     proto == htons(ETH_P_XDSA))) {
- 			const struct dsa_device_ops *ops;
--			int offset;
-+			int offset = 0;
- 
- 			ops = skb->dev->dsa_ptr->tag_ops;
- 			if (ops->flow_dissect &&
-diff --git a/net/ipv4/devinet.c b/net/ipv4/devinet.c
-index 5264510c9983..5f020c051af9 100644
---- a/net/ipv4/devinet.c
-+++ b/net/ipv4/devinet.c
-@@ -1426,11 +1426,6 @@ skip:
- 	}
- }
- 
--static bool inetdev_valid_mtu(unsigned int mtu)
--{
--	return mtu >= IPV4_MIN_MTU;
--}
--
- static void inetdev_send_gratuitous_arp(struct net_device *dev,
- 					struct in_device *in_dev)
- 
-diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
-index 34d49f76d1a7..73cd64c7692f 100644
---- a/net/ipv4/ip_output.c
-+++ b/net/ipv4/ip_output.c
-@@ -1123,13 +1123,17 @@ static int ip_setup_cork(struct sock *sk, struct inet_cork *cork,
- 	rt = *rtp;
- 	if (unlikely(!rt))
- 		return -EFAULT;
--	/*
--	 * We steal reference to this route, caller should not release it
--	 */
--	*rtp = NULL;
-+
- 	cork->fragsize = ip_sk_use_pmtu(sk) ?
--			 dst_mtu(&rt->dst) : rt->dst.dev->mtu;
-+			 dst_mtu(&rt->dst) : READ_ONCE(rt->dst.dev->mtu);
-+
-+	if (!inetdev_valid_mtu(cork->fragsize))
-+		return -ENETUNREACH;
-+
- 	cork->dst = &rt->dst;
-+	/* We stole this route, caller should not release it. */
-+	*rtp = NULL;
-+
- 	cork->length = 0;
- 	cork->ttl = ipc->ttl;
- 	cork->tos = ipc->tos;
-diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
-index 6025cc509d97..e3b28140c10b 100644
---- a/net/ipv4/tcp_output.c
-+++ b/net/ipv4/tcp_output.c
-@@ -708,8 +708,9 @@ static unsigned int tcp_established_options(struct sock *sk, struct sk_buff *skb
- 			min_t(unsigned int, eff_sacks,
- 			      (remaining - TCPOLEN_SACK_BASE_ALIGNED) /
- 			      TCPOLEN_SACK_PERBLOCK);
--		size += TCPOLEN_SACK_BASE_ALIGNED +
--			opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
-+		if (likely(opts->num_sack_blocks))
-+			size += TCPOLEN_SACK_BASE_ALIGNED +
-+				opts->num_sack_blocks * TCPOLEN_SACK_PERBLOCK;
- 	}
- 
- 	return size;
-diff --git a/net/openvswitch/conntrack.c b/net/openvswitch/conntrack.c
-index 48d81857961c..737e37b28d93 100644
---- a/net/openvswitch/conntrack.c
-+++ b/net/openvswitch/conntrack.c
-@@ -879,6 +879,17 @@ static int ovs_ct_nat(struct net *net, struct sw_flow_key *key,
- 	}
- 	err = ovs_ct_nat_execute(skb, ct, ctinfo, &info->range, maniptype);
- 
-+	if (err == NF_ACCEPT &&
-+	    ct->status & IPS_SRC_NAT && ct->status & IPS_DST_NAT) {
-+		if (maniptype == NF_NAT_MANIP_SRC)
-+			maniptype = NF_NAT_MANIP_DST;
-+		else
-+			maniptype = NF_NAT_MANIP_SRC;
-+
-+		err = ovs_ct_nat_execute(skb, ct, ctinfo, &info->range,
-+					 maniptype);
-+	}
-+
- 	/* Mark NAT done if successful and update the flow key. */
- 	if (err == NF_ACCEPT)
- 		ovs_nat_update_key(key, skb, maniptype);
-diff --git a/net/tipc/core.c b/net/tipc/core.c
-index 67ac10434ba2..35f162ece2b7 100644
---- a/net/tipc/core.c
-+++ b/net/tipc/core.c
-@@ -116,14 +116,6 @@ static int __init tipc_init(void)
- 	sysctl_tipc_rmem[1] = RCVBUF_DEF;
- 	sysctl_tipc_rmem[2] = RCVBUF_MAX;
- 
--	err = tipc_netlink_start();
--	if (err)
--		goto out_netlink;
--
--	err = tipc_netlink_compat_start();
--	if (err)
--		goto out_netlink_compat;
--
- 	err = tipc_register_sysctl();
- 	if (err)
- 		goto out_sysctl;
-@@ -144,8 +136,21 @@ static int __init tipc_init(void)
- 	if (err)
- 		goto out_bearer;
- 
-+	err = tipc_netlink_start();
-+	if (err)
-+		goto out_netlink;
-+
-+	err = tipc_netlink_compat_start();
-+	if (err)
-+		goto out_netlink_compat;
-+
- 	pr_info("Started in single node mode\n");
- 	return 0;
-+
-+out_netlink_compat:
-+	tipc_netlink_stop();
-+out_netlink:
-+	tipc_bearer_cleanup();
- out_bearer:
- 	unregister_pernet_device(&tipc_topsrv_net_ops);
- out_pernet_topsrv:
-@@ -155,22 +160,18 @@ out_socket:
- out_pernet:
- 	tipc_unregister_sysctl();
- out_sysctl:
--	tipc_netlink_compat_stop();
--out_netlink_compat:
--	tipc_netlink_stop();
--out_netlink:
- 	pr_err("Unable to start in single node mode\n");
- 	return err;
- }
- 
- static void __exit tipc_exit(void)
- {
-+	tipc_netlink_compat_stop();
-+	tipc_netlink_stop();
- 	tipc_bearer_cleanup();
- 	unregister_pernet_device(&tipc_topsrv_net_ops);
- 	tipc_socket_stop();
- 	unregister_pernet_device(&tipc_net_ops);
--	tipc_netlink_stop();
--	tipc_netlink_compat_stop();
- 	tipc_unregister_sysctl();
- 
- 	pr_info("Deactivated\n");
+-- 
+2.28.0
+

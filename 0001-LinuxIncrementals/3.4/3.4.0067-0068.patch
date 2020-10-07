@@ -1,15 +1,435 @@
-diff --git a/Makefile b/Makefile
-index 9f440dd8256c..656c45f09128 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 4
--SUBLEVEL = 67
-+SUBLEVEL = 68
- EXTRAVERSION =
- NAME = Saber-toothed Squirrel
+From 11db1e4cee071defc371d0fc7f1740024fbe5b06 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 15 Oct 2013 11:54:30 -0700
+Subject: [PATCH 01/33] tcp: must unclone packets before mangling them
+
+[ Upstream commit c52e2421f7368fd36cbe330d2cf41b10452e39a9 ]
+
+TCP stack should make sure it owns skbs before mangling them.
+
+We had various crashes using bnx2x, and it turned out gso_size
+was cleared right before bnx2x driver was populating TC descriptor
+of the _previous_ packet send. TCP stack can sometime retransmit
+packets that are still in Qdisc.
+
+Of course we could make bnx2x driver more robust (using
+ACCESS_ONCE(shinfo->gso_size) for example), but the bug is TCP stack.
+
+We have identified two points where skb_unclone() was needed.
+
+This patch adds a WARN_ON_ONCE() to warn us if we missed another
+fix of this kind.
+
+Kudos to Neal for finding the root cause of this bug. Its visible
+using small MSS.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Neal Cardwell <ncardwell@google.com>
+Cc: Yuchung Cheng <ycheng@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/skbuff.h | 10 ++++++++++
+ net/ipv4/tcp_output.c  |  9 ++++++---
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index dc4d49a0c07d..daabf24655af 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -760,6 +760,16 @@ static inline int skb_cloned(const struct sk_buff *skb)
+ 	       (atomic_read(&skb_shinfo(skb)->dataref) & SKB_DATAREF_MASK) != 1;
+ }
  
++static inline int skb_unclone(struct sk_buff *skb, gfp_t pri)
++{
++	might_sleep_if(pri & __GFP_WAIT);
++
++	if (skb_cloned(skb))
++		return pskb_expand_head(skb, 0, 0, pri);
++
++	return 0;
++}
++
+ /**
+  *	skb_header_cloned - is the header a clone
+  *	@skb: buffer to check
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 12999a3aaf95..987f5cc706b4 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -933,6 +933,9 @@ static void tcp_queue_skb(struct sock *sk, struct sk_buff *skb)
+ static void tcp_set_skb_tso_segs(const struct sock *sk, struct sk_buff *skb,
+ 				 unsigned int mss_now)
+ {
++	/* Make sure we own this skb before messing gso_size/gso_segs */
++	WARN_ON_ONCE(skb_cloned(skb));
++
+ 	if (skb->len <= mss_now || !sk_can_gso(sk) ||
+ 	    skb->ip_summed == CHECKSUM_NONE) {
+ 		/* Avoid the costly divide in the normal
+@@ -1014,9 +1017,7 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
+ 	if (nsize < 0)
+ 		nsize = 0;
+ 
+-	if (skb_cloned(skb) &&
+-	    skb_is_nonlinear(skb) &&
+-	    pskb_expand_head(skb, 0, 0, GFP_ATOMIC))
++	if (skb_unclone(skb, GFP_ATOMIC))
+ 		return -ENOMEM;
+ 
+ 	/* Get a new skb... force flag on. */
+@@ -2129,6 +2130,8 @@ int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
+ 		int oldpcount = tcp_skb_pcount(skb);
+ 
+ 		if (unlikely(oldpcount > 1)) {
++			if (skb_unclone(skb, GFP_ATOMIC))
++				return -ENOMEM;
+ 			tcp_init_tso_segs(sk, skb, cur_mss);
+ 			tcp_adjust_pcount(sk, skb, oldpcount - tcp_skb_pcount(skb));
+ 		}
+-- 
+2.28.0
+
+
+From d1e668e717a602aa9a3c831711472c3e5d19ce7e Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Fri, 4 Oct 2013 10:31:41 -0700
+Subject: [PATCH 02/33] tcp: do not forget FIN in tcp_shifted_skb()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 5e8a402f831dbe7ee831340a91439e46f0d38acd ]
+
+Yuchung found following problem :
+
+ There are bugs in the SACK processing code, merging part in
+ tcp_shift_skb_data(), that incorrectly resets or ignores the sacked
+ skbs FIN flag. When a receiver first SACK the FIN sequence, and later
+ throw away ofo queue (e.g., sack-reneging), the sender will stop
+ retransmitting the FIN flag, and hangs forever.
+
+Following packetdrill test can be used to reproduce the bug.
+
+$ cat sack-merge-bug.pkt
+`sysctl -q net.ipv4.tcp_fack=0`
+
+// Establish a connection and send 10 MSS.
+0.000 socket(..., SOCK_STREAM, IPPROTO_TCP) = 3
++.000 setsockopt(3, SOL_SOCKET, SO_REUSEADDR, [1], 4) = 0
++.000 bind(3, ..., ...) = 0
++.000 listen(3, 1) = 0
+
++.050 < S 0:0(0) win 32792 <mss 1000,sackOK,nop,nop,nop,wscale 7>
++.000 > S. 0:0(0) ack 1 <mss 1460,nop,nop,sackOK,nop,wscale 6>
++.001 < . 1:1(0) ack 1 win 1024
++.000 accept(3, ..., ...) = 4
+
++.100 write(4, ..., 12000) = 12000
++.000 shutdown(4, SHUT_WR) = 0
++.000 > . 1:10001(10000) ack 1
++.050 < . 1:1(0) ack 2001 win 257
++.000 > FP. 10001:12001(2000) ack 1
++.050 < . 1:1(0) ack 2001 win 257 <sack 10001:11001,nop,nop>
++.050 < . 1:1(0) ack 2001 win 257 <sack 10001:12002,nop,nop>
+// SACK reneg
++.050 < . 1:1(0) ack 12001 win 257
++0 %{ print "unacked: ",tcpi_unacked }%
++5 %{ print "" }%
+
+First, a typo inverted left/right of one OR operation, then
+code forgot to advance end_seq if the merged skb carried FIN.
+
+Bug was added in 2.6.29 by commit 832d11c5cd076ab
+("tcp: Try to restore large SKBs while SACK processing")
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Yuchung Cheng <ycheng@google.com>
+Acked-by: Neal Cardwell <ncardwell@google.com>
+Cc: Ilpo Järvinen <ilpo.jarvinen@helsinki.fi>
+Acked-by: Ilpo Järvinen <ilpo.jarvinen@helsinki.fi>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/tcp_input.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 55d96c392e7f..99eb909c9d5f 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -1468,7 +1468,10 @@ static int tcp_shifted_skb(struct sock *sk, struct sk_buff *skb,
+ 		tp->lost_cnt_hint -= tcp_skb_pcount(prev);
+ 	}
+ 
+-	TCP_SKB_CB(skb)->tcp_flags |= TCP_SKB_CB(prev)->tcp_flags;
++	TCP_SKB_CB(prev)->tcp_flags |= TCP_SKB_CB(skb)->tcp_flags;
++	if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
++		TCP_SKB_CB(prev)->end_seq++;
++
+ 	if (skb == tcp_highest_sack(sk))
+ 		tcp_advance_highest_sack(sk, skb);
+ 
+-- 
+2.28.0
+
+
+From 791673fbfa0c130e13b81a6c9e7036e5361986e4 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 1 Oct 2013 21:04:11 -0700
+Subject: [PATCH 03/33] net: do not call sock_put() on TIMEWAIT sockets
+
+[ Upstream commit 80ad1d61e72d626e30ebe8529a0455e660ca4693 ]
+
+commit 3ab5aee7fe84 ("net: Convert TCP & DCCP hash tables to use RCU /
+hlist_nulls") incorrectly used sock_put() on TIMEWAIT sockets.
+
+We should instead use inet_twsk_put()
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/inet_hashtables.c  | 2 +-
+ net/ipv6/inet6_hashtables.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
+index 984ec656b03b..4afcf31bdfeb 100644
+--- a/net/ipv4/inet_hashtables.c
++++ b/net/ipv4/inet_hashtables.c
+@@ -268,7 +268,7 @@ begintw:
+ 			}
+ 			if (unlikely(!INET_TW_MATCH(sk, net, hash, acookie,
+ 				 saddr, daddr, ports, dif))) {
+-				sock_put(sk);
++				inet_twsk_put(inet_twsk(sk));
+ 				goto begintw;
+ 			}
+ 			goto out;
+diff --git a/net/ipv6/inet6_hashtables.c b/net/ipv6/inet6_hashtables.c
+index 73f1a00a96af..e38290b7c7a1 100644
+--- a/net/ipv6/inet6_hashtables.c
++++ b/net/ipv6/inet6_hashtables.c
+@@ -110,7 +110,7 @@ begintw:
+ 				goto out;
+ 			}
+ 			if (!INET6_TW_MATCH(sk, net, hash, saddr, daddr, ports, dif)) {
+-				sock_put(sk);
++				inet_twsk_put(inet_twsk(sk));
+ 				goto begintw;
+ 			}
+ 			goto out;
+-- 
+2.28.0
+
+
+From 75120c139e01f967659134c895f8915eff96fc66 Mon Sep 17 00:00:00 2001
+From: Sebastian Hesselbarth <sebastian.hesselbarth@gmail.com>
+Date: Wed, 2 Oct 2013 12:57:20 +0200
+Subject: [PATCH 04/33] net: mv643xx_eth: update statistics timer from timer
+ context only
+
+[ Upstream commit 041b4ddb84989f06ff1df0ca869b950f1ee3cb1c ]
+
+Each port driver installs a periodic timer to update port statistics
+by calling mib_counters_update. As mib_counters_update is also called
+from non-timer context, we should not reschedule the timer there but
+rather move it to timer-only context.
+
+Signed-off-by: Sebastian Hesselbarth <sebastian.hesselbarth@gmail.com>
+Acked-by: Jason Cooper <jason@lakedaemon.net>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/marvell/mv643xx_eth.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/marvell/mv643xx_eth.c b/drivers/net/ethernet/marvell/mv643xx_eth.c
+index 5e1ca0f05090..cb6f32ebe13f 100644
+--- a/drivers/net/ethernet/marvell/mv643xx_eth.c
++++ b/drivers/net/ethernet/marvell/mv643xx_eth.c
+@@ -1274,15 +1274,13 @@ static void mib_counters_update(struct mv643xx_eth_private *mp)
+ 	p->rx_discard += rdlp(mp, RX_DISCARD_FRAME_CNT);
+ 	p->rx_overrun += rdlp(mp, RX_OVERRUN_FRAME_CNT);
+ 	spin_unlock_bh(&mp->mib_counters_lock);
+-
+-	mod_timer(&mp->mib_counters_timer, jiffies + 30 * HZ);
+ }
+ 
+ static void mib_counters_timer_wrapper(unsigned long _mp)
+ {
+ 	struct mv643xx_eth_private *mp = (void *)_mp;
+-
+ 	mib_counters_update(mp);
++	mod_timer(&mp->mib_counters_timer, jiffies + 30 * HZ);
+ }
+ 
+ 
+-- 
+2.28.0
+
+
+From 7ee57de6eb2cb7196d502028c72a247cec591e8a Mon Sep 17 00:00:00 2001
+From: Sebastian Hesselbarth <sebastian.hesselbarth@gmail.com>
+Date: Wed, 2 Oct 2013 12:57:21 +0200
+Subject: [PATCH 05/33] net: mv643xx_eth: fix orphaned statistics timer crash
+
+[ Upstream commit f564412c935111c583b787bcc18157377b208e2e ]
+
+The periodic statistics timer gets started at port _probe() time, but
+is stopped on _stop() only. In a modular environment, this can cause
+the timer to access already deallocated memory, if the module is unloaded
+without starting the eth device. To fix this, we add the timer right
+before the port is started, instead of at _probe() time.
+
+Signed-off-by: Sebastian Hesselbarth <sebastian.hesselbarth@gmail.com>
+Acked-by: Jason Cooper <jason@lakedaemon.net>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/marvell/mv643xx_eth.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/marvell/mv643xx_eth.c b/drivers/net/ethernet/marvell/mv643xx_eth.c
+index cb6f32ebe13f..ffa6a72dcc60 100644
+--- a/drivers/net/ethernet/marvell/mv643xx_eth.c
++++ b/drivers/net/ethernet/marvell/mv643xx_eth.c
+@@ -2368,6 +2368,7 @@ static int mv643xx_eth_open(struct net_device *dev)
+ 		mp->int_mask |= INT_TX_END_0 << i;
+ 	}
+ 
++	add_timer(&mp->mib_counters_timer);
+ 	port_start(mp);
+ 
+ 	wrlp(mp, INT_MASK_EXT, INT_EXT_LINK_PHY | INT_EXT_TX);
+@@ -2909,7 +2910,6 @@ static int mv643xx_eth_probe(struct platform_device *pdev)
+ 	mp->mib_counters_timer.data = (unsigned long)mp;
+ 	mp->mib_counters_timer.function = mib_counters_timer_wrapper;
+ 	mp->mib_counters_timer.expires = jiffies + 30 * HZ;
+-	add_timer(&mp->mib_counters_timer);
+ 
+ 	spin_lock_init(&mp->mib_counters_lock);
+ 
+-- 
+2.28.0
+
+
+From 5684fac30a35554a167bf4f1b2c1e47fb6464e3d Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@oracle.com>
+Date: Thu, 3 Oct 2013 00:27:20 +0300
+Subject: [PATCH 06/33] net: heap overflow in __audit_sockaddr()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 1661bf364ae9c506bc8795fef70d1532931be1e8 ]
+
+We need to cap ->msg_namelen or it leads to a buffer overflow when we
+to the memcpy() in __audit_sockaddr().  It requires CAP_AUDIT_CONTROL to
+exploit this bug.
+
+The call tree is:
+___sys_recvmsg()
+  move_addr_to_user()
+    audit_sockaddr()
+      __audit_sockaddr()
+
+Reported-by: Jüri Aedla <juri.aedla@gmail.com>
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/compat.c |  2 ++
+ net/socket.c | 24 ++++++++++++++++++++----
+ 2 files changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/net/compat.c b/net/compat.c
+index 014e1c78ecc5..ee84d82d7287 100644
+--- a/net/compat.c
++++ b/net/compat.c
+@@ -71,6 +71,8 @@ int get_compat_msghdr(struct msghdr *kmsg, struct compat_msghdr __user *umsg)
+ 	    __get_user(kmsg->msg_controllen, &umsg->msg_controllen) ||
+ 	    __get_user(kmsg->msg_flags, &umsg->msg_flags))
+ 		return -EFAULT;
++	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
++		return -EINVAL;
+ 	kmsg->msg_name = compat_ptr(tmp1);
+ 	kmsg->msg_iov = compat_ptr(tmp2);
+ 	kmsg->msg_control = compat_ptr(tmp3);
+diff --git a/net/socket.c b/net/socket.c
+index 47ce3ea44300..acc769562707 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -1899,6 +1899,16 @@ struct used_address {
+ 	unsigned int name_len;
+ };
+ 
++static int copy_msghdr_from_user(struct msghdr *kmsg,
++				 struct msghdr __user *umsg)
++{
++	if (copy_from_user(kmsg, umsg, sizeof(struct msghdr)))
++		return -EFAULT;
++	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
++		return -EINVAL;
++	return 0;
++}
++
+ static int ___sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
+ 			  struct msghdr *msg_sys, unsigned flags,
+ 			  struct used_address *used_address)
+@@ -1917,8 +1927,11 @@ static int ___sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
+ 	if (MSG_CMSG_COMPAT & flags) {
+ 		if (get_compat_msghdr(msg_sys, msg_compat))
+ 			return -EFAULT;
+-	} else if (copy_from_user(msg_sys, msg, sizeof(struct msghdr)))
+-		return -EFAULT;
++	} else {
++		err = copy_msghdr_from_user(msg_sys, msg);
++		if (err)
++			return err;
++	}
+ 
+ 	/* do not move before msg_sys is valid */
+ 	err = -EMSGSIZE;
+@@ -2129,8 +2142,11 @@ static int ___sys_recvmsg(struct socket *sock, struct msghdr __user *msg,
+ 	if (MSG_CMSG_COMPAT & flags) {
+ 		if (get_compat_msghdr(msg_sys, msg_compat))
+ 			return -EFAULT;
+-	} else if (copy_from_user(msg_sys, msg, sizeof(struct msghdr)))
+-		return -EFAULT;
++	} else {
++		err = copy_msghdr_from_user(msg_sys, msg);
++		if (err)
++			return err;
++	}
+ 
+ 	err = -EMSGSIZE;
+ 	if (msg_sys->msg_iovlen > UIO_MAXIOV)
+-- 
+2.28.0
+
+
+From 23fd882bca9884d48d8dee9cd0294b955961b004 Mon Sep 17 00:00:00 2001
+From: Mathias Krause <minipli@googlemail.com>
+Date: Mon, 30 Sep 2013 22:03:06 +0200
+Subject: [PATCH 07/33] proc connector: fix info leaks
+
+[ Upstream commit e727ca82e0e9616ab4844301e6bae60ca7327682 ]
+
+Initialize event_data for all possible message types to prevent leaking
+kernel stack contents to userland (up to 20 bytes). Also set the flags
+member of the connector message to 0 to prevent leaking two more stack
+bytes this way.
+
+Signed-off-by: Mathias Krause <minipli@googlemail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/connector/cn_proc.c | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
 diff --git a/drivers/connector/cn_proc.c b/drivers/connector/cn_proc.c
 index 77e1e6cd66ce..2894461e0bdb 100644
 --- a/drivers/connector/cn_proc.c
@@ -142,6 +562,564 @@ index 77e1e6cd66ce..2894461e0bdb 100644
  	cn_netlink_send(msg, CN_IDX_PROC, GFP_KERNEL);
  }
  
+-- 
+2.28.0
+
+
+From ad61d4c760976880cf5a9f2e14f6cbb487bef59a Mon Sep 17 00:00:00 2001
+From: Jiri Benc <jbenc@redhat.com>
+Date: Fri, 4 Oct 2013 17:04:48 +0200
+Subject: [PATCH 08/33] ipv4: fix ineffective source address selection
+
+[ Upstream commit 0a7e22609067ff524fc7bbd45c6951dd08561667 ]
+
+When sending out multicast messages, the source address in inet->mc_addr is
+ignored and rewritten by an autoselected one. This is caused by a typo in
+commit 813b3b5db831 ("ipv4: Use caller's on-stack flowi as-is in output
+route lookups").
+
+Signed-off-by: Jiri Benc <jbenc@redhat.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/route.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index 167ea10b521a..108c73d760df 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -2713,7 +2713,7 @@ static struct rtable *ip_route_output_slow(struct net *net, struct flowi4 *fl4)
+ 							      RT_SCOPE_LINK);
+ 			goto make_route;
+ 		}
+-		if (fl4->saddr) {
++		if (!fl4->saddr) {
+ 			if (ipv4_is_multicast(fl4->daddr))
+ 				fl4->saddr = inet_select_addr(dev_out, 0,
+ 							      fl4->flowi4_scope);
+-- 
+2.28.0
+
+
+From bbcb20aaca3bbbfcb8c53c3587620d59320f805f Mon Sep 17 00:00:00 2001
+From: Marc Kleine-Budde <mkl@pengutronix.de>
+Date: Sat, 5 Oct 2013 21:25:17 +0200
+Subject: [PATCH 09/33] can: dev: fix nlmsg size calculation in can_get_size()
+
+[ Upstream commit fe119a05f8ca481623a8d02efcc984332e612528 ]
+
+This patch fixes the calculation of the nlmsg size, by adding the missing
+nla_total_size().
+
+Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/can/dev.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/can/dev.c b/drivers/net/can/dev.c
+index e86f4c37f981..c2cdefa1651e 100644
+--- a/drivers/net/can/dev.c
++++ b/drivers/net/can/dev.c
+@@ -665,14 +665,14 @@ static size_t can_get_size(const struct net_device *dev)
+ 	size_t size;
+ 
+ 	size = nla_total_size(sizeof(u32));   /* IFLA_CAN_STATE */
+-	size += sizeof(struct can_ctrlmode);  /* IFLA_CAN_CTRLMODE */
++	size += nla_total_size(sizeof(struct can_ctrlmode));  /* IFLA_CAN_CTRLMODE */
+ 	size += nla_total_size(sizeof(u32));  /* IFLA_CAN_RESTART_MS */
+-	size += sizeof(struct can_bittiming); /* IFLA_CAN_BITTIMING */
+-	size += sizeof(struct can_clock);     /* IFLA_CAN_CLOCK */
++	size += nla_total_size(sizeof(struct can_bittiming)); /* IFLA_CAN_BITTIMING */
++	size += nla_total_size(sizeof(struct can_clock));     /* IFLA_CAN_CLOCK */
+ 	if (priv->do_get_berr_counter)        /* IFLA_CAN_BERR_COUNTER */
+-		size += sizeof(struct can_berr_counter);
++		size += nla_total_size(sizeof(struct can_berr_counter));
+ 	if (priv->bittiming_const)	      /* IFLA_CAN_BITTIMING_CONST */
+-		size += sizeof(struct can_bittiming_const);
++		size += nla_total_size(sizeof(struct can_bittiming_const));
+ 
+ 	return size;
+ }
+-- 
+2.28.0
+
+
+From 25c065e6ed51e0fa5b1010c1682b3cad8fd34763 Mon Sep 17 00:00:00 2001
+From: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Date: Tue, 8 Oct 2013 16:41:13 +0200
+Subject: [PATCH 10/33] ipv6: restrict neighbor entry creation to output flow
+
+This patch is based on 3.2.y branch, the one used by reporter. Please let me
+know if it should be different. Thanks.
+
+The patch which introduced the regression was applied on stables:
+3.0.64 3.4.31 3.7.8 3.2.39
+
+The patch which introduced the regression was for stable trees only.
+
+---8<---
+
+Commit 0d6a77079c475033cb622c07c5a880b392ef664e "ipv6: do not create
+neighbor entries for local delivery" introduced a regression on
+which routes to local delivery would not work anymore. Like this:
+
+    $ ip -6 route add local 2001::/64 dev lo
+    $ ping6 -c1 2001::9
+    PING 2001::9(2001::9) 56 data bytes
+    ping: sendmsg: Invalid argument
+
+As this is a local delivery, that commit would not allow the creation of a
+neighbor entry and thus the packet cannot be sent.
+
+But as TPROXY scenario actually needs to avoid the neighbor entry creation only
+for input flow, this patch now limits previous patch to input flow, keeping
+output as before that patch.
+
+Reported-by: Debabrata Banerjee <dbavatar@gmail.com>
+Signed-off-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
+Signed-off-by: Jiri Pirko <jiri@resnulli.us>
+Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+CC: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv6/route.c | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 016ed7c22fc9..4f768a4c2907 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -818,7 +818,7 @@ static struct rt6_info *rt6_alloc_clone(struct rt6_info *ort,
+ }
+ 
+ static struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table, int oif,
+-				      struct flowi6 *fl6, int flags)
++				      struct flowi6 *fl6, int flags, bool input)
+ {
+ 	struct fib6_node *fn;
+ 	struct rt6_info *rt, *nrt;
+@@ -826,8 +826,11 @@ static struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table,
+ 	int attempts = 3;
+ 	int err;
+ 	int reachable = net->ipv6.devconf_all->forwarding ? 0 : RT6_LOOKUP_F_REACHABLE;
++	int local = RTF_NONEXTHOP;
+ 
+ 	strict |= flags & RT6_LOOKUP_F_IFACE;
++	if (input)
++		local |= RTF_LOCAL;
+ 
+ relookup:
+ 	read_lock_bh(&table->tb6_lock);
+@@ -847,7 +850,7 @@ restart:
+ 	read_unlock_bh(&table->tb6_lock);
+ 
+ 	if (!dst_get_neighbour_noref_raw(&rt->dst) &&
+-	    !(rt->rt6i_flags & (RTF_NONEXTHOP | RTF_LOCAL)))
++	    !(rt->rt6i_flags & local))
+ 		nrt = rt6_alloc_cow(rt, &fl6->daddr, &fl6->saddr);
+ 	else if (!(rt->dst.flags & DST_HOST))
+ 		nrt = rt6_alloc_clone(rt, &fl6->daddr);
+@@ -891,7 +894,7 @@ out2:
+ static struct rt6_info *ip6_pol_route_input(struct net *net, struct fib6_table *table,
+ 					    struct flowi6 *fl6, int flags)
+ {
+-	return ip6_pol_route(net, table, fl6->flowi6_iif, fl6, flags);
++	return ip6_pol_route(net, table, fl6->flowi6_iif, fl6, flags, true);
+ }
+ 
+ static struct dst_entry *ip6_route_input_lookup(struct net *net,
+@@ -924,7 +927,7 @@ void ip6_route_input(struct sk_buff *skb)
+ static struct rt6_info *ip6_pol_route_output(struct net *net, struct fib6_table *table,
+ 					     struct flowi6 *fl6, int flags)
+ {
+-	return ip6_pol_route(net, table, fl6->flowi6_oif, fl6, flags);
++	return ip6_pol_route(net, table, fl6->flowi6_oif, fl6, flags, false);
+ }
+ 
+ struct dst_entry * ip6_route_output(struct net *net, const struct sock *sk,
+-- 
+2.28.0
+
+
+From 0a8a2e325e1badbf4dd5243b9368838b0e9ad0e4 Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevic@redhat.com>
+Date: Tue, 15 Oct 2013 14:57:45 -0400
+Subject: [PATCH 11/33] bridge: Correctly clamp MAX forward_delay when enabling
+ STP
+
+[ Upstream commit 4b6c7879d84ad06a2ac5b964808ed599187a188d ]
+
+Commit be4f154d5ef0ca147ab6bcd38857a774133f5450
+	bridge: Clamp forward_delay when enabling STP
+had a typo when attempting to clamp maximum forward delay.
+
+It is possible to set bridge_forward_delay to be higher then
+permitted maximum when STP is off.  When turning STP on, the
+higher then allowed delay has to be clamed down to max value.
+
+Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
+CC: Herbert Xu <herbert@gondor.apana.org.au>
+CC: Stephen Hemminger <shemminger@vyatta.com>
+Reviewed-by: Veaceslav Falico <vfalico@redhat.com>
+Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/bridge/br_stp_if.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/bridge/br_stp_if.c b/net/bridge/br_stp_if.c
+index f774796f7e57..2f100ccef86f 100644
+--- a/net/bridge/br_stp_if.c
++++ b/net/bridge/br_stp_if.c
+@@ -134,7 +134,7 @@ static void br_stp_start(struct net_bridge *br)
+ 
+ 	if (br->bridge_forward_delay < BR_MIN_FORWARD_DELAY)
+ 		__br_set_forward_delay(br, BR_MIN_FORWARD_DELAY);
+-	else if (br->bridge_forward_delay < BR_MAX_FORWARD_DELAY)
++	else if (br->bridge_forward_delay > BR_MAX_FORWARD_DELAY)
+ 		__br_set_forward_delay(br, BR_MAX_FORWARD_DELAY);
+ 
+ 	if (r == 0) {
+-- 
+2.28.0
+
+
+From 5468ba5515e2720cfe19d0c35d481cb4cb97a8aa Mon Sep 17 00:00:00 2001
+From: Marc Kleine-Budde <mkl@pengutronix.de>
+Date: Mon, 7 Oct 2013 23:19:58 +0200
+Subject: [PATCH 12/33] net: vlan: fix nlmsg size calculation in
+ vlan_get_size()
+
+[ Upstream commit c33a39c575068c2ea9bffb22fd6de2df19c74b89 ]
+
+This patch fixes the calculation of the nlmsg size, by adding the missing
+nla_total_size().
+
+Cc: Patrick McHardy <kaber@trash.net>
+Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/8021q/vlan_netlink.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/8021q/vlan_netlink.c b/net/8021q/vlan_netlink.c
+index 50711368ad6a..7f046b4c06bc 100644
+--- a/net/8021q/vlan_netlink.c
++++ b/net/8021q/vlan_netlink.c
+@@ -152,7 +152,7 @@ static size_t vlan_get_size(const struct net_device *dev)
+ 	struct vlan_dev_priv *vlan = vlan_dev_priv(dev);
+ 
+ 	return nla_total_size(2) +	/* IFLA_VLAN_ID */
+-	       sizeof(struct ifla_vlan_flags) + /* IFLA_VLAN_FLAGS */
++	       nla_total_size(sizeof(struct ifla_vlan_flags)) + /* IFLA_VLAN_FLAGS */
+ 	       vlan_qos_map_size(vlan->nr_ingress_mappings) +
+ 	       vlan_qos_map_size(vlan->nr_egress_mappings);
+ }
+-- 
+2.28.0
+
+
+From 120bc4f8543d6928337054fa15a23fda3cd63fe7 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 10 Oct 2013 06:30:09 -0700
+Subject: [PATCH 13/33] l2tp: must disable bh before calling l2tp_xmit_skb()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 455cc32bf128e114455d11ad919321ab89a2c312 ]
+
+François Cachereul made a very nice bug report and suspected
+the bh_lock_sock() / bh_unlok_sock() pair used in l2tp_xmit_skb() from
+process context was not good.
+
+This problem was added by commit 6af88da14ee284aaad6e4326da09a89191ab6165
+("l2tp: Fix locking in l2tp_core.c").
+
+l2tp_eth_dev_xmit() runs from BH context, so we must disable BH
+from other l2tp_xmit_skb() users.
+
+[  452.060011] BUG: soft lockup - CPU#1 stuck for 23s! [accel-pppd:6662]
+[  452.061757] Modules linked in: l2tp_ppp l2tp_netlink l2tp_core pppoe pppox
+ppp_generic slhc ipv6 ext3 mbcache jbd virtio_balloon xfs exportfs dm_mod
+virtio_blk ata_generic virtio_net floppy ata_piix libata virtio_pci virtio_ring virtio [last unloaded: scsi_wait_scan]
+[  452.064012] CPU 1
+[  452.080015] BUG: soft lockup - CPU#2 stuck for 23s! [accel-pppd:6643]
+[  452.080015] CPU 2
+[  452.080015]
+[  452.080015] Pid: 6643, comm: accel-pppd Not tainted 3.2.46.mini #1 Bochs Bochs
+[  452.080015] RIP: 0010:[<ffffffff81059f6c>]  [<ffffffff81059f6c>] do_raw_spin_lock+0x17/0x1f
+[  452.080015] RSP: 0018:ffff88007125fc18  EFLAGS: 00000293
+[  452.080015] RAX: 000000000000aba9 RBX: ffffffff811d0703 RCX: 0000000000000000
+[  452.080015] RDX: 00000000000000ab RSI: ffff8800711f6896 RDI: ffff8800745c8110
+[  452.080015] RBP: ffff88007125fc18 R08: 0000000000000020 R09: 0000000000000000
+[  452.080015] R10: 0000000000000000 R11: 0000000000000280 R12: 0000000000000286
+[  452.080015] R13: 0000000000000020 R14: 0000000000000240 R15: 0000000000000000
+[  452.080015] FS:  00007fdc0cc24700(0000) GS:ffff8800b6f00000(0000) knlGS:0000000000000000
+[  452.080015] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  452.080015] CR2: 00007fdb054899b8 CR3: 0000000074404000 CR4: 00000000000006a0
+[  452.080015] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[  452.080015] DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+[  452.080015] Process accel-pppd (pid: 6643, threadinfo ffff88007125e000, task ffff8800b27e6dd0)
+[  452.080015] Stack:
+[  452.080015]  ffff88007125fc28 ffffffff81256559 ffff88007125fc98 ffffffffa01b2bd1
+[  452.080015]  ffff88007125fc58 000000000000000c 00000000029490d0 0000009c71dbe25e
+[  452.080015]  000000000000005c 000000080000000e 0000000000000000 ffff880071170600
+[  452.080015] Call Trace:
+[  452.080015]  [<ffffffff81256559>] _raw_spin_lock+0xe/0x10
+[  452.080015]  [<ffffffffa01b2bd1>] l2tp_xmit_skb+0x189/0x4ac [l2tp_core]
+[  452.080015]  [<ffffffffa01c2d36>] pppol2tp_sendmsg+0x15e/0x19c [l2tp_ppp]
+[  452.080015]  [<ffffffff811c7872>] __sock_sendmsg_nosec+0x22/0x24
+[  452.080015]  [<ffffffff811c83bd>] sock_sendmsg+0xa1/0xb6
+[  452.080015]  [<ffffffff81254e88>] ? __schedule+0x5c1/0x616
+[  452.080015]  [<ffffffff8103c7c6>] ? __dequeue_signal+0xb7/0x10c
+[  452.080015]  [<ffffffff810bbd21>] ? fget_light+0x75/0x89
+[  452.080015]  [<ffffffff811c8444>] ? sockfd_lookup_light+0x20/0x56
+[  452.080015]  [<ffffffff811c9b34>] sys_sendto+0x10c/0x13b
+[  452.080015]  [<ffffffff8125cac2>] system_call_fastpath+0x16/0x1b
+[  452.080015] Code: 81 48 89 e5 72 0c 31 c0 48 81 ff 45 66 25 81 0f 92 c0 5d c3 55 b8 00 01 00 00 48 89 e5 f0 66 0f c1 07 0f b6 d4 38 d0 74 06 f3 90 <8a> 07 eb f6 5d c3 90 90 55 48 89 e5 9c 58 0f 1f 44 00 00 5d c3
+[  452.080015] Call Trace:
+[  452.080015]  [<ffffffff81256559>] _raw_spin_lock+0xe/0x10
+[  452.080015]  [<ffffffffa01b2bd1>] l2tp_xmit_skb+0x189/0x4ac [l2tp_core]
+[  452.080015]  [<ffffffffa01c2d36>] pppol2tp_sendmsg+0x15e/0x19c [l2tp_ppp]
+[  452.080015]  [<ffffffff811c7872>] __sock_sendmsg_nosec+0x22/0x24
+[  452.080015]  [<ffffffff811c83bd>] sock_sendmsg+0xa1/0xb6
+[  452.080015]  [<ffffffff81254e88>] ? __schedule+0x5c1/0x616
+[  452.080015]  [<ffffffff8103c7c6>] ? __dequeue_signal+0xb7/0x10c
+[  452.080015]  [<ffffffff810bbd21>] ? fget_light+0x75/0x89
+[  452.080015]  [<ffffffff811c8444>] ? sockfd_lookup_light+0x20/0x56
+[  452.080015]  [<ffffffff811c9b34>] sys_sendto+0x10c/0x13b
+[  452.080015]  [<ffffffff8125cac2>] system_call_fastpath+0x16/0x1b
+[  452.064012]
+[  452.064012] Pid: 6662, comm: accel-pppd Not tainted 3.2.46.mini #1 Bochs Bochs
+[  452.064012] RIP: 0010:[<ffffffff81059f6e>]  [<ffffffff81059f6e>] do_raw_spin_lock+0x19/0x1f
+[  452.064012] RSP: 0018:ffff8800b6e83ba0  EFLAGS: 00000297
+[  452.064012] RAX: 000000000000aaa9 RBX: ffff8800b6e83b40 RCX: 0000000000000002
+[  452.064012] RDX: 00000000000000aa RSI: 000000000000000a RDI: ffff8800745c8110
+[  452.064012] RBP: ffff8800b6e83ba0 R08: 000000000000c802 R09: 000000000000001c
+[  452.064012] R10: ffff880071096c4e R11: 0000000000000006 R12: ffff8800b6e83b18
+[  452.064012] R13: ffffffff8125d51e R14: ffff8800b6e83ba0 R15: ffff880072a589c0
+[  452.064012] FS:  00007fdc0b81e700(0000) GS:ffff8800b6e80000(0000) knlGS:0000000000000000
+[  452.064012] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  452.064012] CR2: 0000000000625208 CR3: 0000000074404000 CR4: 00000000000006a0
+[  452.064012] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+[  452.064012] DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
+[  452.064012] Process accel-pppd (pid: 6662, threadinfo ffff88007129a000, task ffff8800744f7410)
+[  452.064012] Stack:
+[  452.064012]  ffff8800b6e83bb0 ffffffff81256559 ffff8800b6e83bc0 ffffffff8121c64a
+[  452.064012]  ffff8800b6e83bf0 ffffffff8121ec7a ffff880072a589c0 ffff880071096c62
+[  452.064012]  0000000000000011 ffffffff81430024 ffff8800b6e83c80 ffffffff8121f276
+[  452.064012] Call Trace:
+[  452.064012]  <IRQ>
+[  452.064012]  [<ffffffff81256559>] _raw_spin_lock+0xe/0x10
+[  452.064012]  [<ffffffff8121c64a>] spin_lock+0x9/0xb
+[  452.064012]  [<ffffffff8121ec7a>] udp_queue_rcv_skb+0x186/0x269
+[  452.064012]  [<ffffffff8121f276>] __udp4_lib_rcv+0x297/0x4ae
+[  452.064012]  [<ffffffff8121c178>] ? raw_rcv+0xe9/0xf0
+[  452.064012]  [<ffffffff8121f4a7>] udp_rcv+0x1a/0x1c
+[  452.064012]  [<ffffffff811fe385>] ip_local_deliver_finish+0x12b/0x1a5
+[  452.064012]  [<ffffffff811fe54e>] ip_local_deliver+0x53/0x84
+[  452.064012]  [<ffffffff811fe1d0>] ip_rcv_finish+0x2bc/0x2f3
+[  452.064012]  [<ffffffff811fe78f>] ip_rcv+0x210/0x269
+[  452.064012]  [<ffffffff8101911e>] ? kvm_clock_get_cycles+0x9/0xb
+[  452.064012]  [<ffffffff811d88cd>] __netif_receive_skb+0x3a5/0x3f7
+[  452.064012]  [<ffffffff811d8eba>] netif_receive_skb+0x57/0x5e
+[  452.064012]  [<ffffffff811cf30f>] ? __netdev_alloc_skb+0x1f/0x3b
+[  452.064012]  [<ffffffffa0049126>] virtnet_poll+0x4ba/0x5a4 [virtio_net]
+[  452.064012]  [<ffffffff811d9417>] net_rx_action+0x73/0x184
+[  452.064012]  [<ffffffffa01b2cc2>] ? l2tp_xmit_skb+0x27a/0x4ac [l2tp_core]
+[  452.064012]  [<ffffffff810343b9>] __do_softirq+0xc3/0x1a8
+[  452.064012]  [<ffffffff81013b56>] ? ack_APIC_irq+0x10/0x12
+[  452.064012]  [<ffffffff81256559>] ? _raw_spin_lock+0xe/0x10
+[  452.064012]  [<ffffffff8125e0ac>] call_softirq+0x1c/0x26
+[  452.064012]  [<ffffffff81003587>] do_softirq+0x45/0x82
+[  452.064012]  [<ffffffff81034667>] irq_exit+0x42/0x9c
+[  452.064012]  [<ffffffff8125e146>] do_IRQ+0x8e/0xa5
+[  452.064012]  [<ffffffff8125676e>] common_interrupt+0x6e/0x6e
+[  452.064012]  <EOI>
+[  452.064012]  [<ffffffff810b82a1>] ? kfree+0x8a/0xa3
+[  452.064012]  [<ffffffffa01b2cc2>] ? l2tp_xmit_skb+0x27a/0x4ac [l2tp_core]
+[  452.064012]  [<ffffffffa01b2c25>] ? l2tp_xmit_skb+0x1dd/0x4ac [l2tp_core]
+[  452.064012]  [<ffffffffa01c2d36>] pppol2tp_sendmsg+0x15e/0x19c [l2tp_ppp]
+[  452.064012]  [<ffffffff811c7872>] __sock_sendmsg_nosec+0x22/0x24
+[  452.064012]  [<ffffffff811c83bd>] sock_sendmsg+0xa1/0xb6
+[  452.064012]  [<ffffffff81254e88>] ? __schedule+0x5c1/0x616
+[  452.064012]  [<ffffffff8103c7c6>] ? __dequeue_signal+0xb7/0x10c
+[  452.064012]  [<ffffffff810bbd21>] ? fget_light+0x75/0x89
+[  452.064012]  [<ffffffff811c8444>] ? sockfd_lookup_light+0x20/0x56
+[  452.064012]  [<ffffffff811c9b34>] sys_sendto+0x10c/0x13b
+[  452.064012]  [<ffffffff8125cac2>] system_call_fastpath+0x16/0x1b
+[  452.064012] Code: 89 e5 72 0c 31 c0 48 81 ff 45 66 25 81 0f 92 c0 5d c3 55 b8 00 01 00 00 48 89 e5 f0 66 0f c1 07 0f b6 d4 38 d0 74 06 f3 90 8a 07 <eb> f6 5d c3 90 90 55 48 89 e5 9c 58 0f 1f 44 00 00 5d c3 55 48
+[  452.064012] Call Trace:
+[  452.064012]  <IRQ>  [<ffffffff81256559>] _raw_spin_lock+0xe/0x10
+[  452.064012]  [<ffffffff8121c64a>] spin_lock+0x9/0xb
+[  452.064012]  [<ffffffff8121ec7a>] udp_queue_rcv_skb+0x186/0x269
+[  452.064012]  [<ffffffff8121f276>] __udp4_lib_rcv+0x297/0x4ae
+[  452.064012]  [<ffffffff8121c178>] ? raw_rcv+0xe9/0xf0
+[  452.064012]  [<ffffffff8121f4a7>] udp_rcv+0x1a/0x1c
+[  452.064012]  [<ffffffff811fe385>] ip_local_deliver_finish+0x12b/0x1a5
+[  452.064012]  [<ffffffff811fe54e>] ip_local_deliver+0x53/0x84
+[  452.064012]  [<ffffffff811fe1d0>] ip_rcv_finish+0x2bc/0x2f3
+[  452.064012]  [<ffffffff811fe78f>] ip_rcv+0x210/0x269
+[  452.064012]  [<ffffffff8101911e>] ? kvm_clock_get_cycles+0x9/0xb
+[  452.064012]  [<ffffffff811d88cd>] __netif_receive_skb+0x3a5/0x3f7
+[  452.064012]  [<ffffffff811d8eba>] netif_receive_skb+0x57/0x5e
+[  452.064012]  [<ffffffff811cf30f>] ? __netdev_alloc_skb+0x1f/0x3b
+[  452.064012]  [<ffffffffa0049126>] virtnet_poll+0x4ba/0x5a4 [virtio_net]
+[  452.064012]  [<ffffffff811d9417>] net_rx_action+0x73/0x184
+[  452.064012]  [<ffffffffa01b2cc2>] ? l2tp_xmit_skb+0x27a/0x4ac [l2tp_core]
+[  452.064012]  [<ffffffff810343b9>] __do_softirq+0xc3/0x1a8
+[  452.064012]  [<ffffffff81013b56>] ? ack_APIC_irq+0x10/0x12
+[  452.064012]  [<ffffffff81256559>] ? _raw_spin_lock+0xe/0x10
+[  452.064012]  [<ffffffff8125e0ac>] call_softirq+0x1c/0x26
+[  452.064012]  [<ffffffff81003587>] do_softirq+0x45/0x82
+[  452.064012]  [<ffffffff81034667>] irq_exit+0x42/0x9c
+[  452.064012]  [<ffffffff8125e146>] do_IRQ+0x8e/0xa5
+[  452.064012]  [<ffffffff8125676e>] common_interrupt+0x6e/0x6e
+[  452.064012]  <EOI>  [<ffffffff810b82a1>] ? kfree+0x8a/0xa3
+[  452.064012]  [<ffffffffa01b2cc2>] ? l2tp_xmit_skb+0x27a/0x4ac [l2tp_core]
+[  452.064012]  [<ffffffffa01b2c25>] ? l2tp_xmit_skb+0x1dd/0x4ac [l2tp_core]
+[  452.064012]  [<ffffffffa01c2d36>] pppol2tp_sendmsg+0x15e/0x19c [l2tp_ppp]
+[  452.064012]  [<ffffffff811c7872>] __sock_sendmsg_nosec+0x22/0x24
+[  452.064012]  [<ffffffff811c83bd>] sock_sendmsg+0xa1/0xb6
+[  452.064012]  [<ffffffff81254e88>] ? __schedule+0x5c1/0x616
+[  452.064012]  [<ffffffff8103c7c6>] ? __dequeue_signal+0xb7/0x10c
+[  452.064012]  [<ffffffff810bbd21>] ? fget_light+0x75/0x89
+[  452.064012]  [<ffffffff811c8444>] ? sockfd_lookup_light+0x20/0x56
+[  452.064012]  [<ffffffff811c9b34>] sys_sendto+0x10c/0x13b
+[  452.064012]  [<ffffffff8125cac2>] system_call_fastpath+0x16/0x1b
+
+Reported-by: François Cachereul <f.cachereul@alphalink.fr>
+Tested-by: François Cachereul <f.cachereul@alphalink.fr>
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: James Chapman <jchapman@katalix.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/l2tp/l2tp_ppp.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
+index b2982f4214d1..904bc098790d 100644
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -357,7 +357,9 @@ static int pppol2tp_sendmsg(struct kiocb *iocb, struct socket *sock, struct msgh
+ 		goto error_put_sess_tun;
+ 	}
+ 
++	local_bh_disable();
+ 	l2tp_xmit_skb(session, skb, session->hdr_len);
++	local_bh_enable();
+ 
+ 	sock_put(ps->tunnel_sock);
+ 	sock_put(sk);
+@@ -432,7 +434,9 @@ static int pppol2tp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
+ 	skb->data[0] = ppph[0];
+ 	skb->data[1] = ppph[1];
+ 
++	local_bh_disable();
+ 	l2tp_xmit_skb(session, skb, session->hdr_len);
++	local_bh_enable();
+ 
+ 	sock_put(sk_tun);
+ 	sock_put(sk);
+-- 
+2.28.0
+
+
+From df290b8ea8c8b3305a3b3a4eb36ec1d2d79570de Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Salva=20Peir=C3=B3?= <speiro@ai2.upv.es>
+Date: Fri, 11 Oct 2013 12:50:03 +0300
+Subject: [PATCH 14/33] farsync: fix info leak in ioctl
+
+[ Upstream commit 96b340406724d87e4621284ebac5e059d67b2194 ]
+
+The fst_get_iface() code fails to initialize the two padding bytes of
+struct sync_serial_settings after the ->loopback member. Add an explicit
+memset(0) before filling the structure to avoid the info leak.
+
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/wan/farsync.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/net/wan/farsync.c b/drivers/net/wan/farsync.c
+index 1a623183cbe5..3710427c3fe1 100644
+--- a/drivers/net/wan/farsync.c
++++ b/drivers/net/wan/farsync.c
+@@ -1972,6 +1972,7 @@ fst_get_iface(struct fst_card_info *card, struct fst_port_info *port,
+ 	}
+ 
+ 	i = port->index;
++	memset(&sync, 0, sizeof(sync));
+ 	sync.clock_rate = FST_RDL(card, portConfig[i].lineSpeed);
+ 	/* Lucky card and linux use same encoding here */
+ 	sync.clock_type = FST_RDB(card, portConfig[i].internalClock) ==
+-- 
+2.28.0
+
+
+From f4358dfd80518a11e4386a15750ad2601d0cf539 Mon Sep 17 00:00:00 2001
+From: Mathias Krause <minipli@googlemail.com>
+Date: Mon, 30 Sep 2013 22:05:40 +0200
+Subject: [PATCH 15/33] unix_diag: fix info leak
+
+[ Upstream commit 6865d1e834be84ddd5808d93d5035b492346c64a ]
+
+When filling the netlink message we miss to wipe the pad field,
+therefore leak one byte of heap memory to userland. Fix this by
+setting pad to 0.
+
+Signed-off-by: Mathias Krause <minipli@googlemail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/unix/diag.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/unix/diag.c b/net/unix/diag.c
+index f0486ae9ebe6..2656840cf203 100644
+--- a/net/unix/diag.c
++++ b/net/unix/diag.c
+@@ -134,6 +134,7 @@ static int sk_diag_fill(struct sock *sk, struct sk_buff *skb, struct unix_diag_r
+ 	rep->udiag_family = AF_UNIX;
+ 	rep->udiag_type = sk->sk_type;
+ 	rep->udiag_state = sk->sk_state;
++	rep->pad = 0;
+ 	rep->udiag_ino = sk_ino;
+ 	sock_diag_save_cookie(sk, rep->udiag_cookie);
+ 
+-- 
+2.28.0
+
+
+From c6077c905957eeb59616ab8a22f3a4527393d40e Mon Sep 17 00:00:00 2001
+From: Mathias Krause <minipli@googlemail.com>
+Date: Mon, 30 Sep 2013 22:03:07 +0200
+Subject: [PATCH 16/33] connector: use nlmsg_len() to check message length
+
+[ Upstream commit 162b2bedc084d2d908a04c93383ba02348b648b0 ]
+
+The current code tests the length of the whole netlink message to be
+at least as long to fit a cn_msg. This is wrong as nlmsg_len includes
+the length of the netlink message header. Use nlmsg_len() instead to
+fix this "off-by-NLMSG_HDRLEN" size check.
+
+Signed-off-by: Mathias Krause <minipli@googlemail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/connector/connector.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
 diff --git a/drivers/connector/connector.c b/drivers/connector/connector.c
 index dde6a0fad408..ea6efe86468e 100644
 --- a/drivers/connector/connector.c
@@ -168,80 +1146,48 @@ index dde6a0fad408..ea6efe86468e 100644
  			kfree_skb(skb);
  			return;
  		}
-diff --git a/drivers/md/dm-snap-persistent.c b/drivers/md/dm-snap-persistent.c
-index 4caa8e6d59d7..2d2b1b7588d7 100644
---- a/drivers/md/dm-snap-persistent.c
-+++ b/drivers/md/dm-snap-persistent.c
-@@ -269,6 +269,14 @@ static chunk_t area_location(struct pstore *ps, chunk_t area)
- 	return NUM_SNAPSHOT_HDR_CHUNKS + ((ps->exceptions_per_area + 1) * area);
- }
- 
-+static void skip_metadata(struct pstore *ps)
-+{
-+	uint32_t stride = ps->exceptions_per_area + 1;
-+	chunk_t next_free = ps->next_free;
-+	if (sector_div(next_free, stride) == NUM_SNAPSHOT_HDR_CHUNKS)
-+		ps->next_free++;
-+}
-+
- /*
-  * Read or write a metadata area.  Remembering to skip the first
-  * chunk which holds the header.
-@@ -502,6 +510,8 @@ static int read_exceptions(struct pstore *ps,
- 
- 	ps->current_area--;
- 
-+	skip_metadata(ps);
-+
- 	return 0;
- }
- 
-@@ -616,8 +626,6 @@ static int persistent_prepare_exception(struct dm_exception_store *store,
- 					struct dm_exception *e)
- {
- 	struct pstore *ps = get_info(store);
--	uint32_t stride;
--	chunk_t next_free;
- 	sector_t size = get_dev_size(dm_snap_cow(store->snap)->bdev);
- 
- 	/* Is there enough room ? */
-@@ -630,10 +638,8 @@ static int persistent_prepare_exception(struct dm_exception_store *store,
- 	 * Move onto the next free pending, making sure to take
- 	 * into account the location of the metadata chunks.
- 	 */
--	stride = (ps->exceptions_per_area + 1);
--	next_free = ++ps->next_free;
--	if (sector_div(next_free, stride) == 1)
--		ps->next_free++;
-+	ps->next_free++;
-+	skip_metadata(ps);
- 
- 	atomic_inc(&ps->pending_count);
- 	return 0;
-diff --git a/drivers/net/can/dev.c b/drivers/net/can/dev.c
-index e86f4c37f981..c2cdefa1651e 100644
---- a/drivers/net/can/dev.c
-+++ b/drivers/net/can/dev.c
-@@ -665,14 +665,14 @@ static size_t can_get_size(const struct net_device *dev)
- 	size_t size;
- 
- 	size = nla_total_size(sizeof(u32));   /* IFLA_CAN_STATE */
--	size += sizeof(struct can_ctrlmode);  /* IFLA_CAN_CTRLMODE */
-+	size += nla_total_size(sizeof(struct can_ctrlmode));  /* IFLA_CAN_CTRLMODE */
- 	size += nla_total_size(sizeof(u32));  /* IFLA_CAN_RESTART_MS */
--	size += sizeof(struct can_bittiming); /* IFLA_CAN_BITTIMING */
--	size += sizeof(struct can_clock);     /* IFLA_CAN_CLOCK */
-+	size += nla_total_size(sizeof(struct can_bittiming)); /* IFLA_CAN_BITTIMING */
-+	size += nla_total_size(sizeof(struct can_clock));     /* IFLA_CAN_CLOCK */
- 	if (priv->do_get_berr_counter)        /* IFLA_CAN_BERR_COUNTER */
--		size += sizeof(struct can_berr_counter);
-+		size += nla_total_size(sizeof(struct can_berr_counter));
- 	if (priv->bittiming_const)	      /* IFLA_CAN_BITTIMING_CONST */
--		size += sizeof(struct can_bittiming_const);
-+		size += nla_total_size(sizeof(struct can_bittiming_const));
- 
- 	return size;
- }
+-- 
+2.28.0
+
+
+From 225be57bbaf2c104f339b1a21efc25ff6b6bd9cb Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Sat, 12 Oct 2013 14:08:34 -0700
+Subject: [PATCH 17/33] bnx2x: record rx queue for LRO packets
+
+[ Upstream commit 60e66fee56b2256dcb1dc2ea1b2ddcb6e273857d ]
+
+RPS support is kind of broken on bnx2x, because only non LRO packets
+get proper rx queue information. This triggers reorders, as it seems
+bnx2x like to generate a non LRO packet for segment including TCP PUSH
+flag : (this might be pure coincidence, but all the reorders I've
+seen involve segments with a PUSH)
+
+11:13:34.335847 IP A > B: . 415808:447136(31328) ack 1 win 457 <nop,nop,timestamp 3789336 3985797>
+11:13:34.335992 IP A > B: . 447136:448560(1424) ack 1 win 457 <nop,nop,timestamp 3789336 3985797>
+11:13:34.336391 IP A > B: . 448560:479888(31328) ack 1 win 457 <nop,nop,timestamp 3789337 3985797>
+11:13:34.336425 IP A > B: P 511216:512640(1424) ack 1 win 457 <nop,nop,timestamp 3789337 3985798>
+11:13:34.336423 IP A > B: . 479888:511216(31328) ack 1 win 457 <nop,nop,timestamp 3789337 3985798>
+11:13:34.336924 IP A > B: . 512640:543968(31328) ack 1 win 457 <nop,nop,timestamp 3789337 3985798>
+11:13:34.336963 IP A > B: . 543968:575296(31328) ack 1 win 457 <nop,nop,timestamp 3789337 3985798>
+
+We must call skb_record_rx_queue() to properly give to RPS (and more
+generally for TX queue selection on forward path) the receive queue
+information.
+
+Similar fix is needed for skb_mark_napi_id(), but will be handled
+in a separate patch to ease stable backports.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Willem de Bruijn <willemb@google.com>
+Cc: Eilon Greenstein <eilong@broadcom.com>
+Acked-by: Dmitry Kravkov <dmitry@broadcom.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c | 1 +
+ 1 file changed, 1 insertion(+)
+
 diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
 index acd824660367..e45b8b6d6848 100644
 --- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
@@ -254,43 +1200,444 @@ index acd824660367..e45b8b6d6848 100644
  			napi_gro_receive(&fp->napi, skb);
  		} else {
  			DP(NETIF_MSG_RX_STATUS,
-diff --git a/drivers/net/ethernet/marvell/mv643xx_eth.c b/drivers/net/ethernet/marvell/mv643xx_eth.c
-index 5e1ca0f05090..ffa6a72dcc60 100644
---- a/drivers/net/ethernet/marvell/mv643xx_eth.c
-+++ b/drivers/net/ethernet/marvell/mv643xx_eth.c
-@@ -1274,15 +1274,13 @@ static void mib_counters_update(struct mv643xx_eth_private *mp)
- 	p->rx_discard += rdlp(mp, RX_DISCARD_FRAME_CNT);
- 	p->rx_overrun += rdlp(mp, RX_OVERRUN_FRAME_CNT);
- 	spin_unlock_bh(&mp->mib_counters_lock);
--
--	mod_timer(&mp->mib_counters_timer, jiffies + 30 * HZ);
- }
- 
- static void mib_counters_timer_wrapper(unsigned long _mp)
+-- 
+2.28.0
+
+
+From 3e5d72cd013a30bbd3a835243b635f0b85c4dd0a Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevich@gmail.com>
+Date: Tue, 15 Oct 2013 22:01:29 -0400
+Subject: [PATCH 18/33] net: dst: provide accessor function to dst->xfrm
+
+[ Upstream commit e87b3998d795123b4139bc3f25490dd236f68212 ]
+
+dst->xfrm is conditionally defined.  Provide accessor funtion that
+is always available.
+
+Signed-off-by: Vlad Yasevich <vyasevich@gmail.com>
+Acked-by: Neil Horman <nhorman@tuxdriver.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/dst.h | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/include/net/dst.h b/include/net/dst.h
+index 8197eadca819..1efe71aad089 100644
+--- a/include/net/dst.h
++++ b/include/net/dst.h
+@@ -464,10 +464,22 @@ static inline struct dst_entry *xfrm_lookup(struct net *net,
  {
- 	struct mv643xx_eth_private *mp = (void *)_mp;
--
- 	mib_counters_update(mp);
-+	mod_timer(&mp->mib_counters_timer, jiffies + 30 * HZ);
+ 	return dst_orig;
+ } 
++
++static inline struct xfrm_state *dst_xfrm(const struct dst_entry *dst)
++{
++	return NULL;
++}
++
+ #else
+ extern struct dst_entry *xfrm_lookup(struct net *net, struct dst_entry *dst_orig,
+ 				     const struct flowi *fl, struct sock *sk,
+ 				     int flags);
++
++/* skb attached with this dst needs transformation if dst->xfrm is valid */
++static inline struct xfrm_state *dst_xfrm(const struct dst_entry *dst)
++{
++	return dst->xfrm;
++}
+ #endif
+ 
+ #endif /* _NET_DST_H */
+-- 
+2.28.0
+
+
+From 80d20e7b6c4e467e16f7520df1abb461063720a0 Mon Sep 17 00:00:00 2001
+From: Fan Du <fan.du@windriver.com>
+Date: Tue, 15 Oct 2013 22:01:30 -0400
+Subject: [PATCH 19/33] sctp: Use software crc32 checksum when xfrm transform
+ will happen.
+
+[ Upstream commit 27127a82561a2a3ed955ce207048e1b066a80a2a ]
+
+igb/ixgbe have hardware sctp checksum support, when this feature is enabled
+and also IPsec is armed to protect sctp traffic, ugly things happened as
+xfrm_output checks CHECKSUM_PARTIAL to do checksum operation(sum every thing
+up and pack the 16bits result in the checksum field). The result is fail
+establishment of sctp communication.
+
+Signed-off-by: Fan Du <fan.du@windriver.com>
+Cc: Neil Horman <nhorman@tuxdriver.com>
+Cc: Steffen Klassert <steffen.klassert@secunet.com>
+Signed-off-by: Vlad Yasevich <vyasevich@gmail.com>
+Acked-by: Neil Horman <nhorman@tuxdriver.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sctp/output.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/net/sctp/output.c b/net/sctp/output.c
+index 32ba8d0e50e2..d957fe11a164 100644
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@ -518,7 +518,8 @@ int sctp_packet_transmit(struct sctp_packet *packet)
+ 	 * by CRC32-C as described in <draft-ietf-tsvwg-sctpcsum-02.txt>.
+ 	 */
+ 	if (!sctp_checksum_disable) {
+-		if (!(dst->dev->features & NETIF_F_SCTP_CSUM)) {
++		if (!(dst->dev->features & NETIF_F_SCTP_CSUM) ||
++		    (dst_xfrm(dst) != NULL)) {
+ 			__u32 crc32 = sctp_start_cksum((__u8 *)sh, cksum_buf_len);
+ 
+ 			/* 3) Put the resultant value into the checksum field in the
+-- 
+2.28.0
+
+
+From f3ce845cfe494296db847559b521706802f6eae0 Mon Sep 17 00:00:00 2001
+From: Vlad Yasevich <vyasevich@gmail.com>
+Date: Tue, 15 Oct 2013 22:01:31 -0400
+Subject: [PATCH 20/33] sctp: Perform software checksum if packet has to be
+ fragmented.
+
+[ Upstream commit d2dbbba77e95dff4b4f901fee236fef6d9552072 ]
+
+IP/IPv6 fragmentation knows how to compute only TCP/UDP checksum.
+This causes problems if SCTP packets has to be fragmented and
+ipsummed has been set to PARTIAL due to checksum offload support.
+This condition can happen when retransmitting after MTU discover,
+or when INIT or other control chunks are larger then MTU.
+Check for the rare fragmentation condition in SCTP and use software
+checksum calculation in this case.
+
+CC: Fan Du <fan.du@windriver.com>
+Signed-off-by: Vlad Yasevich <vyasevich@gmail.com>
+Acked-by: Neil Horman <nhorman@tuxdriver.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sctp/output.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/sctp/output.c b/net/sctp/output.c
+index d957fe11a164..cf3e22c586a6 100644
+--- a/net/sctp/output.c
++++ b/net/sctp/output.c
+@@ -519,7 +519,7 @@ int sctp_packet_transmit(struct sctp_packet *packet)
+ 	 */
+ 	if (!sctp_checksum_disable) {
+ 		if (!(dst->dev->features & NETIF_F_SCTP_CSUM) ||
+-		    (dst_xfrm(dst) != NULL)) {
++		    (dst_xfrm(dst) != NULL) || packet->ipfragok) {
+ 			__u32 crc32 = sctp_start_cksum((__u8 *)sh, cksum_buf_len);
+ 
+ 			/* 3) Put the resultant value into the checksum field in the
+-- 
+2.28.0
+
+
+From 79379b9694d7067f41035a551a7493760092fc48 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Salva=20Peir=C3=B3?= <speiro@ai2.upv.es>
+Date: Wed, 16 Oct 2013 12:46:50 +0200
+Subject: [PATCH 21/33] wanxl: fix info leak in ioctl
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 2b13d06c9584b4eb773f1e80bbaedab9a1c344e1 ]
+
+The wanxl_ioctl() code fails to initialize the two padding bytes of
+struct sync_serial_settings after the ->loopback member. Add an explicit
+memset(0) before filling the structure to avoid the info leak.
+
+Signed-off-by: Salva Peiró <speiro@ai2.upv.es>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/wan/wanxl.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/net/wan/wanxl.c b/drivers/net/wan/wanxl.c
+index feb7541b33fb..ccd496bf32d9 100644
+--- a/drivers/net/wan/wanxl.c
++++ b/drivers/net/wan/wanxl.c
+@@ -355,6 +355,7 @@ static int wanxl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+ 			ifr->ifr_settings.size = size; /* data size wanted */
+ 			return -ENOBUFS;
+ 		}
++		memset(&line, 0, sizeof(line));
+ 		line.clock_type = get_status(port)->clocking;
+ 		line.clock_rate = 0;
+ 		line.loopback = 0;
+-- 
+2.28.0
+
+
+From 4dde1cb060276e93a2ed22e4a167fc260a9d8c23 Mon Sep 17 00:00:00 2001
+From: Daniel Borkmann <dborkman@redhat.com>
+Date: Thu, 17 Oct 2013 22:51:31 +0200
+Subject: [PATCH 22/33] net: unix: inherit SOCK_PASS{CRED, SEC} flags from
+ socket to fix race
+
+[ Upstream commit 90c6bd34f884cd9cee21f1d152baf6c18bcac949 ]
+
+In the case of credentials passing in unix stream sockets (dgram
+sockets seem not affected), we get a rather sparse race after
+commit 16e5726 ("af_unix: dont send SCM_CREDENTIALS by default").
+
+We have a stream server on receiver side that requests credential
+passing from senders (e.g. nc -U). Since we need to set SO_PASSCRED
+on each spawned/accepted socket on server side to 1 first (as it's
+not inherited), it can happen that in the time between accept() and
+setsockopt() we get interrupted, the sender is being scheduled and
+continues with passing data to our receiver. At that time SO_PASSCRED
+is neither set on sender nor receiver side, hence in cmsg's
+SCM_CREDENTIALS we get eventually pid:0, uid:65534, gid:65534
+(== overflow{u,g}id) instead of what we actually would like to see.
+
+On the sender side, here nc -U, the tests in maybe_add_creds()
+invoked through unix_stream_sendmsg() would fail, as at that exact
+time, as mentioned, the sender has neither SO_PASSCRED on his side
+nor sees it on the server side, and we have a valid 'other' socket
+in place. Thus, sender believes it would just look like a normal
+connection, not needing/requesting SO_PASSCRED at that time.
+
+As reverting 16e5726 would not be an option due to the significant
+performance regression reported when having creds always passed,
+one way/trade-off to prevent that would be to set SO_PASSCRED on
+the listener socket and allow inheriting these flags to the spawned
+socket on server side in accept(). It seems also logical to do so
+if we'd tell the listener socket to pass those flags onwards, and
+would fix the race.
+
+Before, strace:
+
+recvmsg(4, {msg_name(0)=NULL, msg_iov(1)=[{"blub\n", 4096}],
+        msg_controllen=32, {cmsg_len=28, cmsg_level=SOL_SOCKET,
+        cmsg_type=SCM_CREDENTIALS{pid=0, uid=65534, gid=65534}},
+        msg_flags=0}, 0) = 5
+
+After, strace:
+
+recvmsg(4, {msg_name(0)=NULL, msg_iov(1)=[{"blub\n", 4096}],
+        msg_controllen=32, {cmsg_len=28, cmsg_level=SOL_SOCKET,
+        cmsg_type=SCM_CREDENTIALS{pid=11580, uid=1000, gid=1000}},
+        msg_flags=0}, 0) = 5
+
+Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Eric W. Biederman <ebiederm@xmission.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/unix/af_unix.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index c4821fd23b79..ed005b425a7c 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -1247,6 +1247,15 @@ static int unix_socketpair(struct socket *socka, struct socket *sockb)
+ 	return 0;
  }
  
++static void unix_sock_inherit_flags(const struct socket *old,
++				    struct socket *new)
++{
++	if (test_bit(SOCK_PASSCRED, &old->flags))
++		set_bit(SOCK_PASSCRED, &new->flags);
++	if (test_bit(SOCK_PASSSEC, &old->flags))
++		set_bit(SOCK_PASSSEC, &new->flags);
++}
++
+ static int unix_accept(struct socket *sock, struct socket *newsock, int flags)
+ {
+ 	struct sock *sk = sock->sk;
+@@ -1281,6 +1290,7 @@ static int unix_accept(struct socket *sock, struct socket *newsock, int flags)
+ 	/* attach accepted sock to socket */
+ 	unix_state_lock(tsk);
+ 	newsock->state = SS_CONNECTED;
++	unix_sock_inherit_flags(sock, newsock);
+ 	sock_graft(tsk, newsock);
+ 	unix_state_unlock(tsk);
+ 	return 0;
+-- 
+2.28.0
+
+
+From 2b5f6d110ee835cba1742c999cabd30a54c10b76 Mon Sep 17 00:00:00 2001
+From: Seif Mazareeb <seif@marvell.com>
+Date: Thu, 17 Oct 2013 20:33:21 -0700
+Subject: [PATCH 23/33] net: fix cipso packet validation when !NETLABEL
+
+[ Upstream commit f2e5ddcc0d12f9c4c7b254358ad245c9dddce13b ]
+
+When CONFIG_NETLABEL is disabled, the cipso_v4_validate() function could loop
+forever in the main loop if opt[opt_iter +1] == 0, this will causing a kernel
+crash in an SMP system, since the CPU executing this function will
+stall /not respond to IPIs.
+
+This problem can be reproduced by running the IP Stack Integrity Checker
+(http://isic.sourceforge.net) using the following command on a Linux machine
+connected to DUT:
+
+"icmpsic -s rand -d <DUT IP address> -r 123456"
+wait (1-2 min)
+
+Signed-off-by: Seif Mazareeb <seif@marvell.com>
+Acked-by: Paul Moore <paul@paul-moore.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/net/cipso_ipv4.h | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/include/net/cipso_ipv4.h b/include/net/cipso_ipv4.h
+index a7a683e30b64..a8c2ef6d3b93 100644
+--- a/include/net/cipso_ipv4.h
++++ b/include/net/cipso_ipv4.h
+@@ -290,6 +290,7 @@ static inline int cipso_v4_validate(const struct sk_buff *skb,
+ 	unsigned char err_offset = 0;
+ 	u8 opt_len = opt[1];
+ 	u8 opt_iter;
++	u8 tag_len;
  
-@@ -2370,6 +2368,7 @@ static int mv643xx_eth_open(struct net_device *dev)
- 		mp->int_mask |= INT_TX_END_0 << i;
+ 	if (opt_len < 8) {
+ 		err_offset = 1;
+@@ -302,11 +303,12 @@ static inline int cipso_v4_validate(const struct sk_buff *skb,
  	}
  
-+	add_timer(&mp->mib_counters_timer);
- 	port_start(mp);
+ 	for (opt_iter = 6; opt_iter < opt_len;) {
+-		if (opt[opt_iter + 1] > (opt_len - opt_iter)) {
++		tag_len = opt[opt_iter + 1];
++		if ((tag_len == 0) || (opt[opt_iter + 1] > (opt_len - opt_iter))) {
+ 			err_offset = opt_iter + 1;
+ 			goto out;
+ 		}
+-		opt_iter += opt[opt_iter + 1];
++		opt_iter += tag_len;
+ 	}
  
- 	wrlp(mp, INT_MASK_EXT, INT_EXT_LINK_PHY | INT_EXT_TX);
-@@ -2911,7 +2910,6 @@ static int mv643xx_eth_probe(struct platform_device *pdev)
- 	mp->mib_counters_timer.data = (unsigned long)mp;
- 	mp->mib_counters_timer.function = mib_counters_timer_wrapper;
- 	mp->mib_counters_timer.expires = jiffies + 30 * HZ;
--	add_timer(&mp->mib_counters_timer);
+ out:
+-- 
+2.28.0
+
+
+From 478e9a72b5e0cc9ecd8b787db90dec01d283123c Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date: Tue, 22 Oct 2013 00:07:47 +0200
+Subject: [PATCH 24/33] inet: fix possible memory corruption with UDP_CORK and
+ UFO
+
+[ This is a simplified -stable version of a set of upstream commits. ]
+
+This is a replacement patch only for stable which does fix the problems
+handled by the following two commits in -net:
+
+"ip_output: do skb ufo init for peeked non ufo skb as well" (e93b7d748be887cd7639b113ba7d7ef792a7efb9)
+"ip6_output: do skb ufo init for peeked non ufo skb as well" (c547dbf55d5f8cf615ccc0e7265e98db27d3fb8b)
+
+Three frames are written on a corked udp socket for which the output
+netdevice has UFO enabled.  If the first and third frame are smaller than
+the mtu and the second one is bigger, we enqueue the second frame with
+skb_append_datato_frags without initializing the gso fields. This leads
+to the third frame appended regulary and thus constructing an invalid skb.
+
+This fixes the problem by always using skb_append_datato_frags as soon
+as the first frag got enqueued to the skb without marking the packet
+as SKB_GSO_UDP.
+
+The problem with only two frames for ipv6 was fixed by "ipv6: udp
+packets following an UFO enqueued packet need also be handled by UFO"
+(2811ebac2521ceac84f2bdae402455baa6a7fb47).
+
+Cc: Jiri Pirko <jiri@resnulli.us>
+Cc: Eric Dumazet <eric.dumazet@gmail.com>
+Cc: David Miller <davem@davemloft.net>
+Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/skbuff.h | 5 +++++
+ net/ipv4/ip_output.c   | 2 +-
+ net/ipv6/ip6_output.c  | 2 +-
+ 3 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index daabf24655af..42b919c36da1 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1208,6 +1208,11 @@ static inline int skb_pagelen(const struct sk_buff *skb)
+ 	return len + skb_headlen(skb);
+ }
  
- 	spin_lock_init(&mp->mib_counters_lock);
++static inline bool skb_has_frags(const struct sk_buff *skb)
++{
++	return skb_shinfo(skb)->nr_frags;
++}
++
+ /**
+  * __skb_fill_page_desc - initialise a paged fragment in an skb
+  * @skb: buffer containing fragment to be initialised
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 3bc4c978d7ad..d6407b563fd8 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -846,7 +846,7 @@ static int __ip_append_data(struct sock *sk,
+ 		csummode = CHECKSUM_PARTIAL;
  
+ 	cork->length += length;
+-	if (((length > mtu) || (skb && skb_is_gso(skb))) &&
++	if (((length > mtu) || (skb && skb_has_frags(skb))) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO) && !rt->dst.header_len) {
+ 		err = ip_ufo_append_data(sk, queue, getfrag, from, length,
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 1acfb19cb570..7dabea3a7125 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1345,7 +1345,7 @@ int ip6_append_data(struct sock *sk, int getfrag(void *from, char *to,
+ 	skb = skb_peek_tail(&sk->sk_write_queue);
+ 	cork->length += length;
+ 	if (((length > mtu) ||
+-	     (skb && skb_is_gso(skb))) &&
++	     (skb && skb_has_frags(skb))) &&
+ 	    (sk->sk_protocol == IPPROTO_UDP) &&
+ 	    (rt->dst.dev->features & NETIF_F_UFO)) {
+ 		err = ip6_ufo_append_data(sk, getfrag, from, length,
+-- 
+2.28.0
+
+
+From 6fdea2fb23fe0a64af442f397b4e717e98e6aba8 Mon Sep 17 00:00:00 2001
+From: Mariusz Ceier <mceier+kernel@gmail.com>
+Date: Mon, 21 Oct 2013 19:45:04 +0200
+Subject: [PATCH 25/33] davinci_emac.c: Fix IFF_ALLMULTI setup
+
+[ Upstream commit d69e0f7ea95fef8059251325a79c004bac01f018 ]
+
+When IFF_ALLMULTI flag is set on interface and IFF_PROMISC isn't,
+emac_dev_mcast_set should only enable RX of multicasts and reset
+MACHASH registers.
+
+It does this, but afterwards it either sets up multicast MACs
+filtering or disables RX of multicasts and resets MACHASH registers
+again, rendering IFF_ALLMULTI flag useless.
+
+This patch fixes emac_dev_mcast_set, so that multicast MACs filtering and
+disabling of RX of multicasts are skipped when IFF_ALLMULTI flag is set.
+
+Tested with kernel 2.6.37.
+
+Signed-off-by: Mariusz Ceier <mceier+kernel@gmail.com>
+Acked-by: Mugunthan V N <mugunthanvnm@ti.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/ti/davinci_emac.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
 diff --git a/drivers/net/ethernet/ti/davinci_emac.c b/drivers/net/ethernet/ti/davinci_emac.c
 index 43fada572596..c336d36cf5ca 100644
 --- a/drivers/net/ethernet/ti/davinci_emac.c
@@ -305,76 +1652,52 @@ index 43fada572596..c336d36cf5ca 100644
  			struct netdev_hw_addr *ha;
  
  			mbp_enable = (mbp_enable | EMAC_MBP_RXMCAST);
-diff --git a/drivers/net/wan/farsync.c b/drivers/net/wan/farsync.c
-index 1a623183cbe5..3710427c3fe1 100644
---- a/drivers/net/wan/farsync.c
-+++ b/drivers/net/wan/farsync.c
-@@ -1972,6 +1972,7 @@ fst_get_iface(struct fst_card_info *card, struct fst_port_info *port,
- 	}
- 
- 	i = port->index;
-+	memset(&sync, 0, sizeof(sync));
- 	sync.clock_rate = FST_RDL(card, portConfig[i].lineSpeed);
- 	/* Lucky card and linux use same encoding here */
- 	sync.clock_type = FST_RDB(card, portConfig[i].internalClock) ==
-diff --git a/drivers/net/wan/wanxl.c b/drivers/net/wan/wanxl.c
-index feb7541b33fb..ccd496bf32d9 100644
---- a/drivers/net/wan/wanxl.c
-+++ b/drivers/net/wan/wanxl.c
-@@ -355,6 +355,7 @@ static int wanxl_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
- 			ifr->ifr_settings.size = size; /* data size wanted */
- 			return -ENOBUFS;
- 		}
-+		memset(&line, 0, sizeof(line));
- 		line.clock_type = get_status(port)->clocking;
- 		line.clock_rate = 0;
- 		line.loopback = 0;
-diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
-index 9def72f018e0..b3440c66a995 100644
---- a/drivers/usb/serial/option.c
-+++ b/drivers/usb/serial/option.c
-@@ -457,6 +457,10 @@ static void option_instat_callback(struct urb *urb);
- #define CHANGHONG_VENDOR_ID			0x2077
- #define CHANGHONG_PRODUCT_CH690			0x7001
- 
-+/* Inovia */
-+#define INOVIA_VENDOR_ID			0x20a6
-+#define INOVIA_SEW858				0x1105
-+
- /* some devices interfaces need special handling due to a number of reasons */
- enum option_blacklist_reason {
- 		OPTION_BLACKLIST_NONE = 0,
-@@ -1279,7 +1283,9 @@ static const struct usb_device_id option_ids[] = {
- 
- 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD100) },
- 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD145) },
--	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD200) },
-+	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD200),
-+		.driver_info = (kernel_ulong_t)&net_intf6_blacklist
-+	},
- 	{ USB_DEVICE(CELOT_VENDOR_ID, CELOT_PRODUCT_CT680M) }, /* CT-650 CDMA 450 1xEVDO modem */
- 	{ USB_DEVICE_AND_INTERFACE_INFO(SAMSUNG_VENDOR_ID, SAMSUNG_PRODUCT_GT_B3730, USB_CLASS_CDC_DATA, 0x00, 0x00) }, /* Samsung GT-B3730 LTE USB modem.*/
- 	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CEM600) },
-@@ -1367,6 +1373,7 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE_AND_INTERFACE_INFO(0x2001, 0x7d03, 0xff, 0x00, 0x00) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e01, 0xff, 0xff, 0xff) }, /* D-Link DWM-152/C1 */
- 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e02, 0xff, 0xff, 0xff) }, /* D-Link DWM-156/C1 */
-+	{ USB_DEVICE(INOVIA_VENDOR_ID, INOVIA_SEW858) },
- 	{ } /* Terminating entry */
- };
- MODULE_DEVICE_TABLE(usb, option_ids);
-diff --git a/drivers/usb/serial/ti_usb_3410_5052.c b/drivers/usb/serial/ti_usb_3410_5052.c
-index a7492ba5371a..1b0430e00b75 100644
---- a/drivers/usb/serial/ti_usb_3410_5052.c
-+++ b/drivers/usb/serial/ti_usb_3410_5052.c
-@@ -210,6 +210,7 @@ static struct usb_device_id ti_id_table_combined[19+2*TI_EXTRA_VID_PID_COUNT+1]
- 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_454B_PRODUCT_ID) },
- 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_454C_PRODUCT_ID) },
- 	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_PRODUCT_ID) },
-+	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_STRIP_PORT_ID) },
- 	{ USB_DEVICE(TI_VENDOR_ID, FRI2_PRODUCT_ID) },
- 	{ }
- };
+-- 
+2.28.0
+
+
+From 6f4f3714260023be6ddfcc0bc56191acc450f0ca Mon Sep 17 00:00:00 2001
+From: Eric Sandeen <sandeen@redhat.com>
+Date: Thu, 26 Apr 2012 13:10:39 -0500
+Subject: [PATCH 26/33] ext3: return 32/64-bit dir name hash according to usage
+ type
+
+commit d7dab39b6e16d5eea78ed3c705d2a2d0772b4f06 upstream.
+
+This is based on commit d1f5273e9adb40724a85272f248f210dc4ce919a
+ext4: return 32/64-bit dir name hash according to usage type
+by Fan Yong <yong.fan@whamcloud.com>
+
+Traditionally ext2/3/4 has returned a 32-bit hash value from llseek()
+to appease NFSv2, which can only handle a 32-bit cookie for seekdir()
+and telldir().  However, this causes problems if there are 32-bit hash
+collisions, since the NFSv2 server can get stuck resending the same
+entries from the directory repeatedly.
+
+Allow ext3 to return a full 64-bit hash (both major and minor) for
+telldir to decrease the chance of hash collisions.
+
+This patch does implement a new ext3_dir_llseek op, because with 64-bit
+hashes, nfs will attempt to seek to a hash "offset" which is much
+larger than ext3's s_maxbytes.  So for dx dirs, we call
+generic_file_llseek_size() with the appropriate max hash value as the
+maximum seekable size.  Otherwise we just pass through to
+generic_file_llseek().
+
+Patch-updated-by: Bernd Schubert <bernd.schubert@itwm.fraunhofer.de>
+Patch-updated-by: Eric Sandeen <sandeen@redhat.com>
+(blame us if something is not correct)
+
+Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Cc: Benjamin LaHaise <bcrl@kvack.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ext3/dir.c  | 167 ++++++++++++++++++++++++++++++++++++-------------
+ fs/ext3/ext3.h |   6 +-
+ fs/ext3/hash.c |   4 +-
+ 3 files changed, 129 insertions(+), 48 deletions(-)
+
 diff --git a/fs/ext3/dir.c b/fs/ext3/dir.c
 index cc761ad8fa57..92490e9f85ca 100644
 --- a/fs/ext3/dir.c
@@ -680,93 +2003,167 @@ index d10231ddcf8a..ede315cdf126 100644
  	hinfo->hash = hash;
  	hinfo->minor_hash = minor_hash;
  	return 0;
-diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
-index dc4d49a0c07d..42b919c36da1 100644
---- a/include/linux/skbuff.h
-+++ b/include/linux/skbuff.h
-@@ -760,6 +760,16 @@ static inline int skb_cloned(const struct sk_buff *skb)
- 	       (atomic_read(&skb_shinfo(skb)->dataref) & SKB_DATAREF_MASK) != 1;
+-- 
+2.28.0
+
+
+From df6516ade182c732e3d2691e0b60190f7abc1261 Mon Sep 17 00:00:00 2001
+From: Mikulas Patocka <mpatocka@redhat.com>
+Date: Wed, 16 Oct 2013 03:17:47 +0100
+Subject: [PATCH 27/33] dm snapshot: fix data corruption
+
+commit e9c6a182649f4259db704ae15a91ac820e63b0ca upstream.
+
+This patch fixes a particular type of data corruption that has been
+encountered when loading a snapshot's metadata from disk.
+
+When we allocate a new chunk in persistent_prepare, we increment
+ps->next_free and we make sure that it doesn't point to a metadata area
+by further incrementing it if necessary.
+
+When we load metadata from disk on device activation, ps->next_free is
+positioned after the last used data chunk. However, if this last used
+data chunk is followed by a metadata area, ps->next_free is positioned
+erroneously to the metadata area. A newly-allocated chunk is placed at
+the same location as the metadata area, resulting in data or metadata
+corruption.
+
+This patch changes the code so that ps->next_free skips the metadata
+area when metadata are loaded in function read_exceptions.
+
+The patch also moves a piece of code from persistent_prepare_exception
+to a separate function skip_metadata to avoid code duplication.
+
+CVE-2013-4299
+
+Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+Cc: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Alasdair G Kergon <agk@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/dm-snap-persistent.c | 18 ++++++++++++------
+ 1 file changed, 12 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/md/dm-snap-persistent.c b/drivers/md/dm-snap-persistent.c
+index 4caa8e6d59d7..2d2b1b7588d7 100644
+--- a/drivers/md/dm-snap-persistent.c
++++ b/drivers/md/dm-snap-persistent.c
+@@ -269,6 +269,14 @@ static chunk_t area_location(struct pstore *ps, chunk_t area)
+ 	return NUM_SNAPSHOT_HDR_CHUNKS + ((ps->exceptions_per_area + 1) * area);
  }
  
-+static inline int skb_unclone(struct sk_buff *skb, gfp_t pri)
++static void skip_metadata(struct pstore *ps)
 +{
-+	might_sleep_if(pri & __GFP_WAIT);
-+
-+	if (skb_cloned(skb))
-+		return pskb_expand_head(skb, 0, 0, pri);
-+
-+	return 0;
++	uint32_t stride = ps->exceptions_per_area + 1;
++	chunk_t next_free = ps->next_free;
++	if (sector_div(next_free, stride) == NUM_SNAPSHOT_HDR_CHUNKS)
++		ps->next_free++;
 +}
 +
- /**
-  *	skb_header_cloned - is the header a clone
-  *	@skb: buffer to check
-@@ -1198,6 +1208,11 @@ static inline int skb_pagelen(const struct sk_buff *skb)
- 	return len + skb_headlen(skb);
+ /*
+  * Read or write a metadata area.  Remembering to skip the first
+  * chunk which holds the header.
+@@ -502,6 +510,8 @@ static int read_exceptions(struct pstore *ps,
+ 
+ 	ps->current_area--;
+ 
++	skip_metadata(ps);
++
+ 	return 0;
  }
  
-+static inline bool skb_has_frags(const struct sk_buff *skb)
-+{
-+	return skb_shinfo(skb)->nr_frags;
-+}
-+
- /**
-  * __skb_fill_page_desc - initialise a paged fragment in an skb
-  * @skb: buffer containing fragment to be initialised
-diff --git a/include/net/cipso_ipv4.h b/include/net/cipso_ipv4.h
-index a7a683e30b64..a8c2ef6d3b93 100644
---- a/include/net/cipso_ipv4.h
-+++ b/include/net/cipso_ipv4.h
-@@ -290,6 +290,7 @@ static inline int cipso_v4_validate(const struct sk_buff *skb,
- 	unsigned char err_offset = 0;
- 	u8 opt_len = opt[1];
- 	u8 opt_iter;
-+	u8 tag_len;
- 
- 	if (opt_len < 8) {
- 		err_offset = 1;
-@@ -302,11 +303,12 @@ static inline int cipso_v4_validate(const struct sk_buff *skb,
- 	}
- 
- 	for (opt_iter = 6; opt_iter < opt_len;) {
--		if (opt[opt_iter + 1] > (opt_len - opt_iter)) {
-+		tag_len = opt[opt_iter + 1];
-+		if ((tag_len == 0) || (opt[opt_iter + 1] > (opt_len - opt_iter))) {
- 			err_offset = opt_iter + 1;
- 			goto out;
- 		}
--		opt_iter += opt[opt_iter + 1];
-+		opt_iter += tag_len;
- 	}
- 
- out:
-diff --git a/include/net/dst.h b/include/net/dst.h
-index 8197eadca819..1efe71aad089 100644
---- a/include/net/dst.h
-+++ b/include/net/dst.h
-@@ -464,10 +464,22 @@ static inline struct dst_entry *xfrm_lookup(struct net *net,
+@@ -616,8 +626,6 @@ static int persistent_prepare_exception(struct dm_exception_store *store,
+ 					struct dm_exception *e)
  {
- 	return dst_orig;
- } 
-+
-+static inline struct xfrm_state *dst_xfrm(const struct dst_entry *dst)
-+{
-+	return NULL;
-+}
-+
- #else
- extern struct dst_entry *xfrm_lookup(struct net *net, struct dst_entry *dst_orig,
- 				     const struct flowi *fl, struct sock *sk,
- 				     int flags);
-+
-+/* skb attached with this dst needs transformation if dst->xfrm is valid */
-+static inline struct xfrm_state *dst_xfrm(const struct dst_entry *dst)
-+{
-+	return dst->xfrm;
-+}
- #endif
+ 	struct pstore *ps = get_info(store);
+-	uint32_t stride;
+-	chunk_t next_free;
+ 	sector_t size = get_dev_size(dm_snap_cow(store->snap)->bdev);
  
- #endif /* _NET_DST_H */
+ 	/* Is there enough room ? */
+@@ -630,10 +638,8 @@ static int persistent_prepare_exception(struct dm_exception_store *store,
+ 	 * Move onto the next free pending, making sure to take
+ 	 * into account the location of the metadata chunks.
+ 	 */
+-	stride = (ps->exceptions_per_area + 1);
+-	next_free = ++ps->next_free;
+-	if (sector_div(next_free, stride) == 1)
+-		ps->next_free++;
++	ps->next_free++;
++	skip_metadata(ps);
+ 
+ 	atomic_inc(&ps->pending_count);
+ 	return 0;
+-- 
+2.28.0
+
+
+From 60c6aa3ad74360adfaa171598a0ea9d0783ad532 Mon Sep 17 00:00:00 2001
+From: Fengguang Wu <fengguang.wu@intel.com>
+Date: Wed, 16 Oct 2013 13:47:03 -0700
+Subject: [PATCH 28/33] writeback: fix negative bdi max pause
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit e3b6c655b91e01a1dade056cfa358581b47a5351 upstream.
+
+Toralf runs trinity on UML/i386.  After some time it hangs and the last
+message line is
+
+	BUG: soft lockup - CPU#0 stuck for 22s! [trinity-child0:1521]
+
+It's found that pages_dirtied becomes very large.  More than 1000000000
+pages in this case:
+
+	period = HZ * pages_dirtied / task_ratelimit;
+	BUG_ON(pages_dirtied > 2000000000);
+	BUG_ON(pages_dirtied > 1000000000);      <---------
+
+UML debug printf shows that we got negative pause here:
+
+	ick: pause : -984
+	ick: pages_dirtied : 0
+	ick: task_ratelimit: 0
+
+	 pause:
+	+       if (pause < 0)  {
+	+               extern int printf(char *, ...);
+	+               printf("ick : pause : %li\n", pause);
+	+               printf("ick: pages_dirtied : %lu\n", pages_dirtied);
+	+               printf("ick: task_ratelimit: %lu\n", task_ratelimit);
+	+               BUG_ON(1);
+	+       }
+	        trace_balance_dirty_pages(bdi,
+
+Since pause is bounded by [min_pause, max_pause] where min_pause is also
+bounded by max_pause.  It's suspected and demonstrated that the
+max_pause calculation goes wrong:
+
+	ick: pause : -717
+	ick: min_pause : -177
+	ick: max_pause : -717
+	ick: pages_dirtied : 14
+	ick: task_ratelimit: 0
+
+The problem lies in the two "long = unsigned long" assignments in
+bdi_max_pause() which might go negative if the highest bit is 1, and the
+min_t(long, ...) check failed to protect it falling under 0.  Fix all of
+them by using "unsigned long" throughout the function.
+
+Signed-off-by: Fengguang Wu <fengguang.wu@intel.com>
+Reported-by: Toralf Förster <toralf.foerster@gmx.de>
+Tested-by: Toralf Förster <toralf.foerster@gmx.de>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Cc: Richard Weinberger <richard@nod.at>
+Cc: Geert Uytterhoeven <geert@linux-m68k.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/page-writeback.c | 10 +++++-----
+ 1 file changed, 5 insertions(+), 5 deletions(-)
+
 diff --git a/mm/page-writeback.c b/mm/page-writeback.c
 index bc8465f579a8..3b15e2a147a2 100644
 --- a/mm/page-writeback.c
@@ -796,339 +2193,38 @@ index bc8465f579a8..3b15e2a147a2 100644
  }
  
  static long bdi_min_pause(struct backing_dev_info *bdi,
-diff --git a/net/8021q/vlan_netlink.c b/net/8021q/vlan_netlink.c
-index 50711368ad6a..7f046b4c06bc 100644
---- a/net/8021q/vlan_netlink.c
-+++ b/net/8021q/vlan_netlink.c
-@@ -152,7 +152,7 @@ static size_t vlan_get_size(const struct net_device *dev)
- 	struct vlan_dev_priv *vlan = vlan_dev_priv(dev);
- 
- 	return nla_total_size(2) +	/* IFLA_VLAN_ID */
--	       sizeof(struct ifla_vlan_flags) + /* IFLA_VLAN_FLAGS */
-+	       nla_total_size(sizeof(struct ifla_vlan_flags)) + /* IFLA_VLAN_FLAGS */
- 	       vlan_qos_map_size(vlan->nr_ingress_mappings) +
- 	       vlan_qos_map_size(vlan->nr_egress_mappings);
- }
-diff --git a/net/bridge/br_stp_if.c b/net/bridge/br_stp_if.c
-index f774796f7e57..2f100ccef86f 100644
---- a/net/bridge/br_stp_if.c
-+++ b/net/bridge/br_stp_if.c
-@@ -134,7 +134,7 @@ static void br_stp_start(struct net_bridge *br)
- 
- 	if (br->bridge_forward_delay < BR_MIN_FORWARD_DELAY)
- 		__br_set_forward_delay(br, BR_MIN_FORWARD_DELAY);
--	else if (br->bridge_forward_delay < BR_MAX_FORWARD_DELAY)
-+	else if (br->bridge_forward_delay > BR_MAX_FORWARD_DELAY)
- 		__br_set_forward_delay(br, BR_MAX_FORWARD_DELAY);
- 
- 	if (r == 0) {
-diff --git a/net/compat.c b/net/compat.c
-index 014e1c78ecc5..ee84d82d7287 100644
---- a/net/compat.c
-+++ b/net/compat.c
-@@ -71,6 +71,8 @@ int get_compat_msghdr(struct msghdr *kmsg, struct compat_msghdr __user *umsg)
- 	    __get_user(kmsg->msg_controllen, &umsg->msg_controllen) ||
- 	    __get_user(kmsg->msg_flags, &umsg->msg_flags))
- 		return -EFAULT;
-+	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
-+		return -EINVAL;
- 	kmsg->msg_name = compat_ptr(tmp1);
- 	kmsg->msg_iov = compat_ptr(tmp2);
- 	kmsg->msg_control = compat_ptr(tmp3);
-diff --git a/net/ipv4/inet_hashtables.c b/net/ipv4/inet_hashtables.c
-index 984ec656b03b..4afcf31bdfeb 100644
---- a/net/ipv4/inet_hashtables.c
-+++ b/net/ipv4/inet_hashtables.c
-@@ -268,7 +268,7 @@ begintw:
- 			}
- 			if (unlikely(!INET_TW_MATCH(sk, net, hash, acookie,
- 				 saddr, daddr, ports, dif))) {
--				sock_put(sk);
-+				inet_twsk_put(inet_twsk(sk));
- 				goto begintw;
- 			}
- 			goto out;
-diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
-index 3bc4c978d7ad..d6407b563fd8 100644
---- a/net/ipv4/ip_output.c
-+++ b/net/ipv4/ip_output.c
-@@ -846,7 +846,7 @@ static int __ip_append_data(struct sock *sk,
- 		csummode = CHECKSUM_PARTIAL;
- 
- 	cork->length += length;
--	if (((length > mtu) || (skb && skb_is_gso(skb))) &&
-+	if (((length > mtu) || (skb && skb_has_frags(skb))) &&
- 	    (sk->sk_protocol == IPPROTO_UDP) &&
- 	    (rt->dst.dev->features & NETIF_F_UFO) && !rt->dst.header_len) {
- 		err = ip_ufo_append_data(sk, queue, getfrag, from, length,
-diff --git a/net/ipv4/route.c b/net/ipv4/route.c
-index 167ea10b521a..108c73d760df 100644
---- a/net/ipv4/route.c
-+++ b/net/ipv4/route.c
-@@ -2713,7 +2713,7 @@ static struct rtable *ip_route_output_slow(struct net *net, struct flowi4 *fl4)
- 							      RT_SCOPE_LINK);
- 			goto make_route;
- 		}
--		if (fl4->saddr) {
-+		if (!fl4->saddr) {
- 			if (ipv4_is_multicast(fl4->daddr))
- 				fl4->saddr = inet_select_addr(dev_out, 0,
- 							      fl4->flowi4_scope);
-diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-index 55d96c392e7f..99eb909c9d5f 100644
---- a/net/ipv4/tcp_input.c
-+++ b/net/ipv4/tcp_input.c
-@@ -1468,7 +1468,10 @@ static int tcp_shifted_skb(struct sock *sk, struct sk_buff *skb,
- 		tp->lost_cnt_hint -= tcp_skb_pcount(prev);
- 	}
- 
--	TCP_SKB_CB(skb)->tcp_flags |= TCP_SKB_CB(prev)->tcp_flags;
-+	TCP_SKB_CB(prev)->tcp_flags |= TCP_SKB_CB(skb)->tcp_flags;
-+	if (TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN)
-+		TCP_SKB_CB(prev)->end_seq++;
-+
- 	if (skb == tcp_highest_sack(sk))
- 		tcp_advance_highest_sack(sk, skb);
- 
-diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
-index 12999a3aaf95..987f5cc706b4 100644
---- a/net/ipv4/tcp_output.c
-+++ b/net/ipv4/tcp_output.c
-@@ -933,6 +933,9 @@ static void tcp_queue_skb(struct sock *sk, struct sk_buff *skb)
- static void tcp_set_skb_tso_segs(const struct sock *sk, struct sk_buff *skb,
- 				 unsigned int mss_now)
- {
-+	/* Make sure we own this skb before messing gso_size/gso_segs */
-+	WARN_ON_ONCE(skb_cloned(skb));
-+
- 	if (skb->len <= mss_now || !sk_can_gso(sk) ||
- 	    skb->ip_summed == CHECKSUM_NONE) {
- 		/* Avoid the costly divide in the normal
-@@ -1014,9 +1017,7 @@ int tcp_fragment(struct sock *sk, struct sk_buff *skb, u32 len,
- 	if (nsize < 0)
- 		nsize = 0;
- 
--	if (skb_cloned(skb) &&
--	    skb_is_nonlinear(skb) &&
--	    pskb_expand_head(skb, 0, 0, GFP_ATOMIC))
-+	if (skb_unclone(skb, GFP_ATOMIC))
- 		return -ENOMEM;
- 
- 	/* Get a new skb... force flag on. */
-@@ -2129,6 +2130,8 @@ int tcp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
- 		int oldpcount = tcp_skb_pcount(skb);
- 
- 		if (unlikely(oldpcount > 1)) {
-+			if (skb_unclone(skb, GFP_ATOMIC))
-+				return -ENOMEM;
- 			tcp_init_tso_segs(sk, skb, cur_mss);
- 			tcp_adjust_pcount(sk, skb, oldpcount - tcp_skb_pcount(skb));
- 		}
-diff --git a/net/ipv6/inet6_hashtables.c b/net/ipv6/inet6_hashtables.c
-index 73f1a00a96af..e38290b7c7a1 100644
---- a/net/ipv6/inet6_hashtables.c
-+++ b/net/ipv6/inet6_hashtables.c
-@@ -110,7 +110,7 @@ begintw:
- 				goto out;
- 			}
- 			if (!INET6_TW_MATCH(sk, net, hash, saddr, daddr, ports, dif)) {
--				sock_put(sk);
-+				inet_twsk_put(inet_twsk(sk));
- 				goto begintw;
- 			}
- 			goto out;
-diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index 1acfb19cb570..7dabea3a7125 100644
---- a/net/ipv6/ip6_output.c
-+++ b/net/ipv6/ip6_output.c
-@@ -1345,7 +1345,7 @@ int ip6_append_data(struct sock *sk, int getfrag(void *from, char *to,
- 	skb = skb_peek_tail(&sk->sk_write_queue);
- 	cork->length += length;
- 	if (((length > mtu) ||
--	     (skb && skb_is_gso(skb))) &&
-+	     (skb && skb_has_frags(skb))) &&
- 	    (sk->sk_protocol == IPPROTO_UDP) &&
- 	    (rt->dst.dev->features & NETIF_F_UFO)) {
- 		err = ip6_ufo_append_data(sk, getfrag, from, length,
-diff --git a/net/ipv6/route.c b/net/ipv6/route.c
-index 016ed7c22fc9..4f768a4c2907 100644
---- a/net/ipv6/route.c
-+++ b/net/ipv6/route.c
-@@ -818,7 +818,7 @@ static struct rt6_info *rt6_alloc_clone(struct rt6_info *ort,
- }
- 
- static struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table, int oif,
--				      struct flowi6 *fl6, int flags)
-+				      struct flowi6 *fl6, int flags, bool input)
- {
- 	struct fib6_node *fn;
- 	struct rt6_info *rt, *nrt;
-@@ -826,8 +826,11 @@ static struct rt6_info *ip6_pol_route(struct net *net, struct fib6_table *table,
- 	int attempts = 3;
- 	int err;
- 	int reachable = net->ipv6.devconf_all->forwarding ? 0 : RT6_LOOKUP_F_REACHABLE;
-+	int local = RTF_NONEXTHOP;
- 
- 	strict |= flags & RT6_LOOKUP_F_IFACE;
-+	if (input)
-+		local |= RTF_LOCAL;
- 
- relookup:
- 	read_lock_bh(&table->tb6_lock);
-@@ -847,7 +850,7 @@ restart:
- 	read_unlock_bh(&table->tb6_lock);
- 
- 	if (!dst_get_neighbour_noref_raw(&rt->dst) &&
--	    !(rt->rt6i_flags & (RTF_NONEXTHOP | RTF_LOCAL)))
-+	    !(rt->rt6i_flags & local))
- 		nrt = rt6_alloc_cow(rt, &fl6->daddr, &fl6->saddr);
- 	else if (!(rt->dst.flags & DST_HOST))
- 		nrt = rt6_alloc_clone(rt, &fl6->daddr);
-@@ -891,7 +894,7 @@ out2:
- static struct rt6_info *ip6_pol_route_input(struct net *net, struct fib6_table *table,
- 					    struct flowi6 *fl6, int flags)
- {
--	return ip6_pol_route(net, table, fl6->flowi6_iif, fl6, flags);
-+	return ip6_pol_route(net, table, fl6->flowi6_iif, fl6, flags, true);
- }
- 
- static struct dst_entry *ip6_route_input_lookup(struct net *net,
-@@ -924,7 +927,7 @@ void ip6_route_input(struct sk_buff *skb)
- static struct rt6_info *ip6_pol_route_output(struct net *net, struct fib6_table *table,
- 					     struct flowi6 *fl6, int flags)
- {
--	return ip6_pol_route(net, table, fl6->flowi6_oif, fl6, flags);
-+	return ip6_pol_route(net, table, fl6->flowi6_oif, fl6, flags, false);
- }
- 
- struct dst_entry * ip6_route_output(struct net *net, const struct sock *sk,
-diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
-index b2982f4214d1..904bc098790d 100644
---- a/net/l2tp/l2tp_ppp.c
-+++ b/net/l2tp/l2tp_ppp.c
-@@ -357,7 +357,9 @@ static int pppol2tp_sendmsg(struct kiocb *iocb, struct socket *sock, struct msgh
- 		goto error_put_sess_tun;
- 	}
- 
-+	local_bh_disable();
- 	l2tp_xmit_skb(session, skb, session->hdr_len);
-+	local_bh_enable();
- 
- 	sock_put(ps->tunnel_sock);
- 	sock_put(sk);
-@@ -432,7 +434,9 @@ static int pppol2tp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
- 	skb->data[0] = ppph[0];
- 	skb->data[1] = ppph[1];
- 
-+	local_bh_disable();
- 	l2tp_xmit_skb(session, skb, session->hdr_len);
-+	local_bh_enable();
- 
- 	sock_put(sk_tun);
- 	sock_put(sk);
-diff --git a/net/sctp/output.c b/net/sctp/output.c
-index 32ba8d0e50e2..cf3e22c586a6 100644
---- a/net/sctp/output.c
-+++ b/net/sctp/output.c
-@@ -518,7 +518,8 @@ int sctp_packet_transmit(struct sctp_packet *packet)
- 	 * by CRC32-C as described in <draft-ietf-tsvwg-sctpcsum-02.txt>.
- 	 */
- 	if (!sctp_checksum_disable) {
--		if (!(dst->dev->features & NETIF_F_SCTP_CSUM)) {
-+		if (!(dst->dev->features & NETIF_F_SCTP_CSUM) ||
-+		    (dst_xfrm(dst) != NULL) || packet->ipfragok) {
- 			__u32 crc32 = sctp_start_cksum((__u8 *)sh, cksum_buf_len);
- 
- 			/* 3) Put the resultant value into the checksum field in the
-diff --git a/net/socket.c b/net/socket.c
-index 47ce3ea44300..acc769562707 100644
---- a/net/socket.c
-+++ b/net/socket.c
-@@ -1899,6 +1899,16 @@ struct used_address {
- 	unsigned int name_len;
- };
- 
-+static int copy_msghdr_from_user(struct msghdr *kmsg,
-+				 struct msghdr __user *umsg)
-+{
-+	if (copy_from_user(kmsg, umsg, sizeof(struct msghdr)))
-+		return -EFAULT;
-+	if (kmsg->msg_namelen > sizeof(struct sockaddr_storage))
-+		return -EINVAL;
-+	return 0;
-+}
-+
- static int ___sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
- 			  struct msghdr *msg_sys, unsigned flags,
- 			  struct used_address *used_address)
-@@ -1917,8 +1927,11 @@ static int ___sys_sendmsg(struct socket *sock, struct msghdr __user *msg,
- 	if (MSG_CMSG_COMPAT & flags) {
- 		if (get_compat_msghdr(msg_sys, msg_compat))
- 			return -EFAULT;
--	} else if (copy_from_user(msg_sys, msg, sizeof(struct msghdr)))
--		return -EFAULT;
-+	} else {
-+		err = copy_msghdr_from_user(msg_sys, msg);
-+		if (err)
-+			return err;
-+	}
- 
- 	/* do not move before msg_sys is valid */
- 	err = -EMSGSIZE;
-@@ -2129,8 +2142,11 @@ static int ___sys_recvmsg(struct socket *sock, struct msghdr __user *msg,
- 	if (MSG_CMSG_COMPAT & flags) {
- 		if (get_compat_msghdr(msg_sys, msg_compat))
- 			return -EFAULT;
--	} else if (copy_from_user(msg_sys, msg, sizeof(struct msghdr)))
--		return -EFAULT;
-+	} else {
-+		err = copy_msghdr_from_user(msg_sys, msg);
-+		if (err)
-+			return err;
-+	}
- 
- 	err = -EMSGSIZE;
- 	if (msg_sys->msg_iovlen > UIO_MAXIOV)
-diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
-index c4821fd23b79..ed005b425a7c 100644
---- a/net/unix/af_unix.c
-+++ b/net/unix/af_unix.c
-@@ -1247,6 +1247,15 @@ static int unix_socketpair(struct socket *socka, struct socket *sockb)
- 	return 0;
- }
- 
-+static void unix_sock_inherit_flags(const struct socket *old,
-+				    struct socket *new)
-+{
-+	if (test_bit(SOCK_PASSCRED, &old->flags))
-+		set_bit(SOCK_PASSCRED, &new->flags);
-+	if (test_bit(SOCK_PASSSEC, &old->flags))
-+		set_bit(SOCK_PASSSEC, &new->flags);
-+}
-+
- static int unix_accept(struct socket *sock, struct socket *newsock, int flags)
- {
- 	struct sock *sk = sock->sk;
-@@ -1281,6 +1290,7 @@ static int unix_accept(struct socket *sock, struct socket *newsock, int flags)
- 	/* attach accepted sock to socket */
- 	unix_state_lock(tsk);
- 	newsock->state = SS_CONNECTED;
-+	unix_sock_inherit_flags(sock, newsock);
- 	sock_graft(tsk, newsock);
- 	unix_state_unlock(tsk);
- 	return 0;
-diff --git a/net/unix/diag.c b/net/unix/diag.c
-index f0486ae9ebe6..2656840cf203 100644
---- a/net/unix/diag.c
-+++ b/net/unix/diag.c
-@@ -134,6 +134,7 @@ static int sk_diag_fill(struct sock *sk, struct sk_buff *skb, struct unix_diag_r
- 	rep->udiag_family = AF_UNIX;
- 	rep->udiag_type = sk->sk_type;
- 	rep->udiag_state = sk->sk_state;
-+	rep->pad = 0;
- 	rep->udiag_ino = sk_ino;
- 	sock_diag_save_cookie(sk, rep->udiag_cookie);
- 
+-- 
+2.28.0
+
+
+From 5b81d479d6b12a0c44e261de0e454ed740c7f81d Mon Sep 17 00:00:00 2001
+From: Johannes Berg <johannes.berg@intel.com>
+Date: Fri, 11 Oct 2013 14:47:05 +0200
+Subject: [PATCH 29/33] wireless: radiotap: fix parsing buffer overrun
+
+commit f5563318ff1bde15b10e736e97ffce13be08bc1a upstream.
+
+When parsing an invalid radiotap header, the parser can overrun
+the buffer that is passed in because it doesn't correctly check
+ 1) the minimum radiotap header size
+ 2) the space for extended bitmaps
+
+The first issue doesn't affect any in-kernel user as they all
+check the minimum size before calling the radiotap function.
+The second issue could potentially affect the kernel if an skb
+is passed in that consists only of the radiotap header with a
+lot of extended bitmaps that extend past the SKB. In that case
+a read-only buffer overrun by at most 4 bytes is possible.
+
+Fix this by adding the appropriate checks to the parser.
+
+Reported-by: Evan Huus <eapache@gmail.com>
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/wireless/radiotap.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
 diff --git a/net/wireless/radiotap.c b/net/wireless/radiotap.c
 index c4ad7958af52..617a310025b1 100644
 --- a/net/wireless/radiotap.c
@@ -1154,3 +2250,148 @@ index c4ad7958af52..617a310025b1 100644
  			    (unsigned long)iterator->_max_length)
  				return -EINVAL;
  		}
+-- 
+2.28.0
+
+
+From d588c4db43ccd763e8f7d87fecf1da138a080a1d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Diego=20Elio=20Petten=C3=B2?= <flameeyes@flameeyes.eu>
+Date: Tue, 8 Oct 2013 20:03:37 +0100
+Subject: [PATCH 30/33] USB: serial: ti_usb_3410_5052: add Abbott strip port ID
+ to combined table as well.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit c9d09dc7ad106492c17c587b6eeb99fe3f43e522 upstream.
+
+Without this change, the USB cable for Freestyle Option and compatible
+glucometers will not be detected by the driver.
+
+Signed-off-by: Diego Elio Pettenò <flameeyes@flameeyes.eu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/ti_usb_3410_5052.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/serial/ti_usb_3410_5052.c b/drivers/usb/serial/ti_usb_3410_5052.c
+index a7492ba5371a..1b0430e00b75 100644
+--- a/drivers/usb/serial/ti_usb_3410_5052.c
++++ b/drivers/usb/serial/ti_usb_3410_5052.c
+@@ -210,6 +210,7 @@ static struct usb_device_id ti_id_table_combined[19+2*TI_EXTRA_VID_PID_COUNT+1]
+ 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_454B_PRODUCT_ID) },
+ 	{ USB_DEVICE(IBM_VENDOR_ID, IBM_454C_PRODUCT_ID) },
+ 	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_PRODUCT_ID) },
++	{ USB_DEVICE(ABBOTT_VENDOR_ID, ABBOTT_STRIP_PORT_ID) },
+ 	{ USB_DEVICE(TI_VENDOR_ID, FRI2_PRODUCT_ID) },
+ 	{ }
+ };
+-- 
+2.28.0
+
+
+From 9598aad103c5c62a7b10946d154126acd1a305de Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Sat, 5 Oct 2013 18:14:18 -0700
+Subject: [PATCH 31/33] USB: serial: option: add support for Inovia SEW858
+ device
+
+commit f4c19b8e165cff1a6607c21f8809441d61cab7ec upstream.
+
+This patch adds the device id for the Inovia SEW858 device to the option driver.
+
+Reported-by: Pavel Parkhomenko <ra85551@gmail.com>
+Tested-by: Pavel Parkhomenko <ra85551@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/option.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index 9def72f018e0..6ef208e8f2d3 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -457,6 +457,10 @@ static void option_instat_callback(struct urb *urb);
+ #define CHANGHONG_VENDOR_ID			0x2077
+ #define CHANGHONG_PRODUCT_CH690			0x7001
+ 
++/* Inovia */
++#define INOVIA_VENDOR_ID			0x20a6
++#define INOVIA_SEW858				0x1105
++
+ /* some devices interfaces need special handling due to a number of reasons */
+ enum option_blacklist_reason {
+ 		OPTION_BLACKLIST_NONE = 0,
+@@ -1367,6 +1371,7 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x2001, 0x7d03, 0xff, 0x00, 0x00) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e01, 0xff, 0xff, 0xff) }, /* D-Link DWM-152/C1 */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(0x07d1, 0x3e02, 0xff, 0xff, 0xff) }, /* D-Link DWM-156/C1 */
++	{ USB_DEVICE(INOVIA_VENDOR_ID, INOVIA_SEW858) },
+ 	{ } /* Terminating entry */
+ };
+ MODULE_DEVICE_TABLE(usb, option_ids);
+-- 
+2.28.0
+
+
+From f99343bd91aae0447f4fcacf7c7b2a86065eae21 Mon Sep 17 00:00:00 2001
+From: Enrico Mioso <mrkiko.rs@gmail.com>
+Date: Tue, 15 Oct 2013 15:06:47 +0200
+Subject: [PATCH 32/33] usb: serial: option: blacklist Olivetti Olicard200
+
+commit fd8573f5828873343903215f203f14dc82de397c upstream.
+
+Interface 6 of this device speaks QMI as per tests done by us.
+Credits go to Antonella for providing the hardware.
+
+Signed-off-by: Enrico Mioso <mrkiko.rs@gmail.com>
+Signed-off-by: Antonella Pellizzari <anto.pellizzari83@gmail.com>
+Tested-by: Dan Williams <dcbw@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/option.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index 6ef208e8f2d3..b3440c66a995 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -1283,7 +1283,9 @@ static const struct usb_device_id option_ids[] = {
+ 
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD100) },
+ 	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD145) },
+-	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD200) },
++	{ USB_DEVICE(OLIVETTI_VENDOR_ID, OLIVETTI_PRODUCT_OLICARD200),
++		.driver_info = (kernel_ulong_t)&net_intf6_blacklist
++	},
+ 	{ USB_DEVICE(CELOT_VENDOR_ID, CELOT_PRODUCT_CT680M) }, /* CT-650 CDMA 450 1xEVDO modem */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(SAMSUNG_VENDOR_ID, SAMSUNG_PRODUCT_GT_B3730, USB_CLASS_CDC_DATA, 0x00, 0x00) }, /* Samsung GT-B3730 LTE USB modem.*/
+ 	{ USB_DEVICE(YUGA_VENDOR_ID, YUGA_PRODUCT_CEM600) },
+-- 
+2.28.0
+
+
+From 575e5ec35de8f39fa6cc14f80b87ead3b7487780 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Mon, 4 Nov 2013 04:23:59 -0800
+Subject: [PATCH 33/33] Linux 3.4.68
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 9f440dd8256c..656c45f09128 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 4
+-SUBLEVEL = 67
++SUBLEVEL = 68
+ EXTRAVERSION =
+ NAME = Saber-toothed Squirrel
+ 
+-- 
+2.28.0
+

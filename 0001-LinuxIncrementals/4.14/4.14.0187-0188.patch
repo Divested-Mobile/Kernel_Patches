@@ -1,28 +1,1005 @@
-diff --git a/Makefile b/Makefile
-index 42b7d816d102..7dc8eec60e7c 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- # SPDX-License-Identifier: GPL-2.0
- VERSION = 4
- PATCHLEVEL = 14
--SUBLEVEL = 187
-+SUBLEVEL = 188
- EXTRAVERSION =
- NAME = Petit Gorille
+From b74639caf40325e2e8eb5383aa601f894064f5d7 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 1 Jun 2020 19:12:06 +0100
+Subject: [PATCH 01/28] btrfs: fix a block group ref counter leak after failure
+ to remove block group
+
+[ Upstream commit 9fecd13202f520f3f25d5b1c313adb740fe19773 ]
+
+When removing a block group, if we fail to delete the block group's item
+from the extent tree, we jump to the 'out' label and end up decrementing
+the block group's reference count once only (by 1), resulting in a counter
+leak because the block group at that point was already removed from the
+block group cache rbtree - so we have to decrement the reference count
+twice, once for the rbtree and once for our lookup at the start of the
+function.
+
+There is a second bug where if removing the free space tree entries (the
+call to remove_block_group_free_space()) fails we end up jumping to the
+'out_put_group' label but end up decrementing the reference count only
+once, when we should have done it twice, since we have already removed
+the block group from the block group cache rbtree. This happens because
+the reference count decrement for the rbtree reference happens after
+attempting to remove the free space tree entries, which is far away from
+the place where we remove the block group from the rbtree.
+
+To make things less error prone, decrement the reference count for the
+rbtree immediately after removing the block group from it. This also
+eleminates the need for two different exit labels on error, renaming
+'out_put_label' to just 'out' and removing the old 'out'.
+
+Fixes: f6033c5e333238 ("btrfs: fix block group leak when removing fails")
+CC: stable@vger.kernel.org # 4.4+
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Reviewed-by: Anand Jain <anand.jain@oracle.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/extent-tree.c | 19 +++++++++----------
+ 1 file changed, 9 insertions(+), 10 deletions(-)
+
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index 51e26f90f0bb..63b8812ba508 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -10554,7 +10554,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+ 	path = btrfs_alloc_path();
+ 	if (!path) {
+ 		ret = -ENOMEM;
+-		goto out_put_group;
++		goto out;
+ 	}
  
-diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
-index 583aed906933..4a23d89e251c 100644
---- a/arch/mips/kernel/traps.c
-+++ b/arch/mips/kernel/traps.c
-@@ -2135,6 +2135,7 @@ static void configure_status(void)
+ 	/*
+@@ -10591,7 +10591,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+ 		ret = btrfs_orphan_add(trans, BTRFS_I(inode));
+ 		if (ret) {
+ 			btrfs_add_delayed_iput(inode);
+-			goto out_put_group;
++			goto out;
+ 		}
+ 		clear_nlink(inode);
+ 		/* One for the block groups ref */
+@@ -10614,13 +10614,13 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
  
- 	change_c0_status(ST0_CU|ST0_MX|ST0_RE|ST0_FR|ST0_BEV|ST0_TS|ST0_KX|ST0_SX|ST0_UX,
- 			 status_set);
-+	back_to_back_c0_hazard();
+ 	ret = btrfs_search_slot(trans, tree_root, &key, path, -1, 1);
+ 	if (ret < 0)
+-		goto out_put_group;
++		goto out;
+ 	if (ret > 0)
+ 		btrfs_release_path(path);
+ 	if (ret == 0) {
+ 		ret = btrfs_del_item(trans, tree_root, path);
+ 		if (ret)
+-			goto out_put_group;
++			goto out;
+ 		btrfs_release_path(path);
+ 	}
+ 
+@@ -10629,6 +10629,9 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+ 		 &fs_info->block_group_cache_tree);
+ 	RB_CLEAR_NODE(&block_group->cache_node);
+ 
++	/* Once for the block groups rbtree */
++	btrfs_put_block_group(block_group);
++
+ 	if (fs_info->first_logical_byte == block_group->key.objectid)
+ 		fs_info->first_logical_byte = (u64)-1;
+ 	spin_unlock(&fs_info->block_group_cache_lock);
+@@ -10778,10 +10781,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+ 
+ 	ret = remove_block_group_free_space(trans, fs_info, block_group);
+ 	if (ret)
+-		goto out_put_group;
+-
+-	/* Once for the block groups rbtree */
+-	btrfs_put_block_group(block_group);
++		goto out;
+ 
+ 	ret = btrfs_search_slot(trans, root, &key, path, -1, 1);
+ 	if (ret > 0)
+@@ -10791,10 +10791,9 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
+ 
+ 	ret = btrfs_del_item(trans, root, path);
+ 
+-out_put_group:
++out:
+ 	/* Once for the lookup reference */
+ 	btrfs_put_block_group(block_group);
+-out:
+ 	btrfs_free_path(path);
+ 	return ret;
+ }
+-- 
+2.28.0
+
+
+From e3c6933157099f8fa9da59dd4df38fcda54d7a47 Mon Sep 17 00:00:00 2001
+From: Anand Jain <Anand.Jain@oracle.com>
+Date: Thu, 15 Feb 2018 12:29:38 +0800
+Subject: [PATCH 02/28] btrfs: cow_file_range() num_bytes and disk_num_bytes
+ are same
+
+[ Upstream commit 3752d22fcea160cc2493e34f5e0e41cdd7fdd921 ]
+
+This patch deletes local variable disk_num_bytes as its value
+is same as num_bytes in the function cow_file_range().
+
+Signed-off-by: Anand Jain <anand.jain@oracle.com>
+Reviewed-by: Nikolay Borisov <nborisov@suse.com>
+Reviewed-by: David Sterba <dsterba@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/inode.c | 16 ++++++----------
+ 1 file changed, 6 insertions(+), 10 deletions(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index 39ad582d72c4..a8ae9a070487 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -978,7 +978,6 @@ static noinline int cow_file_range(struct inode *inode,
+ 	u64 alloc_hint = 0;
+ 	u64 num_bytes;
+ 	unsigned long ram_size;
+-	u64 disk_num_bytes;
+ 	u64 cur_alloc_size = 0;
+ 	u64 blocksize = fs_info->sectorsize;
+ 	struct btrfs_key ins;
+@@ -996,7 +995,6 @@ static noinline int cow_file_range(struct inode *inode,
+ 
+ 	num_bytes = ALIGN(end - start + 1, blocksize);
+ 	num_bytes = max(blocksize,  num_bytes);
+-	disk_num_bytes = num_bytes;
+ 
+ 	inode_should_defrag(BTRFS_I(inode), start, end, num_bytes, SZ_64K);
+ 
+@@ -1023,15 +1021,14 @@ static noinline int cow_file_range(struct inode *inode,
+ 		}
+ 	}
+ 
+-	BUG_ON(disk_num_bytes >
+-	       btrfs_super_total_bytes(fs_info->super_copy));
++	BUG_ON(num_bytes > btrfs_super_total_bytes(fs_info->super_copy));
+ 
+ 	alloc_hint = get_extent_allocation_hint(inode, start, num_bytes);
+ 	btrfs_drop_extent_cache(BTRFS_I(inode), start,
+ 			start + num_bytes - 1, 0);
+ 
+-	while (disk_num_bytes > 0) {
+-		cur_alloc_size = disk_num_bytes;
++	while (num_bytes > 0) {
++		cur_alloc_size = num_bytes;
+ 		ret = btrfs_reserve_extent(root, cur_alloc_size, cur_alloc_size,
+ 					   fs_info->sectorsize, 0, alloc_hint,
+ 					   &ins, 1, 1);
+@@ -1097,11 +1094,10 @@ static noinline int cow_file_range(struct inode *inode,
+ 					     delalloc_end, locked_page,
+ 					     EXTENT_LOCKED | EXTENT_DELALLOC,
+ 					     page_ops);
+-		if (disk_num_bytes < cur_alloc_size)
+-			disk_num_bytes = 0;
++		if (num_bytes < cur_alloc_size)
++			num_bytes = 0;
+ 		else
+-			disk_num_bytes -= cur_alloc_size;
+-		num_bytes -= cur_alloc_size;
++			num_bytes -= cur_alloc_size;
+ 		alloc_hint = ins.objectid + ins.offset;
+ 		start += cur_alloc_size;
+ 		extent_reserved = false;
+-- 
+2.28.0
+
+
+From 6d87c029bbf07c99028e95aad3c524335ba19370 Mon Sep 17 00:00:00 2001
+From: Filipe Manana <fdmanana@suse.com>
+Date: Mon, 8 Jun 2020 13:32:55 +0100
+Subject: [PATCH 03/28] btrfs: fix data block group relocation failure due to
+ concurrent scrub
+
+[ Upstream commit 432cd2a10f1c10cead91fe706ff5dc52f06d642a ]
+
+When running relocation of a data block group while scrub is running in
+parallel, it is possible that the relocation will fail and abort the
+current transaction with an -EINVAL error:
+
+   [134243.988595] BTRFS info (device sdc): found 14 extents, stage: move data extents
+   [134243.999871] ------------[ cut here ]------------
+   [134244.000741] BTRFS: Transaction aborted (error -22)
+   [134244.001692] WARNING: CPU: 0 PID: 26954 at fs/btrfs/ctree.c:1071 __btrfs_cow_block+0x6a7/0x790 [btrfs]
+   [134244.003380] Modules linked in: btrfs blake2b_generic xor raid6_pq (...)
+   [134244.012577] CPU: 0 PID: 26954 Comm: btrfs Tainted: G        W         5.6.0-rc7-btrfs-next-58 #5
+   [134244.014162] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.12.0-59-gc9ba5276e321-prebuilt.qemu.org 04/01/2014
+   [134244.016184] RIP: 0010:__btrfs_cow_block+0x6a7/0x790 [btrfs]
+   [134244.017151] Code: 48 c7 c7 (...)
+   [134244.020549] RSP: 0018:ffffa41607863888 EFLAGS: 00010286
+   [134244.021515] RAX: 0000000000000000 RBX: ffff9614bdfe09c8 RCX: 0000000000000000
+   [134244.022822] RDX: 0000000000000001 RSI: ffffffffb3d63980 RDI: 0000000000000001
+   [134244.024124] RBP: ffff961589e8c000 R08: 0000000000000000 R09: 0000000000000001
+   [134244.025424] R10: ffffffffc0ae5955 R11: 0000000000000000 R12: ffff9614bd530d08
+   [134244.026725] R13: ffff9614ced41b88 R14: ffff9614bdfe2a48 R15: 0000000000000000
+   [134244.028024] FS:  00007f29b63c08c0(0000) GS:ffff9615ba600000(0000) knlGS:0000000000000000
+   [134244.029491] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+   [134244.030560] CR2: 00007f4eb339b000 CR3: 0000000130d6e006 CR4: 00000000003606f0
+   [134244.031997] DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+   [134244.033153] DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+   [134244.034484] Call Trace:
+   [134244.034984]  btrfs_cow_block+0x12b/0x2b0 [btrfs]
+   [134244.035859]  do_relocation+0x30b/0x790 [btrfs]
+   [134244.036681]  ? do_raw_spin_unlock+0x49/0xc0
+   [134244.037460]  ? _raw_spin_unlock+0x29/0x40
+   [134244.038235]  relocate_tree_blocks+0x37b/0x730 [btrfs]
+   [134244.039245]  relocate_block_group+0x388/0x770 [btrfs]
+   [134244.040228]  btrfs_relocate_block_group+0x161/0x2e0 [btrfs]
+   [134244.041323]  btrfs_relocate_chunk+0x36/0x110 [btrfs]
+   [134244.041345]  btrfs_balance+0xc06/0x1860 [btrfs]
+   [134244.043382]  ? btrfs_ioctl_balance+0x27c/0x310 [btrfs]
+   [134244.045586]  btrfs_ioctl_balance+0x1ed/0x310 [btrfs]
+   [134244.045611]  btrfs_ioctl+0x1880/0x3760 [btrfs]
+   [134244.049043]  ? do_raw_spin_unlock+0x49/0xc0
+   [134244.049838]  ? _raw_spin_unlock+0x29/0x40
+   [134244.050587]  ? __handle_mm_fault+0x11b3/0x14b0
+   [134244.051417]  ? ksys_ioctl+0x92/0xb0
+   [134244.052070]  ksys_ioctl+0x92/0xb0
+   [134244.052701]  ? trace_hardirqs_off_thunk+0x1a/0x1c
+   [134244.053511]  __x64_sys_ioctl+0x16/0x20
+   [134244.054206]  do_syscall_64+0x5c/0x280
+   [134244.054891]  entry_SYSCALL_64_after_hwframe+0x49/0xbe
+   [134244.055819] RIP: 0033:0x7f29b51c9dd7
+   [134244.056491] Code: 00 00 00 (...)
+   [134244.059767] RSP: 002b:00007ffcccc1dd08 EFLAGS: 00000202 ORIG_RAX: 0000000000000010
+   [134244.061168] RAX: ffffffffffffffda RBX: 0000000000000001 RCX: 00007f29b51c9dd7
+   [134244.062474] RDX: 00007ffcccc1dda0 RSI: 00000000c4009420 RDI: 0000000000000003
+   [134244.063771] RBP: 0000000000000003 R08: 00005565cea4b000 R09: 0000000000000000
+   [134244.065032] R10: 0000000000000541 R11: 0000000000000202 R12: 00007ffcccc2060a
+   [134244.066327] R13: 00007ffcccc1dda0 R14: 0000000000000002 R15: 00007ffcccc1dec0
+   [134244.067626] irq event stamp: 0
+   [134244.068202] hardirqs last  enabled at (0): [<0000000000000000>] 0x0
+   [134244.069351] hardirqs last disabled at (0): [<ffffffffb2abdedf>] copy_process+0x74f/0x2020
+   [134244.070909] softirqs last  enabled at (0): [<ffffffffb2abdedf>] copy_process+0x74f/0x2020
+   [134244.072392] softirqs last disabled at (0): [<0000000000000000>] 0x0
+   [134244.073432] ---[ end trace bd7c03622e0b0a99 ]---
+
+The -EINVAL error comes from the following chain of function calls:
+
+  __btrfs_cow_block() <-- aborts the transaction
+    btrfs_reloc_cow_block()
+      replace_file_extents()
+        get_new_location() <-- returns -EINVAL
+
+When relocating a data block group, for each allocated extent of the block
+group, we preallocate another extent (at prealloc_file_extent_cluster()),
+associated with the data relocation inode, and then dirty all its pages.
+These preallocated extents have, and must have, the same size that extents
+from the data block group being relocated have.
+
+Later before we start the relocation stage that updates pointers (bytenr
+field of file extent items) to point to the the new extents, we trigger
+writeback for the data relocation inode. The expectation is that writeback
+will write the pages to the previously preallocated extents, that it
+follows the NOCOW path. That is generally the case, however, if a scrub
+is running it may have turned the block group that contains those extents
+into RO mode, in which case writeback falls back to the COW path.
+
+However in the COW path instead of allocating exactly one extent with the
+expected size, the allocator may end up allocating several smaller extents
+due to free space fragmentation - because we tell it at cow_file_range()
+that the minimum allocation size can match the filesystem's sector size.
+This later breaks the relocation's expectation that an extent associated
+to a file extent item in the data relocation inode has the same size as
+the respective extent pointed by a file extent item in another tree - in
+this case the extent to which the relocation inode poins to is smaller,
+causing relocation.c:get_new_location() to return -EINVAL.
+
+For example, if we are relocating a data block group X that has a logical
+address of X and the block group has an extent allocated at the logical
+address X + 128KiB with a size of 64KiB:
+
+1) At prealloc_file_extent_cluster() we allocate an extent for the data
+   relocation inode with a size of 64KiB and associate it to the file
+   offset 128KiB (X + 128KiB - X) of the data relocation inode. This
+   preallocated extent was allocated at block group Z;
+
+2) A scrub running in parallel turns block group Z into RO mode and
+   starts scrubing its extents;
+
+3) Relocation triggers writeback for the data relocation inode;
+
+4) When running delalloc (btrfs_run_delalloc_range()), we try first the
+   NOCOW path because the data relocation inode has BTRFS_INODE_PREALLOC
+   set in its flags. However, because block group Z is in RO mode, the
+   NOCOW path (run_delalloc_nocow()) falls back into the COW path, by
+   calling cow_file_range();
+
+5) At cow_file_range(), in the first iteration of the while loop we call
+   btrfs_reserve_extent() to allocate a 64KiB extent and pass it a minimum
+   allocation size of 4KiB (fs_info->sectorsize). Due to free space
+   fragmentation, btrfs_reserve_extent() ends up allocating two extents
+   of 32KiB each, each one on a different iteration of that while loop;
+
+6) Writeback of the data relocation inode completes;
+
+7) Relocation proceeds and ends up at relocation.c:replace_file_extents(),
+   with a leaf which has a file extent item that points to the data extent
+   from block group X, that has a logical address (bytenr) of X + 128KiB
+   and a size of 64KiB. Then it calls get_new_location(), which does a
+   lookup in the data relocation tree for a file extent item starting at
+   offset 128KiB (X + 128KiB - X) and belonging to the data relocation
+   inode. It finds a corresponding file extent item, however that item
+   points to an extent that has a size of 32KiB, which doesn't match the
+   expected size of 64KiB, resuling in -EINVAL being returned from this
+   function and propagated up to __btrfs_cow_block(), which aborts the
+   current transaction.
+
+To fix this make sure that at cow_file_range() when we call the allocator
+we pass it a minimum allocation size corresponding the desired extent size
+if the inode belongs to the data relocation tree, otherwise pass it the
+filesystem's sector size as the minimum allocation size.
+
+CC: stable@vger.kernel.org # 4.4+
+Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+Signed-off-by: Filipe Manana <fdmanana@suse.com>
+Signed-off-by: David Sterba <dsterba@suse.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/btrfs/inode.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index a8ae9a070487..57908ee964a2 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -979,6 +979,7 @@ static noinline int cow_file_range(struct inode *inode,
+ 	u64 num_bytes;
+ 	unsigned long ram_size;
+ 	u64 cur_alloc_size = 0;
++	u64 min_alloc_size;
+ 	u64 blocksize = fs_info->sectorsize;
+ 	struct btrfs_key ins;
+ 	struct extent_map *em;
+@@ -1027,10 +1028,26 @@ static noinline int cow_file_range(struct inode *inode,
+ 	btrfs_drop_extent_cache(BTRFS_I(inode), start,
+ 			start + num_bytes - 1, 0);
+ 
++	/*
++	 * Relocation relies on the relocated extents to have exactly the same
++	 * size as the original extents. Normally writeback for relocation data
++	 * extents follows a NOCOW path because relocation preallocates the
++	 * extents. However, due to an operation such as scrub turning a block
++	 * group to RO mode, it may fallback to COW mode, so we must make sure
++	 * an extent allocated during COW has exactly the requested size and can
++	 * not be split into smaller extents, otherwise relocation breaks and
++	 * fails during the stage where it updates the bytenr of file extent
++	 * items.
++	 */
++	if (root->root_key.objectid == BTRFS_DATA_RELOC_TREE_OBJECTID)
++		min_alloc_size = num_bytes;
++	else
++		min_alloc_size = fs_info->sectorsize;
++
+ 	while (num_bytes > 0) {
+ 		cur_alloc_size = num_bytes;
+ 		ret = btrfs_reserve_extent(root, cur_alloc_size, cur_alloc_size,
+-					   fs_info->sectorsize, 0, alloc_hint,
++					   min_alloc_size, 0, alloc_hint,
+ 					   &ins, 1, 1);
+ 		if (ret < 0)
+ 			goto out_unlock;
+-- 
+2.28.0
+
+
+From eba151dc93e6a0b8b905745045a7e7599959d9a2 Mon Sep 17 00:00:00 2001
+From: Hugh Dickins <hughd@google.com>
+Date: Thu, 25 Jun 2020 20:29:59 -0700
+Subject: [PATCH 04/28] mm: fix swap cache node allocation mask
+
+[ Upstream commit 243bce09c91b0145aeaedd5afba799d81841c030 ]
+
+Chris Murphy reports that a slightly overcommitted load, testing swap
+and zram along with i915, splats and keeps on splatting, when it had
+better fail less noisily:
+
+  gnome-shell: page allocation failure: order:0,
+  mode:0x400d0(__GFP_IO|__GFP_FS|__GFP_COMP|__GFP_RECLAIMABLE),
+  nodemask=(null),cpuset=/,mems_allowed=0
+  CPU: 2 PID: 1155 Comm: gnome-shell Not tainted 5.7.0-1.fc33.x86_64 #1
+  Call Trace:
+    dump_stack+0x64/0x88
+    warn_alloc.cold+0x75/0xd9
+    __alloc_pages_slowpath.constprop.0+0xcfa/0xd30
+    __alloc_pages_nodemask+0x2df/0x320
+    alloc_slab_page+0x195/0x310
+    allocate_slab+0x3c5/0x440
+    ___slab_alloc+0x40c/0x5f0
+    __slab_alloc+0x1c/0x30
+    kmem_cache_alloc+0x20e/0x220
+    xas_nomem+0x28/0x70
+    add_to_swap_cache+0x321/0x400
+    __read_swap_cache_async+0x105/0x240
+    swap_cluster_readahead+0x22c/0x2e0
+    shmem_swapin+0x8e/0xc0
+    shmem_swapin_page+0x196/0x740
+    shmem_getpage_gfp+0x3a2/0xa60
+    shmem_read_mapping_page_gfp+0x32/0x60
+    shmem_get_pages+0x155/0x5e0 [i915]
+    __i915_gem_object_get_pages+0x68/0xa0 [i915]
+    i915_vma_pin+0x3fe/0x6c0 [i915]
+    eb_add_vma+0x10b/0x2c0 [i915]
+    i915_gem_do_execbuffer+0x704/0x3430 [i915]
+    i915_gem_execbuffer2_ioctl+0x1ea/0x3e0 [i915]
+    drm_ioctl_kernel+0x86/0xd0 [drm]
+    drm_ioctl+0x206/0x390 [drm]
+    ksys_ioctl+0x82/0xc0
+    __x64_sys_ioctl+0x16/0x20
+    do_syscall_64+0x5b/0xf0
+    entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Reported on 5.7, but it goes back really to 3.1: when
+shmem_read_mapping_page_gfp() was implemented for use by i915, and
+allowed for __GFP_NORETRY and __GFP_NOWARN flags in most places, but
+missed swapin's "& GFP_KERNEL" mask for page tree node allocation in
+__read_swap_cache_async() - that was to mask off HIGHUSER_MOVABLE bits
+from what page cache uses, but GFP_RECLAIM_MASK is now what's needed.
+
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=208085
+Link: http://lkml.kernel.org/r/alpine.LSU.2.11.2006151330070.11064@eggly.anvils
+Fixes: 68da9f055755 ("tmpfs: pass gfp to shmem_getpage_gfp")
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+Reviewed-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+Reported-by: Chris Murphy <lists@colorremedies.com>
+Analyzed-by: Vlastimil Babka <vbabka@suse.cz>
+Analyzed-by: Matthew Wilcox <willy@infradead.org>
+Tested-by: Chris Murphy <lists@colorremedies.com>
+Cc: <stable@vger.kernel.org>	[3.1+]
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/swap_state.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/mm/swap_state.c b/mm/swap_state.c
+index 326439428daf..755be95d52f9 100644
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@ -23,6 +23,7 @@
+ #include <linux/huge_mm.h>
+ 
+ #include <asm/pgtable.h>
++#include "internal.h"
+ 
+ /*
+  * swapper_space is a fiction, retained to simplify the path through
+@@ -403,7 +404,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
+ 		/*
+ 		 * call radix_tree_preload() while we can wait.
+ 		 */
+-		err = radix_tree_maybe_preload(gfp_mask & GFP_KERNEL);
++		err = radix_tree_maybe_preload(gfp_mask & GFP_RECLAIM_MASK);
+ 		if (err)
+ 			break;
+ 
+-- 
+2.28.0
+
+
+From 3ecfc0fdaea1ec318583add149ca34b173ad1c6f Mon Sep 17 00:00:00 2001
+From: Borislav Petkov <bp@suse.de>
+Date: Thu, 18 Jun 2020 20:25:25 +0200
+Subject: [PATCH 05/28] EDAC/amd64: Read back the scrub rate PCI register on
+ F15h
+
+[ Upstream commit ee470bb25d0dcdf126f586ec0ae6dca66cb340a4 ]
+
+Commit:
+
+  da92110dfdfa ("EDAC, amd64_edac: Extend scrub rate support to F15hM60h")
+
+added support for F15h, model 0x60 CPUs but in doing so, missed to read
+back SCRCTRL PCI config register on F15h CPUs which are *not* model
+0x60. Add that read so that doing
+
+  $ cat /sys/devices/system/edac/mc/mc0/sdram_scrub_rate
+
+can show the previously set DRAM scrub rate.
+
+Fixes: da92110dfdfa ("EDAC, amd64_edac: Extend scrub rate support to F15hM60h")
+Reported-by: Anders Andersson <pipatron@gmail.com>
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Cc: <stable@vger.kernel.org> #v4.4..
+Link: https://lkml.kernel.org/r/CAKkunMbNWppx_i6xSdDHLseA2QQmGJqj_crY=NF-GZML5np4Vw@mail.gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/edac/amd64_edac.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index b36abd253786..21c5f95596be 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -261,6 +261,8 @@ static int get_scrub_rate(struct mem_ctl_info *mci)
+ 
+ 		if (pvt->model == 0x60)
+ 			amd64_read_pci_cfg(pvt->F2, F15H_M60H_SCRCTRL, &scrubval);
++		else
++			amd64_read_pci_cfg(pvt->F3, SCRCTRL, &scrubval);
+ 		break;
+ 
+ 	case 0x17:
+-- 
+2.28.0
+
+
+From 01a425d081beb9be8865ad3c1d3b601313316b3b Mon Sep 17 00:00:00 2001
+From: Tuomas Tynkkynen <tuomas.tynkkynen@iki.fi>
+Date: Sun, 21 Jun 2020 13:43:26 +0300
+Subject: [PATCH 06/28] usbnet: smsc95xx: Fix use-after-free after removal
+
+[ Upstream commit b835a71ef64a61383c414d6bf2896d2c0161deca ]
+
+Syzbot reports an use-after-free in workqueue context:
+
+BUG: KASAN: use-after-free in mutex_unlock+0x19/0x40 kernel/locking/mutex.c:737
+ mutex_unlock+0x19/0x40 kernel/locking/mutex.c:737
+ __smsc95xx_mdio_read drivers/net/usb/smsc95xx.c:217 [inline]
+ smsc95xx_mdio_read+0x583/0x870 drivers/net/usb/smsc95xx.c:278
+ check_carrier+0xd1/0x2e0 drivers/net/usb/smsc95xx.c:644
+ process_one_work+0x777/0xf90 kernel/workqueue.c:2274
+ worker_thread+0xa8f/0x1430 kernel/workqueue.c:2420
+ kthread+0x2df/0x300 kernel/kthread.c:255
+
+It looks like that smsc95xx_unbind() is freeing the structures that are
+still in use by the concurrently running workqueue callback. Thus switch
+to using cancel_delayed_work_sync() to ensure the work callback really
+is no longer active.
+
+Reported-by: syzbot+29dc7d4ae19b703ff947@syzkaller.appspotmail.com
+Signed-off-by: Tuomas Tynkkynen <tuomas.tynkkynen@iki.fi>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/usb/smsc95xx.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/usb/smsc95xx.c b/drivers/net/usb/smsc95xx.c
+index fc48da1c702d..bcb99bee450a 100644
+--- a/drivers/net/usb/smsc95xx.c
++++ b/drivers/net/usb/smsc95xx.c
+@@ -1338,7 +1338,7 @@ static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
+ 	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
+ 
+ 	if (pdata) {
+-		cancel_delayed_work(&pdata->carrier_check);
++		cancel_delayed_work_sync(&pdata->carrier_check);
+ 		netif_dbg(dev, ifdown, dev->net, "free pdata\n");
+ 		kfree(pdata);
+ 		pdata = NULL;
+-- 
+2.28.0
+
+
+From 00d2b1efa0bb10c441195f400b6e7b3d58b0af8d Mon Sep 17 00:00:00 2001
+From: Dongli Zhang <dongli.zhang@oracle.com>
+Date: Mon, 1 Jun 2020 21:45:47 -0700
+Subject: [PATCH 07/28] mm/slub.c: fix corrupted freechain in deactivate_slab()
+
+[ Upstream commit 52f23478081ae0dcdb95d1650ea1e7d52d586829 ]
+
+The slub_debug is able to fix the corrupted slab freelist/page.
+However, alloc_debug_processing() only checks the validity of current
+and next freepointer during allocation path.  As a result, once some
+objects have their freepointers corrupted, deactivate_slab() may lead to
+page fault.
+
+Below is from a test kernel module when 'slub_debug=PUF,kmalloc-128
+slub_nomerge'.  The test kernel corrupts the freepointer of one free
+object on purpose.  Unfortunately, deactivate_slab() does not detect it
+when iterating the freechain.
+
+  BUG: unable to handle page fault for address: 00000000123456f8
+  #PF: supervisor read access in kernel mode
+  #PF: error_code(0x0000) - not-present page
+  PGD 0 P4D 0
+  Oops: 0000 [#1] SMP PTI
+  ... ...
+  RIP: 0010:deactivate_slab.isra.92+0xed/0x490
+  ... ...
+  Call Trace:
+   ___slab_alloc+0x536/0x570
+   __slab_alloc+0x17/0x30
+   __kmalloc+0x1d9/0x200
+   ext4_htree_store_dirent+0x30/0xf0
+   htree_dirblock_to_tree+0xcb/0x1c0
+   ext4_htree_fill_tree+0x1bc/0x2d0
+   ext4_readdir+0x54f/0x920
+   iterate_dir+0x88/0x190
+   __x64_sys_getdents+0xa6/0x140
+   do_syscall_64+0x49/0x170
+   entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Therefore, this patch adds extra consistency check in deactivate_slab().
+Once an object's freepointer is corrupted, all following objects
+starting at this object are isolated.
+
+[akpm@linux-foundation.org: fix build with CONFIG_SLAB_DEBUG=n]
+Signed-off-by: Dongli Zhang <dongli.zhang@oracle.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Joe Jin <joe.jin@oracle.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Link: http://lkml.kernel.org/r/20200331031450.12182-1-dongli.zhang@oracle.com
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/slub.c | 27 +++++++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index 8807a0c98a67..66b798712933 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -658,6 +658,20 @@ static void slab_fix(struct kmem_cache *s, char *fmt, ...)
+ 	va_end(args);
  }
  
- unsigned int hwrena;
++static bool freelist_corrupted(struct kmem_cache *s, struct page *page,
++			       void *freelist, void *nextfree)
++{
++	if ((s->flags & SLAB_CONSISTENCY_CHECKS) &&
++	    !check_valid_pointer(s, page, nextfree)) {
++		object_err(s, page, freelist, "Freechain corrupt");
++		freelist = NULL;
++		slab_fix(s, "Isolate corrupted freechain");
++		return true;
++	}
++
++	return false;
++}
++
+ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
+ {
+ 	unsigned int off;	/* Offset of last byte */
+@@ -1339,6 +1353,11 @@ static inline void inc_slabs_node(struct kmem_cache *s, int node,
+ static inline void dec_slabs_node(struct kmem_cache *s, int node,
+ 							int objects) {}
+ 
++static bool freelist_corrupted(struct kmem_cache *s, struct page *page,
++			       void *freelist, void *nextfree)
++{
++	return false;
++}
+ #endif /* CONFIG_SLUB_DEBUG */
+ 
+ /*
+@@ -2029,6 +2048,14 @@ static void deactivate_slab(struct kmem_cache *s, struct page *page,
+ 		void *prior;
+ 		unsigned long counters;
+ 
++		/*
++		 * If 'nextfree' is invalid, it is possible that the object at
++		 * 'freelist' is already corrupted.  So isolate all objects
++		 * starting at 'freelist'.
++		 */
++		if (freelist_corrupted(s, page, freelist, nextfree))
++			break;
++
+ 		do {
+ 			prior = page->freelist;
+ 			counters = page->counters;
+-- 
+2.28.0
+
+
+From 88451e4b5479ddae7427ca422bbcf916a9e8ebd4 Mon Sep 17 00:00:00 2001
+From: Qian Cai <cai@lca.pw>
+Date: Mon, 1 Jun 2020 21:45:57 -0700
+Subject: [PATCH 08/28] mm/slub: fix stack overruns with SLUB_STATS
+
+[ Upstream commit a68ee0573991e90af2f1785db309206408bad3e5 ]
+
+There is no need to copy SLUB_STATS items from root memcg cache to new
+memcg cache copies.  Doing so could result in stack overruns because the
+store function only accepts 0 to clear the stat and returns an error for
+everything else while the show method would print out the whole stat.
+
+Then, the mismatch of the lengths returns from show and store methods
+happens in memcg_propagate_slab_attrs():
+
+	else if (root_cache->max_attr_size < ARRAY_SIZE(mbuf))
+		buf = mbuf;
+
+max_attr_size is only 2 from slab_attr_store(), then, it uses mbuf[64]
+in show_stat() later where a bounch of sprintf() would overrun the stack
+variable.  Fix it by always allocating a page of buffer to be used in
+show_stat() if SLUB_STATS=y which should only be used for debug purpose.
+
+  # echo 1 > /sys/kernel/slab/fs_cache/shrink
+  BUG: KASAN: stack-out-of-bounds in number+0x421/0x6e0
+  Write of size 1 at addr ffffc900256cfde0 by task kworker/76:0/53251
+
+  Hardware name: HPE ProLiant DL385 Gen10/ProLiant DL385 Gen10, BIOS A40 07/10/2019
+  Workqueue: memcg_kmem_cache memcg_kmem_cache_create_func
+  Call Trace:
+    number+0x421/0x6e0
+    vsnprintf+0x451/0x8e0
+    sprintf+0x9e/0xd0
+    show_stat+0x124/0x1d0
+    alloc_slowpath_show+0x13/0x20
+    __kmem_cache_create+0x47a/0x6b0
+
+  addr ffffc900256cfde0 is located in stack of task kworker/76:0/53251 at offset 0 in frame:
+   process_one_work+0x0/0xb90
+
+  this frame has 1 object:
+   [32, 72) 'lockdep_map'
+
+  Memory state around the buggy address:
+   ffffc900256cfc80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   ffffc900256cfd00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  >ffffc900256cfd80: 00 00 00 00 00 00 00 00 00 00 00 00 f1 f1 f1 f1
+                                                         ^
+   ffffc900256cfe00: 00 00 00 00 00 f2 f2 f2 00 00 00 00 00 00 00 00
+   ffffc900256cfe80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  ==================================================================
+  Kernel panic - not syncing: stack-protector: Kernel stack is corrupted in: __kmem_cache_create+0x6ac/0x6b0
+  Workqueue: memcg_kmem_cache memcg_kmem_cache_create_func
+  Call Trace:
+    __kmem_cache_create+0x6ac/0x6b0
+
+Fixes: 107dab5c92d5 ("slub: slub-specific propagation changes")
+Signed-off-by: Qian Cai <cai@lca.pw>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Cc: Glauber Costa <glauber@scylladb.com>
+Cc: Christoph Lameter <cl@linux.com>
+Cc: Pekka Enberg <penberg@kernel.org>
+Cc: David Rientjes <rientjes@google.com>
+Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+Link: http://lkml.kernel.org/r/20200429222356.4322-1-cai@lca.pw
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ mm/slub.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/mm/slub.c b/mm/slub.c
+index 66b798712933..09d4cc4391bb 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -5601,7 +5601,8 @@ static void memcg_propagate_slab_attrs(struct kmem_cache *s)
+ 		 */
+ 		if (buffer)
+ 			buf = buffer;
+-		else if (root_cache->max_attr_size < ARRAY_SIZE(mbuf))
++		else if (root_cache->max_attr_size < ARRAY_SIZE(mbuf) &&
++			 !IS_ENABLED(CONFIG_SLUB_STATS))
+ 			buf = mbuf;
+ 		else {
+ 			buffer = (char *) get_zeroed_page(GFP_KERNEL);
+-- 
+2.28.0
+
+
+From 4336374bc2220bf3c439b70c31d9e8f6f9583ea8 Mon Sep 17 00:00:00 2001
+From: Zqiang <qiang.zhang@windriver.com>
+Date: Fri, 12 Jun 2020 11:52:10 +0800
+Subject: [PATCH 09/28] usb: usbtest: fix missing kfree(dev->buf) in
+ usbtest_disconnect
+
+[ Upstream commit 28ebeb8db77035e058a510ce9bd17c2b9a009dba ]
+
+BUG: memory leak
+unreferenced object 0xffff888055046e00 (size 256):
+  comm "kworker/2:9", pid 2570, jiffies 4294942129 (age 1095.500s)
+  hex dump (first 32 bytes):
+    00 70 04 55 80 88 ff ff 18 bb 5a 81 ff ff ff ff  .p.U......Z.....
+    f5 96 78 81 ff ff ff ff 37 de 8e 81 ff ff ff ff  ..x.....7.......
+  backtrace:
+    [<00000000d121dccf>] kmemleak_alloc_recursive
+include/linux/kmemleak.h:43 [inline]
+    [<00000000d121dccf>] slab_post_alloc_hook mm/slab.h:586 [inline]
+    [<00000000d121dccf>] slab_alloc_node mm/slub.c:2786 [inline]
+    [<00000000d121dccf>] slab_alloc mm/slub.c:2794 [inline]
+    [<00000000d121dccf>] kmem_cache_alloc_trace+0x15e/0x2d0 mm/slub.c:2811
+    [<000000005c3c3381>] kmalloc include/linux/slab.h:555 [inline]
+    [<000000005c3c3381>] usbtest_probe+0x286/0x19d0
+drivers/usb/misc/usbtest.c:2790
+    [<000000001cec6910>] usb_probe_interface+0x2bd/0x870
+drivers/usb/core/driver.c:361
+    [<000000007806c118>] really_probe+0x48d/0x8f0 drivers/base/dd.c:551
+    [<00000000a3308c3e>] driver_probe_device+0xfc/0x2a0 drivers/base/dd.c:724
+    [<000000003ef66004>] __device_attach_driver+0x1b6/0x240
+drivers/base/dd.c:831
+    [<00000000eee53e97>] bus_for_each_drv+0x14e/0x1e0 drivers/base/bus.c:431
+    [<00000000bb0648d0>] __device_attach+0x1f9/0x350 drivers/base/dd.c:897
+    [<00000000838b324a>] device_initial_probe+0x1a/0x20 drivers/base/dd.c:944
+    [<0000000030d501c1>] bus_probe_device+0x1e1/0x280 drivers/base/bus.c:491
+    [<000000005bd7adef>] device_add+0x131d/0x1c40 drivers/base/core.c:2504
+    [<00000000a0937814>] usb_set_configuration+0xe84/0x1ab0
+drivers/usb/core/message.c:2030
+    [<00000000e3934741>] generic_probe+0x6a/0xe0 drivers/usb/core/generic.c:210
+    [<0000000098ade0f1>] usb_probe_device+0x90/0xd0
+drivers/usb/core/driver.c:266
+    [<000000007806c118>] really_probe+0x48d/0x8f0 drivers/base/dd.c:551
+    [<00000000a3308c3e>] driver_probe_device+0xfc/0x2a0 drivers/base/dd.c:724
+
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Reported-by: Kyungtae Kim <kt0755@gmail.com>
+Signed-off-by: Zqiang <qiang.zhang@windriver.com>
+Link: https://lore.kernel.org/r/20200612035210.20494-1-qiang.zhang@windriver.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/usb/misc/usbtest.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/misc/usbtest.c b/drivers/usb/misc/usbtest.c
+index b3fc602b2e24..49476c0304b2 100644
+--- a/drivers/usb/misc/usbtest.c
++++ b/drivers/usb/misc/usbtest.c
+@@ -2769,6 +2769,7 @@ static void usbtest_disconnect(struct usb_interface *intf)
+ 
+ 	usb_set_intfdata(intf, NULL);
+ 	dev_dbg(&intf->dev, "disconnect\n");
++	kfree(dev->buf);
+ 	kfree(dev);
+ }
+ 
+-- 
+2.28.0
+
+
+From ac31ef00ad96c2bcf7efc919560cc6404bda8e39 Mon Sep 17 00:00:00 2001
+From: Douglas Anderson <dianders@chromium.org>
+Date: Tue, 2 Jun 2020 15:47:39 -0700
+Subject: [PATCH 10/28] kgdb: Avoid suspicious RCU usage warning
+
+[ Upstream commit 440ab9e10e2e6e5fd677473ee6f9e3af0f6904d6 ]
+
+At times when I'm using kgdb I see a splat on my console about
+suspicious RCU usage.  I managed to come up with a case that could
+reproduce this that looked like this:
+
+  WARNING: suspicious RCU usage
+  5.7.0-rc4+ #609 Not tainted
+  -----------------------------
+  kernel/pid.c:395 find_task_by_pid_ns() needs rcu_read_lock() protection!
+
+  other info that might help us debug this:
+
+    rcu_scheduler_active = 2, debug_locks = 1
+  3 locks held by swapper/0/1:
+   #0: ffffff81b6b8e988 (&dev->mutex){....}-{3:3}, at: __device_attach+0x40/0x13c
+   #1: ffffffd01109e9e8 (dbg_master_lock){....}-{2:2}, at: kgdb_cpu_enter+0x20c/0x7ac
+   #2: ffffffd01109ea90 (dbg_slave_lock){....}-{2:2}, at: kgdb_cpu_enter+0x3ec/0x7ac
+
+  stack backtrace:
+  CPU: 7 PID: 1 Comm: swapper/0 Not tainted 5.7.0-rc4+ #609
+  Hardware name: Google Cheza (rev3+) (DT)
+  Call trace:
+   dump_backtrace+0x0/0x1b8
+   show_stack+0x1c/0x24
+   dump_stack+0xd4/0x134
+   lockdep_rcu_suspicious+0xf0/0x100
+   find_task_by_pid_ns+0x5c/0x80
+   getthread+0x8c/0xb0
+   gdb_serial_stub+0x9d4/0xd04
+   kgdb_cpu_enter+0x284/0x7ac
+   kgdb_handle_exception+0x174/0x20c
+   kgdb_brk_fn+0x24/0x30
+   call_break_hook+0x6c/0x7c
+   brk_handler+0x20/0x5c
+   do_debug_exception+0x1c8/0x22c
+   el1_sync_handler+0x3c/0xe4
+   el1_sync+0x7c/0x100
+   rpmh_rsc_probe+0x38/0x420
+   platform_drv_probe+0x94/0xb4
+   really_probe+0x134/0x300
+   driver_probe_device+0x68/0x100
+   __device_attach_driver+0x90/0xa8
+   bus_for_each_drv+0x84/0xcc
+   __device_attach+0xb4/0x13c
+   device_initial_probe+0x18/0x20
+   bus_probe_device+0x38/0x98
+   device_add+0x38c/0x420
+
+If I understand properly we should just be able to blanket kgdb under
+one big RCU read lock and the problem should go away.  We'll add it to
+the beast-of-a-function known as kgdb_cpu_enter().
+
+With this I no longer get any splats and things seem to work fine.
+
+Signed-off-by: Douglas Anderson <dianders@chromium.org>
+Link: https://lore.kernel.org/r/20200602154729.v2.1.I70e0d4fd46d5ed2aaf0c98a355e8e1b7a5bb7e4e@changeid
+Signed-off-by: Daniel Thompson <daniel.thompson@linaro.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ kernel/debug/debug_core.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/kernel/debug/debug_core.c b/kernel/debug/debug_core.c
+index 159a53ff2716..694fcd049282 100644
+--- a/kernel/debug/debug_core.c
++++ b/kernel/debug/debug_core.c
+@@ -489,6 +489,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 		arch_kgdb_ops.disable_hw_break(regs);
+ 
+ acquirelock:
++	rcu_read_lock();
+ 	/*
+ 	 * Interrupts will be restored by the 'trap return' code, except when
+ 	 * single stepping.
+@@ -545,6 +546,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 			atomic_dec(&slaves_in_kgdb);
+ 			dbg_touch_watchdogs();
+ 			local_irq_restore(flags);
++			rcu_read_unlock();
+ 			return 0;
+ 		}
+ 		cpu_relax();
+@@ -563,6 +565,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 		raw_spin_unlock(&dbg_master_lock);
+ 		dbg_touch_watchdogs();
+ 		local_irq_restore(flags);
++		rcu_read_unlock();
+ 
+ 		goto acquirelock;
+ 	}
+@@ -682,6 +685,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
+ 	raw_spin_unlock(&dbg_master_lock);
+ 	dbg_touch_watchdogs();
+ 	local_irq_restore(flags);
++	rcu_read_unlock();
+ 
+ 	return kgdb_info[cpu].ret_state;
+ }
+-- 
+2.28.0
+
+
+From 687ca6afdae1f737a6adec8a3a8ec0b13ed45258 Mon Sep 17 00:00:00 2001
+From: Herbert Xu <herbert@gondor.apana.org.au>
+Date: Mon, 8 Jun 2020 16:48:43 +1000
+Subject: [PATCH 11/28] crypto: af_alg - fix use-after-free in af_alg_accept()
+ due to bh_lock_sock()
+
+commit 34c86f4c4a7be3b3e35aa48bd18299d4c756064d upstream.
+
+The locking in af_alg_release_parent is broken as the BH socket
+lock can only be taken if there is a code-path to handle the case
+where the lock is owned by process-context.  Instead of adding
+such handling, we can fix this by changing the ref counts to
+atomic_t.
+
+This patch also modifies the main refcnt to include both normal
+and nokey sockets.  This way we don't have to fudge the nokey
+ref count when a socket changes from nokey to normal.
+
+Credits go to Mauricio Faria de Oliveira who diagnosed this bug
+and sent a patch for it:
+
+https://lore.kernel.org/linux-crypto/20200605161657.535043-1-mfo@canonical.com/
+
+Reported-by: Brian Moyles <bmoyles@netflix.com>
+Reported-by: Mauricio Faria de Oliveira <mfo@canonical.com>
+Fixes: 37f96694cf73 ("crypto: af_alg - Use bh_lock_sock in...")
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ crypto/af_alg.c         | 26 +++++++++++---------------
+ crypto/algif_aead.c     |  9 +++------
+ crypto/algif_hash.c     |  9 +++------
+ crypto/algif_skcipher.c |  9 +++------
+ include/crypto/if_alg.h |  4 ++--
+ 5 files changed, 22 insertions(+), 35 deletions(-)
+
 diff --git a/crypto/af_alg.c b/crypto/af_alg.c
 index 0679c35adf55..3f3b57f80bdb 100644
 --- a/crypto/af_alg.c
@@ -170,193 +1147,90 @@ index 1ce1284c9ed9..d9ec5dca8672 100644
  
  	err = 0;
  
-diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
-index 0e18eed62c57..2f15e38fb3f8 100644
---- a/drivers/block/virtio_blk.c
-+++ b/drivers/block/virtio_blk.c
-@@ -879,6 +879,7 @@ out_put_disk:
- 	put_disk(vblk->disk);
- out_free_vq:
- 	vdev->config->del_vqs(vdev);
-+	kfree(vblk->vqs);
- out_free_vblk:
- 	kfree(vblk);
- out_free_index:
-diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
-index b36abd253786..21c5f95596be 100644
---- a/drivers/edac/amd64_edac.c
-+++ b/drivers/edac/amd64_edac.c
-@@ -261,6 +261,8 @@ static int get_scrub_rate(struct mem_ctl_info *mci)
+diff --git a/include/crypto/if_alg.h b/include/crypto/if_alg.h
+index ac0eae8372ab..2ea6a95ca825 100644
+--- a/include/crypto/if_alg.h
++++ b/include/crypto/if_alg.h
+@@ -34,8 +34,8 @@ struct alg_sock {
  
- 		if (pvt->model == 0x60)
- 			amd64_read_pci_cfg(pvt->F2, F15H_M60H_SCRCTRL, &scrubval);
-+		else
-+			amd64_read_pci_cfg(pvt->F3, SCRCTRL, &scrubval);
- 		break;
+ 	struct sock *parent;
  
- 	case 0x17:
-diff --git a/drivers/firmware/efi/Kconfig b/drivers/firmware/efi/Kconfig
-index 86210f75d233..a4fadd42221d 100644
---- a/drivers/firmware/efi/Kconfig
-+++ b/drivers/firmware/efi/Kconfig
-@@ -164,6 +164,17 @@ config RESET_ATTACK_MITIGATION
- 	  have been evicted, since otherwise it will trigger even on clean
- 	  reboots.
+-	unsigned int refcnt;
+-	unsigned int nokey_refcnt;
++	atomic_t refcnt;
++	atomic_t nokey_refcnt;
  
-+config EFI_CUSTOM_SSDT_OVERLAYS
-+	bool "Load custom ACPI SSDT overlay from an EFI variable"
-+	depends on EFI_VARS && ACPI
-+	default ACPI_TABLE_UPGRADE
-+	help
-+	  Allow loading of an ACPI SSDT overlay from an EFI variable specified
-+	  by a kernel command line option.
-+
-+	  See Documentation/admin-guide/acpi/ssdt-overlays.rst for more
-+	  information.endmenu
-+
- endmenu
+ 	const struct af_alg_type *type;
+ 	void *private;
+-- 
+2.28.0
+
+
+From f9e9f6c7331ffc61d58d35685e724e76ed2f893b Mon Sep 17 00:00:00 2001
+From: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+Date: Wed, 24 Jun 2020 01:51:33 +0530
+Subject: [PATCH 12/28] cxgb4: use unaligned conversion for fetching timestamp
+
+[ Upstream commit 589b1c9c166dce120e27b32a83a78f55464a7ef9 ]
+
+Use get_unaligned_be64() to fetch the timestamp needed for ns_to_ktime()
+conversion.
+
+Fixes following sparse warning:
+sge.c:3282:43: warning: cast to restricted __be64
+
+Fixes: a456950445a0 ("cxgb4: time stamping interface for PTP")
+Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/chelsio/cxgb4/sge.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/sge.c b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+index 4ef68f69b58c..0a5c4c7da505 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
+@@ -2088,7 +2088,7 @@ static noinline int t4_systim_to_hwstamp(struct adapter *adapter,
  
- config UEFI_CPER
-diff --git a/drivers/firmware/efi/efi.c b/drivers/firmware/efi/efi.c
-index b39b7e6d4e4d..a3dc6cb7326a 100644
---- a/drivers/firmware/efi/efi.c
-+++ b/drivers/firmware/efi/efi.c
-@@ -221,7 +221,7 @@ static void generic_ops_unregister(void)
- 	efivars_unregister(&generic_efivars);
+ 	hwtstamps = skb_hwtstamps(skb);
+ 	memset(hwtstamps, 0, sizeof(*hwtstamps));
+-	hwtstamps->hwtstamp = ns_to_ktime(be64_to_cpu(*((u64 *)data)));
++	hwtstamps->hwtstamp = ns_to_ktime(get_unaligned_be64(data));
+ 
+ 	return RX_PTP_PKT_SUC;
  }
- 
--#if IS_ENABLED(CONFIG_ACPI)
-+#ifdef CONFIG_EFI_CUSTOM_SSDT_OVERLAYS
- #define EFIVAR_SSDT_NAME_MAX	16
- static char efivar_ssdt[EFIVAR_SSDT_NAME_MAX] __initdata;
- static int __init efivar_ssdt_setup(char *str)
-diff --git a/drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c b/drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c
-index 298d6a8bab12..82cb93935188 100644
---- a/drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c
-+++ b/drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c
-@@ -214,9 +214,8 @@ sun4i_hdmi_connector_detect(struct drm_connector *connector, bool force)
- 	struct sun4i_hdmi *hdmi = drm_connector_to_sun4i_hdmi(connector);
- 	unsigned long reg;
- 
--	if (readl_poll_timeout(hdmi->base + SUN4I_HDMI_HPD_REG, reg,
--			       reg & SUN4I_HDMI_HPD_HIGH,
--			       0, 500000)) {
-+	reg = readl(hdmi->base + SUN4I_HDMI_HPD_REG);
-+	if (reg & SUN4I_HDMI_HPD_HIGH) {
- 		cec_phys_addr_invalidate(hdmi->cec_adap);
- 		return connector_status_disconnected;
- 	}
-diff --git a/drivers/hwmon/acpi_power_meter.c b/drivers/hwmon/acpi_power_meter.c
-index ba3af4505d8f..e40d8907853b 100644
---- a/drivers/hwmon/acpi_power_meter.c
-+++ b/drivers/hwmon/acpi_power_meter.c
-@@ -895,7 +895,7 @@ static int acpi_power_meter_add(struct acpi_device *device)
- 
- 	res = setup_attrs(resource);
- 	if (res)
--		goto exit_free;
-+		goto exit_free_capability;
- 
- 	resource->hwmon_dev = hwmon_device_register(&device->dev);
- 	if (IS_ERR(resource->hwmon_dev)) {
-@@ -908,6 +908,8 @@ static int acpi_power_meter_add(struct acpi_device *device)
- 
- exit_remove:
- 	remove_attrs(resource);
-+exit_free_capability:
-+	free_capabilities(resource);
- exit_free:
- 	kfree(resource);
- exit:
-diff --git a/drivers/hwmon/max6697.c b/drivers/hwmon/max6697.c
-index 221fd1492057..6df28fe0577d 100644
---- a/drivers/hwmon/max6697.c
-+++ b/drivers/hwmon/max6697.c
-@@ -47,8 +47,9 @@ static const u8 MAX6697_REG_CRIT[] = {
-  * Map device tree / platform data register bit map to chip bit map.
-  * Applies to alert register and over-temperature register.
-  */
--#define MAX6697_MAP_BITS(reg)	((((reg) & 0x7e) >> 1) | \
-+#define MAX6697_ALERT_MAP_BITS(reg)	((((reg) & 0x7e) >> 1) | \
- 				 (((reg) & 0x01) << 6) | ((reg) & 0x80))
-+#define MAX6697_OVERT_MAP_BITS(reg) (((reg) >> 1) | (((reg) & 0x01) << 7))
- 
- #define MAX6697_REG_STAT(n)		(0x44 + (n))
- 
-@@ -587,12 +588,12 @@ static int max6697_init_chip(struct max6697_data *data,
- 		return ret;
- 
- 	ret = i2c_smbus_write_byte_data(client, MAX6697_REG_ALERT_MASK,
--					MAX6697_MAP_BITS(pdata->alert_mask));
-+				MAX6697_ALERT_MAP_BITS(pdata->alert_mask));
- 	if (ret < 0)
- 		return ret;
- 
- 	ret = i2c_smbus_write_byte_data(client, MAX6697_REG_OVERT_MASK,
--				MAX6697_MAP_BITS(pdata->over_temperature_mask));
-+			MAX6697_OVERT_MAP_BITS(pdata->over_temperature_mask));
- 	if (ret < 0)
- 		return ret;
- 
-diff --git a/drivers/i2c/algos/i2c-algo-pca.c b/drivers/i2c/algos/i2c-algo-pca.c
-index e370804ec8bc..3a9db4626cb6 100644
---- a/drivers/i2c/algos/i2c-algo-pca.c
-+++ b/drivers/i2c/algos/i2c-algo-pca.c
-@@ -326,7 +326,8 @@ static int pca_xfer(struct i2c_adapter *i2c_adap,
- 			DEB2("BUS ERROR - SDA Stuck low\n");
- 			pca_reset(adap);
- 			goto out;
--		case 0x90: /* Bus error - SCL stuck low */
-+		case 0x78: /* Bus error - SCL stuck low (PCA9665) */
-+		case 0x90: /* Bus error - SCL stuck low (PCA9564) */
- 			DEB2("BUS ERROR - SCL Stuck low\n");
- 			pca_reset(adap);
- 			goto out;
-diff --git a/drivers/irqchip/irq-gic.c b/drivers/irqchip/irq-gic.c
-index 651d726e8b12..eef4f8192068 100644
---- a/drivers/irqchip/irq-gic.c
-+++ b/drivers/irqchip/irq-gic.c
-@@ -324,10 +324,8 @@ static int gic_irq_set_vcpu_affinity(struct irq_data *d, void *vcpu)
- static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
- 			    bool force)
- {
--	void __iomem *reg = gic_dist_base(d) + GIC_DIST_TARGET + (gic_irq(d) & ~3);
--	unsigned int cpu, shift = (gic_irq(d) % 4) * 8;
--	u32 val, mask, bit;
--	unsigned long flags;
-+	void __iomem *reg = gic_dist_base(d) + GIC_DIST_TARGET + gic_irq(d);
-+	unsigned int cpu;
- 
- 	if (!force)
- 		cpu = cpumask_any_and(mask_val, cpu_online_mask);
-@@ -337,13 +335,7 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
- 	if (cpu >= NR_GIC_CPU_IF || cpu >= nr_cpu_ids)
- 		return -EINVAL;
- 
--	gic_lock_irqsave(flags);
--	mask = 0xff << shift;
--	bit = gic_cpu_map[cpu] << shift;
--	val = readl_relaxed(reg) & ~mask;
--	writel_relaxed(val | bit, reg);
--	gic_unlock_irqrestore(flags);
--
-+	writeb_relaxed(gic_cpu_map[cpu], reg);
- 	irq_data_update_effective_affinity(d, cpumask_of(cpu));
- 
- 	return IRQ_SET_MASK_OK_DONE;
-diff --git a/drivers/md/dm-zoned-target.c b/drivers/md/dm-zoned-target.c
-index 497a2bc5da51..9d8d453b2735 100644
---- a/drivers/md/dm-zoned-target.c
-+++ b/drivers/md/dm-zoned-target.c
-@@ -789,7 +789,7 @@ static int dmz_ctr(struct dm_target *ti, unsigned int argc, char **argv)
- 	}
- 
- 	/* Set target (no write same support) */
--	ti->max_io_len = dev->zone_nr_sectors << 9;
-+	ti->max_io_len = dev->zone_nr_sectors;
- 	ti->num_flush_bios = 1;
- 	ti->num_discard_bios = 1;
- 	ti->num_write_zeroes_bios = 1;
+-- 
+2.28.0
+
+
+From b728e1f0bfdcaea4bf787277a1c62f14896beb0d Mon Sep 17 00:00:00 2001
+From: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+Date: Wed, 24 Jun 2020 01:51:34 +0530
+Subject: [PATCH 13/28] cxgb4: parse TC-U32 key values and masks natively
+
+[ Upstream commit 27f78cb245abdb86735529c13b0a579f57829e71 ]
+
+TC-U32 passes all keys values and masks in __be32 format. The parser
+already expects this and hence pass the value and masks in __be32
+natively to the parser.
+
+Fixes following sparse warnings in several places:
+cxgb4_tc_u32.c:57:21: warning: incorrect type in assignment (different base
+types)
+cxgb4_tc_u32.c:57:21:    expected unsigned int [usertype] val
+cxgb4_tc_u32.c:57:21:    got restricted __be32 [usertype] val
+cxgb4_tc_u32_parse.h:48:24: warning: cast to restricted __be32
+
+Fixes: 2e8aad7bf203 ("cxgb4: add parser to translate u32 filters to internal spec")
+Signed-off-by: Rahul Lakkireddy <rahul.lakkireddy@chelsio.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c |  18 +--
+ .../chelsio/cxgb4/cxgb4_tc_u32_parse.h        | 122 ++++++++++++------
+ 2 files changed, 91 insertions(+), 49 deletions(-)
+
 diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
 index 48970ba08bdc..de5804ddefbd 100644
 --- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_u32.c
@@ -673,236 +1547,282 @@ index a4b99edcc339..141085e159e5 100644
  };
  
  struct cxgb4_link {
-diff --git a/drivers/net/ethernet/chelsio/cxgb4/sge.c b/drivers/net/ethernet/chelsio/cxgb4/sge.c
-index 4ef68f69b58c..0a5c4c7da505 100644
---- a/drivers/net/ethernet/chelsio/cxgb4/sge.c
-+++ b/drivers/net/ethernet/chelsio/cxgb4/sge.c
-@@ -2088,7 +2088,7 @@ static noinline int t4_systim_to_hwstamp(struct adapter *adapter,
+-- 
+2.28.0
+
+
+From a5275f24da114c79f419430f32a0ff1dbb26e7a1 Mon Sep 17 00:00:00 2001
+From: Chu Lin <linchuyuan@google.com>
+Date: Tue, 23 Jun 2020 22:13:08 +0000
+Subject: [PATCH 14/28] hwmon: (max6697) Make sure the OVERT mask is set
+ correctly
+
+[ Upstream commit 016983d138cbe99a5c0aaae0103ee88f5300beb3 ]
+
+Per the datasheet for max6697, OVERT mask and ALERT mask are different.
+For example, the 7th bit of OVERT is the local channel but for alert
+mask, the 6th bit is the local channel. Therefore, we can't apply the
+same mask for both registers. In addition to that, the max6697 driver
+is supposed to be compatibale with different models. I manually went over
+all the listed chips and made sure all chip types have the same layout.
+
+Testing;
+    mask value of 0x9 should map to 0x44 for ALERT and 0x84 for OVERT.
+    I used iotool to read the reg value back to verify. I only tested this
+    change on max6581.
+
+Reference:
+https://datasheets.maximintegrated.com/en/ds/MAX6581.pdf
+https://datasheets.maximintegrated.com/en/ds/MAX6697.pdf
+https://datasheets.maximintegrated.com/en/ds/MAX6699.pdf
+
+Signed-off-by: Chu Lin <linchuyuan@google.com>
+Fixes: 5372d2d71c46e ("hwmon: Driver for Maxim MAX6697 and compatibles")
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/hwmon/max6697.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/hwmon/max6697.c b/drivers/hwmon/max6697.c
+index 221fd1492057..6df28fe0577d 100644
+--- a/drivers/hwmon/max6697.c
++++ b/drivers/hwmon/max6697.c
+@@ -47,8 +47,9 @@ static const u8 MAX6697_REG_CRIT[] = {
+  * Map device tree / platform data register bit map to chip bit map.
+  * Applies to alert register and over-temperature register.
+  */
+-#define MAX6697_MAP_BITS(reg)	((((reg) & 0x7e) >> 1) | \
++#define MAX6697_ALERT_MAP_BITS(reg)	((((reg) & 0x7e) >> 1) | \
+ 				 (((reg) & 0x01) << 6) | ((reg) & 0x80))
++#define MAX6697_OVERT_MAP_BITS(reg) (((reg) >> 1) | (((reg) & 0x01) << 7))
  
- 	hwtstamps = skb_hwtstamps(skb);
- 	memset(hwtstamps, 0, sizeof(*hwtstamps));
--	hwtstamps->hwtstamp = ns_to_ktime(be64_to_cpu(*((u64 *)data)));
-+	hwtstamps->hwtstamp = ns_to_ktime(get_unaligned_be64(data));
+ #define MAX6697_REG_STAT(n)		(0x44 + (n))
  
- 	return RX_PTP_PKT_SUC;
- }
-diff --git a/drivers/net/usb/smsc95xx.c b/drivers/net/usb/smsc95xx.c
-index fc48da1c702d..bcb99bee450a 100644
---- a/drivers/net/usb/smsc95xx.c
-+++ b/drivers/net/usb/smsc95xx.c
-@@ -1338,7 +1338,7 @@ static void smsc95xx_unbind(struct usbnet *dev, struct usb_interface *intf)
- 	struct smsc95xx_priv *pdata = (struct smsc95xx_priv *)(dev->data[0]);
+@@ -587,12 +588,12 @@ static int max6697_init_chip(struct max6697_data *data,
+ 		return ret;
  
- 	if (pdata) {
--		cancel_delayed_work(&pdata->carrier_check);
-+		cancel_delayed_work_sync(&pdata->carrier_check);
- 		netif_dbg(dev, ifdown, dev->net, "free pdata\n");
- 		kfree(pdata);
- 		pdata = NULL;
-diff --git a/drivers/usb/misc/usbtest.c b/drivers/usb/misc/usbtest.c
-index b3fc602b2e24..49476c0304b2 100644
---- a/drivers/usb/misc/usbtest.c
-+++ b/drivers/usb/misc/usbtest.c
-@@ -2769,6 +2769,7 @@ static void usbtest_disconnect(struct usb_interface *intf)
- 
- 	usb_set_intfdata(intf, NULL);
- 	dev_dbg(&intf->dev, "disconnect\n");
-+	kfree(dev->buf);
- 	kfree(dev);
- }
- 
-diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
-index 51e26f90f0bb..63b8812ba508 100644
---- a/fs/btrfs/extent-tree.c
-+++ b/fs/btrfs/extent-tree.c
-@@ -10554,7 +10554,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
- 	path = btrfs_alloc_path();
- 	if (!path) {
- 		ret = -ENOMEM;
--		goto out_put_group;
-+		goto out;
- 	}
- 
- 	/*
-@@ -10591,7 +10591,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
- 		ret = btrfs_orphan_add(trans, BTRFS_I(inode));
- 		if (ret) {
- 			btrfs_add_delayed_iput(inode);
--			goto out_put_group;
-+			goto out;
- 		}
- 		clear_nlink(inode);
- 		/* One for the block groups ref */
-@@ -10614,13 +10614,13 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
- 
- 	ret = btrfs_search_slot(trans, tree_root, &key, path, -1, 1);
+ 	ret = i2c_smbus_write_byte_data(client, MAX6697_REG_ALERT_MASK,
+-					MAX6697_MAP_BITS(pdata->alert_mask));
++				MAX6697_ALERT_MAP_BITS(pdata->alert_mask));
  	if (ret < 0)
--		goto out_put_group;
-+		goto out;
- 	if (ret > 0)
- 		btrfs_release_path(path);
- 	if (ret == 0) {
- 		ret = btrfs_del_item(trans, tree_root, path);
- 		if (ret)
--			goto out_put_group;
-+			goto out;
- 		btrfs_release_path(path);
+ 		return ret;
+ 
+ 	ret = i2c_smbus_write_byte_data(client, MAX6697_REG_OVERT_MASK,
+-				MAX6697_MAP_BITS(pdata->over_temperature_mask));
++			MAX6697_OVERT_MAP_BITS(pdata->over_temperature_mask));
+ 	if (ret < 0)
+ 		return ret;
+ 
+-- 
+2.28.0
+
+
+From 91437c8300cf69966d438c8e82431a1f324a2ca4 Mon Sep 17 00:00:00 2001
+From: Misono Tomohiro <misono.tomohiro@jp.fujitsu.com>
+Date: Thu, 25 Jun 2020 13:32:42 +0900
+Subject: [PATCH 15/28] hwmon: (acpi_power_meter) Fix potential memory leak in
+ acpi_power_meter_add()
+
+[ Upstream commit 8b97f9922211c44a739c5cbd9502ecbb9f17f6d1 ]
+
+Although it rarely happens, we should call free_capabilities()
+if error happens after read_capabilities() to free allocated strings.
+
+Fixes: de584afa5e188 ("hwmon driver for ACPI 4.0 power meters")
+Signed-off-by: Misono Tomohiro <misono.tomohiro@jp.fujitsu.com>
+Link: https://lore.kernel.org/r/20200625043242.31175-1-misono.tomohiro@jp.fujitsu.com
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/hwmon/acpi_power_meter.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/hwmon/acpi_power_meter.c b/drivers/hwmon/acpi_power_meter.c
+index ba3af4505d8f..e40d8907853b 100644
+--- a/drivers/hwmon/acpi_power_meter.c
++++ b/drivers/hwmon/acpi_power_meter.c
+@@ -895,7 +895,7 @@ static int acpi_power_meter_add(struct acpi_device *device)
+ 
+ 	res = setup_attrs(resource);
+ 	if (res)
+-		goto exit_free;
++		goto exit_free_capability;
+ 
+ 	resource->hwmon_dev = hwmon_device_register(&device->dev);
+ 	if (IS_ERR(resource->hwmon_dev)) {
+@@ -908,6 +908,8 @@ static int acpi_power_meter_add(struct acpi_device *device)
+ 
+ exit_remove:
+ 	remove_attrs(resource);
++exit_free_capability:
++	free_capabilities(resource);
+ exit_free:
+ 	kfree(resource);
+ exit:
+-- 
+2.28.0
+
+
+From 7e3bde4e063c6db01f4f0b52649b3ab81160ff5f Mon Sep 17 00:00:00 2001
+From: Chen-Yu Tsai <wens@csie.org>
+Date: Mon, 29 Jun 2020 14:00:32 +0800
+Subject: [PATCH 16/28] drm: sun4i: hdmi: Remove extra HPD polling
+
+[ Upstream commit bda8eaa6dee7525f4dac950810a85a88bf6c2ba0 ]
+
+The HPD sense mechanism in Allwinner's old HDMI encoder hardware is more
+or less an input-only GPIO. Other GPIO-based HPD implementations
+directly return the current state, instead of polling for a specific
+state and returning the other if that times out.
+
+Remove the I/O polling from sun4i_hdmi_connector_detect() and directly
+return a known state based on the current reading. This also gets rid
+of excessive CPU usage by kworker as reported on Stack Exchange [1] and
+Armbian forums [2].
+
+ [1] https://superuser.com/questions/1515001/debian-10-buster-on-cubietruck-with-bug-in-sun4i-drm-hdmi
+ [2] https://forum.armbian.com/topic/14282-headless-systems-and-sun4i_drm_hdmi-a10a20/
+
+Fixes: 9c5681011a0c ("drm/sun4i: Add HDMI support")
+Signed-off-by: Chen-Yu Tsai <wens@csie.org>
+Signed-off-by: Maxime Ripard <maxime@cerno.tech>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200629060032.24134-1-wens@kernel.org
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c b/drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c
+index 298d6a8bab12..82cb93935188 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_hdmi_enc.c
+@@ -214,9 +214,8 @@ sun4i_hdmi_connector_detect(struct drm_connector *connector, bool force)
+ 	struct sun4i_hdmi *hdmi = drm_connector_to_sun4i_hdmi(connector);
+ 	unsigned long reg;
+ 
+-	if (readl_poll_timeout(hdmi->base + SUN4I_HDMI_HPD_REG, reg,
+-			       reg & SUN4I_HDMI_HPD_HIGH,
+-			       0, 500000)) {
++	reg = readl(hdmi->base + SUN4I_HDMI_HPD_REG);
++	if (reg & SUN4I_HDMI_HPD_HIGH) {
+ 		cec_phys_addr_invalidate(hdmi->cec_adap);
+ 		return connector_status_disconnected;
  	}
- 
-@@ -10629,6 +10629,9 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
- 		 &fs_info->block_group_cache_tree);
- 	RB_CLEAR_NODE(&block_group->cache_node);
- 
-+	/* Once for the block groups rbtree */
-+	btrfs_put_block_group(block_group);
-+
- 	if (fs_info->first_logical_byte == block_group->key.objectid)
- 		fs_info->first_logical_byte = (u64)-1;
- 	spin_unlock(&fs_info->block_group_cache_lock);
-@@ -10778,10 +10781,7 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
- 
- 	ret = remove_block_group_free_space(trans, fs_info, block_group);
- 	if (ret)
--		goto out_put_group;
--
--	/* Once for the block groups rbtree */
--	btrfs_put_block_group(block_group);
-+		goto out;
- 
- 	ret = btrfs_search_slot(trans, root, &key, path, -1, 1);
- 	if (ret > 0)
-@@ -10791,10 +10791,9 @@ int btrfs_remove_block_group(struct btrfs_trans_handle *trans,
- 
- 	ret = btrfs_del_item(trans, root, path);
- 
--out_put_group:
-+out:
- 	/* Once for the lookup reference */
- 	btrfs_put_block_group(block_group);
--out:
- 	btrfs_free_path(path);
- 	return ret;
- }
-diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
-index 39ad582d72c4..57908ee964a2 100644
---- a/fs/btrfs/inode.c
-+++ b/fs/btrfs/inode.c
-@@ -978,8 +978,8 @@ static noinline int cow_file_range(struct inode *inode,
- 	u64 alloc_hint = 0;
- 	u64 num_bytes;
- 	unsigned long ram_size;
--	u64 disk_num_bytes;
- 	u64 cur_alloc_size = 0;
-+	u64 min_alloc_size;
- 	u64 blocksize = fs_info->sectorsize;
- 	struct btrfs_key ins;
- 	struct extent_map *em;
-@@ -996,7 +996,6 @@ static noinline int cow_file_range(struct inode *inode,
- 
- 	num_bytes = ALIGN(end - start + 1, blocksize);
- 	num_bytes = max(blocksize,  num_bytes);
--	disk_num_bytes = num_bytes;
- 
- 	inode_should_defrag(BTRFS_I(inode), start, end, num_bytes, SZ_64K);
- 
-@@ -1023,17 +1022,32 @@ static noinline int cow_file_range(struct inode *inode,
- 		}
- 	}
- 
--	BUG_ON(disk_num_bytes >
--	       btrfs_super_total_bytes(fs_info->super_copy));
-+	BUG_ON(num_bytes > btrfs_super_total_bytes(fs_info->super_copy));
- 
- 	alloc_hint = get_extent_allocation_hint(inode, start, num_bytes);
- 	btrfs_drop_extent_cache(BTRFS_I(inode), start,
- 			start + num_bytes - 1, 0);
- 
--	while (disk_num_bytes > 0) {
--		cur_alloc_size = disk_num_bytes;
-+	/*
-+	 * Relocation relies on the relocated extents to have exactly the same
-+	 * size as the original extents. Normally writeback for relocation data
-+	 * extents follows a NOCOW path because relocation preallocates the
-+	 * extents. However, due to an operation such as scrub turning a block
-+	 * group to RO mode, it may fallback to COW mode, so we must make sure
-+	 * an extent allocated during COW has exactly the requested size and can
-+	 * not be split into smaller extents, otherwise relocation breaks and
-+	 * fails during the stage where it updates the bytenr of file extent
-+	 * items.
-+	 */
-+	if (root->root_key.objectid == BTRFS_DATA_RELOC_TREE_OBJECTID)
-+		min_alloc_size = num_bytes;
-+	else
-+		min_alloc_size = fs_info->sectorsize;
-+
-+	while (num_bytes > 0) {
-+		cur_alloc_size = num_bytes;
- 		ret = btrfs_reserve_extent(root, cur_alloc_size, cur_alloc_size,
--					   fs_info->sectorsize, 0, alloc_hint,
-+					   min_alloc_size, 0, alloc_hint,
- 					   &ins, 1, 1);
- 		if (ret < 0)
- 			goto out_unlock;
-@@ -1097,11 +1111,10 @@ static noinline int cow_file_range(struct inode *inode,
- 					     delalloc_end, locked_page,
- 					     EXTENT_LOCKED | EXTENT_DELALLOC,
- 					     page_ops);
--		if (disk_num_bytes < cur_alloc_size)
--			disk_num_bytes = 0;
-+		if (num_bytes < cur_alloc_size)
-+			num_bytes = 0;
- 		else
--			disk_num_bytes -= cur_alloc_size;
--		num_bytes -= cur_alloc_size;
-+			num_bytes -= cur_alloc_size;
- 		alloc_hint = ins.objectid + ins.offset;
- 		start += cur_alloc_size;
- 		extent_reserved = false;
-diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
-index 58e7288e5151..64e52374ecc2 100644
---- a/fs/cifs/connect.c
-+++ b/fs/cifs/connect.c
-@@ -4324,9 +4324,12 @@ cifs_construct_tcon(struct cifs_sb_info *cifs_sb, kuid_t fsuid)
- 	vol_info->retry = master_tcon->retry;
- 	vol_info->nocase = master_tcon->nocase;
- 	vol_info->local_lease = master_tcon->local_lease;
-+	vol_info->resilient = master_tcon->use_resilient;
-+	vol_info->persistent = master_tcon->use_persistent;
- 	vol_info->no_linux_ext = !master_tcon->unix_ext;
- 	vol_info->sectype = master_tcon->ses->sectype;
- 	vol_info->sign = master_tcon->ses->sign;
-+	vol_info->seal = master_tcon->seal;
- 
- 	rc = cifs_set_vol_auth(vol_info, master_tcon->ses);
- 	if (rc) {
-diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
-index bdce714e9448..528fe225b65a 100644
---- a/fs/cifs/inode.c
-+++ b/fs/cifs/inode.c
-@@ -1778,6 +1778,7 @@ cifs_rename2(struct inode *source_dir, struct dentry *source_dentry,
- 	FILE_UNIX_BASIC_INFO *info_buf_target;
- 	unsigned int xid;
- 	int rc, tmprc;
-+	bool new_target = d_really_is_negative(target_dentry);
- 
- 	if (flags & ~RENAME_NOREPLACE)
- 		return -EINVAL;
-@@ -1854,8 +1855,13 @@ cifs_rename2(struct inode *source_dir, struct dentry *source_dentry,
- 	 */
- 
- unlink_target:
--	/* Try unlinking the target dentry if it's not negative */
--	if (d_really_is_positive(target_dentry) && (rc == -EACCES || rc == -EEXIST)) {
-+	/*
-+	 * If the target dentry was created during the rename, try
-+	 * unlinking it if it's not negative
-+	 */
-+	if (new_target &&
-+	    d_really_is_positive(target_dentry) &&
-+	    (rc == -EACCES || rc == -EEXIST)) {
- 		if (d_is_dir(target_dentry))
- 			tmprc = cifs_rmdir(target_dir, target_dentry);
- 		else
+-- 
+2.28.0
+
+
+From 8040aa48727ef980cae72b0c5c45d7663626e472 Mon Sep 17 00:00:00 2001
+From: Hou Tao <houtao1@huawei.com>
+Date: Mon, 15 Jun 2020 12:14:59 +0800
+Subject: [PATCH 17/28] virtio-blk: free vblk-vqs in error path of
+ virtblk_probe()
+
+[ Upstream commit e7eea44eefbdd5f0345a0a8b80a3ca1c21030d06 ]
+
+Else there will be memory leak if alloc_disk() fails.
+
+Fixes: 6a27b656fc02 ("block: virtio-blk: support multi virt queues per virtio-blk device")
+Signed-off-by: Hou Tao <houtao1@huawei.com>
+Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+Reviewed-by: Ming Lei <ming.lei@redhat.com>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/block/virtio_blk.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/block/virtio_blk.c b/drivers/block/virtio_blk.c
+index 0e18eed62c57..2f15e38fb3f8 100644
+--- a/drivers/block/virtio_blk.c
++++ b/drivers/block/virtio_blk.c
+@@ -879,6 +879,7 @@ static int virtblk_probe(struct virtio_device *vdev)
+ 	put_disk(vblk->disk);
+ out_free_vq:
+ 	vdev->config->del_vqs(vdev);
++	kfree(vblk->vqs);
+ out_free_vblk:
+ 	kfree(vblk);
+ out_free_index:
+-- 
+2.28.0
+
+
+From 97071dcd17c14081979a4482b62ba3264149d88d Mon Sep 17 00:00:00 2001
+From: Chris Packham <chris.packham@alliedtelesis.co.nz>
+Date: Thu, 2 Jul 2020 10:39:11 +1200
+Subject: [PATCH 18/28] i2c: algo-pca: Add 0x78 as SCL stuck low status for
+ PCA9665
+
+[ Upstream commit cd217f2300793a106b49c7dfcbfb26e348bc7593 ]
+
+The PCA9665 datasheet says that I2CSTA = 78h indicates that SCL is stuck
+low, this differs to the PCA9564 which uses 90h for this indication.
+Treat either 0x78 or 0x90 as an indication that the SCL line is stuck.
+
+Based on looking through the PCA9564 and PCA9665 datasheets this should
+be safe for both chips. The PCA9564 should not return 0x78 for any valid
+state and the PCA9665 should not return 0x90.
+
+Fixes: eff9ec95efaa ("i2c-algo-pca: Add PCA9665 support")
+Signed-off-by: Chris Packham <chris.packham@alliedtelesis.co.nz>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Wolfram Sang <wsa@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/i2c/algos/i2c-algo-pca.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/i2c/algos/i2c-algo-pca.c b/drivers/i2c/algos/i2c-algo-pca.c
+index e370804ec8bc..3a9db4626cb6 100644
+--- a/drivers/i2c/algos/i2c-algo-pca.c
++++ b/drivers/i2c/algos/i2c-algo-pca.c
+@@ -326,7 +326,8 @@ static int pca_xfer(struct i2c_adapter *i2c_adap,
+ 			DEB2("BUS ERROR - SDA Stuck low\n");
+ 			pca_reset(adap);
+ 			goto out;
+-		case 0x90: /* Bus error - SCL stuck low */
++		case 0x78: /* Bus error - SCL stuck low (PCA9665) */
++		case 0x90: /* Bus error - SCL stuck low (PCA9564) */
+ 			DEB2("BUS ERROR - SCL Stuck low\n");
+ 			pca_reset(adap);
+ 			goto out;
+-- 
+2.28.0
+
+
+From 15fefb108c7af7ec8e19a88caed928d8b88120ff Mon Sep 17 00:00:00 2001
+From: "J. Bruce Fields" <bfields@redhat.com>
+Date: Tue, 16 Jun 2020 16:43:18 -0400
+Subject: [PATCH 19/28] nfsd: apply umask on fs without ACL support
+
+commit 22cf8419f1319ff87ec759d0ebdff4cbafaee832 upstream.
+
+The server is failing to apply the umask when creating new objects on
+filesystems without ACL support.
+
+To reproduce this, you need to use NFSv4.2 and a client and server
+recent enough to support umask, and you need to export a filesystem that
+lacks ACL support (for example, ext4 with the "noacl" mount option).
+
+Filesystems with ACL support are expected to take care of the umask
+themselves (usually by calling posix_acl_create).
+
+For filesystems without ACL support, this is up to the caller of
+vfs_create(), vfs_mknod(), or vfs_mkdir().
+
+Reported-by: Elliott Mitchell <ehem+debian@m5p.com>
+Reported-by: Salvatore Bonaccorso <carnil@debian.org>
+Tested-by: Salvatore Bonaccorso <carnil@debian.org>
+Fixes: 47057abde515 ("nfsd: add support for the umask attribute")
+Cc: stable@vger.kernel.org
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/nfsd/vfs.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
 diff --git a/fs/nfsd/vfs.c b/fs/nfsd/vfs.c
 index 06d1f2edf2ec..a64065ad8851 100644
 --- a/fs/nfsd/vfs.c
@@ -927,140 +1847,34 @@ index 06d1f2edf2ec..a64065ad8851 100644
  	host_err = vfs_create(dirp, dchild, iap->ia_mode, true);
  	if (host_err < 0) {
  		fh_drop_write(fhp);
-diff --git a/include/crypto/if_alg.h b/include/crypto/if_alg.h
-index ac0eae8372ab..2ea6a95ca825 100644
---- a/include/crypto/if_alg.h
-+++ b/include/crypto/if_alg.h
-@@ -34,8 +34,8 @@ struct alg_sock {
- 
- 	struct sock *parent;
- 
--	unsigned int refcnt;
--	unsigned int nokey_refcnt;
-+	atomic_t refcnt;
-+	atomic_t nokey_refcnt;
- 
- 	const struct af_alg_type *type;
- 	void *private;
-diff --git a/kernel/debug/debug_core.c b/kernel/debug/debug_core.c
-index 159a53ff2716..694fcd049282 100644
---- a/kernel/debug/debug_core.c
-+++ b/kernel/debug/debug_core.c
-@@ -489,6 +489,7 @@ static int kgdb_cpu_enter(struct kgdb_state *ks, struct pt_regs *regs,
- 		arch_kgdb_ops.disable_hw_break(regs);
- 
- acquirelock:
-+	rcu_read_lock();
- 	/*
- 	 * Interrupts will be restored by the 'trap return' code, except when
- 	 * single stepping.
-@@ -545,6 +546,7 @@ return_normal:
- 			atomic_dec(&slaves_in_kgdb);
- 			dbg_touch_watchdogs();
- 			local_irq_restore(flags);
-+			rcu_read_unlock();
- 			return 0;
- 		}
- 		cpu_relax();
-@@ -563,6 +565,7 @@ return_normal:
- 		raw_spin_unlock(&dbg_master_lock);
- 		dbg_touch_watchdogs();
- 		local_irq_restore(flags);
-+		rcu_read_unlock();
- 
- 		goto acquirelock;
- 	}
-@@ -682,6 +685,7 @@ kgdb_restore:
- 	raw_spin_unlock(&dbg_master_lock);
- 	dbg_touch_watchdogs();
- 	local_irq_restore(flags);
-+	rcu_read_unlock();
- 
- 	return kgdb_info[cpu].ret_state;
- }
-diff --git a/mm/slub.c b/mm/slub.c
-index 8807a0c98a67..09d4cc4391bb 100644
---- a/mm/slub.c
-+++ b/mm/slub.c
-@@ -658,6 +658,20 @@ static void slab_fix(struct kmem_cache *s, char *fmt, ...)
- 	va_end(args);
- }
- 
-+static bool freelist_corrupted(struct kmem_cache *s, struct page *page,
-+			       void *freelist, void *nextfree)
-+{
-+	if ((s->flags & SLAB_CONSISTENCY_CHECKS) &&
-+	    !check_valid_pointer(s, page, nextfree)) {
-+		object_err(s, page, freelist, "Freechain corrupt");
-+		freelist = NULL;
-+		slab_fix(s, "Isolate corrupted freechain");
-+		return true;
-+	}
-+
-+	return false;
-+}
-+
- static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
- {
- 	unsigned int off;	/* Offset of last byte */
-@@ -1339,6 +1353,11 @@ static inline void inc_slabs_node(struct kmem_cache *s, int node,
- static inline void dec_slabs_node(struct kmem_cache *s, int node,
- 							int objects) {}
- 
-+static bool freelist_corrupted(struct kmem_cache *s, struct page *page,
-+			       void *freelist, void *nextfree)
-+{
-+	return false;
-+}
- #endif /* CONFIG_SLUB_DEBUG */
- 
- /*
-@@ -2029,6 +2048,14 @@ static void deactivate_slab(struct kmem_cache *s, struct page *page,
- 		void *prior;
- 		unsigned long counters;
- 
-+		/*
-+		 * If 'nextfree' is invalid, it is possible that the object at
-+		 * 'freelist' is already corrupted.  So isolate all objects
-+		 * starting at 'freelist'.
-+		 */
-+		if (freelist_corrupted(s, page, freelist, nextfree))
-+			break;
-+
- 		do {
- 			prior = page->freelist;
- 			counters = page->counters;
-@@ -5574,7 +5601,8 @@ static void memcg_propagate_slab_attrs(struct kmem_cache *s)
- 		 */
- 		if (buffer)
- 			buf = buffer;
--		else if (root_cache->max_attr_size < ARRAY_SIZE(mbuf))
-+		else if (root_cache->max_attr_size < ARRAY_SIZE(mbuf) &&
-+			 !IS_ENABLED(CONFIG_SLUB_STATS))
- 			buf = mbuf;
- 		else {
- 			buffer = (char *) get_zeroed_page(GFP_KERNEL);
-diff --git a/mm/swap_state.c b/mm/swap_state.c
-index 326439428daf..755be95d52f9 100644
---- a/mm/swap_state.c
-+++ b/mm/swap_state.c
-@@ -23,6 +23,7 @@
- #include <linux/huge_mm.h>
- 
- #include <asm/pgtable.h>
-+#include "internal.h"
- 
- /*
-  * swapper_space is a fiction, retained to simplify the path through
-@@ -403,7 +404,7 @@ struct page *__read_swap_cache_async(swp_entry_t entry, gfp_t gfp_mask,
- 		/*
- 		 * call radix_tree_preload() while we can wait.
- 		 */
--		err = radix_tree_maybe_preload(gfp_mask & GFP_KERNEL);
-+		err = radix_tree_maybe_preload(gfp_mask & GFP_RECLAIM_MASK);
- 		if (err)
- 			break;
- 
+-- 
+2.28.0
+
+
+From 282aba56713bbc58155716b55ca7222b2d9cf3c8 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Tue, 7 Jul 2020 14:42:38 +0200
+Subject: [PATCH 20/28] Revert "ALSA: usb-audio: Improve frames size
+ computation"
+
+This reverts commit 99703c921864a318e3e8aae74fde071b1ff35bea which is
+commit f0bd62b64016508938df9babe47f65c2c727d25c upstream.
+
+It causes a number of reported issues and a fix for it has not hit
+Linus's tree yet.  Revert this to resolve those problems.
+
+Cc: Alexander Tsoy <alexander@tsoy.me>
+Cc: Takashi Iwai <tiwai@suse.de>
+Cc: Sasha Levin <sashal@kernel.org>
+Cc: Hans de Goede <jwrdegoede@fedoraproject.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ sound/usb/card.h     |  4 ----
+ sound/usb/endpoint.c | 43 +++++--------------------------------------
+ sound/usb/endpoint.h |  1 -
+ sound/usb/pcm.c      |  2 --
+ 4 files changed, 5 insertions(+), 45 deletions(-)
+
 diff --git a/sound/usb/card.h b/sound/usb/card.h
 index 9dbcbb27c28e..ed87cc83eb47 100644
 --- a/sound/usb/card.h
@@ -1188,3 +2002,409 @@ index fd73186d6003..ff38fca1781b 100644
  		else
  			counts = snd_usb_endpoint_next_packet_size(ep);
  
+-- 
+2.28.0
+
+
+From 0e1839bb7a5bafccd2a3146860c197b887991566 Mon Sep 17 00:00:00 2001
+From: Paul Aurich <paul@darkrain42.org>
+Date: Fri, 26 Jun 2020 12:58:05 -0700
+Subject: [PATCH 21/28] SMB3: Honor 'seal' flag for multiuser mounts
+
+commit cc15461c73d7d044d56c47e869a215e49bd429c8 upstream.
+
+Ensure multiuser SMB3 mounts use encryption for all users' tcons if the
+mount options are configured to require encryption. Without this, only
+the primary tcon and IPC tcons are guaranteed to be encrypted. Per-user
+tcons would only be encrypted if the server was configured to require
+encryption.
+
+Signed-off-by: Paul Aurich <paul@darkrain42.org>
+CC: Stable <stable@vger.kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Reviewed-by: Aurelien Aptel <aaptel@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/cifs/connect.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 58e7288e5151..c92f5eb49393 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -4327,6 +4327,7 @@ cifs_construct_tcon(struct cifs_sb_info *cifs_sb, kuid_t fsuid)
+ 	vol_info->no_linux_ext = !master_tcon->unix_ext;
+ 	vol_info->sectype = master_tcon->ses->sectype;
+ 	vol_info->sign = master_tcon->ses->sign;
++	vol_info->seal = master_tcon->seal;
+ 
+ 	rc = cifs_set_vol_auth(vol_info, master_tcon->ses);
+ 	if (rc) {
+-- 
+2.28.0
+
+
+From 9db66da3575f5727128856256096f4f3115f8d8c Mon Sep 17 00:00:00 2001
+From: Paul Aurich <paul@darkrain42.org>
+Date: Fri, 26 Jun 2020 12:58:06 -0700
+Subject: [PATCH 22/28] SMB3: Honor persistent/resilient handle flags for
+ multiuser mounts
+
+commit 00dfbc2f9c61185a2e662f27c45a0bb29b2a134f upstream.
+
+Without this:
+
+- persistent handles will only be enabled for per-user tcons if the
+  server advertises the 'Continuous Availabity' capability
+- resilient handles would never be enabled for per-user tcons
+
+Signed-off-by: Paul Aurich <paul@darkrain42.org>
+CC: Stable <stable@vger.kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Reviewed-by: Aurelien Aptel <aaptel@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/cifs/connect.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index c92f5eb49393..64e52374ecc2 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -4324,6 +4324,8 @@ cifs_construct_tcon(struct cifs_sb_info *cifs_sb, kuid_t fsuid)
+ 	vol_info->retry = master_tcon->retry;
+ 	vol_info->nocase = master_tcon->nocase;
+ 	vol_info->local_lease = master_tcon->local_lease;
++	vol_info->resilient = master_tcon->use_resilient;
++	vol_info->persistent = master_tcon->use_persistent;
+ 	vol_info->no_linux_ext = !master_tcon->unix_ext;
+ 	vol_info->sectype = master_tcon->ses->sectype;
+ 	vol_info->sign = master_tcon->ses->sign;
+-- 
+2.28.0
+
+
+From fb28917db91643cf61d4f8b377c2a1ed601f9abb Mon Sep 17 00:00:00 2001
+From: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+Date: Sun, 28 Jun 2020 21:06:38 -0400
+Subject: [PATCH 23/28] cifs: Fix the target file was deleted when rename
+ failed.
+
+commit 9ffad9263b467efd8f8dc7ae1941a0a655a2bab2 upstream.
+
+When xfstest generic/035, we found the target file was deleted
+if the rename return -EACESS.
+
+In cifs_rename2, we unlink the positive target dentry if rename
+failed with EACESS or EEXIST, even if the target dentry is positived
+before rename. Then the existing file was deleted.
+
+We should just delete the target file which created during the
+rename.
+
+Reported-by: Hulk Robot <hulkci@huawei.com>
+Signed-off-by: Zhang Xiaoxu <zhangxiaoxu5@huawei.com>
+Cc: stable@vger.kernel.org
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Reviewed-by: Aurelien Aptel <aaptel@suse.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/cifs/inode.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/fs/cifs/inode.c b/fs/cifs/inode.c
+index bdce714e9448..528fe225b65a 100644
+--- a/fs/cifs/inode.c
++++ b/fs/cifs/inode.c
+@@ -1778,6 +1778,7 @@ cifs_rename2(struct inode *source_dir, struct dentry *source_dentry,
+ 	FILE_UNIX_BASIC_INFO *info_buf_target;
+ 	unsigned int xid;
+ 	int rc, tmprc;
++	bool new_target = d_really_is_negative(target_dentry);
+ 
+ 	if (flags & ~RENAME_NOREPLACE)
+ 		return -EINVAL;
+@@ -1854,8 +1855,13 @@ cifs_rename2(struct inode *source_dir, struct dentry *source_dentry,
+ 	 */
+ 
+ unlink_target:
+-	/* Try unlinking the target dentry if it's not negative */
+-	if (d_really_is_positive(target_dentry) && (rc == -EACCES || rc == -EEXIST)) {
++	/*
++	 * If the target dentry was created during the rename, try
++	 * unlinking it if it's not negative
++	 */
++	if (new_target &&
++	    d_really_is_positive(target_dentry) &&
++	    (rc == -EACCES || rc == -EEXIST)) {
+ 		if (d_is_dir(target_dentry))
+ 			tmprc = cifs_rmdir(target_dir, target_dentry);
+ 		else
+-- 
+2.28.0
+
+
+From ef2c83786b0b6438030761b926e12ab02d13089e Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hauke@hauke-m.de>
+Date: Fri, 3 Jul 2020 00:53:34 +0200
+Subject: [PATCH 24/28] MIPS: Add missing EHB in mtc0 -> mfc0 sequence for
+ DSPen
+
+commit fcec538ef8cca0ad0b84432235dccd9059c8e6f8 upstream.
+
+This resolves the hazard between the mtc0 in the change_c0_status() and
+the mfc0 in configure_exception_vector(). Without resolving this hazard
+configure_exception_vector() could read an old value and would restore
+this old value again. This would revert the changes change_c0_status()
+did. I checked this by printing out the read_c0_status() at the end of
+per_cpu_trap_init() and the ST0_MX is not set without this patch.
+
+The hazard is documented in the MIPS Architecture Reference Manual Vol.
+III: MIPS32/microMIPS32 Privileged Resource Architecture (MD00088), rev
+6.03 table 8.1 which includes:
+
+   Producer | Consumer | Hazard
+  ----------|----------|----------------------------
+   mtc0     | mfc0     | any coprocessor 0 register
+
+I saw this hazard on an Atheros AR9344 rev 2 SoC with a MIPS 74Kc CPU.
+There the change_c0_status() function would activate the DSPen by
+setting ST0_MX in the c0_status register. This was reverted and then the
+system got a DSP exception when the DSP registers were saved in
+save_dsp() in the first process switch. The crash looks like this:
+
+[    0.089999] Mount-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.097796] Mountpoint-cache hash table entries: 1024 (order: 0, 4096 bytes, linear)
+[    0.107070] Kernel panic - not syncing: Unexpected DSP exception
+[    0.113470] Rebooting in 1 seconds..
+
+We saw this problem in OpenWrt only on the MIPS 74Kc based Atheros SoCs,
+not on the 24Kc based SoCs. We only saw it with kernel 5.4 not with
+kernel 4.19, in addition we had to use GCC 8.4 or 9.X, with GCC 8.3 it
+did not happen.
+
+In the kernel I bisected this problem to commit 9012d011660e ("compiler:
+allow all arches to enable CONFIG_OPTIMIZE_INLINING"), but when this was
+reverted it also happened after commit 172dcd935c34b ("MIPS: Always
+allocate exception vector for MIPSr2+").
+
+Commit 0b24cae4d535 ("MIPS: Add missing EHB in mtc0 -> mfc0 sequence.")
+does similar changes to a different file. I am not sure if there are
+more places affected by this problem.
+
+Signed-off-by: Hauke Mehrtens <hauke@hauke-m.de>
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/mips/kernel/traps.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/mips/kernel/traps.c b/arch/mips/kernel/traps.c
+index 583aed906933..4a23d89e251c 100644
+--- a/arch/mips/kernel/traps.c
++++ b/arch/mips/kernel/traps.c
+@@ -2135,6 +2135,7 @@ static void configure_status(void)
+ 
+ 	change_c0_status(ST0_CU|ST0_MX|ST0_RE|ST0_FR|ST0_BEV|ST0_TS|ST0_KX|ST0_SX|ST0_UX,
+ 			 status_set);
++	back_to_back_c0_hazard();
+ }
+ 
+ unsigned int hwrena;
+-- 
+2.28.0
+
+
+From fa1c518dfe21052a8758a01116c457f57f139f5b Mon Sep 17 00:00:00 2001
+From: Marc Zyngier <maz@kernel.org>
+Date: Sun, 21 Jun 2020 14:43:15 +0100
+Subject: [PATCH 25/28] irqchip/gic: Atomically update affinity
+
+commit 005c34ae4b44f085120d7f371121ec7ded677761 upstream.
+
+The GIC driver uses a RMW sequence to update the affinity, and
+relies on the gic_lock_irqsave/gic_unlock_irqrestore sequences
+to update it atomically.
+
+But these sequences only expand into anything meaningful if
+the BL_SWITCHER option is selected, which almost never happens.
+
+It also turns out that using a RMW and locks is just as silly,
+as the GIC distributor supports byte accesses for the GICD_TARGETRn
+registers, which when used make the update atomic by definition.
+
+Drop the terminally broken code and replace it by a byte write.
+
+Fixes: 04c8b0f82c7d ("irqchip/gic: Make locking a BL_SWITCHER only feature")
+Cc: stable@vger.kernel.org
+Signed-off-by: Marc Zyngier <maz@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/irqchip/irq-gic.c | 14 +++-----------
+ 1 file changed, 3 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/irqchip/irq-gic.c b/drivers/irqchip/irq-gic.c
+index 651d726e8b12..eef4f8192068 100644
+--- a/drivers/irqchip/irq-gic.c
++++ b/drivers/irqchip/irq-gic.c
+@@ -324,10 +324,8 @@ static int gic_irq_set_vcpu_affinity(struct irq_data *d, void *vcpu)
+ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
+ 			    bool force)
+ {
+-	void __iomem *reg = gic_dist_base(d) + GIC_DIST_TARGET + (gic_irq(d) & ~3);
+-	unsigned int cpu, shift = (gic_irq(d) % 4) * 8;
+-	u32 val, mask, bit;
+-	unsigned long flags;
++	void __iomem *reg = gic_dist_base(d) + GIC_DIST_TARGET + gic_irq(d);
++	unsigned int cpu;
+ 
+ 	if (!force)
+ 		cpu = cpumask_any_and(mask_val, cpu_online_mask);
+@@ -337,13 +335,7 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *mask_val,
+ 	if (cpu >= NR_GIC_CPU_IF || cpu >= nr_cpu_ids)
+ 		return -EINVAL;
+ 
+-	gic_lock_irqsave(flags);
+-	mask = 0xff << shift;
+-	bit = gic_cpu_map[cpu] << shift;
+-	val = readl_relaxed(reg) & ~mask;
+-	writel_relaxed(val | bit, reg);
+-	gic_unlock_irqrestore(flags);
+-
++	writeb_relaxed(gic_cpu_map[cpu], reg);
+ 	irq_data_update_effective_affinity(d, cpumask_of(cpu));
+ 
+ 	return IRQ_SET_MASK_OK_DONE;
+-- 
+2.28.0
+
+
+From 89306f5ea312c1b8271550bfa04a603fb1666972 Mon Sep 17 00:00:00 2001
+From: Hou Tao <houtao1@huawei.com>
+Date: Mon, 15 Jun 2020 11:33:23 +0800
+Subject: [PATCH 26/28] dm zoned: assign max_io_len correctly
+
+commit 7b2377486767503d47265e4d487a63c651f6b55d upstream.
+
+The unit of max_io_len is sector instead of byte (spotted through
+code review), so fix it.
+
+Fixes: 3b1a94c88b79 ("dm zoned: drive-managed zoned block device target")
+Cc: stable@vger.kernel.org
+Signed-off-by: Hou Tao <houtao1@huawei.com>
+Reviewed-by: Damien Le Moal <damien.lemoal@wdc.com>
+Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/dm-zoned-target.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/md/dm-zoned-target.c b/drivers/md/dm-zoned-target.c
+index 497a2bc5da51..9d8d453b2735 100644
+--- a/drivers/md/dm-zoned-target.c
++++ b/drivers/md/dm-zoned-target.c
+@@ -789,7 +789,7 @@ static int dmz_ctr(struct dm_target *ti, unsigned int argc, char **argv)
+ 	}
+ 
+ 	/* Set target (no write same support) */
+-	ti->max_io_len = dev->zone_nr_sectors << 9;
++	ti->max_io_len = dev->zone_nr_sectors;
+ 	ti->num_flush_bios = 1;
+ 	ti->num_discard_bios = 1;
+ 	ti->num_write_zeroes_bios = 1;
+-- 
+2.28.0
+
+
+From d08e8347b707c9bf19d2eed36870fc85f0384c75 Mon Sep 17 00:00:00 2001
+From: Peter Jones <pjones@redhat.com>
+Date: Mon, 15 Jun 2020 16:24:08 -0400
+Subject: [PATCH 27/28] efi: Make it possible to disable efivar_ssdt entirely
+
+commit 435d1a471598752446a72ad1201b3c980526d869 upstream.
+
+In most cases, such as CONFIG_ACPI_CUSTOM_DSDT and
+CONFIG_ACPI_TABLE_UPGRADE, boot-time modifications to firmware tables
+are tied to specific Kconfig options.  Currently this is not the case
+for modifying the ACPI SSDT via the efivar_ssdt kernel command line
+option and associated EFI variable.
+
+This patch adds CONFIG_EFI_CUSTOM_SSDT_OVERLAYS, which defaults
+disabled, in order to allow enabling or disabling that feature during
+the build.
+
+Cc: <stable@vger.kernel.org>
+Signed-off-by: Peter Jones <pjones@redhat.com>
+Link: https://lore.kernel.org/r/20200615202408.2242614-1-pjones@redhat.com
+Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/firmware/efi/Kconfig | 11 +++++++++++
+ drivers/firmware/efi/efi.c   |  2 +-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/firmware/efi/Kconfig b/drivers/firmware/efi/Kconfig
+index 86210f75d233..a4fadd42221d 100644
+--- a/drivers/firmware/efi/Kconfig
++++ b/drivers/firmware/efi/Kconfig
+@@ -164,6 +164,17 @@ config RESET_ATTACK_MITIGATION
+ 	  have been evicted, since otherwise it will trigger even on clean
+ 	  reboots.
+ 
++config EFI_CUSTOM_SSDT_OVERLAYS
++	bool "Load custom ACPI SSDT overlay from an EFI variable"
++	depends on EFI_VARS && ACPI
++	default ACPI_TABLE_UPGRADE
++	help
++	  Allow loading of an ACPI SSDT overlay from an EFI variable specified
++	  by a kernel command line option.
++
++	  See Documentation/admin-guide/acpi/ssdt-overlays.rst for more
++	  information.endmenu
++
+ endmenu
+ 
+ config UEFI_CPER
+diff --git a/drivers/firmware/efi/efi.c b/drivers/firmware/efi/efi.c
+index b39b7e6d4e4d..a3dc6cb7326a 100644
+--- a/drivers/firmware/efi/efi.c
++++ b/drivers/firmware/efi/efi.c
+@@ -221,7 +221,7 @@ static void generic_ops_unregister(void)
+ 	efivars_unregister(&generic_efivars);
+ }
+ 
+-#if IS_ENABLED(CONFIG_ACPI)
++#ifdef CONFIG_EFI_CUSTOM_SSDT_OVERLAYS
+ #define EFIVAR_SSDT_NAME_MAX	16
+ static char efivar_ssdt[EFIVAR_SSDT_NAME_MAX] __initdata;
+ static int __init efivar_ssdt_setup(char *str)
+-- 
+2.28.0
+
+
+From 56dfe6252c6823c486ce4b1a922d72abc7e3c6b1 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Thu, 9 Jul 2020 09:36:33 +0200
+Subject: [PATCH 28/28] Linux 4.14.188
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 42b7d816d102..7dc8eec60e7c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 14
+-SUBLEVEL = 187
++SUBLEVEL = 188
+ EXTRAVERSION =
+ NAME = Petit Gorille
+ 
+-- 
+2.28.0
+

@@ -1,3 +1,84 @@
+From 0c0be310ba29e4a053e8aac934aebe590c5da909 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fw@strlen.de>
+Date: Thu, 18 Feb 2016 15:03:24 +0100
+Subject: [PATCH 01/29] netlink: remove mmapped netlink support
+
+commit d1b4c689d4130bcfd3532680b64db562300716b6 upstream.
+
+mmapped netlink has a number of unresolved issues:
+
+- TX zerocopy support had to be disabled more than a year ago via
+  commit 4682a0358639b29cf ("netlink: Always copy on mmap TX.")
+  because the content of the mmapped area can change after netlink
+  attribute validation but before message processing.
+
+- RX support was implemented mainly to speed up nfqueue dumping packet
+  payload to userspace.  However, since commit ae08ce0021087a5d812d2
+  ("netfilter: nfnetlink_queue: zero copy support") we avoid one copy
+  with the socket-based interface too (via the skb_zerocopy helper).
+
+The other problem is that skbs attached to mmaped netlink socket
+behave different from normal skbs:
+
+- they don't have a shinfo area, so all functions that use skb_shinfo()
+(e.g. skb_clone) cannot be used.
+
+- reserving headroom prevents userspace from seeing the content as
+it expects message to start at skb->head.
+See for instance
+commit aa3a022094fa ("netlink: not trim skb for mmaped socket when dump").
+
+- skbs handed e.g. to netlink_ack must have non-NULL skb->sk, else we
+crash because it needs the sk to check if a tx ring is attached.
+
+Also not obvious, leads to non-intuitive bug fixes such as 7c7bdf359
+("netfilter: nfnetlink: use original skbuff when acking batches").
+
+mmaped netlink also didn't play nicely with the skb_zerocopy helper
+used by nfqueue and openvswitch.  Daniel Borkmann fixed this via
+commit 6bb0fef489f6 ("netlink, mmap: fix edge-case leakages in nf queue
+zero-copy")' but at the cost of also needing to provide remaining
+length to the allocation function.
+
+nfqueue also has problems when used with mmaped rx netlink:
+- mmaped netlink doesn't allow use of nfqueue batch verdict messages.
+  Problem is that in the mmap case, the allocation time also determines
+  the ordering in which the frame will be seen by userspace (A
+  allocating before B means that A is located in earlier ring slot,
+  but this also means that B might get a lower sequence number then A
+  since seqno is decided later.  To fix this we would need to extend the
+  spinlocked region to also cover the allocation and message setup which
+  isn't desirable.
+- nfqueue can now be configured to queue large (GSO) skbs to userspace.
+  Queing GSO packets is faster than having to force a software segmentation
+  in the kernel, so this is a desirable option.  However, with a mmap based
+  ring one has to use 64kb per ring slot element, else mmap has to fall back
+  to the socket path (NL_MMAP_STATUS_COPY) for all large packets.
+
+To use the mmap interface, userspace not only has to probe for mmap netlink
+support, it also has to implement a recv/socket receive path in order to
+handle messages that exceed the size of an rx ring element.
+
+Cc: Daniel Borkmann <daniel@iogearbox.net>
+Cc: Ken-ichirou MATSUZAWA <chamaken@gmail.com>
+Cc: Pablo Neira Ayuso <pablo@netfilter.org>
+Cc: Patrick McHardy <kaber@trash.net>
+Cc: Thomas Graf <tgraf@suug.ch>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Shi Yuejie <shiyuejie@outlook.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ Documentation/networking/netlink_mmap.txt | 332 ----------
+ include/uapi/linux/netlink.h              |   4 +
+ include/uapi/linux/netlink_diag.h         |   2 +
+ net/netlink/Kconfig                       |   9 -
+ net/netlink/af_netlink.c                  | 751 +---------------------
+ net/netlink/af_netlink.h                  |  15 -
+ net/netlink/diag.c                        |  39 --
+ 7 files changed, 14 insertions(+), 1138 deletions(-)
+ delete mode 100644 Documentation/networking/netlink_mmap.txt
+
 diff --git a/Documentation/networking/netlink_mmap.txt b/Documentation/networking/netlink_mmap.txt
 deleted file mode 100644
 index 54f10478e8e3..000000000000
@@ -336,175 +417,6 @@ index 54f10478e8e3..000000000000
 -
 -	/* Advance frame offset to next frame */
 -	frame_offset = (frame_offset + frame_size) % ring_size;
-diff --git a/Makefile b/Makefile
-index d9cc21df444d..cf9303a5d621 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 4
--SUBLEVEL = 55
-+SUBLEVEL = 56
- EXTRAVERSION =
- NAME = Blurry Fish Butt
- 
-diff --git a/arch/x86/kernel/cpu/perf_event.c b/arch/x86/kernel/cpu/perf_event.c
-index 1a8256dd6729..5b2f2306fbcc 100644
---- a/arch/x86/kernel/cpu/perf_event.c
-+++ b/arch/x86/kernel/cpu/perf_event.c
-@@ -1996,8 +1996,8 @@ static int x86_pmu_event_init(struct perf_event *event)
- 
- static void refresh_pce(void *ignored)
- {
--	if (current->mm)
--		load_mm_cr4(current->mm);
-+	if (current->active_mm)
-+		load_mm_cr4(current->active_mm);
- }
- 
- static void x86_pmu_event_mapped(struct perf_event *event)
-diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
-index f129a9af6357..b6b0077da1af 100644
---- a/arch/x86/kernel/head64.c
-+++ b/arch/x86/kernel/head64.c
-@@ -4,6 +4,7 @@
-  *  Copyright (C) 2000 Andrea Arcangeli <andrea@suse.de> SuSE
-  */
- 
-+#define DISABLE_BRANCH_PROFILING
- #include <linux/init.h>
- #include <linux/linkage.h>
- #include <linux/types.h>
-diff --git a/arch/x86/mm/kasan_init_64.c b/arch/x86/mm/kasan_init_64.c
-index d470cf219a2d..4e5ac46adc9d 100644
---- a/arch/x86/mm/kasan_init_64.c
-+++ b/arch/x86/mm/kasan_init_64.c
-@@ -1,3 +1,4 @@
-+#define DISABLE_BRANCH_PROFILING
- #define pr_fmt(fmt) "kasan: " fmt
- #include <linux/bootmem.h>
- #include <linux/kasan.h>
-diff --git a/drivers/net/vrf.c b/drivers/net/vrf.c
-index d6b619667f1a..349aecbc210a 100644
---- a/drivers/net/vrf.c
-+++ b/drivers/net/vrf.c
-@@ -345,6 +345,7 @@ static netdev_tx_t is_ip_tx_frame(struct sk_buff *skb, struct net_device *dev)
- 
- static netdev_tx_t vrf_xmit(struct sk_buff *skb, struct net_device *dev)
- {
-+	int len = skb->len;
- 	netdev_tx_t ret = is_ip_tx_frame(skb, dev);
- 
- 	if (likely(ret == NET_XMIT_SUCCESS || ret == NET_XMIT_CN)) {
-@@ -352,7 +353,7 @@ static netdev_tx_t vrf_xmit(struct sk_buff *skb, struct net_device *dev)
- 
- 		u64_stats_update_begin(&dstats->syncp);
- 		dstats->tx_pkts++;
--		dstats->tx_bytes += skb->len;
-+		dstats->tx_bytes += len;
- 		u64_stats_update_end(&dstats->syncp);
- 	} else {
- 		this_cpu_inc(dev->dstats->tx_drps);
-diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
-index 6fa8e165878e..590750ab6564 100644
---- a/drivers/net/vxlan.c
-+++ b/drivers/net/vxlan.c
-@@ -2600,7 +2600,7 @@ static int vxlan_validate(struct nlattr *tb[], struct nlattr *data[])
- 
- 	if (data[IFLA_VXLAN_ID]) {
- 		__u32 id = nla_get_u32(data[IFLA_VXLAN_ID]);
--		if (id >= VXLAN_VID_MASK)
-+		if (id >= VXLAN_N_VID)
- 			return -ERANGE;
- 	}
- 
-diff --git a/fs/ext4/crypto_policy.c b/fs/ext4/crypto_policy.c
-index 8a9feb341f31..dd561f916f0b 100644
---- a/fs/ext4/crypto_policy.c
-+++ b/fs/ext4/crypto_policy.c
-@@ -156,6 +156,12 @@ int ext4_is_child_context_consistent_with_parent(struct inode *parent,
- 		WARN_ON(1);	/* Should never happen */
- 		return 0;
- 	}
-+
-+	/* No restrictions on file types which are never encrypted */
-+	if (!S_ISREG(child->i_mode) && !S_ISDIR(child->i_mode) &&
-+	    !S_ISLNK(child->i_mode))
-+		return 1;
-+
- 	/* no restrictions if the parent directory is not encrypted */
- 	if (!ext4_encrypted_inode(parent))
- 		return 1;
-diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
-index 1fb12f9c97a6..789e2d6724a9 100644
---- a/fs/ext4/ioctl.c
-+++ b/fs/ext4/ioctl.c
-@@ -633,8 +633,12 @@ resizefs_out:
- 		if (err)
- 			goto encryption_policy_out;
- 
-+		mutex_lock(&inode->i_mutex);
-+
- 		err = ext4_process_policy(&policy, inode);
- 
-+		mutex_unlock(&inode->i_mutex);
-+
- 		mnt_drop_write_file(filp);
- encryption_policy_out:
- 		return err;
-diff --git a/fs/f2fs/crypto_policy.c b/fs/f2fs/crypto_policy.c
-index e504f548b64e..5bbd1989d5e6 100644
---- a/fs/f2fs/crypto_policy.c
-+++ b/fs/f2fs/crypto_policy.c
-@@ -149,6 +149,11 @@ int f2fs_is_child_context_consistent_with_parent(struct inode *parent,
- 		BUG_ON(1);
- 	}
- 
-+	/* No restrictions on file types which are never encrypted */
-+	if (!S_ISREG(child->i_mode) && !S_ISDIR(child->i_mode) &&
-+	    !S_ISLNK(child->i_mode))
-+		return 1;
-+
- 	/* no restrictions if the parent directory is not encrypted */
- 	if (!f2fs_encrypted_inode(parent))
- 		return 1;
-diff --git a/fs/f2fs/file.c b/fs/f2fs/file.c
-index a197215ad52b..4b449d263333 100644
---- a/fs/f2fs/file.c
-+++ b/fs/f2fs/file.c
-@@ -1535,12 +1535,19 @@ static int f2fs_ioc_set_encryption_policy(struct file *filp, unsigned long arg)
- #ifdef CONFIG_F2FS_FS_ENCRYPTION
- 	struct f2fs_encryption_policy policy;
- 	struct inode *inode = file_inode(filp);
-+	int err;
- 
- 	if (copy_from_user(&policy, (struct f2fs_encryption_policy __user *)arg,
- 				sizeof(policy)))
- 		return -EFAULT;
- 
--	return f2fs_process_policy(&policy, inode);
-+	mutex_lock(&inode->i_mutex);
-+
-+	err = f2fs_process_policy(&policy, inode);
-+
-+	mutex_unlock(&inode->i_mutex);
-+
-+	return err;
- #else
- 	return -EOPNOTSUPP;
- #endif
-diff --git a/include/linux/dccp.h b/include/linux/dccp.h
-index 61d042bbbf60..68449293c4b6 100644
---- a/include/linux/dccp.h
-+++ b/include/linux/dccp.h
-@@ -163,6 +163,7 @@ struct dccp_request_sock {
- 	__u64			 dreq_isr;
- 	__u64			 dreq_gsr;
- 	__be32			 dreq_service;
-+	spinlock_t		 dreq_lock;
- 	struct list_head	 dreq_featneg;
- 	__u32			 dreq_timestamp_echo;
- 	__u32			 dreq_timestamp_time;
 diff --git a/include/uapi/linux/netlink.h b/include/uapi/linux/netlink.h
 index f095155d8749..0dba4e4ed2be 100644
 --- a/include/uapi/linux/netlink.h
@@ -549,535 +461,6 @@ index f2159d30d1f5..d79399394b46 100644
 +#endif
  
  #endif
-diff --git a/include/uapi/linux/packet_diag.h b/include/uapi/linux/packet_diag.h
-index d08c63f3dd6f..0c5d5dd61b6a 100644
---- a/include/uapi/linux/packet_diag.h
-+++ b/include/uapi/linux/packet_diag.h
-@@ -64,7 +64,7 @@ struct packet_diag_mclist {
- 	__u32	pdmc_count;
- 	__u16	pdmc_type;
- 	__u16	pdmc_alen;
--	__u8	pdmc_addr[MAX_ADDR_LEN];
-+	__u8	pdmc_addr[32]; /* MAX_ADDR_LEN */
- };
- 
- struct packet_diag_ring {
-diff --git a/kernel/futex.c b/kernel/futex.c
-index 9d251dc3ec40..3057dabf726f 100644
---- a/kernel/futex.c
-+++ b/kernel/futex.c
-@@ -2690,7 +2690,6 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
- {
- 	struct hrtimer_sleeper timeout, *to = NULL;
- 	struct rt_mutex_waiter rt_waiter;
--	struct rt_mutex *pi_mutex = NULL;
- 	struct futex_hash_bucket *hb;
- 	union futex_key key2 = FUTEX_KEY_INIT;
- 	struct futex_q q = futex_q_init;
-@@ -2774,6 +2773,8 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
- 		if (q.pi_state && (q.pi_state->owner != current)) {
- 			spin_lock(q.lock_ptr);
- 			ret = fixup_pi_state_owner(uaddr2, &q, current);
-+			if (ret && rt_mutex_owner(&q.pi_state->pi_mutex) == current)
-+				rt_mutex_unlock(&q.pi_state->pi_mutex);
- 			/*
- 			 * Drop the reference to the pi state which
- 			 * the requeue_pi() code acquired for us.
-@@ -2782,6 +2783,8 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
- 			spin_unlock(q.lock_ptr);
- 		}
- 	} else {
-+		struct rt_mutex *pi_mutex;
-+
- 		/*
- 		 * We have been woken up by futex_unlock_pi(), a timeout, or a
- 		 * signal.  futex_unlock_pi() will not destroy the lock_ptr nor
-@@ -2805,18 +2808,19 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
- 		if (res)
- 			ret = (res < 0) ? res : 0;
- 
-+		/*
-+		 * If fixup_pi_state_owner() faulted and was unable to handle
-+		 * the fault, unlock the rt_mutex and return the fault to
-+		 * userspace.
-+		 */
-+		if (ret && rt_mutex_owner(pi_mutex) == current)
-+			rt_mutex_unlock(pi_mutex);
-+
- 		/* Unqueue and drop the lock. */
- 		unqueue_me_pi(&q);
- 	}
- 
--	/*
--	 * If fixup_pi_state_owner() faulted and was unable to handle the
--	 * fault, unlock the rt_mutex and return the fault to userspace.
--	 */
--	if (ret == -EFAULT) {
--		if (pi_mutex && rt_mutex_owner(pi_mutex) == current)
--			rt_mutex_unlock(pi_mutex);
--	} else if (ret == -EINTR) {
-+	if (ret == -EINTR) {
- 		/*
- 		 * We've already been requeued, but cannot restart by calling
- 		 * futex_lock_pi() directly. We could restart this syscall, but
-diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
-index f7fba74108a9..e24754a0e052 100644
---- a/net/bridge/br_input.c
-+++ b/net/bridge/br_input.c
-@@ -29,6 +29,7 @@ EXPORT_SYMBOL(br_should_route_hook);
- static int
- br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
- {
-+	br_drop_fake_rtable(skb);
- 	return netif_receive_skb(skb);
- }
- 
-diff --git a/net/bridge/br_netfilter_hooks.c b/net/bridge/br_netfilter_hooks.c
-index 7ddbe7ec81d6..97fc19f001bf 100644
---- a/net/bridge/br_netfilter_hooks.c
-+++ b/net/bridge/br_netfilter_hooks.c
-@@ -516,21 +516,6 @@ static unsigned int br_nf_pre_routing(void *priv,
- }
- 
- 
--/* PF_BRIDGE/LOCAL_IN ************************************************/
--/* The packet is locally destined, which requires a real
-- * dst_entry, so detach the fake one.  On the way up, the
-- * packet would pass through PRE_ROUTING again (which already
-- * took place when the packet entered the bridge), but we
-- * register an IPv4 PRE_ROUTING 'sabotage' hook that will
-- * prevent this from happening. */
--static unsigned int br_nf_local_in(void *priv,
--				   struct sk_buff *skb,
--				   const struct nf_hook_state *state)
--{
--	br_drop_fake_rtable(skb);
--	return NF_ACCEPT;
--}
--
- /* PF_BRIDGE/FORWARD *************************************************/
- static int br_nf_forward_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
- {
-@@ -901,12 +886,6 @@ static struct nf_hook_ops br_nf_ops[] __read_mostly = {
- 		.priority = NF_BR_PRI_BRNF,
- 	},
- 	{
--		.hook = br_nf_local_in,
--		.pf = NFPROTO_BRIDGE,
--		.hooknum = NF_BR_LOCAL_IN,
--		.priority = NF_BR_PRI_BRNF,
--	},
--	{
- 		.hook = br_nf_forward_ip,
- 		.pf = NFPROTO_BRIDGE,
- 		.hooknum = NF_BR_FORWARD,
-diff --git a/net/core/dev.c b/net/core/dev.c
-index 08215a85c742..48399d8ce614 100644
---- a/net/core/dev.c
-+++ b/net/core/dev.c
-@@ -1677,27 +1677,54 @@ EXPORT_SYMBOL_GPL(net_dec_ingress_queue);
- static struct static_key netstamp_needed __read_mostly;
- #ifdef HAVE_JUMP_LABEL
- static atomic_t netstamp_needed_deferred;
-+static atomic_t netstamp_wanted;
- static void netstamp_clear(struct work_struct *work)
- {
- 	int deferred = atomic_xchg(&netstamp_needed_deferred, 0);
-+	int wanted;
- 
--	while (deferred--)
--		static_key_slow_dec(&netstamp_needed);
-+	wanted = atomic_add_return(deferred, &netstamp_wanted);
-+	if (wanted > 0)
-+		static_key_enable(&netstamp_needed);
-+	else
-+		static_key_disable(&netstamp_needed);
- }
- static DECLARE_WORK(netstamp_work, netstamp_clear);
- #endif
- 
- void net_enable_timestamp(void)
- {
-+#ifdef HAVE_JUMP_LABEL
-+	int wanted;
-+
-+	while (1) {
-+		wanted = atomic_read(&netstamp_wanted);
-+		if (wanted <= 0)
-+			break;
-+		if (atomic_cmpxchg(&netstamp_wanted, wanted, wanted + 1) == wanted)
-+			return;
-+	}
-+	atomic_inc(&netstamp_needed_deferred);
-+	schedule_work(&netstamp_work);
-+#else
- 	static_key_slow_inc(&netstamp_needed);
-+#endif
- }
- EXPORT_SYMBOL(net_enable_timestamp);
- 
- void net_disable_timestamp(void)
- {
- #ifdef HAVE_JUMP_LABEL
--	/* net_disable_timestamp() can be called from non process context */
--	atomic_inc(&netstamp_needed_deferred);
-+	int wanted;
-+
-+	while (1) {
-+		wanted = atomic_read(&netstamp_wanted);
-+		if (wanted <= 1)
-+			break;
-+		if (atomic_cmpxchg(&netstamp_wanted, wanted, wanted - 1) == wanted)
-+			return;
-+	}
-+	atomic_dec(&netstamp_needed_deferred);
- 	schedule_work(&netstamp_work);
- #else
- 	static_key_slow_dec(&netstamp_needed);
-diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index 4968b5ddea69..73dfd7729bc9 100644
---- a/net/core/skbuff.c
-+++ b/net/core/skbuff.c
-@@ -3678,13 +3678,14 @@ void skb_complete_tx_timestamp(struct sk_buff *skb,
- 	if (!skb_may_tx_timestamp(sk, false))
- 		return;
- 
--	/* take a reference to prevent skb_orphan() from freeing the socket */
--	sock_hold(sk);
--
--	*skb_hwtstamps(skb) = *hwtstamps;
--	__skb_complete_tx_timestamp(skb, sk, SCM_TSTAMP_SND);
--
--	sock_put(sk);
-+	/* Take a reference to prevent skb_orphan() from freeing the socket,
-+	 * but only if the socket refcount is not zero.
-+	 */
-+	if (likely(atomic_inc_not_zero(&sk->sk_refcnt))) {
-+		*skb_hwtstamps(skb) = *hwtstamps;
-+		__skb_complete_tx_timestamp(skb, sk, SCM_TSTAMP_SND);
-+		sock_put(sk);
-+	}
- }
- EXPORT_SYMBOL_GPL(skb_complete_tx_timestamp);
- 
-@@ -3735,7 +3736,7 @@ void skb_complete_wifi_ack(struct sk_buff *skb, bool acked)
- {
- 	struct sock *sk = skb->sk;
- 	struct sock_exterr_skb *serr;
--	int err;
-+	int err = 1;
- 
- 	skb->wifi_acked_valid = 1;
- 	skb->wifi_acked = acked;
-@@ -3745,14 +3746,15 @@ void skb_complete_wifi_ack(struct sk_buff *skb, bool acked)
- 	serr->ee.ee_errno = ENOMSG;
- 	serr->ee.ee_origin = SO_EE_ORIGIN_TXSTATUS;
- 
--	/* take a reference to prevent skb_orphan() from freeing the socket */
--	sock_hold(sk);
--
--	err = sock_queue_err_skb(sk, skb);
-+	/* Take a reference to prevent skb_orphan() from freeing the socket,
-+	 * but only if the socket refcount is not zero.
-+	 */
-+	if (likely(atomic_inc_not_zero(&sk->sk_refcnt))) {
-+		err = sock_queue_err_skb(sk, skb);
-+		sock_put(sk);
-+	}
- 	if (err)
- 		kfree_skb(skb);
--
--	sock_put(sk);
- }
- EXPORT_SYMBOL_GPL(skb_complete_wifi_ack);
- 
-diff --git a/net/dccp/ccids/ccid2.c b/net/dccp/ccids/ccid2.c
-index f053198e730c..5e3a7302f774 100644
---- a/net/dccp/ccids/ccid2.c
-+++ b/net/dccp/ccids/ccid2.c
-@@ -749,6 +749,7 @@ static void ccid2_hc_tx_exit(struct sock *sk)
- 	for (i = 0; i < hc->tx_seqbufc; i++)
- 		kfree(hc->tx_seqbuf[i]);
- 	hc->tx_seqbufc = 0;
-+	dccp_ackvec_parsed_cleanup(&hc->tx_av_chunks);
- }
- 
- static void ccid2_hc_rx_packet_recv(struct sock *sk, struct sk_buff *skb)
-diff --git a/net/dccp/ipv4.c b/net/dccp/ipv4.c
-index 0759f5b9180e..6467bf392e1b 100644
---- a/net/dccp/ipv4.c
-+++ b/net/dccp/ipv4.c
-@@ -289,7 +289,8 @@ static void dccp_v4_err(struct sk_buff *skb, u32 info)
- 
- 	switch (type) {
- 	case ICMP_REDIRECT:
--		dccp_do_redirect(skb, sk);
-+		if (!sock_owned_by_user(sk))
-+			dccp_do_redirect(skb, sk);
- 		goto out;
- 	case ICMP_SOURCE_QUENCH:
- 		/* Just silently ignore these. */
-diff --git a/net/dccp/ipv6.c b/net/dccp/ipv6.c
-index 27c4e81efa24..8113ad58fcb4 100644
---- a/net/dccp/ipv6.c
-+++ b/net/dccp/ipv6.c
-@@ -122,10 +122,12 @@ static void dccp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
- 	np = inet6_sk(sk);
- 
- 	if (type == NDISC_REDIRECT) {
--		struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
-+		if (!sock_owned_by_user(sk)) {
-+			struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
- 
--		if (dst)
--			dst->ops->redirect(dst, sk, skb);
-+			if (dst)
-+				dst->ops->redirect(dst, sk, skb);
-+		}
- 		goto out;
- 	}
- 
-diff --git a/net/dccp/minisocks.c b/net/dccp/minisocks.c
-index 1994f8af646b..68eed344b471 100644
---- a/net/dccp/minisocks.c
-+++ b/net/dccp/minisocks.c
-@@ -122,6 +122,7 @@ struct sock *dccp_create_openreq_child(const struct sock *sk,
- 			/* It is still raw copy of parent, so invalidate
- 			 * destructor and make plain sk_free() */
- 			newsk->sk_destruct = NULL;
-+			bh_unlock_sock(newsk);
- 			sk_free(newsk);
- 			return NULL;
- 		}
-@@ -145,6 +146,13 @@ struct sock *dccp_check_req(struct sock *sk, struct sk_buff *skb,
- 	struct dccp_request_sock *dreq = dccp_rsk(req);
- 	bool own_req;
- 
-+	/* TCP/DCCP listeners became lockless.
-+	 * DCCP stores complex state in its request_sock, so we need
-+	 * a protection for them, now this code runs without being protected
-+	 * by the parent (listener) lock.
-+	 */
-+	spin_lock_bh(&dreq->dreq_lock);
-+
- 	/* Check for retransmitted REQUEST */
- 	if (dccp_hdr(skb)->dccph_type == DCCP_PKT_REQUEST) {
- 
-@@ -159,7 +167,7 @@ struct sock *dccp_check_req(struct sock *sk, struct sk_buff *skb,
- 			inet_rtx_syn_ack(sk, req);
- 		}
- 		/* Network Duplicate, discard packet */
--		return NULL;
-+		goto out;
- 	}
- 
- 	DCCP_SKB_CB(skb)->dccpd_reset_code = DCCP_RESET_CODE_PACKET_ERROR;
-@@ -185,20 +193,20 @@ struct sock *dccp_check_req(struct sock *sk, struct sk_buff *skb,
- 
- 	child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb, req, NULL,
- 							 req, &own_req);
--	if (!child)
--		goto listen_overflow;
--
--	return inet_csk_complete_hashdance(sk, child, req, own_req);
-+	if (child) {
-+		child = inet_csk_complete_hashdance(sk, child, req, own_req);
-+		goto out;
-+	}
- 
--listen_overflow:
--	dccp_pr_debug("listen_overflow!\n");
- 	DCCP_SKB_CB(skb)->dccpd_reset_code = DCCP_RESET_CODE_TOO_BUSY;
- drop:
- 	if (dccp_hdr(skb)->dccph_type != DCCP_PKT_RESET)
- 		req->rsk_ops->send_reset(sk, skb);
- 
- 	inet_csk_reqsk_queue_drop(sk, req);
--	return NULL;
-+out:
-+	spin_unlock_bh(&dreq->dreq_lock);
-+	return child;
- }
- 
- EXPORT_SYMBOL_GPL(dccp_check_req);
-@@ -249,6 +257,7 @@ int dccp_reqsk_init(struct request_sock *req,
- {
- 	struct dccp_request_sock *dreq = dccp_rsk(req);
- 
-+	spin_lock_init(&dreq->dreq_lock);
- 	inet_rsk(req)->ir_rmt_port = dccp_hdr(skb)->dccph_sport;
- 	inet_rsk(req)->ir_num	   = ntohs(dccp_hdr(skb)->dccph_dport);
- 	inet_rsk(req)->acked	   = 0;
-diff --git a/net/ipv4/route.c b/net/ipv4/route.c
-index ef2f527a119b..da4d68d78590 100644
---- a/net/ipv4/route.c
-+++ b/net/ipv4/route.c
-@@ -1958,6 +1958,7 @@ int ip_route_input_noref(struct sk_buff *skb, __be32 daddr, __be32 saddr,
- {
- 	int res;
- 
-+	tos &= IPTOS_RT_MASK;
- 	rcu_read_lock();
- 
- 	/* Multicast recognition logic is moved from route cache to here.
-diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
-index b58a38eea059..198fc2314c82 100644
---- a/net/ipv4/tcp_ipv4.c
-+++ b/net/ipv4/tcp_ipv4.c
-@@ -271,10 +271,13 @@ EXPORT_SYMBOL(tcp_v4_connect);
-  */
- void tcp_v4_mtu_reduced(struct sock *sk)
- {
--	struct dst_entry *dst;
- 	struct inet_sock *inet = inet_sk(sk);
--	u32 mtu = tcp_sk(sk)->mtu_info;
-+	struct dst_entry *dst;
-+	u32 mtu;
- 
-+	if ((1 << sk->sk_state) & (TCPF_LISTEN | TCPF_CLOSE))
-+		return;
-+	mtu = tcp_sk(sk)->mtu_info;
- 	dst = inet_csk_update_pmtu(sk, mtu);
- 	if (!dst)
- 		return;
-@@ -420,7 +423,8 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
- 
- 	switch (type) {
- 	case ICMP_REDIRECT:
--		do_redirect(icmp_skb, sk);
-+		if (!sock_owned_by_user(sk))
-+			do_redirect(icmp_skb, sk);
- 		goto out;
- 	case ICMP_SOURCE_QUENCH:
- 		/* Just silently ignore these. */
-diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
-index 193ba1fa8a9a..ebb34d0c5e80 100644
---- a/net/ipv4/tcp_timer.c
-+++ b/net/ipv4/tcp_timer.c
-@@ -223,7 +223,8 @@ void tcp_delack_timer_handler(struct sock *sk)
- 
- 	sk_mem_reclaim_partial(sk);
- 
--	if (sk->sk_state == TCP_CLOSE || !(icsk->icsk_ack.pending & ICSK_ACK_TIMER))
-+	if (((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN)) ||
-+	    !(icsk->icsk_ack.pending & ICSK_ACK_TIMER))
- 		goto out;
- 
- 	if (time_after(icsk->icsk_ack.timeout, jiffies)) {
-@@ -504,7 +505,8 @@ void tcp_write_timer_handler(struct sock *sk)
- 	struct inet_connection_sock *icsk = inet_csk(sk);
- 	int event;
- 
--	if (sk->sk_state == TCP_CLOSE || !icsk->icsk_pending)
-+	if (((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN)) ||
-+	    !icsk->icsk_pending)
- 		goto out;
- 
- 	if (time_after(icsk->icsk_timeout, jiffies)) {
-diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
-index 34cf46d74554..85bf86458706 100644
---- a/net/ipv6/ip6_fib.c
-+++ b/net/ipv6/ip6_fib.c
-@@ -903,6 +903,8 @@ add:
- 			ins = &rt->dst.rt6_next;
- 			iter = *ins;
- 			while (iter) {
-+				if (iter->rt6i_metric > rt->rt6i_metric)
-+					break;
- 				if (rt6_qualify_for_ecmp(iter)) {
- 					*ins = iter->dst.rt6_next;
- 					fib6_purge_rt(iter, fn, info->nl_net);
-diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index 58900c21e4e4..8004532fa882 100644
---- a/net/ipv6/ip6_output.c
-+++ b/net/ipv6/ip6_output.c
-@@ -742,13 +742,14 @@ slow_path:
- 	 *	Fragment the datagram.
- 	 */
- 
--	*prevhdr = NEXTHDR_FRAGMENT;
- 	troom = rt->dst.dev->needed_tailroom;
- 
- 	/*
- 	 *	Keep copying data until we run out.
- 	 */
- 	while (left > 0)	{
-+		u8 *fragnexthdr_offset;
-+
- 		len = left;
- 		/* IF: it doesn't fit, use 'mtu' - the data space left */
- 		if (len > mtu)
-@@ -793,6 +794,10 @@ slow_path:
- 		 */
- 		skb_copy_from_linear_data(skb, skb_network_header(frag), hlen);
- 
-+		fragnexthdr_offset = skb_network_header(frag);
-+		fragnexthdr_offset += prevhdr - skb_network_header(skb);
-+		*fragnexthdr_offset = NEXTHDR_FRAGMENT;
-+
- 		/*
- 		 *	Build fragment header.
- 		 */
-diff --git a/net/ipv6/ip6_vti.c b/net/ipv6/ip6_vti.c
-index 0a8610b33d79..bdcc4d9cedd3 100644
---- a/net/ipv6/ip6_vti.c
-+++ b/net/ipv6/ip6_vti.c
-@@ -680,6 +680,10 @@ vti6_parm_to_user(struct ip6_tnl_parm2 *u, const struct __ip6_tnl_parm *p)
- 	u->link = p->link;
- 	u->i_key = p->i_key;
- 	u->o_key = p->o_key;
-+	if (u->i_key)
-+		u->i_flags |= GRE_KEY;
-+	if (u->o_key)
-+		u->o_flags |= GRE_KEY;
- 	u->proto = p->proto;
- 
- 	memcpy(u->name, p->name, sizeof(u->name));
-diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
-index 76a8c8057a23..1a63c4deef26 100644
---- a/net/ipv6/tcp_ipv6.c
-+++ b/net/ipv6/tcp_ipv6.c
-@@ -376,10 +376,12 @@ static void tcp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
- 	np = inet6_sk(sk);
- 
- 	if (type == NDISC_REDIRECT) {
--		struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
-+		if (!sock_owned_by_user(sk)) {
-+			struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
- 
--		if (dst)
--			dst->ops->redirect(dst, sk, skb);
-+			if (dst)
-+				dst->ops->redirect(dst, sk, skb);
-+		}
- 		goto out;
- 	}
- 
-diff --git a/net/l2tp/l2tp_ip.c b/net/l2tp/l2tp_ip.c
-index 445b7cd0826a..48ab93842322 100644
---- a/net/l2tp/l2tp_ip.c
-+++ b/net/l2tp/l2tp_ip.c
-@@ -383,7 +383,7 @@ static int l2tp_ip_backlog_recv(struct sock *sk, struct sk_buff *skb)
- drop:
- 	IP_INC_STATS(sock_net(sk), IPSTATS_MIB_INDISCARDS);
- 	kfree_skb(skb);
--	return -1;
-+	return 0;
- }
- 
- /* Userspace will call sendmsg() on the tunnel socket to send L2TP
-diff --git a/net/mpls/af_mpls.c b/net/mpls/af_mpls.c
-index 881bc2072809..52cfc4478511 100644
---- a/net/mpls/af_mpls.c
-+++ b/net/mpls/af_mpls.c
-@@ -1567,6 +1567,7 @@ static void mpls_net_exit(struct net *net)
- 	for (index = 0; index < platform_labels; index++) {
- 		struct mpls_route *rt = rtnl_dereference(platform_label[index]);
- 		RCU_INIT_POINTER(platform_label[index], NULL);
-+		mpls_notify_route(net, index, rt, NULL, NULL);
- 		mpls_rt_free(rt);
- 	}
- 	rtnl_unlock();
 diff --git a/net/netlink/Kconfig b/net/netlink/Kconfig
 index 2c5e95e9bfbd..5d6e8c05b3d4 100644
 --- a/net/netlink/Kconfig
@@ -2050,6 +1433,241 @@ index 3ee63a3cff30..8dd836a8dd60 100644
  	nlmsg_end(skb, nlh);
  	return 0;
  
+-- 
+2.28.0
+
+
+From 51a219a1371ed26ce45acc8209d6064257d00f70 Mon Sep 17 00:00:00 2001
+From: Matthias Schiffer <mschiffer@universe-factory.net>
+Date: Thu, 23 Feb 2017 17:19:41 +0100
+Subject: [PATCH 02/29] vxlan: correctly validate VXLAN ID against VXLAN_N_VID
+
+[ Upstream commit 4e37d6911f36545b286d15073f6f2222f840e81c ]
+
+The incorrect check caused an off-by-one error: the maximum VID 0xffffff
+was unusable.
+
+Fixes: d342894c5d2f ("vxlan: virtual extensible lan")
+Signed-off-by: Matthias Schiffer <mschiffer@universe-factory.net>
+Acked-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/vxlan.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 6fa8e165878e..590750ab6564 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -2600,7 +2600,7 @@ static int vxlan_validate(struct nlattr *tb[], struct nlattr *data[])
+ 
+ 	if (data[IFLA_VXLAN_ID]) {
+ 		__u32 id = nla_get_u32(data[IFLA_VXLAN_ID]);
+-		if (id >= VXLAN_VID_MASK)
++		if (id >= VXLAN_N_VID)
+ 			return -ERANGE;
+ 	}
+ 
+-- 
+2.28.0
+
+
+From f1b3aae1f1bfdbec1956670aa3aa28d25f88d4b3 Mon Sep 17 00:00:00 2001
+From: David Forster <dforster@brocade.com>
+Date: Fri, 24 Feb 2017 14:20:32 +0000
+Subject: [PATCH 03/29] vti6: return GRE_KEY for vti6
+
+[ Upstream commit 7dcdf941cdc96692ab99fd790c8cc68945514851 ]
+
+Align vti6 with vti by returning GRE_KEY flag. This enables iproute2
+to display tunnel keys on "ip -6 tunnel show"
+
+Signed-off-by: David Forster <dforster@brocade.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv6/ip6_vti.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/net/ipv6/ip6_vti.c b/net/ipv6/ip6_vti.c
+index 0a8610b33d79..bdcc4d9cedd3 100644
+--- a/net/ipv6/ip6_vti.c
++++ b/net/ipv6/ip6_vti.c
+@@ -680,6 +680,10 @@ vti6_parm_to_user(struct ip6_tnl_parm2 *u, const struct __ip6_tnl_parm *p)
+ 	u->link = p->link;
+ 	u->i_key = p->i_key;
+ 	u->o_key = p->o_key;
++	if (u->i_key)
++		u->i_flags |= GRE_KEY;
++	if (u->o_key)
++		u->o_flags |= GRE_KEY;
+ 	u->proto = p->proto;
+ 
+ 	memcpy(u->name, p->name, sizeof(u->name));
+-- 
+2.28.0
+
+
+From 354f79125f12bcd7352704e770c0b10c4a4b424e Mon Sep 17 00:00:00 2001
+From: Julian Anastasov <ja@ssi.bg>
+Date: Sun, 26 Feb 2017 17:14:35 +0200
+Subject: [PATCH 04/29] ipv4: mask tos for input route
+
+[ Upstream commit 6e28099d38c0e50d62c1afc054e37e573adf3d21 ]
+
+Restore the lost masking of TOS in input route code to
+allow ip rules to match it properly.
+
+Problem [1] noticed by Shmulik Ladkani <shmulik.ladkani@gmail.com>
+
+[1] http://marc.info/?t=137331755300040&r=1&w=2
+
+Fixes: 89aef8921bfb ("ipv4: Delete routing cache.")
+Signed-off-by: Julian Anastasov <ja@ssi.bg>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/route.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index ef2f527a119b..da4d68d78590 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -1958,6 +1958,7 @@ int ip_route_input_noref(struct sk_buff *skb, __be32 daddr, __be32 saddr,
+ {
+ 	int res;
+ 
++	tos &= IPTOS_RT_MASK;
+ 	rcu_read_lock();
+ 
+ 	/* Multicast recognition logic is moved from route cache to here.
+-- 
+2.28.0
+
+
+From 2cd0afc64e333f2ef62444300418883cff0e79da Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Paul=20H=C3=BCber?= <phueber@kernsp.in>
+Date: Sun, 26 Feb 2017 17:58:19 +0100
+Subject: [PATCH 05/29] l2tp: avoid use-after-free caused by
+ l2tp_ip_backlog_recv
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 51fb60eb162ab84c5edf2ae9c63cf0b878e5547e ]
+
+l2tp_ip_backlog_recv may not return -1 if the packet gets dropped.
+The return value is passed up to ip_local_deliver_finish, which treats
+negative values as an IP protocol number for resubmission.
+
+Signed-off-by: Paul Hüber <phueber@kernsp.in>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/l2tp/l2tp_ip.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/l2tp/l2tp_ip.c b/net/l2tp/l2tp_ip.c
+index 445b7cd0826a..48ab93842322 100644
+--- a/net/l2tp/l2tp_ip.c
++++ b/net/l2tp/l2tp_ip.c
+@@ -383,7 +383,7 @@ static int l2tp_ip_backlog_recv(struct sock *sk, struct sk_buff *skb)
+ drop:
+ 	IP_INC_STATS(sock_net(sk), IPSTATS_MIB_INDISCARDS);
+ 	kfree_skb(skb);
+-	return -1;
++	return 0;
+ }
+ 
+ /* Userspace will call sendmsg() on the tunnel socket to send L2TP
+-- 
+2.28.0
+
+
+From f331d6445a3e4013428b06169acf3ae33614e69b Mon Sep 17 00:00:00 2001
+From: Alexander Potapenko <glider@google.com>
+Date: Wed, 1 Mar 2017 12:57:20 +0100
+Subject: [PATCH 06/29] net: don't call strlen() on the user buffer in
+ packet_bind_spkt()
+
+[ Upstream commit 540e2894f7905538740aaf122bd8e0548e1c34a4 ]
+
+KMSAN (KernelMemorySanitizer, a new error detection tool) reports use of
+uninitialized memory in packet_bind_spkt():
+Acked-by: Eric Dumazet <edumazet@google.com>
+
+==================================================================
+BUG: KMSAN: use of unitialized memory
+CPU: 0 PID: 1074 Comm: packet Not tainted 4.8.0-rc6+ #1891
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs
+01/01/2011
+ 0000000000000000 ffff88006b6dfc08 ffffffff82559ae8 ffff88006b6dfb48
+ ffffffff818a7c91 ffffffff85b9c870 0000000000000092 ffffffff85b9c550
+ 0000000000000000 0000000000000092 00000000ec400911 0000000000000002
+Call Trace:
+ [<     inline     >] __dump_stack lib/dump_stack.c:15
+ [<ffffffff82559ae8>] dump_stack+0x238/0x290 lib/dump_stack.c:51
+ [<ffffffff818a6626>] kmsan_report+0x276/0x2e0 mm/kmsan/kmsan.c:1003
+ [<ffffffff818a783b>] __msan_warning+0x5b/0xb0
+mm/kmsan/kmsan_instr.c:424
+ [<     inline     >] strlen lib/string.c:484
+ [<ffffffff8259b58d>] strlcpy+0x9d/0x200 lib/string.c:144
+ [<ffffffff84b2eca4>] packet_bind_spkt+0x144/0x230
+net/packet/af_packet.c:3132
+ [<ffffffff84242e4d>] SYSC_bind+0x40d/0x5f0 net/socket.c:1370
+ [<ffffffff84242a22>] SyS_bind+0x82/0xa0 net/socket.c:1356
+ [<ffffffff8515991b>] entry_SYSCALL_64_fastpath+0x13/0x8f
+arch/x86/entry/entry_64.o:?
+chained origin: 00000000eba00911
+ [<ffffffff810bb787>] save_stack_trace+0x27/0x50
+arch/x86/kernel/stacktrace.c:67
+ [<     inline     >] kmsan_save_stack_with_flags mm/kmsan/kmsan.c:322
+ [<     inline     >] kmsan_save_stack mm/kmsan/kmsan.c:334
+ [<ffffffff818a59f8>] kmsan_internal_chain_origin+0x118/0x1e0
+mm/kmsan/kmsan.c:527
+ [<ffffffff818a7773>] __msan_set_alloca_origin4+0xc3/0x130
+mm/kmsan/kmsan_instr.c:380
+ [<ffffffff84242b69>] SYSC_bind+0x129/0x5f0 net/socket.c:1356
+ [<ffffffff84242a22>] SyS_bind+0x82/0xa0 net/socket.c:1356
+ [<ffffffff8515991b>] entry_SYSCALL_64_fastpath+0x13/0x8f
+arch/x86/entry/entry_64.o:?
+origin description: ----address@SYSC_bind (origin=00000000eb400911)
+==================================================================
+(the line numbers are relative to 4.8-rc6, but the bug persists
+upstream)
+
+, when I run the following program as root:
+
+=====================================
+ #include <string.h>
+ #include <sys/socket.h>
+ #include <netpacket/packet.h>
+ #include <net/ethernet.h>
+
+ int main() {
+   struct sockaddr addr;
+   memset(&addr, 0xff, sizeof(addr));
+   addr.sa_family = AF_PACKET;
+   int fd = socket(PF_PACKET, SOCK_PACKET, htons(ETH_P_ALL));
+   bind(fd, &addr, sizeof(addr));
+   return 0;
+ }
+=====================================
+
+This happens because addr.sa_data copied from the userspace is not
+zero-terminated, and copying it with strlcpy() in packet_bind_spkt()
+results in calling strlen() on the kernel copy of that non-terminated
+buffer.
+
+Signed-off-by: Alexander Potapenko <glider@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/packet/af_packet.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
 diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
 index d805cd577a60..3975ac809934 100644
 --- a/net/packet/af_packet.c
@@ -2076,6 +1694,1355 @@ index d805cd577a60..3975ac809934 100644
  
  	return packet_do_bind(sk, name, 0, pkt_sk(sk)->num);
  }
+-- 
+2.28.0
+
+
+From a70c328597045be2962098916c88ddd172caa054 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Wed, 1 Mar 2017 14:28:39 -0800
+Subject: [PATCH 07/29] net: net_enable_timestamp() can be called from irq
+ contexts
+
+[ Upstream commit 13baa00ad01bb3a9f893e3a08cbc2d072fc0c15d ]
+
+It is now very clear that silly TCP listeners might play with
+enabling/disabling timestamping while new children are added
+to their accept queue.
+
+Meaning net_enable_timestamp() can be called from BH context
+while current state of the static key is not enabled.
+
+Lets play safe and allow all contexts.
+
+The work queue is scheduled only under the problematic cases,
+which are the static key enable/disable transition, to not slow down
+critical paths.
+
+This extends and improves what we did in commit 5fa8bbda38c6 ("net: use
+a work queue to defer net_disable_timestamp() work")
+
+Fixes: b90e5794c5bd ("net: dont call jump_label_dec from irq context")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/dev.c | 35 +++++++++++++++++++++++++++++++----
+ 1 file changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 08215a85c742..48399d8ce614 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1677,27 +1677,54 @@ EXPORT_SYMBOL_GPL(net_dec_ingress_queue);
+ static struct static_key netstamp_needed __read_mostly;
+ #ifdef HAVE_JUMP_LABEL
+ static atomic_t netstamp_needed_deferred;
++static atomic_t netstamp_wanted;
+ static void netstamp_clear(struct work_struct *work)
+ {
+ 	int deferred = atomic_xchg(&netstamp_needed_deferred, 0);
++	int wanted;
+ 
+-	while (deferred--)
+-		static_key_slow_dec(&netstamp_needed);
++	wanted = atomic_add_return(deferred, &netstamp_wanted);
++	if (wanted > 0)
++		static_key_enable(&netstamp_needed);
++	else
++		static_key_disable(&netstamp_needed);
+ }
+ static DECLARE_WORK(netstamp_work, netstamp_clear);
+ #endif
+ 
+ void net_enable_timestamp(void)
+ {
++#ifdef HAVE_JUMP_LABEL
++	int wanted;
++
++	while (1) {
++		wanted = atomic_read(&netstamp_wanted);
++		if (wanted <= 0)
++			break;
++		if (atomic_cmpxchg(&netstamp_wanted, wanted, wanted + 1) == wanted)
++			return;
++	}
++	atomic_inc(&netstamp_needed_deferred);
++	schedule_work(&netstamp_work);
++#else
+ 	static_key_slow_inc(&netstamp_needed);
++#endif
+ }
+ EXPORT_SYMBOL(net_enable_timestamp);
+ 
+ void net_disable_timestamp(void)
+ {
+ #ifdef HAVE_JUMP_LABEL
+-	/* net_disable_timestamp() can be called from non process context */
+-	atomic_inc(&netstamp_needed_deferred);
++	int wanted;
++
++	while (1) {
++		wanted = atomic_read(&netstamp_wanted);
++		if (wanted <= 1)
++			break;
++		if (atomic_cmpxchg(&netstamp_wanted, wanted, wanted - 1) == wanted)
++			return;
++	}
++	atomic_dec(&netstamp_needed_deferred);
+ 	schedule_work(&netstamp_work);
+ #else
+ 	static_key_slow_dec(&netstamp_needed);
+-- 
+2.28.0
+
+
+From 9216632bf4a0bafdc998d1c68b37b70446775900 Mon Sep 17 00:00:00 2001
+From: Arnaldo Carvalho de Melo <acme@redhat.com>
+Date: Wed, 1 Mar 2017 16:35:07 -0300
+Subject: [PATCH 08/29] dccp: Unlock sock before calling sk_free()
+
+[ Upstream commit d5afb6f9b6bb2c57bd0c05e76e12489dc0d037d9 ]
+
+The code where sk_clone() came from created a new socket and locked it,
+but then, on the error path didn't unlock it.
+
+This problem stayed there for a long while, till b0691c8ee7c2 ("net:
+Unlock sock before calling sk_free()") fixed it, but unfortunately the
+callers of sk_clone() (now sk_clone_locked()) were not audited and the
+one in dccp_create_openreq_child() remained.
+
+Now in the age of the syskaller fuzzer, this was finally uncovered, as
+reported by Dmitry:
+
+ ---- 8< ----
+
+I've got the following report while running syzkaller fuzzer on
+86292b33d4b7 ("Merge branch 'akpm' (patches from Andrew)")
+
+  [ BUG: held lock freed! ]
+  4.10.0+ #234 Not tainted
+  -------------------------
+  syz-executor6/6898 is freeing memory
+  ffff88006286cac0-ffff88006286d3b7, with a lock still held there!
+   (slock-AF_INET6){+.-...}, at: [<ffffffff8362c2c9>] spin_lock
+  include/linux/spinlock.h:299 [inline]
+   (slock-AF_INET6){+.-...}, at: [<ffffffff8362c2c9>]
+  sk_clone_lock+0x3d9/0x12c0 net/core/sock.c:1504
+  5 locks held by syz-executor6/6898:
+   #0:  (sk_lock-AF_INET6){+.+.+.}, at: [<ffffffff839a34b4>] lock_sock
+  include/net/sock.h:1460 [inline]
+   #0:  (sk_lock-AF_INET6){+.+.+.}, at: [<ffffffff839a34b4>]
+  inet_stream_connect+0x44/0xa0 net/ipv4/af_inet.c:681
+   #1:  (rcu_read_lock){......}, at: [<ffffffff83bc1c2a>]
+  inet6_csk_xmit+0x12a/0x5d0 net/ipv6/inet6_connection_sock.c:126
+   #2:  (rcu_read_lock){......}, at: [<ffffffff8369b424>] __skb_unlink
+  include/linux/skbuff.h:1767 [inline]
+   #2:  (rcu_read_lock){......}, at: [<ffffffff8369b424>] __skb_dequeue
+  include/linux/skbuff.h:1783 [inline]
+   #2:  (rcu_read_lock){......}, at: [<ffffffff8369b424>]
+  process_backlog+0x264/0x730 net/core/dev.c:4835
+   #3:  (rcu_read_lock){......}, at: [<ffffffff83aeb5c0>]
+  ip6_input_finish+0x0/0x1700 net/ipv6/ip6_input.c:59
+   #4:  (slock-AF_INET6){+.-...}, at: [<ffffffff8362c2c9>] spin_lock
+  include/linux/spinlock.h:299 [inline]
+   #4:  (slock-AF_INET6){+.-...}, at: [<ffffffff8362c2c9>]
+  sk_clone_lock+0x3d9/0x12c0 net/core/sock.c:1504
+
+Fix it just like was done by b0691c8ee7c2 ("net: Unlock sock before calling
+sk_free()").
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Cc: Cong Wang <xiyou.wangcong@gmail.com>
+Cc: Eric Dumazet <edumazet@google.com>
+Cc: Gerrit Renker <gerrit@erg.abdn.ac.uk>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20170301153510.GE15145@kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/dccp/minisocks.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/dccp/minisocks.c b/net/dccp/minisocks.c
+index 1994f8af646b..e314caa39176 100644
+--- a/net/dccp/minisocks.c
++++ b/net/dccp/minisocks.c
+@@ -122,6 +122,7 @@ struct sock *dccp_create_openreq_child(const struct sock *sk,
+ 			/* It is still raw copy of parent, so invalidate
+ 			 * destructor and make plain sk_free() */
+ 			newsk->sk_destruct = NULL;
++			bh_unlock_sock(newsk);
+ 			sk_free(newsk);
+ 			return NULL;
+ 		}
+-- 
+2.28.0
+
+
+From 2681a7853ad73bfebc3a683765a496bb283c6648 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Fri, 3 Mar 2017 14:08:21 -0800
+Subject: [PATCH 09/29] tcp: fix various issues for sockets morphing to listen
+ state
+
+[ Upstream commit 02b2faaf0af1d85585f6d6980e286d53612acfc2 ]
+
+Dmitry Vyukov reported a divide by 0 triggered by syzkaller, exploiting
+tcp_disconnect() path that was never really considered and/or used
+before syzkaller ;)
+
+I was not able to reproduce the bug, but it seems issues here are the
+three possible actions that assumed they would never trigger on a
+listener.
+
+1) tcp_write_timer_handler
+2) tcp_delack_timer_handler
+3) MTU reduction
+
+Only IPv6 MTU reduction was properly testing TCP_CLOSE and TCP_LISTEN
+ states from tcp_v6_mtu_reduced()
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/tcp_ipv4.c  | 7 +++++--
+ net/ipv4/tcp_timer.c | 6 ++++--
+ 2 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index b58a38eea059..f66d4b5d47f9 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -271,10 +271,13 @@ EXPORT_SYMBOL(tcp_v4_connect);
+  */
+ void tcp_v4_mtu_reduced(struct sock *sk)
+ {
+-	struct dst_entry *dst;
+ 	struct inet_sock *inet = inet_sk(sk);
+-	u32 mtu = tcp_sk(sk)->mtu_info;
++	struct dst_entry *dst;
++	u32 mtu;
+ 
++	if ((1 << sk->sk_state) & (TCPF_LISTEN | TCPF_CLOSE))
++		return;
++	mtu = tcp_sk(sk)->mtu_info;
+ 	dst = inet_csk_update_pmtu(sk, mtu);
+ 	if (!dst)
+ 		return;
+diff --git a/net/ipv4/tcp_timer.c b/net/ipv4/tcp_timer.c
+index 193ba1fa8a9a..ebb34d0c5e80 100644
+--- a/net/ipv4/tcp_timer.c
++++ b/net/ipv4/tcp_timer.c
+@@ -223,7 +223,8 @@ void tcp_delack_timer_handler(struct sock *sk)
+ 
+ 	sk_mem_reclaim_partial(sk);
+ 
+-	if (sk->sk_state == TCP_CLOSE || !(icsk->icsk_ack.pending & ICSK_ACK_TIMER))
++	if (((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN)) ||
++	    !(icsk->icsk_ack.pending & ICSK_ACK_TIMER))
+ 		goto out;
+ 
+ 	if (time_after(icsk->icsk_ack.timeout, jiffies)) {
+@@ -504,7 +505,8 @@ void tcp_write_timer_handler(struct sock *sk)
+ 	struct inet_connection_sock *icsk = inet_csk(sk);
+ 	int event;
+ 
+-	if (sk->sk_state == TCP_CLOSE || !icsk->icsk_pending)
++	if (((1 << sk->sk_state) & (TCPF_CLOSE | TCPF_LISTEN)) ||
++	    !icsk->icsk_pending)
+ 		goto out;
+ 
+ 	if (time_after(icsk->icsk_timeout, jiffies)) {
+-- 
+2.28.0
+
+
+From 9e7683301beef0cef8254eecb661e7eac3146717 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Fri, 3 Mar 2017 21:01:02 -0800
+Subject: [PATCH 10/29] net: fix socket refcounting in skb_complete_wifi_ack()
+
+[ Upstream commit dd4f10722aeb10f4f582948839f066bebe44e5fb ]
+
+TX skbs do not necessarily hold a reference on skb->sk->sk_refcnt
+By the time TX completion happens, sk_refcnt might be already 0.
+
+sock_hold()/sock_put() would then corrupt critical state, like
+sk_wmem_alloc.
+
+Fixes: bf7fa551e0ce ("mac80211: Resolve sk_refcnt/sk_wmem_alloc issue in wifi ack path")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Alexander Duyck <alexander.h.duyck@intel.com>
+Cc: Johannes Berg <johannes@sipsolutions.net>
+Cc: Soheil Hassas Yeganeh <soheil@google.com>
+Cc: Willem de Bruijn <willemb@google.com>
+Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/skbuff.c | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 4968b5ddea69..370f4f86e2b5 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -3735,7 +3735,7 @@ void skb_complete_wifi_ack(struct sk_buff *skb, bool acked)
+ {
+ 	struct sock *sk = skb->sk;
+ 	struct sock_exterr_skb *serr;
+-	int err;
++	int err = 1;
+ 
+ 	skb->wifi_acked_valid = 1;
+ 	skb->wifi_acked = acked;
+@@ -3745,14 +3745,15 @@ void skb_complete_wifi_ack(struct sk_buff *skb, bool acked)
+ 	serr->ee.ee_errno = ENOMSG;
+ 	serr->ee.ee_origin = SO_EE_ORIGIN_TXSTATUS;
+ 
+-	/* take a reference to prevent skb_orphan() from freeing the socket */
+-	sock_hold(sk);
+-
+-	err = sock_queue_err_skb(sk, skb);
++	/* Take a reference to prevent skb_orphan() from freeing the socket,
++	 * but only if the socket refcount is not zero.
++	 */
++	if (likely(atomic_inc_not_zero(&sk->sk_refcnt))) {
++		err = sock_queue_err_skb(sk, skb);
++		sock_put(sk);
++	}
+ 	if (err)
+ 		kfree_skb(skb);
+-
+-	sock_put(sk);
+ }
+ EXPORT_SYMBOL_GPL(skb_complete_wifi_ack);
+ 
+-- 
+2.28.0
+
+
+From ec4d8692b76e08a40221eb7c74775a390114f098 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Fri, 3 Mar 2017 21:01:03 -0800
+Subject: [PATCH 11/29] net: fix socket refcounting in
+ skb_complete_tx_timestamp()
+
+[ Upstream commit 9ac25fc063751379cb77434fef9f3b088cd3e2f7 ]
+
+TX skbs do not necessarily hold a reference on skb->sk->sk_refcnt
+By the time TX completion happens, sk_refcnt might be already 0.
+
+sock_hold()/sock_put() would then corrupt critical state, like
+sk_wmem_alloc and lead to leaks or use after free.
+
+Fixes: 62bccb8cdb69 ("net-timestamp: Make the clone operation stand-alone from phy timestamping")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Alexander Duyck <alexander.h.duyck@intel.com>
+Cc: Johannes Berg <johannes@sipsolutions.net>
+Cc: Soheil Hassas Yeganeh <soheil@google.com>
+Cc: Willem de Bruijn <willemb@google.com>
+Acked-by: Soheil Hassas Yeganeh <soheil@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/skbuff.c | 15 ++++++++-------
+ 1 file changed, 8 insertions(+), 7 deletions(-)
+
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 370f4f86e2b5..73dfd7729bc9 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -3678,13 +3678,14 @@ void skb_complete_tx_timestamp(struct sk_buff *skb,
+ 	if (!skb_may_tx_timestamp(sk, false))
+ 		return;
+ 
+-	/* take a reference to prevent skb_orphan() from freeing the socket */
+-	sock_hold(sk);
+-
+-	*skb_hwtstamps(skb) = *hwtstamps;
+-	__skb_complete_tx_timestamp(skb, sk, SCM_TSTAMP_SND);
+-
+-	sock_put(sk);
++	/* Take a reference to prevent skb_orphan() from freeing the socket,
++	 * but only if the socket refcount is not zero.
++	 */
++	if (likely(atomic_inc_not_zero(&sk->sk_refcnt))) {
++		*skb_hwtstamps(skb) = *hwtstamps;
++		__skb_complete_tx_timestamp(skb, sk, SCM_TSTAMP_SND);
++		sock_put(sk);
++	}
+ }
+ EXPORT_SYMBOL_GPL(skb_complete_tx_timestamp);
+ 
+-- 
+2.28.0
+
+
+From d0ebde92fbeb98eedbfce15cef3c86b652846d25 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Sun, 5 Mar 2017 10:52:16 -0800
+Subject: [PATCH 12/29] dccp: fix use-after-free in dccp_feat_activate_values
+
+[ Upstream commit 62f8f4d9066c1c6f2474845d1ca7e2891f2ae3fd ]
+
+Dmitry reported crashes in DCCP stack [1]
+
+Problem here is that when I got rid of listener spinlock, I missed the
+fact that DCCP stores a complex state in struct dccp_request_sock,
+while TCP does not.
+
+Since multiple cpus could access it at the same time, we need to add
+protection.
+
+[1]
+BUG: KASAN: use-after-free in dccp_feat_activate_values+0x967/0xab0
+net/dccp/feat.c:1541 at addr ffff88003713be68
+Read of size 8 by task syz-executor2/8457
+CPU: 2 PID: 8457 Comm: syz-executor2 Not tainted 4.10.0-rc7+ #127
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+Call Trace:
+ <IRQ>
+ __dump_stack lib/dump_stack.c:15 [inline]
+ dump_stack+0x292/0x398 lib/dump_stack.c:51
+ kasan_object_err+0x1c/0x70 mm/kasan/report.c:162
+ print_address_description mm/kasan/report.c:200 [inline]
+ kasan_report_error mm/kasan/report.c:289 [inline]
+ kasan_report.part.1+0x20e/0x4e0 mm/kasan/report.c:311
+ kasan_report mm/kasan/report.c:332 [inline]
+ __asan_report_load8_noabort+0x29/0x30 mm/kasan/report.c:332
+ dccp_feat_activate_values+0x967/0xab0 net/dccp/feat.c:1541
+ dccp_create_openreq_child+0x464/0x610 net/dccp/minisocks.c:121
+ dccp_v6_request_recv_sock+0x1f6/0x1960 net/dccp/ipv6.c:457
+ dccp_check_req+0x335/0x5a0 net/dccp/minisocks.c:186
+ dccp_v6_rcv+0x69e/0x1d00 net/dccp/ipv6.c:711
+ ip6_input_finish+0x46d/0x17a0 net/ipv6/ip6_input.c:279
+ NF_HOOK include/linux/netfilter.h:257 [inline]
+ ip6_input+0xdb/0x590 net/ipv6/ip6_input.c:322
+ dst_input include/net/dst.h:507 [inline]
+ ip6_rcv_finish+0x289/0x890 net/ipv6/ip6_input.c:69
+ NF_HOOK include/linux/netfilter.h:257 [inline]
+ ipv6_rcv+0x12ec/0x23d0 net/ipv6/ip6_input.c:203
+ __netif_receive_skb_core+0x1ae5/0x3400 net/core/dev.c:4190
+ __netif_receive_skb+0x2a/0x170 net/core/dev.c:4228
+ process_backlog+0xe5/0x6c0 net/core/dev.c:4839
+ napi_poll net/core/dev.c:5202 [inline]
+ net_rx_action+0xe70/0x1900 net/core/dev.c:5267
+ __do_softirq+0x2fb/0xb7d kernel/softirq.c:284
+ do_softirq_own_stack+0x1c/0x30 arch/x86/entry/entry_64.S:902
+ </IRQ>
+ do_softirq.part.17+0x1e8/0x230 kernel/softirq.c:328
+ do_softirq kernel/softirq.c:176 [inline]
+ __local_bh_enable_ip+0x1f2/0x200 kernel/softirq.c:181
+ local_bh_enable include/linux/bottom_half.h:31 [inline]
+ rcu_read_unlock_bh include/linux/rcupdate.h:971 [inline]
+ ip6_finish_output2+0xbb0/0x23d0 net/ipv6/ip6_output.c:123
+ ip6_finish_output+0x302/0x960 net/ipv6/ip6_output.c:148
+ NF_HOOK_COND include/linux/netfilter.h:246 [inline]
+ ip6_output+0x1cb/0x8d0 net/ipv6/ip6_output.c:162
+ ip6_xmit+0xcdf/0x20d0 include/net/dst.h:501
+ inet6_csk_xmit+0x320/0x5f0 net/ipv6/inet6_connection_sock.c:179
+ dccp_transmit_skb+0xb09/0x1120 net/dccp/output.c:141
+ dccp_xmit_packet+0x215/0x760 net/dccp/output.c:280
+ dccp_write_xmit+0x168/0x1d0 net/dccp/output.c:362
+ dccp_sendmsg+0x79c/0xb10 net/dccp/proto.c:796
+ inet_sendmsg+0x164/0x5b0 net/ipv4/af_inet.c:744
+ sock_sendmsg_nosec net/socket.c:635 [inline]
+ sock_sendmsg+0xca/0x110 net/socket.c:645
+ SYSC_sendto+0x660/0x810 net/socket.c:1687
+ SyS_sendto+0x40/0x50 net/socket.c:1655
+ entry_SYSCALL_64_fastpath+0x1f/0xc2
+RIP: 0033:0x4458b9
+RSP: 002b:00007f8ceb77bb58 EFLAGS: 00000282 ORIG_RAX: 000000000000002c
+RAX: ffffffffffffffda RBX: 0000000000000017 RCX: 00000000004458b9
+RDX: 0000000000000023 RSI: 0000000020e60000 RDI: 0000000000000017
+RBP: 00000000006e1b90 R08: 00000000200f9fe1 R09: 0000000000000020
+R10: 0000000000008010 R11: 0000000000000282 R12: 00000000007080a8
+R13: 0000000000000000 R14: 00007f8ceb77c9c0 R15: 00007f8ceb77c700
+Object at ffff88003713be50, in cache kmalloc-64 size: 64
+Allocated:
+PID = 8446
+ save_stack_trace+0x16/0x20 arch/x86/kernel/stacktrace.c:57
+ save_stack+0x43/0xd0 mm/kasan/kasan.c:502
+ set_track mm/kasan/kasan.c:514 [inline]
+ kasan_kmalloc+0xad/0xe0 mm/kasan/kasan.c:605
+ kmem_cache_alloc_trace+0x82/0x270 mm/slub.c:2738
+ kmalloc include/linux/slab.h:490 [inline]
+ dccp_feat_entry_new+0x214/0x410 net/dccp/feat.c:467
+ dccp_feat_push_change+0x38/0x220 net/dccp/feat.c:487
+ __feat_register_sp+0x223/0x2f0 net/dccp/feat.c:741
+ dccp_feat_propagate_ccid+0x22b/0x2b0 net/dccp/feat.c:949
+ dccp_feat_server_ccid_dependencies+0x1b3/0x250 net/dccp/feat.c:1012
+ dccp_make_response+0x1f1/0xc90 net/dccp/output.c:423
+ dccp_v6_send_response+0x4ec/0xc20 net/dccp/ipv6.c:217
+ dccp_v6_conn_request+0xaba/0x11b0 net/dccp/ipv6.c:377
+ dccp_rcv_state_process+0x51e/0x1650 net/dccp/input.c:606
+ dccp_v6_do_rcv+0x213/0x350 net/dccp/ipv6.c:632
+ sk_backlog_rcv include/net/sock.h:893 [inline]
+ __sk_receive_skb+0x36f/0xcc0 net/core/sock.c:479
+ dccp_v6_rcv+0xba5/0x1d00 net/dccp/ipv6.c:742
+ ip6_input_finish+0x46d/0x17a0 net/ipv6/ip6_input.c:279
+ NF_HOOK include/linux/netfilter.h:257 [inline]
+ ip6_input+0xdb/0x590 net/ipv6/ip6_input.c:322
+ dst_input include/net/dst.h:507 [inline]
+ ip6_rcv_finish+0x289/0x890 net/ipv6/ip6_input.c:69
+ NF_HOOK include/linux/netfilter.h:257 [inline]
+ ipv6_rcv+0x12ec/0x23d0 net/ipv6/ip6_input.c:203
+ __netif_receive_skb_core+0x1ae5/0x3400 net/core/dev.c:4190
+ __netif_receive_skb+0x2a/0x170 net/core/dev.c:4228
+ process_backlog+0xe5/0x6c0 net/core/dev.c:4839
+ napi_poll net/core/dev.c:5202 [inline]
+ net_rx_action+0xe70/0x1900 net/core/dev.c:5267
+ __do_softirq+0x2fb/0xb7d kernel/softirq.c:284
+Freed:
+PID = 15
+ save_stack_trace+0x16/0x20 arch/x86/kernel/stacktrace.c:57
+ save_stack+0x43/0xd0 mm/kasan/kasan.c:502
+ set_track mm/kasan/kasan.c:514 [inline]
+ kasan_slab_free+0x73/0xc0 mm/kasan/kasan.c:578
+ slab_free_hook mm/slub.c:1355 [inline]
+ slab_free_freelist_hook mm/slub.c:1377 [inline]
+ slab_free mm/slub.c:2954 [inline]
+ kfree+0xe8/0x2b0 mm/slub.c:3874
+ dccp_feat_entry_destructor.part.4+0x48/0x60 net/dccp/feat.c:418
+ dccp_feat_entry_destructor net/dccp/feat.c:416 [inline]
+ dccp_feat_list_pop net/dccp/feat.c:541 [inline]
+ dccp_feat_activate_values+0x57f/0xab0 net/dccp/feat.c:1543
+ dccp_create_openreq_child+0x464/0x610 net/dccp/minisocks.c:121
+ dccp_v6_request_recv_sock+0x1f6/0x1960 net/dccp/ipv6.c:457
+ dccp_check_req+0x335/0x5a0 net/dccp/minisocks.c:186
+ dccp_v6_rcv+0x69e/0x1d00 net/dccp/ipv6.c:711
+ ip6_input_finish+0x46d/0x17a0 net/ipv6/ip6_input.c:279
+ NF_HOOK include/linux/netfilter.h:257 [inline]
+ ip6_input+0xdb/0x590 net/ipv6/ip6_input.c:322
+ dst_input include/net/dst.h:507 [inline]
+ ip6_rcv_finish+0x289/0x890 net/ipv6/ip6_input.c:69
+ NF_HOOK include/linux/netfilter.h:257 [inline]
+ ipv6_rcv+0x12ec/0x23d0 net/ipv6/ip6_input.c:203
+ __netif_receive_skb_core+0x1ae5/0x3400 net/core/dev.c:4190
+ __netif_receive_skb+0x2a/0x170 net/core/dev.c:4228
+ process_backlog+0xe5/0x6c0 net/core/dev.c:4839
+ napi_poll net/core/dev.c:5202 [inline]
+ net_rx_action+0xe70/0x1900 net/core/dev.c:5267
+ __do_softirq+0x2fb/0xb7d kernel/softirq.c:284
+Memory state around the buggy address:
+ ffff88003713bd00: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+ ffff88003713bd80: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
+>ffff88003713be00: fc fc fc fc fc fc fc fc fc fc fb fb fb fb fb fb
+                                                          ^
+
+Fixes: 079096f103fa ("tcp/dccp: install syn_recv requests into ehash table")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Tested-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/dccp.h |  1 +
+ net/dccp/minisocks.c | 24 ++++++++++++++++--------
+ 2 files changed, 17 insertions(+), 8 deletions(-)
+
+diff --git a/include/linux/dccp.h b/include/linux/dccp.h
+index 61d042bbbf60..68449293c4b6 100644
+--- a/include/linux/dccp.h
++++ b/include/linux/dccp.h
+@@ -163,6 +163,7 @@ struct dccp_request_sock {
+ 	__u64			 dreq_isr;
+ 	__u64			 dreq_gsr;
+ 	__be32			 dreq_service;
++	spinlock_t		 dreq_lock;
+ 	struct list_head	 dreq_featneg;
+ 	__u32			 dreq_timestamp_echo;
+ 	__u32			 dreq_timestamp_time;
+diff --git a/net/dccp/minisocks.c b/net/dccp/minisocks.c
+index e314caa39176..68eed344b471 100644
+--- a/net/dccp/minisocks.c
++++ b/net/dccp/minisocks.c
+@@ -146,6 +146,13 @@ struct sock *dccp_check_req(struct sock *sk, struct sk_buff *skb,
+ 	struct dccp_request_sock *dreq = dccp_rsk(req);
+ 	bool own_req;
+ 
++	/* TCP/DCCP listeners became lockless.
++	 * DCCP stores complex state in its request_sock, so we need
++	 * a protection for them, now this code runs without being protected
++	 * by the parent (listener) lock.
++	 */
++	spin_lock_bh(&dreq->dreq_lock);
++
+ 	/* Check for retransmitted REQUEST */
+ 	if (dccp_hdr(skb)->dccph_type == DCCP_PKT_REQUEST) {
+ 
+@@ -160,7 +167,7 @@ struct sock *dccp_check_req(struct sock *sk, struct sk_buff *skb,
+ 			inet_rtx_syn_ack(sk, req);
+ 		}
+ 		/* Network Duplicate, discard packet */
+-		return NULL;
++		goto out;
+ 	}
+ 
+ 	DCCP_SKB_CB(skb)->dccpd_reset_code = DCCP_RESET_CODE_PACKET_ERROR;
+@@ -186,20 +193,20 @@ struct sock *dccp_check_req(struct sock *sk, struct sk_buff *skb,
+ 
+ 	child = inet_csk(sk)->icsk_af_ops->syn_recv_sock(sk, skb, req, NULL,
+ 							 req, &own_req);
+-	if (!child)
+-		goto listen_overflow;
+-
+-	return inet_csk_complete_hashdance(sk, child, req, own_req);
++	if (child) {
++		child = inet_csk_complete_hashdance(sk, child, req, own_req);
++		goto out;
++	}
+ 
+-listen_overflow:
+-	dccp_pr_debug("listen_overflow!\n");
+ 	DCCP_SKB_CB(skb)->dccpd_reset_code = DCCP_RESET_CODE_TOO_BUSY;
+ drop:
+ 	if (dccp_hdr(skb)->dccph_type != DCCP_PKT_RESET)
+ 		req->rsk_ops->send_reset(sk, skb);
+ 
+ 	inet_csk_reqsk_queue_drop(sk, req);
+-	return NULL;
++out:
++	spin_unlock_bh(&dreq->dreq_lock);
++	return child;
+ }
+ 
+ EXPORT_SYMBOL_GPL(dccp_check_req);
+@@ -250,6 +257,7 @@ int dccp_reqsk_init(struct request_sock *req,
+ {
+ 	struct dccp_request_sock *dreq = dccp_rsk(req);
+ 
++	spin_lock_init(&dreq->dreq_lock);
+ 	inet_rsk(req)->ir_rmt_port = dccp_hdr(skb)->dccph_sport;
+ 	inet_rsk(req)->ir_num	   = ntohs(dccp_hdr(skb)->dccph_dport);
+ 	inet_rsk(req)->acked	   = 0;
+-- 
+2.28.0
+
+
+From e671f1cc588f380b17e1c0ce38c7c712d13dfe93 Mon Sep 17 00:00:00 2001
+From: David Ahern <dsa@cumulusnetworks.com>
+Date: Mon, 6 Mar 2017 08:53:04 -0800
+Subject: [PATCH 13/29] vrf: Fix use-after-free in vrf_xmit
+
+[ Upstream commit f7887d40e541f74402df0684a1463c0a0bb68c68 ]
+
+KASAN detected a use-after-free:
+
+[  269.467067] BUG: KASAN: use-after-free in vrf_xmit+0x7f1/0x827 [vrf] at addr ffff8800350a21c0
+[  269.467067] Read of size 4 by task ssh/1879
+[  269.467067] CPU: 1 PID: 1879 Comm: ssh Not tainted 4.10.0+ #249
+[  269.467067] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.7.5-20140531_083030-gandalf 04/01/2014
+[  269.467067] Call Trace:
+[  269.467067]  dump_stack+0x81/0xb6
+[  269.467067]  kasan_object_err+0x21/0x78
+[  269.467067]  kasan_report+0x2f7/0x450
+[  269.467067]  ? vrf_xmit+0x7f1/0x827 [vrf]
+[  269.467067]  ? ip_output+0xa4/0xdb
+[  269.467067]  __asan_load4+0x6b/0x6d
+[  269.467067]  vrf_xmit+0x7f1/0x827 [vrf]
+...
+
+Which corresponds to the skb access after xmit handling. Fix by saving
+skb->len and using the saved value to update stats.
+
+Fixes: 193125dbd8eb2 ("net: Introduce VRF device driver")
+Signed-off-by: David Ahern <dsa@cumulusnetworks.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/vrf.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/vrf.c b/drivers/net/vrf.c
+index d6b619667f1a..349aecbc210a 100644
+--- a/drivers/net/vrf.c
++++ b/drivers/net/vrf.c
+@@ -345,6 +345,7 @@ static netdev_tx_t is_ip_tx_frame(struct sk_buff *skb, struct net_device *dev)
+ 
+ static netdev_tx_t vrf_xmit(struct sk_buff *skb, struct net_device *dev)
+ {
++	int len = skb->len;
+ 	netdev_tx_t ret = is_ip_tx_frame(skb, dev);
+ 
+ 	if (likely(ret == NET_XMIT_SUCCESS || ret == NET_XMIT_CN)) {
+@@ -352,7 +353,7 @@ static netdev_tx_t vrf_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ 		u64_stats_update_begin(&dstats->syncp);
+ 		dstats->tx_pkts++;
+-		dstats->tx_bytes += skb->len;
++		dstats->tx_bytes += len;
+ 		u64_stats_update_end(&dstats->syncp);
+ 	} else {
+ 		this_cpu_inc(dev->dstats->tx_drps);
+-- 
+2.28.0
+
+
+From 6c72458ab428ce659261fa060295e580503a5b12 Mon Sep 17 00:00:00 2001
+From: "Dmitry V. Levin" <ldv@altlinux.org>
+Date: Tue, 7 Mar 2017 23:50:50 +0300
+Subject: [PATCH 14/29] uapi: fix linux/packet_diag.h userspace compilation
+ error
+
+[ Upstream commit 745cb7f8a5de0805cade3de3991b7a95317c7c73 ]
+
+Replace MAX_ADDR_LEN with its numeric value to fix the following
+linux/packet_diag.h userspace compilation error:
+
+/usr/include/linux/packet_diag.h:67:17: error: 'MAX_ADDR_LEN' undeclared here (not in a function)
+  __u8 pdmc_addr[MAX_ADDR_LEN];
+
+This is not the first case in the UAPI where the numeric value
+of MAX_ADDR_LEN is used instead of symbolic one, uapi/linux/if_link.h
+already does the same:
+
+$ grep MAX_ADDR_LEN include/uapi/linux/if_link.h
+	__u8 mac[32]; /* MAX_ADDR_LEN */
+
+There are no UAPI headers besides these two that use MAX_ADDR_LEN.
+
+Signed-off-by: Dmitry V. Levin <ldv@altlinux.org>
+Acked-by: Pavel Emelyanov <xemul@virtuozzo.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/uapi/linux/packet_diag.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/uapi/linux/packet_diag.h b/include/uapi/linux/packet_diag.h
+index d08c63f3dd6f..0c5d5dd61b6a 100644
+--- a/include/uapi/linux/packet_diag.h
++++ b/include/uapi/linux/packet_diag.h
+@@ -64,7 +64,7 @@ struct packet_diag_mclist {
+ 	__u32	pdmc_count;
+ 	__u16	pdmc_type;
+ 	__u16	pdmc_alen;
+-	__u8	pdmc_addr[MAX_ADDR_LEN];
++	__u8	pdmc_addr[32]; /* MAX_ADDR_LEN */
+ };
+ 
+ struct packet_diag_ring {
+-- 
+2.28.0
+
+
+From 710fbeb3f5c5441fbe002b2c1566ceaad0725c01 Mon Sep 17 00:00:00 2001
+From: Etienne Noss <etienne.noss@wifirst.fr>
+Date: Fri, 10 Mar 2017 16:55:32 +0100
+Subject: [PATCH 15/29] act_connmark: avoid crashing on malformed nlattrs with
+ null parms
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 52491c7607c5527138095edf44c53169dc1ddb82 ]
+
+tcf_connmark_init does not check in its configuration if TCA_CONNMARK_PARMS
+is set, resulting in a null pointer dereference when trying to access it.
+
+[501099.043007] BUG: unable to handle kernel NULL pointer dereference at 0000000000000004
+[501099.043039] IP: [<ffffffffc10c60fb>] tcf_connmark_init+0x8b/0x180 [act_connmark]
+...
+[501099.044334] Call Trace:
+[501099.044345]  [<ffffffffa47270e8>] ? tcf_action_init_1+0x198/0x1b0
+[501099.044363]  [<ffffffffa47271b0>] ? tcf_action_init+0xb0/0x120
+[501099.044380]  [<ffffffffa47250a4>] ? tcf_exts_validate+0xc4/0x110
+[501099.044398]  [<ffffffffc0f5fa97>] ? u32_set_parms+0xa7/0x270 [cls_u32]
+[501099.044417]  [<ffffffffc0f60bf0>] ? u32_change+0x680/0x87b [cls_u32]
+[501099.044436]  [<ffffffffa4725d1d>] ? tc_ctl_tfilter+0x4dd/0x8a0
+[501099.044454]  [<ffffffffa44a23a1>] ? security_capable+0x41/0x60
+[501099.044471]  [<ffffffffa470ca01>] ? rtnetlink_rcv_msg+0xe1/0x220
+[501099.044490]  [<ffffffffa470c920>] ? rtnl_newlink+0x870/0x870
+[501099.044507]  [<ffffffffa472cc61>] ? netlink_rcv_skb+0xa1/0xc0
+[501099.044524]  [<ffffffffa47073f4>] ? rtnetlink_rcv+0x24/0x30
+[501099.044541]  [<ffffffffa472c634>] ? netlink_unicast+0x184/0x230
+[501099.044558]  [<ffffffffa472c9d8>] ? netlink_sendmsg+0x2f8/0x3b0
+[501099.044576]  [<ffffffffa46d8880>] ? sock_sendmsg+0x30/0x40
+[501099.044592]  [<ffffffffa46d8e03>] ? SYSC_sendto+0xd3/0x150
+[501099.044608]  [<ffffffffa425fda1>] ? __do_page_fault+0x2d1/0x510
+[501099.044626]  [<ffffffffa47fbd7b>] ? system_call_fast_compare_end+0xc/0x9b
+
+Fixes: 22a5dc0e5e3e ("net: sched: Introduce connmark action")
+Signed-off-by: Étienne Noss <etienne.noss@wifirst.fr>
+Signed-off-by: Victorien Molle <victorien.molle@wifirst.fr>
+Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sched/act_connmark.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/net/sched/act_connmark.c b/net/sched/act_connmark.c
+index bb41699c6c49..7ecb14f3db54 100644
+--- a/net/sched/act_connmark.c
++++ b/net/sched/act_connmark.c
+@@ -109,6 +109,9 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
+ 	if (ret < 0)
+ 		return ret;
+ 
++	if (!tb[TCA_CONNMARK_PARMS])
++		return -EINVAL;
++
+ 	parm = nla_data(tb[TCA_CONNMARK_PARMS]);
+ 
+ 	if (!tcf_hash_check(parm->index, a, bind)) {
+-- 
+2.28.0
+
+
+From b57955ea30e13aa37e5955bf20617f839f32c560 Mon Sep 17 00:00:00 2001
+From: David Ahern <dsa@cumulusnetworks.com>
+Date: Fri, 10 Mar 2017 09:46:15 -0800
+Subject: [PATCH 16/29] mpls: Send route delete notifications when router
+ module is unloaded
+
+[ Upstream commit e37791ec1ad785b59022ae211f63a16189bacebf ]
+
+When the mpls_router module is unloaded, mpls routes are deleted but
+notifications are not sent to userspace leaving userspace caches
+out of sync. Add the call to mpls_notify_route in mpls_net_exit as
+routes are freed.
+
+Fixes: 0189197f44160 ("mpls: Basic routing support")
+Signed-off-by: David Ahern <dsa@cumulusnetworks.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/mpls/af_mpls.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/mpls/af_mpls.c b/net/mpls/af_mpls.c
+index 881bc2072809..52cfc4478511 100644
+--- a/net/mpls/af_mpls.c
++++ b/net/mpls/af_mpls.c
+@@ -1567,6 +1567,7 @@ static void mpls_net_exit(struct net *net)
+ 	for (index = 0; index < platform_labels; index++) {
+ 		struct mpls_route *rt = rtnl_dereference(platform_label[index]);
+ 		RCU_INIT_POINTER(platform_label[index], NULL);
++		mpls_notify_route(net, index, rt, NULL, NULL);
+ 		mpls_rt_free(rt);
+ 	}
+ 	rtnl_unlock();
+-- 
+2.28.0
+
+
+From 5f8bc3856e285cc12597879039c17f7397f4b37d Mon Sep 17 00:00:00 2001
+From: Sabrina Dubroca <sd@queasysnail.net>
+Date: Mon, 13 Mar 2017 13:28:09 +0100
+Subject: [PATCH 17/29] ipv6: make ECMP route replacement less greedy
+
+[ Upstream commit 67e194007be08d071294456274dd53e0a04fdf90 ]
+
+Commit 27596472473a ("ipv6: fix ECMP route replacement") introduced a
+loop that removes all siblings of an ECMP route that is being
+replaced. However, this loop doesn't stop when it has replaced
+siblings, and keeps removing other routes with a higher metric.
+We also end up triggering the WARN_ON after the loop, because after
+this nsiblings < 0.
+
+Instead, stop the loop when we have taken care of all routes with the
+same metric as the route being replaced.
+
+  Reproducer:
+  ===========
+    #!/bin/sh
+
+    ip netns add ns1
+    ip netns add ns2
+    ip -net ns1 link set lo up
+
+    for x in 0 1 2 ; do
+        ip link add veth$x netns ns2 type veth peer name eth$x netns ns1
+        ip -net ns1 link set eth$x up
+        ip -net ns2 link set veth$x up
+    done
+
+    ip -net ns1 -6 r a 2000::/64 nexthop via fe80::0 dev eth0 \
+            nexthop via fe80::1 dev eth1 nexthop via fe80::2 dev eth2
+    ip -net ns1 -6 r a 2000::/64 via fe80::42 dev eth0 metric 256
+    ip -net ns1 -6 r a 2000::/64 via fe80::43 dev eth0 metric 2048
+
+    echo "before replace, 3 routes"
+    ip -net ns1 -6 r | grep -v '^fe80\|^ff00'
+    echo
+
+    ip -net ns1 -6 r c 2000::/64 nexthop via fe80::4 dev eth0 \
+            nexthop via fe80::5 dev eth1 nexthop via fe80::6 dev eth2
+
+    echo "after replace, only 2 routes, metric 2048 is gone"
+    ip -net ns1 -6 r | grep -v '^fe80\|^ff00'
+
+Fixes: 27596472473a ("ipv6: fix ECMP route replacement")
+Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+Acked-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+Reviewed-by: Xin Long <lucien.xin@gmail.com>
+Reviewed-by: Michal Kubecek <mkubecek@suse.cz>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv6/ip6_fib.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
+index 34cf46d74554..85bf86458706 100644
+--- a/net/ipv6/ip6_fib.c
++++ b/net/ipv6/ip6_fib.c
+@@ -903,6 +903,8 @@ add:
+ 			ins = &rt->dst.rt6_next;
+ 			iter = *ins;
+ 			while (iter) {
++				if (iter->rt6i_metric > rt->rt6i_metric)
++					break;
+ 				if (rt6_qualify_for_ecmp(iter)) {
+ 					*ins = iter->dst.rt6_next;
+ 					fib6_purge_rt(iter, fn, info->nl_net);
+-- 
+2.28.0
+
+
+From aed728c38c483650885dfd975dd9f4903e5505bf Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fw@strlen.de>
+Date: Mon, 13 Mar 2017 16:24:28 +0100
+Subject: [PATCH 18/29] ipv6: avoid write to a possibly cloned skb
+
+[ Upstream commit 79e49503efe53a8c51d8b695bedc8a346c5e4a87 ]
+
+ip6_fragment, in case skb has a fraglist, checks if the
+skb is cloned.  If it is, it will move to the 'slow path' and allocates
+new skbs for each fragment.
+
+However, right before entering the slowpath loop, it updates the
+nexthdr value of the last ipv6 extension header to NEXTHDR_FRAGMENT,
+to account for the fragment header that will be inserted in the new
+ipv6-fragment skbs.
+
+In case original skb is cloned this munges nexthdr value of another
+skb.  Avoid this by doing the nexthdr update for each of the new fragment
+skbs separately.
+
+This was observed with tcpdump on a bridge device where netfilter ipv6
+reassembly is active:  tcpdump shows malformed fragment headers as
+the l4 header (icmpv6, tcp, etc). is decoded as a fragment header.
+
+Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Reported-by: Andreas Karis <akaris@redhat.com>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv6/ip6_output.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 58900c21e4e4..8004532fa882 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -742,13 +742,14 @@ slow_path:
+ 	 *	Fragment the datagram.
+ 	 */
+ 
+-	*prevhdr = NEXTHDR_FRAGMENT;
+ 	troom = rt->dst.dev->needed_tailroom;
+ 
+ 	/*
+ 	 *	Keep copying data until we run out.
+ 	 */
+ 	while (left > 0)	{
++		u8 *fragnexthdr_offset;
++
+ 		len = left;
+ 		/* IF: it doesn't fit, use 'mtu' - the data space left */
+ 		if (len > mtu)
+@@ -793,6 +794,10 @@ slow_path:
+ 		 */
+ 		skb_copy_from_linear_data(skb, skb_network_header(frag), hlen);
+ 
++		fragnexthdr_offset = skb_network_header(frag);
++		fragnexthdr_offset += prevhdr - skb_network_header(skb);
++		*fragnexthdr_offset = NEXTHDR_FRAGMENT;
++
+ 		/*
+ 		 *	Build fragment header.
+ 		 */
+-- 
+2.28.0
+
+
+From 56f9b9502f2d15b9c7b83f9cfb32798e2e364f61 Mon Sep 17 00:00:00 2001
+From: Florian Westphal <fw@strlen.de>
+Date: Mon, 13 Mar 2017 17:38:17 +0100
+Subject: [PATCH 19/29] bridge: drop netfilter fake rtable unconditionally
+
+[ Upstream commit a13b2082ece95247779b9995c4e91b4246bed023 ]
+
+Andreas reports kernel oops during rmmod of the br_netfilter module.
+Hannes debugged the oops down to a NULL rt6info->rt6i_indev.
+
+Problem is that br_netfilter has the nasty concept of adding a fake
+rtable to skb->dst; this happens in a br_netfilter prerouting hook.
+
+A second hook (in bridge LOCAL_IN) is supposed to remove these again
+before the skb is handed up the stack.
+
+However, on module unload hooks get unregistered which means an
+skb could traverse the prerouting hook that attaches the fake_rtable,
+while the 'fake rtable remove' hook gets removed from the hooklist
+immediately after.
+
+Fixes: 34666d467cbf1e2e3c7 ("netfilter: bridge: move br_netfilter out of the core")
+Reported-by: Andreas Karis <akaris@redhat.com>
+Debugged-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: Florian Westphal <fw@strlen.de>
+Acked-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/bridge/br_input.c           |  1 +
+ net/bridge/br_netfilter_hooks.c | 21 ---------------------
+ 2 files changed, 1 insertion(+), 21 deletions(-)
+
+diff --git a/net/bridge/br_input.c b/net/bridge/br_input.c
+index f7fba74108a9..e24754a0e052 100644
+--- a/net/bridge/br_input.c
++++ b/net/bridge/br_input.c
+@@ -29,6 +29,7 @@ EXPORT_SYMBOL(br_should_route_hook);
+ static int
+ br_netif_receive_skb(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
++	br_drop_fake_rtable(skb);
+ 	return netif_receive_skb(skb);
+ }
+ 
+diff --git a/net/bridge/br_netfilter_hooks.c b/net/bridge/br_netfilter_hooks.c
+index 7ddbe7ec81d6..97fc19f001bf 100644
+--- a/net/bridge/br_netfilter_hooks.c
++++ b/net/bridge/br_netfilter_hooks.c
+@@ -516,21 +516,6 @@ static unsigned int br_nf_pre_routing(void *priv,
+ }
+ 
+ 
+-/* PF_BRIDGE/LOCAL_IN ************************************************/
+-/* The packet is locally destined, which requires a real
+- * dst_entry, so detach the fake one.  On the way up, the
+- * packet would pass through PRE_ROUTING again (which already
+- * took place when the packet entered the bridge), but we
+- * register an IPv4 PRE_ROUTING 'sabotage' hook that will
+- * prevent this from happening. */
+-static unsigned int br_nf_local_in(void *priv,
+-				   struct sk_buff *skb,
+-				   const struct nf_hook_state *state)
+-{
+-	br_drop_fake_rtable(skb);
+-	return NF_ACCEPT;
+-}
+-
+ /* PF_BRIDGE/FORWARD *************************************************/
+ static int br_nf_forward_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+@@ -900,12 +885,6 @@ static struct nf_hook_ops br_nf_ops[] __read_mostly = {
+ 		.hooknum = NF_BR_PRE_ROUTING,
+ 		.priority = NF_BR_PRI_BRNF,
+ 	},
+-	{
+-		.hook = br_nf_local_in,
+-		.pf = NFPROTO_BRIDGE,
+-		.hooknum = NF_BR_LOCAL_IN,
+-		.priority = NF_BR_PRI_BRNF,
+-	},
+ 	{
+ 		.hook = br_nf_forward_ip,
+ 		.pf = NFPROTO_BRIDGE,
+-- 
+2.28.0
+
+
+From 4ab956b561334866dfe1b17d9c7567313e07cfa2 Mon Sep 17 00:00:00 2001
+From: Jon Maxwell <jmaxwell37@gmail.com>
+Date: Fri, 10 Mar 2017 16:40:33 +1100
+Subject: [PATCH 20/29] dccp/tcp: fix routing redirect race
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 45caeaa5ac0b4b11784ac6f932c0ad4c6b67cda0 ]
+
+As Eric Dumazet pointed out this also needs to be fixed in IPv6.
+v2: Contains the IPv6 tcp/Ipv6 dccp patches as well.
+
+We have seen a few incidents lately where a dst_enty has been freed
+with a dangling TCP socket reference (sk->sk_dst_cache) pointing to that
+dst_entry. If the conditions/timings are right a crash then ensues when the
+freed dst_entry is referenced later on. A Common crashing back trace is:
+
+ #8 [] page_fault at ffffffff8163e648
+    [exception RIP: __tcp_ack_snd_check+74]
+.
+.
+ #9 [] tcp_rcv_established at ffffffff81580b64
+#10 [] tcp_v4_do_rcv at ffffffff8158b54a
+#11 [] tcp_v4_rcv at ffffffff8158cd02
+#12 [] ip_local_deliver_finish at ffffffff815668f4
+#13 [] ip_local_deliver at ffffffff81566bd9
+#14 [] ip_rcv_finish at ffffffff8156656d
+#15 [] ip_rcv at ffffffff81566f06
+#16 [] __netif_receive_skb_core at ffffffff8152b3a2
+#17 [] __netif_receive_skb at ffffffff8152b608
+#18 [] netif_receive_skb at ffffffff8152b690
+#19 [] vmxnet3_rq_rx_complete at ffffffffa015eeaf [vmxnet3]
+#20 [] vmxnet3_poll_rx_only at ffffffffa015f32a [vmxnet3]
+#21 [] net_rx_action at ffffffff8152bac2
+#22 [] __do_softirq at ffffffff81084b4f
+#23 [] call_softirq at ffffffff8164845c
+#24 [] do_softirq at ffffffff81016fc5
+#25 [] irq_exit at ffffffff81084ee5
+#26 [] do_IRQ at ffffffff81648ff8
+
+Of course it may happen with other NIC drivers as well.
+
+It's found the freed dst_entry here:
+
+ 224 static bool tcp_in_quickack_mode(struct sock *sk)↩
+ 225 {↩
+ 226 ▹       const struct inet_connection_sock *icsk = inet_csk(sk);↩
+ 227 ▹       const struct dst_entry *dst = __sk_dst_get(sk);↩
+ 228 ↩
+ 229 ▹       return (dst && dst_metric(dst, RTAX_QUICKACK)) ||↩
+ 230 ▹       ▹       (icsk->icsk_ack.quick && !icsk->icsk_ack.pingpong);↩
+ 231 }↩
+
+But there are other backtraces attributed to the same freed dst_entry in
+netfilter code as well.
+
+All the vmcores showed 2 significant clues:
+
+- Remote hosts behind the default gateway had always been redirected to a
+different gateway. A rtable/dst_entry will be added for that host. Making
+more dst_entrys with lower reference counts. Making this more probable.
+
+- All vmcores showed a postitive LockDroppedIcmps value, e.g:
+
+LockDroppedIcmps                  267
+
+A closer look at the tcp_v4_err() handler revealed that do_redirect() will run
+regardless of whether user space has the socket locked. This can result in a
+race condition where the same dst_entry cached in sk->sk_dst_entry can be
+decremented twice for the same socket via:
+
+do_redirect()->__sk_dst_check()-> dst_release().
+
+Which leads to the dst_entry being prematurely freed with another socket
+pointing to it via sk->sk_dst_cache and a subsequent crash.
+
+To fix this skip do_redirect() if usespace has the socket locked. Instead let
+the redirect take place later when user space does not have the socket
+locked.
+
+The dccp/IPv6 code is very similar in this respect, so fixing it there too.
+
+As Eric Garver pointed out the following commit now invalidates routes. Which
+can set the dst->obsolete flag so that ipv4_dst_check() returns null and
+triggers the dst_release().
+
+Fixes: ceb3320610d6 ("ipv4: Kill routes during PMTU/redirect updates.")
+Cc: Eric Garver <egarver@redhat.com>
+Cc: Hannes Sowa <hsowa@redhat.com>
+Signed-off-by: Jon Maxwell <jmaxwell37@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/dccp/ipv4.c     | 3 ++-
+ net/dccp/ipv6.c     | 8 +++++---
+ net/ipv4/tcp_ipv4.c | 3 ++-
+ net/ipv6/tcp_ipv6.c | 8 +++++---
+ 4 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/net/dccp/ipv4.c b/net/dccp/ipv4.c
+index 0759f5b9180e..6467bf392e1b 100644
+--- a/net/dccp/ipv4.c
++++ b/net/dccp/ipv4.c
+@@ -289,7 +289,8 @@ static void dccp_v4_err(struct sk_buff *skb, u32 info)
+ 
+ 	switch (type) {
+ 	case ICMP_REDIRECT:
+-		dccp_do_redirect(skb, sk);
++		if (!sock_owned_by_user(sk))
++			dccp_do_redirect(skb, sk);
+ 		goto out;
+ 	case ICMP_SOURCE_QUENCH:
+ 		/* Just silently ignore these. */
+diff --git a/net/dccp/ipv6.c b/net/dccp/ipv6.c
+index 27c4e81efa24..8113ad58fcb4 100644
+--- a/net/dccp/ipv6.c
++++ b/net/dccp/ipv6.c
+@@ -122,10 +122,12 @@ static void dccp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+ 	np = inet6_sk(sk);
+ 
+ 	if (type == NDISC_REDIRECT) {
+-		struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
++		if (!sock_owned_by_user(sk)) {
++			struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
+ 
+-		if (dst)
+-			dst->ops->redirect(dst, sk, skb);
++			if (dst)
++				dst->ops->redirect(dst, sk, skb);
++		}
+ 		goto out;
+ 	}
+ 
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index f66d4b5d47f9..198fc2314c82 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -423,7 +423,8 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
+ 
+ 	switch (type) {
+ 	case ICMP_REDIRECT:
+-		do_redirect(icmp_skb, sk);
++		if (!sock_owned_by_user(sk))
++			do_redirect(icmp_skb, sk);
+ 		goto out;
+ 	case ICMP_SOURCE_QUENCH:
+ 		/* Just silently ignore these. */
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index 76a8c8057a23..1a63c4deef26 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -376,10 +376,12 @@ static void tcp_v6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+ 	np = inet6_sk(sk);
+ 
+ 	if (type == NDISC_REDIRECT) {
+-		struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
++		if (!sock_owned_by_user(sk)) {
++			struct dst_entry *dst = __sk_dst_check(sk, np->dst_cookie);
+ 
+-		if (dst)
+-			dst->ops->redirect(dst, sk, skb);
++			if (dst)
++				dst->ops->redirect(dst, sk, skb);
++		}
+ 		goto out;
+ 	}
+ 
+-- 
+2.28.0
+
+
+From 676fe978525d3d3f583e1f6463f3b25623e81afd Mon Sep 17 00:00:00 2001
+From: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Date: Mon, 13 Mar 2017 00:01:30 +0100
+Subject: [PATCH 21/29] dccp: fix memory leak during tear-down of unsuccessful
+ connection request
+
+[ Upstream commit 72ef9c4125c7b257e3a714d62d778ab46583d6a3 ]
+
+This patch fixes a memory leak, which happens if the connection request
+is not fulfilled between parsing the DCCP options and handling the SYN
+(because e.g. the backlog is full), because we forgot to free the
+list of ack vectors.
+
+Reported-by: Jianwen Ji <jiji@redhat.com>
+Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/dccp/ccids/ccid2.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/net/dccp/ccids/ccid2.c b/net/dccp/ccids/ccid2.c
+index f053198e730c..5e3a7302f774 100644
+--- a/net/dccp/ccids/ccid2.c
++++ b/net/dccp/ccids/ccid2.c
+@@ -749,6 +749,7 @@ static void ccid2_hc_tx_exit(struct sock *sk)
+ 	for (i = 0; i < hc->tx_seqbufc; i++)
+ 		kfree(hc->tx_seqbuf[i]);
+ 	hc->tx_seqbufc = 0;
++	dccp_ackvec_parsed_cleanup(&hc->tx_av_chunks);
+ }
+ 
+ static void ccid2_hc_rx_packet_recv(struct sock *sk, struct sk_buff *skb)
+-- 
+2.28.0
+
+
+From c10ffe988f15a0306d5d8cb1c6b475c9fe2fc2c9 Mon Sep 17 00:00:00 2001
+From: Roman Mashak <mrv@mojatatu.com>
+Date: Fri, 24 Feb 2017 11:00:32 -0500
+Subject: [PATCH 22/29] net sched actions: decrement module reference count
+ after table flush.
+
+[ Upstream commit edb9d1bff4bbe19b8ae0e71b1f38732591a9eeb2 ]
+
+When tc actions are loaded as a module and no actions have been installed,
+flushing them would result in actions removed from the memory, but modules
+reference count not being decremented, so that the modules would not be
+unloaded.
+
+Following is example with GACT action:
+
+% sudo modprobe act_gact
+% lsmod
+Module                  Size  Used by
+act_gact               16384  0
+%
+% sudo tc actions ls action gact
+%
+% sudo tc actions flush action gact
+% lsmod
+Module                  Size  Used by
+act_gact               16384  1
+% sudo tc actions flush action gact
+% lsmod
+Module                  Size  Used by
+act_gact               16384  2
+% sudo rmmod act_gact
+rmmod: ERROR: Module act_gact is in use
+....
+
+After the fix:
+% lsmod
+Module                  Size  Used by
+act_gact               16384  0
+%
+% sudo tc actions add action pass index 1
+% sudo tc actions add action pass index 2
+% sudo tc actions add action pass index 3
+% lsmod
+Module                  Size  Used by
+act_gact               16384  3
+%
+% sudo tc actions flush action gact
+% lsmod
+Module                  Size  Used by
+act_gact               16384  0
+%
+% sudo tc actions flush action gact
+% lsmod
+Module                  Size  Used by
+act_gact               16384  0
+% sudo rmmod act_gact
+% lsmod
+Module                  Size  Used by
+%
+
+Fixes: f97017cdefef ("net-sched: Fix actions flushing")
+Signed-off-by: Roman Mashak <mrv@mojatatu.com>
+Signed-off-by: Jamal Hadi Salim <jhs@mojatatu.com>
+Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sched/act_api.c | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
 diff --git a/net/sched/act_api.c b/net/sched/act_api.c
 index 06e7c4a37245..694a06f1e0d5 100644
 --- a/net/sched/act_api.c
@@ -2100,17 +3067,409 @@ index 06e7c4a37245..694a06f1e0d5 100644
  	kfree_skb(skb);
  	return err;
  }
-diff --git a/net/sched/act_connmark.c b/net/sched/act_connmark.c
-index bb41699c6c49..7ecb14f3db54 100644
---- a/net/sched/act_connmark.c
-+++ b/net/sched/act_connmark.c
-@@ -109,6 +109,9 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
- 	if (ret < 0)
- 		return ret;
- 
-+	if (!tb[TCA_CONNMARK_PARMS])
-+		return -EINVAL;
+-- 
+2.28.0
+
+
+From fd74e8d258da9f9678da6bf88a0b02b2c1b71d0c Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Mon, 19 Dec 2016 14:20:13 -0800
+Subject: [PATCH 23/29] fscrypt: fix renaming and linking special files
+
+commit 42d97eb0ade31e1bc537d086842f5d6e766d9d51 upstream.
+
+Attempting to link a device node, named pipe, or socket file into an
+encrypted directory through rename(2) or link(2) always failed with
+EPERM.  This happened because fscrypt_has_permitted_context() saw that
+the file was unencrypted and forbid creating the link.  This behavior
+was unexpected because such files are never encrypted; only regular
+files, directories, and symlinks can be encrypted.
+
+To fix this, make fscrypt_has_permitted_context() always return true on
+special files.
+
+This will be covered by a test in my encryption xfstests patchset.
+
+Fixes: 9bd8212f981e ("ext4 crypto: add encryption policy and password salt support")
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Reviewed-by: Richard Weinberger <richard@nod.at>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ext4/crypto_policy.c | 6 ++++++
+ fs/f2fs/crypto_policy.c | 5 +++++
+ 2 files changed, 11 insertions(+)
+
+diff --git a/fs/ext4/crypto_policy.c b/fs/ext4/crypto_policy.c
+index 8a9feb341f31..dd561f916f0b 100644
+--- a/fs/ext4/crypto_policy.c
++++ b/fs/ext4/crypto_policy.c
+@@ -156,6 +156,12 @@ int ext4_is_child_context_consistent_with_parent(struct inode *parent,
+ 		WARN_ON(1);	/* Should never happen */
+ 		return 0;
+ 	}
 +
- 	parm = nla_data(tb[TCA_CONNMARK_PARMS]);
++	/* No restrictions on file types which are never encrypted */
++	if (!S_ISREG(child->i_mode) && !S_ISDIR(child->i_mode) &&
++	    !S_ISLNK(child->i_mode))
++		return 1;
++
+ 	/* no restrictions if the parent directory is not encrypted */
+ 	if (!ext4_encrypted_inode(parent))
+ 		return 1;
+diff --git a/fs/f2fs/crypto_policy.c b/fs/f2fs/crypto_policy.c
+index e504f548b64e..5bbd1989d5e6 100644
+--- a/fs/f2fs/crypto_policy.c
++++ b/fs/f2fs/crypto_policy.c
+@@ -149,6 +149,11 @@ int f2fs_is_child_context_consistent_with_parent(struct inode *parent,
+ 		BUG_ON(1);
+ 	}
  
- 	if (!tcf_hash_check(parm->index, a, bind)) {
++	/* No restrictions on file types which are never encrypted */
++	if (!S_ISREG(child->i_mode) && !S_ISDIR(child->i_mode) &&
++	    !S_ISLNK(child->i_mode))
++		return 1;
++
+ 	/* no restrictions if the parent directory is not encrypted */
+ 	if (!f2fs_encrypted_inode(parent))
+ 		return 1;
+-- 
+2.28.0
+
+
+From 3a19419c50c6ee386ca6d22a23acc2df51583d3d Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Sat, 15 Oct 2016 09:48:50 -0400
+Subject: [PATCH 24/29] fscrypto: lock inode while setting encryption policy
+
+commit 8906a8223ad4909b391c5628f7991ebceda30e52 upstream.
+
+i_rwsem needs to be acquired while setting an encryption policy so that
+concurrent calls to FS_IOC_SET_ENCRYPTION_POLICY are correctly
+serialized (especially the ->get_context() + ->set_context() pair), and
+so that new files cannot be created in the directory during or after the
+->empty_dir() check.
+
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Reviewed-by: Richard Weinberger <richard@nod.at>
+Cc: stable@vger.kernel.org
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ext4/ioctl.c | 4 ++++
+ fs/f2fs/file.c  | 9 ++++++++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index 1fb12f9c97a6..789e2d6724a9 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -633,8 +633,12 @@ resizefs_out:
+ 		if (err)
+ 			goto encryption_policy_out;
+ 
++		mutex_lock(&inode->i_mutex);
++
+ 		err = ext4_process_policy(&policy, inode);
+ 
++		mutex_unlock(&inode->i_mutex);
++
+ 		mnt_drop_write_file(filp);
+ encryption_policy_out:
+ 		return err;
+diff --git a/fs/f2fs/file.c b/fs/f2fs/file.c
+index a197215ad52b..4b449d263333 100644
+--- a/fs/f2fs/file.c
++++ b/fs/f2fs/file.c
+@@ -1535,12 +1535,19 @@ static int f2fs_ioc_set_encryption_policy(struct file *filp, unsigned long arg)
+ #ifdef CONFIG_F2FS_FS_ENCRYPTION
+ 	struct f2fs_encryption_policy policy;
+ 	struct inode *inode = file_inode(filp);
++	int err;
+ 
+ 	if (copy_from_user(&policy, (struct f2fs_encryption_policy __user *)arg,
+ 				sizeof(policy)))
+ 		return -EFAULT;
+ 
+-	return f2fs_process_policy(&policy, inode);
++	mutex_lock(&inode->i_mutex);
++
++	err = f2fs_process_policy(&policy, inode);
++
++	mutex_unlock(&inode->i_mutex);
++
++	return err;
+ #else
+ 	return -EOPNOTSUPP;
+ #endif
+-- 
+2.28.0
+
+
+From 8e0ec20539f8c626463ae43fcaeb218e3b2b5dc4 Mon Sep 17 00:00:00 2001
+From: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Date: Mon, 13 Mar 2017 19:33:37 +0300
+Subject: [PATCH 25/29] x86/kasan: Fix boot with KASAN=y and
+ PROFILE_ANNOTATED_BRANCHES=y
+
+commit be3606ff739d1c1be36389f8737c577ad87e1f57 upstream.
+
+The kernel doesn't boot with both PROFILE_ANNOTATED_BRANCHES=y and KASAN=y
+options selected. With branch profiling enabled we end up calling
+ftrace_likely_update() before kasan_early_init(). ftrace_likely_update() is
+built with KASAN instrumentation, so calling it before kasan has been
+initialized leads to crash.
+
+Use DISABLE_BRANCH_PROFILING define to make sure that we don't call
+ftrace_likely_update() from early code before kasan_early_init().
+
+Fixes: ef7f0d6a6ca8 ("x86_64: add KASan support")
+Reported-by: Fengguang Wu <fengguang.wu@intel.com>
+Signed-off-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+Cc: kasan-dev@googlegroups.com
+Cc: Alexander Potapenko <glider@google.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: lkp@01.org
+Cc: Dmitry Vyukov <dvyukov@google.com>
+Link: http://lkml.kernel.org/r/20170313163337.1704-1-aryabinin@virtuozzo.com
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/head64.c    | 1 +
+ arch/x86/mm/kasan_init_64.c | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/arch/x86/kernel/head64.c b/arch/x86/kernel/head64.c
+index f129a9af6357..b6b0077da1af 100644
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@ -4,6 +4,7 @@
+  *  Copyright (C) 2000 Andrea Arcangeli <andrea@suse.de> SuSE
+  */
+ 
++#define DISABLE_BRANCH_PROFILING
+ #include <linux/init.h>
+ #include <linux/linkage.h>
+ #include <linux/types.h>
+diff --git a/arch/x86/mm/kasan_init_64.c b/arch/x86/mm/kasan_init_64.c
+index d470cf219a2d..4e5ac46adc9d 100644
+--- a/arch/x86/mm/kasan_init_64.c
++++ b/arch/x86/mm/kasan_init_64.c
+@@ -1,3 +1,4 @@
++#define DISABLE_BRANCH_PROFILING
+ #define pr_fmt(fmt) "kasan: " fmt
+ #include <linux/bootmem.h>
+ #include <linux/kasan.h>
+-- 
+2.28.0
+
+
+From 62f57041fbdf15db6336542384a4b36f1f387299 Mon Sep 17 00:00:00 2001
+From: Andy Lutomirski <luto@kernel.org>
+Date: Thu, 16 Mar 2017 12:59:39 -0700
+Subject: [PATCH 26/29] x86/perf: Fix CR4.PCE propagation to use active_mm
+ instead of mm
+
+commit 5dc855d44c2ad960a86f593c60461f1ae1566b6d upstream.
+
+If one thread mmaps a perf event while another thread in the same mm
+is in some context where active_mm != mm (which can happen in the
+scheduler, for example), refresh_pce() would write the wrong value
+to CR4.PCE.  This broke some PAPI tests.
+
+Reported-and-tested-by: Vince Weaver <vincent.weaver@maine.edu>
+Signed-off-by: Andy Lutomirski <luto@kernel.org>
+Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Borislav Petkov <bpetkov@suse.de>
+Cc: H. Peter Anvin <hpa@zytor.com>
+Cc: Jiri Olsa <jolsa@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: stable@vger.kernel.org
+Fixes: 7911d3f7af14 ("perf/x86: Only allow rdpmc if a perf_event is mapped")
+Link: http://lkml.kernel.org/r/0c5b38a76ea50e405f9abe07a13dfaef87c173a1.1489694270.git.luto@kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/cpu/perf_event.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/kernel/cpu/perf_event.c b/arch/x86/kernel/cpu/perf_event.c
+index 1a8256dd6729..5b2f2306fbcc 100644
+--- a/arch/x86/kernel/cpu/perf_event.c
++++ b/arch/x86/kernel/cpu/perf_event.c
+@@ -1996,8 +1996,8 @@ static int x86_pmu_event_init(struct perf_event *event)
+ 
+ static void refresh_pce(void *ignored)
+ {
+-	if (current->mm)
+-		load_mm_cr4(current->mm);
++	if (current->active_mm)
++		load_mm_cr4(current->active_mm);
+ }
+ 
+ static void x86_pmu_event_mapped(struct perf_event *event)
+-- 
+2.28.0
+
+
+From 44854c191e2cb62d369eb9927e6b6683c11d6b04 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Sat, 4 Mar 2017 10:27:18 +0100
+Subject: [PATCH 27/29] futex: Fix potential use-after-free in FUTEX_REQUEUE_PI
+
+commit c236c8e95a3d395b0494e7108f0d41cf36ec107c upstream.
+
+While working on the futex code, I stumbled over this potential
+use-after-free scenario. Dmitry triggered it later with syzkaller.
+
+pi_mutex is a pointer into pi_state, which we drop the reference on in
+unqueue_me_pi(). So any access to that pointer after that is bad.
+
+Since other sites already do rt_mutex_unlock() with hb->lock held, see
+for example futex_lock_pi(), simply move the unlock before
+unqueue_me_pi().
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Darren Hart <dvhart@linux.intel.com>
+Cc: juri.lelli@arm.com
+Cc: bigeasy@linutronix.de
+Cc: xlpang@redhat.com
+Cc: rostedt@goodmis.org
+Cc: mathieu.desnoyers@efficios.com
+Cc: jdesfossez@efficios.com
+Cc: dvhart@infradead.org
+Cc: bristot@redhat.com
+Link: http://lkml.kernel.org/r/20170304093558.801744246@infradead.org
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/futex.c | 20 +++++++++++---------
+ 1 file changed, 11 insertions(+), 9 deletions(-)
+
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 9d251dc3ec40..45170163a0b3 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -2690,7 +2690,6 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ {
+ 	struct hrtimer_sleeper timeout, *to = NULL;
+ 	struct rt_mutex_waiter rt_waiter;
+-	struct rt_mutex *pi_mutex = NULL;
+ 	struct futex_hash_bucket *hb;
+ 	union futex_key key2 = FUTEX_KEY_INIT;
+ 	struct futex_q q = futex_q_init;
+@@ -2782,6 +2781,8 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 			spin_unlock(q.lock_ptr);
+ 		}
+ 	} else {
++		struct rt_mutex *pi_mutex;
++
+ 		/*
+ 		 * We have been woken up by futex_unlock_pi(), a timeout, or a
+ 		 * signal.  futex_unlock_pi() will not destroy the lock_ptr nor
+@@ -2805,18 +2806,19 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 		if (res)
+ 			ret = (res < 0) ? res : 0;
+ 
++		/*
++		 * If fixup_pi_state_owner() faulted and was unable to handle
++		 * the fault, unlock the rt_mutex and return the fault to
++		 * userspace.
++		 */
++		if (ret && rt_mutex_owner(pi_mutex) == current)
++			rt_mutex_unlock(pi_mutex);
++
+ 		/* Unqueue and drop the lock. */
+ 		unqueue_me_pi(&q);
+ 	}
+ 
+-	/*
+-	 * If fixup_pi_state_owner() faulted and was unable to handle the
+-	 * fault, unlock the rt_mutex and return the fault to userspace.
+-	 */
+-	if (ret == -EFAULT) {
+-		if (pi_mutex && rt_mutex_owner(pi_mutex) == current)
+-			rt_mutex_unlock(pi_mutex);
+-	} else if (ret == -EINTR) {
++	if (ret == -EINTR) {
+ 		/*
+ 		 * We've already been requeued, but cannot restart by calling
+ 		 * futex_lock_pi() directly. We could restart this syscall, but
+-- 
+2.28.0
+
+
+From 99d403faba47e5adeb11dbf1094972fc78c29a75 Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Sat, 4 Mar 2017 10:27:19 +0100
+Subject: [PATCH 28/29] futex: Add missing error handling to FUTEX_REQUEUE_PI
+
+commit 9bbb25afeb182502ca4f2c4f3f88af0681b34cae upstream.
+
+Thomas spotted that fixup_pi_state_owner() can return errors and we
+fail to unlock the rt_mutex in that case.
+
+Reported-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Reviewed-by: Darren Hart <dvhart@linux.intel.com>
+Cc: juri.lelli@arm.com
+Cc: bigeasy@linutronix.de
+Cc: xlpang@redhat.com
+Cc: rostedt@goodmis.org
+Cc: mathieu.desnoyers@efficios.com
+Cc: jdesfossez@efficios.com
+Cc: dvhart@infradead.org
+Cc: bristot@redhat.com
+Link: http://lkml.kernel.org/r/20170304093558.867401760@infradead.org
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/futex.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 45170163a0b3..3057dabf726f 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -2773,6 +2773,8 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 		if (q.pi_state && (q.pi_state->owner != current)) {
+ 			spin_lock(q.lock_ptr);
+ 			ret = fixup_pi_state_owner(uaddr2, &q, current);
++			if (ret && rt_mutex_owner(&q.pi_state->pi_mutex) == current)
++				rt_mutex_unlock(&q.pi_state->pi_mutex);
+ 			/*
+ 			 * Drop the reference to the pi state which
+ 			 * the requeue_pi() code acquired for us.
+-- 
+2.28.0
+
+
+From 0136bca4e0f65075b0b4716a270f8b04c6c46abc Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Wed, 22 Mar 2017 12:17:51 +0100
+Subject: [PATCH 29/29] Linux 4.4.56
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index d9cc21df444d..cf9303a5d621 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+-SUBLEVEL = 55
++SUBLEVEL = 56
+ EXTRAVERSION =
+ NAME = Blurry Fish Butt
+ 
+-- 
+2.28.0
+

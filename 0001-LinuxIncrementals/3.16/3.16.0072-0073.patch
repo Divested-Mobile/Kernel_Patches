@@ -1,3 +1,345 @@
+From 3157fbc900bdb366b2186e5a6e506cc5e4697cf0 Mon Sep 17 00:00:00 2001
+From: Ben Hutchings <ben@decadent.org.uk>
+Date: Sat, 3 Aug 2019 17:11:42 +0100
+Subject: [PATCH 1/5] tcp: Clear sk_send_head after purging the write queue
+
+Denis Andzakovic discovered a potential use-after-free in older kernel
+versions, using syzkaller.  tcp_write_queue_purge() frees all skbs in
+the TCP write queue and can leave sk->sk_send_head pointing to freed
+memory.  tcp_disconnect() clears that pointer after calling
+tcp_write_queue_purge(), but tcp_connect() does not.  It is
+(surprisingly) possible to add to the write queue between
+disconnection and reconnection, so this needs to be done in both
+places.
+
+This bug was introduced by backports of commit 7f582b248d0a ("tcp:
+purge write queue in tcp_connect_init()") and does not exist upstream
+because of earlier changes in commit 75c119afe14f ("tcp: implement
+rb-tree based retransmit queue").  The latter is a major change that's
+not suitable for stable.
+
+Reported-by: Denis Andzakovic <denis.andzakovic@pulsesecurity.co.nz>
+Bisected-by: Salvatore Bonaccorso <carnil@debian.org>
+Fixes: 7f582b248d0a ("tcp: purge write queue in tcp_connect_init()")
+Cc: <stable@vger.kernel.org> # before 4.15
+Cc: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ include/net/tcp.h | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 79762b662de3..7667c9adc92a 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1352,6 +1352,8 @@ struct tcp_fastopen_context {
+ 	struct rcu_head		rcu;
+ };
+ 
++static inline void tcp_init_send_head(struct sock *sk);
++
+ /* write queue abstraction */
+ static inline void tcp_write_queue_purge(struct sock *sk)
+ {
+@@ -1359,6 +1361,7 @@ static inline void tcp_write_queue_purge(struct sock *sk)
+ 
+ 	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL)
+ 		sk_wmem_free_skb(sk, skb);
++	tcp_init_send_head(sk);
+ 	sk_mem_reclaim(sk);
+ 	tcp_clear_all_retrans_hints(tcp_sk(sk));
+ }
+-- 
+2.28.0
+
+
+From f1fbae6cd2bd84b17e399d969a2f889ac1bd9afb Mon Sep 17 00:00:00 2001
+From: "zhangyi (F)" <yi.zhang@huawei.com>
+Date: Sat, 23 Mar 2019 11:43:05 -0400
+Subject: [PATCH 2/5] ext4: brelse all indirect buffer in
+ ext4_ind_remove_space()
+
+commit 674a2b27234d1b7afcb0a9162e81b2e53aeef217 upstream.
+
+All indirect buffers get by ext4_find_shared() should be released no
+mater the branch should be freed or not. But now, we forget to release
+the lower depth indirect buffers when removing space from the same
+higher depth indirect block. It will lead to buffer leak and futher
+more, it may lead to quota information corruption when using old quota,
+consider the following case.
+
+ - Create and mount an empty ext4 filesystem without extent and quota
+   features,
+ - quotacheck and enable the user & group quota,
+ - Create some files and write some data to them, and then punch hole
+   to some files of them, it may trigger the buffer leak problem
+   mentioned above.
+ - Disable quota and run quotacheck again, it will create two new
+   aquota files and write the checked quota information to them, which
+   probably may reuse the freed indirect block(the buffer and page
+   cache was not freed) as data block.
+ - Enable quota again, it will invoke
+   vfs_load_quota_inode()->invalidate_bdev() to try to clean unused
+   buffers and pagecache. Unfortunately, because of the buffer of quota
+   data block is still referenced, quota code cannot read the up to date
+   quota info from the device and lead to quota information corruption.
+
+This problem can be reproduced by xfstests generic/231 on ext3 file
+system or ext4 file system without extent and quota features.
+
+This patch fix this problem by releasing the missing indirect buffers,
+in ext4_ind_remove_space().
+
+Reported-by: Hulk Robot <hulkci@huawei.com>
+Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ fs/ext4/indirect.c | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/fs/ext4/indirect.c b/fs/ext4/indirect.c
+index 8df46f49a3d5..71e9576314dd 100644
+--- a/fs/ext4/indirect.c
++++ b/fs/ext4/indirect.c
+@@ -1481,10 +1481,14 @@ end_range:
+ 					   partial->p + 1,
+ 					   partial2->p,
+ 					   (chain+n-1) - partial);
+-			BUFFER_TRACE(partial->bh, "call brelse");
+-			brelse(partial->bh);
+-			BUFFER_TRACE(partial2->bh, "call brelse");
+-			brelse(partial2->bh);
++			while (partial > chain) {
++				BUFFER_TRACE(partial->bh, "call brelse");
++				brelse(partial->bh);
++			}
++			while (partial2 > chain2) {
++				BUFFER_TRACE(partial2->bh, "call brelse");
++				brelse(partial2->bh);
++			}
+ 			return 0;
+ 		}
+ 
+-- 
+2.28.0
+
+
+From 2d74faa1f0c8a23ffb83146f23526ea812f1ef7f Mon Sep 17 00:00:00 2001
+From: "zhangyi (F)" <yi.zhang@huawei.com>
+Date: Sat, 23 Mar 2019 11:56:01 -0400
+Subject: [PATCH 3/5] ext4: cleanup bh release code in ext4_ind_remove_space()
+
+commit 5e86bdda41534e17621d5a071b294943cae4376e upstream.
+
+Currently, we are releasing the indirect buffer where we are done with
+it in ext4_ind_remove_space(), so we can see the brelse() and
+BUFFER_TRACE() everywhere.  It seems fragile and hard to read, and we
+may probably forget to release the buffer some day.  This patch cleans
+up the code by putting of the code which releases the buffers to the
+end of the function.
+
+Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Reviewed-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ fs/ext4/indirect.c | 47 ++++++++++++++++++++++------------------------
+ 1 file changed, 22 insertions(+), 25 deletions(-)
+
+diff --git a/fs/ext4/indirect.c b/fs/ext4/indirect.c
+index 71e9576314dd..475a1d40f23e 100644
+--- a/fs/ext4/indirect.c
++++ b/fs/ext4/indirect.c
+@@ -1313,6 +1313,7 @@ int ext4_ind_remove_space(handle_t *handle, struct inode *inode,
+ 	ext4_lblk_t offsets[4], offsets2[4];
+ 	Indirect chain[4], chain2[4];
+ 	Indirect *partial, *partial2;
++	Indirect *p = NULL, *p2 = NULL;
+ 	ext4_lblk_t max_block;
+ 	__le32 nr = 0, nr2 = 0;
+ 	int n = 0, n2 = 0;
+@@ -1354,7 +1355,7 @@ int ext4_ind_remove_space(handle_t *handle, struct inode *inode,
+ 		}
+ 
+ 
+-		partial = ext4_find_shared(inode, n, offsets, chain, &nr);
++		partial = p = ext4_find_shared(inode, n, offsets, chain, &nr);
+ 		if (nr) {
+ 			if (partial == chain) {
+ 				/* Shared branch grows from the inode */
+@@ -1379,13 +1380,11 @@ int ext4_ind_remove_space(handle_t *handle, struct inode *inode,
+ 				partial->p + 1,
+ 				(__le32 *)partial->bh->b_data+addr_per_block,
+ 				(chain+n-1) - partial);
+-			BUFFER_TRACE(partial->bh, "call brelse");
+-			brelse(partial->bh);
+ 			partial--;
+ 		}
+ 
+ end_range:
+-		partial2 = ext4_find_shared(inode, n2, offsets2, chain2, &nr2);
++		partial2 = p2 = ext4_find_shared(inode, n2, offsets2, chain2, &nr2);
+ 		if (nr2) {
+ 			if (partial2 == chain2) {
+ 				/*
+@@ -1415,16 +1414,14 @@ end_range:
+ 					   (__le32 *)partial2->bh->b_data,
+ 					   partial2->p,
+ 					   (chain2+n2-1) - partial2);
+-			BUFFER_TRACE(partial2->bh, "call brelse");
+-			brelse(partial2->bh);
+ 			partial2--;
+ 		}
+ 		goto do_indirects;
+ 	}
+ 
+ 	/* Punch happened within the same level (n == n2) */
+-	partial = ext4_find_shared(inode, n, offsets, chain, &nr);
+-	partial2 = ext4_find_shared(inode, n2, offsets2, chain2, &nr2);
++	partial = p = ext4_find_shared(inode, n, offsets, chain, &nr);
++	partial2 = p2 = ext4_find_shared(inode, n2, offsets2, chain2, &nr2);
+ 
+ 	/* Free top, but only if partial2 isn't its subtree. */
+ 	if (nr) {
+@@ -1481,15 +1478,7 @@ end_range:
+ 					   partial->p + 1,
+ 					   partial2->p,
+ 					   (chain+n-1) - partial);
+-			while (partial > chain) {
+-				BUFFER_TRACE(partial->bh, "call brelse");
+-				brelse(partial->bh);
+-			}
+-			while (partial2 > chain2) {
+-				BUFFER_TRACE(partial2->bh, "call brelse");
+-				brelse(partial2->bh);
+-			}
+-			return 0;
++			goto cleanup;
+ 		}
+ 
+ 		/*
+@@ -1504,8 +1493,6 @@ end_range:
+ 					   partial->p + 1,
+ 					   (__le32 *)partial->bh->b_data+addr_per_block,
+ 					   (chain+n-1) - partial);
+-			BUFFER_TRACE(partial->bh, "call brelse");
+-			brelse(partial->bh);
+ 			partial--;
+ 		}
+ 		if (partial2 > chain2 && depth2 <= depth) {
+@@ -1513,11 +1500,21 @@ end_range:
+ 					   (__le32 *)partial2->bh->b_data,
+ 					   partial2->p,
+ 					   (chain2+n2-1) - partial2);
+-			BUFFER_TRACE(partial2->bh, "call brelse");
+-			brelse(partial2->bh);
+ 			partial2--;
+ 		}
+ 	}
++
++cleanup:
++	while (p && p > chain) {
++		BUFFER_TRACE(p->bh, "call brelse");
++		brelse(p->bh);
++		p--;
++	}
++	while (p2 && p2 > chain2) {
++		BUFFER_TRACE(p2->bh, "call brelse");
++		brelse(p2->bh);
++		p2--;
++	}
+ 	return 0;
+ 
+ do_indirects:
+@@ -1525,7 +1522,7 @@ do_indirects:
+ 	switch (offsets[0]) {
+ 	default:
+ 		if (++n >= n2)
+-			return 0;
++			break;
+ 		nr = i_data[EXT4_IND_BLOCK];
+ 		if (nr) {
+ 			ext4_free_branches(handle, inode, NULL, &nr, &nr+1, 1);
+@@ -1533,7 +1530,7 @@ do_indirects:
+ 		}
+ 	case EXT4_IND_BLOCK:
+ 		if (++n >= n2)
+-			return 0;
++			break;
+ 		nr = i_data[EXT4_DIND_BLOCK];
+ 		if (nr) {
+ 			ext4_free_branches(handle, inode, NULL, &nr, &nr+1, 2);
+@@ -1541,7 +1538,7 @@ do_indirects:
+ 		}
+ 	case EXT4_DIND_BLOCK:
+ 		if (++n >= n2)
+-			return 0;
++			break;
+ 		nr = i_data[EXT4_TIND_BLOCK];
+ 		if (nr) {
+ 			ext4_free_branches(handle, inode, NULL, &nr, &nr+1, 3);
+@@ -1550,5 +1547,5 @@ do_indirects:
+ 	case EXT4_TIND_BLOCK:
+ 		;
+ 	}
+-	return 0;
++	goto cleanup;
+ }
+-- 
+2.28.0
+
+
+From ba7df77b948f22b519acfef0a8077bd4af05e85c Mon Sep 17 00:00:00 2001
+From: "Jason A. Donenfeld" <Jason@zx2c4.com>
+Date: Sun, 8 Jan 2017 13:54:01 +0100
+Subject: [PATCH 4/5] siphash: implement HalfSipHash1-3 for hash tables
+
+commit 1ae2324f732c9c4e2fa4ebd885fa1001b70d52e1 upstream.
+
+HalfSipHash, or hsiphash, is a shortened version of SipHash, which
+generates 32-bit outputs using a weaker 64-bit key. It has *much* lower
+security margins, and shouldn't be used for anything too sensitive, but
+it could be used as a hashtable key function replacement, if the output
+is never exposed, and if the security requirement is not too high.
+
+The goal is to make this something that performance-critical jhash users
+would be willing to use.
+
+On 64-bit machines, HalfSipHash1-3 is slower than SipHash1-3, so we alias
+SipHash1-3 to HalfSipHash1-3 on those systems.
+
+64-bit x86_64:
+[    0.509409] test_siphash:     SipHash2-4 cycles: 4049181
+[    0.510650] test_siphash:     SipHash1-3 cycles: 2512884
+[    0.512205] test_siphash: HalfSipHash1-3 cycles: 3429920
+[    0.512904] test_siphash:    JenkinsHash cycles:  978267
+So, we map hsiphash() -> SipHash1-3
+
+32-bit x86:
+[    0.509868] test_siphash:     SipHash2-4 cycles: 14812892
+[    0.513601] test_siphash:     SipHash1-3 cycles:  9510710
+[    0.515263] test_siphash: HalfSipHash1-3 cycles:  3856157
+[    0.515952] test_siphash:    JenkinsHash cycles:  1148567
+So, we map hsiphash() -> HalfSipHash1-3
+
+hsiphash() is roughly 3 times slower than jhash(), but comes with a
+considerable security improvement.
+
+Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
+Reviewed-by: Jean-Philippe Aumasson <jeanphilippe.aumasson@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+[bwh: Backported to 3.16 to avoid a build regression for WireGuard with
+ only part of the siphash API available]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ Documentation/siphash.txt |  75 +++++++++
+ include/linux/siphash.h   |  57 ++++++-
+ lib/siphash.c             | 321 +++++++++++++++++++++++++++++++++++++-
+ lib/test_siphash.c        |  98 +++++++++++-
+ 4 files changed, 546 insertions(+), 5 deletions(-)
+
 diff --git a/Documentation/siphash.txt b/Documentation/siphash.txt
 index e8e6ddbbaab4..908d348ff777 100644
 --- a/Documentation/siphash.txt
@@ -81,153 +423,6 @@ index e8e6ddbbaab4..908d348ff777 100644
 +this will not be a problem, as the hashtable lookup isn't the bottleneck. And
 +in general, this is probably a good sacrifice to make for the security and DoS
 +resistance of HalfSipHash.
-diff --git a/Makefile b/Makefile
-index e2d6e0b9f22d..935fc9df7b17 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 16
--SUBLEVEL = 72
-+SUBLEVEL = 73
- EXTRAVERSION =
- NAME = Museum of Fishiegoodies
- 
-diff --git a/fs/ext4/indirect.c b/fs/ext4/indirect.c
-index 8df46f49a3d5..475a1d40f23e 100644
---- a/fs/ext4/indirect.c
-+++ b/fs/ext4/indirect.c
-@@ -1313,6 +1313,7 @@ int ext4_ind_remove_space(handle_t *handle, struct inode *inode,
- 	ext4_lblk_t offsets[4], offsets2[4];
- 	Indirect chain[4], chain2[4];
- 	Indirect *partial, *partial2;
-+	Indirect *p = NULL, *p2 = NULL;
- 	ext4_lblk_t max_block;
- 	__le32 nr = 0, nr2 = 0;
- 	int n = 0, n2 = 0;
-@@ -1354,7 +1355,7 @@ int ext4_ind_remove_space(handle_t *handle, struct inode *inode,
- 		}
- 
- 
--		partial = ext4_find_shared(inode, n, offsets, chain, &nr);
-+		partial = p = ext4_find_shared(inode, n, offsets, chain, &nr);
- 		if (nr) {
- 			if (partial == chain) {
- 				/* Shared branch grows from the inode */
-@@ -1379,13 +1380,11 @@ int ext4_ind_remove_space(handle_t *handle, struct inode *inode,
- 				partial->p + 1,
- 				(__le32 *)partial->bh->b_data+addr_per_block,
- 				(chain+n-1) - partial);
--			BUFFER_TRACE(partial->bh, "call brelse");
--			brelse(partial->bh);
- 			partial--;
- 		}
- 
- end_range:
--		partial2 = ext4_find_shared(inode, n2, offsets2, chain2, &nr2);
-+		partial2 = p2 = ext4_find_shared(inode, n2, offsets2, chain2, &nr2);
- 		if (nr2) {
- 			if (partial2 == chain2) {
- 				/*
-@@ -1415,16 +1414,14 @@ end_range:
- 					   (__le32 *)partial2->bh->b_data,
- 					   partial2->p,
- 					   (chain2+n2-1) - partial2);
--			BUFFER_TRACE(partial2->bh, "call brelse");
--			brelse(partial2->bh);
- 			partial2--;
- 		}
- 		goto do_indirects;
- 	}
- 
- 	/* Punch happened within the same level (n == n2) */
--	partial = ext4_find_shared(inode, n, offsets, chain, &nr);
--	partial2 = ext4_find_shared(inode, n2, offsets2, chain2, &nr2);
-+	partial = p = ext4_find_shared(inode, n, offsets, chain, &nr);
-+	partial2 = p2 = ext4_find_shared(inode, n2, offsets2, chain2, &nr2);
- 
- 	/* Free top, but only if partial2 isn't its subtree. */
- 	if (nr) {
-@@ -1481,11 +1478,7 @@ end_range:
- 					   partial->p + 1,
- 					   partial2->p,
- 					   (chain+n-1) - partial);
--			BUFFER_TRACE(partial->bh, "call brelse");
--			brelse(partial->bh);
--			BUFFER_TRACE(partial2->bh, "call brelse");
--			brelse(partial2->bh);
--			return 0;
-+			goto cleanup;
- 		}
- 
- 		/*
-@@ -1500,8 +1493,6 @@ end_range:
- 					   partial->p + 1,
- 					   (__le32 *)partial->bh->b_data+addr_per_block,
- 					   (chain+n-1) - partial);
--			BUFFER_TRACE(partial->bh, "call brelse");
--			brelse(partial->bh);
- 			partial--;
- 		}
- 		if (partial2 > chain2 && depth2 <= depth) {
-@@ -1509,11 +1500,21 @@ end_range:
- 					   (__le32 *)partial2->bh->b_data,
- 					   partial2->p,
- 					   (chain2+n2-1) - partial2);
--			BUFFER_TRACE(partial2->bh, "call brelse");
--			brelse(partial2->bh);
- 			partial2--;
- 		}
- 	}
-+
-+cleanup:
-+	while (p && p > chain) {
-+		BUFFER_TRACE(p->bh, "call brelse");
-+		brelse(p->bh);
-+		p--;
-+	}
-+	while (p2 && p2 > chain2) {
-+		BUFFER_TRACE(p2->bh, "call brelse");
-+		brelse(p2->bh);
-+		p2--;
-+	}
- 	return 0;
- 
- do_indirects:
-@@ -1521,7 +1522,7 @@ do_indirects:
- 	switch (offsets[0]) {
- 	default:
- 		if (++n >= n2)
--			return 0;
-+			break;
- 		nr = i_data[EXT4_IND_BLOCK];
- 		if (nr) {
- 			ext4_free_branches(handle, inode, NULL, &nr, &nr+1, 1);
-@@ -1529,7 +1530,7 @@ do_indirects:
- 		}
- 	case EXT4_IND_BLOCK:
- 		if (++n >= n2)
--			return 0;
-+			break;
- 		nr = i_data[EXT4_DIND_BLOCK];
- 		if (nr) {
- 			ext4_free_branches(handle, inode, NULL, &nr, &nr+1, 2);
-@@ -1537,7 +1538,7 @@ do_indirects:
- 		}
- 	case EXT4_DIND_BLOCK:
- 		if (++n >= n2)
--			return 0;
-+			break;
- 		nr = i_data[EXT4_TIND_BLOCK];
- 		if (nr) {
- 			ext4_free_branches(handle, inode, NULL, &nr, &nr+1, 3);
-@@ -1546,5 +1547,5 @@ do_indirects:
- 	case EXT4_TIND_BLOCK:
- 		;
- 	}
--	return 0;
-+	goto cleanup;
- }
 diff --git a/include/linux/siphash.h b/include/linux/siphash.h
 index c8c7ae2e687b..bf21591a9e5e 100644
 --- a/include/linux/siphash.h
@@ -301,27 +496,6 @@ index c8c7ae2e687b..bf21591a9e5e 100644
 +}
 +
  #endif /* _LINUX_SIPHASH_H */
-diff --git a/include/net/tcp.h b/include/net/tcp.h
-index 79762b662de3..7667c9adc92a 100644
---- a/include/net/tcp.h
-+++ b/include/net/tcp.h
-@@ -1352,6 +1352,8 @@ struct tcp_fastopen_context {
- 	struct rcu_head		rcu;
- };
- 
-+static inline void tcp_init_send_head(struct sock *sk);
-+
- /* write queue abstraction */
- static inline void tcp_write_queue_purge(struct sock *sk)
- {
-@@ -1359,6 +1361,7 @@ static inline void tcp_write_queue_purge(struct sock *sk)
- 
- 	while ((skb = __skb_dequeue(&sk->sk_write_queue)) != NULL)
- 		sk_wmem_free_skb(sk, skb);
-+	tcp_init_send_head(sk);
- 	sk_mem_reclaim(sk);
- 	tcp_clear_all_retrans_hints(tcp_sk(sk));
- }
 diff --git a/lib/siphash.c b/lib/siphash.c
 index c43cf406e71b..3ae58b4edad6 100644
 --- a/lib/siphash.c
@@ -795,3 +969,31 @@ index d972acfc15e4..a6d854d933bf 100644
  	if (!ret)
  		pr_info("self-tests: pass\n");
  	return ret;
+-- 
+2.28.0
+
+
+From a3d313e3302feca0b4fc0660c05f94010f133552 Mon Sep 17 00:00:00 2001
+From: Ben Hutchings <ben@decadent.org.uk>
+Date: Tue, 20 Aug 2019 19:01:58 +0100
+Subject: [PATCH 5/5] Linux 3.16.73
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index e2d6e0b9f22d..935fc9df7b17 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 16
+-SUBLEVEL = 72
++SUBLEVEL = 73
+ EXTRAVERSION =
+ NAME = Museum of Fishiegoodies
+ 
+-- 
+2.28.0
+

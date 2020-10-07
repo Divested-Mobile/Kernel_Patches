@@ -1,277 +1,173 @@
-diff --git a/Makefile b/Makefile
-index 71e8efa..30ad2fe 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 0
--SUBLEVEL = 74
-+SUBLEVEL = 75
- EXTRAVERSION =
- NAME = Sneaky Weasel
- 
-diff --git a/arch/arm/mm/cache-feroceon-l2.c b/arch/arm/mm/cache-feroceon-l2.c
-index e0b0e7a..09f8851 100644
---- a/arch/arm/mm/cache-feroceon-l2.c
-+++ b/arch/arm/mm/cache-feroceon-l2.c
-@@ -342,6 +342,7 @@ void __init feroceon_l2_init(int __l2_wt_override)
- 	outer_cache.inv_range = feroceon_l2_inv_range;
- 	outer_cache.clean_range = feroceon_l2_clean_range;
- 	outer_cache.flush_range = feroceon_l2_flush_range;
-+	outer_cache.inv_all = l2_inv_all;
- 
- 	enable_l2();
- 
-diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
-index d2ac8e2..1eb45de 100644
---- a/arch/x86/include/asm/kvm_host.h
-+++ b/arch/x86/include/asm/kvm_host.h
-@@ -391,8 +391,8 @@ struct kvm_vcpu_arch {
- 	gpa_t time;
- 	struct pvclock_vcpu_time_info hv_clock;
- 	unsigned int hw_tsc_khz;
--	unsigned int time_offset;
--	struct page *time_page;
-+	struct gfn_to_hva_cache pv_time;
-+	bool pv_time_enabled;
- 	u64 last_guest_tsc;
- 	u64 last_kernel_ns;
- 	u64 last_tsc_nsec;
-diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index e329dc5..15e79a6 100644
---- a/arch/x86/kvm/x86.c
-+++ b/arch/x86/kvm/x86.c
-@@ -1073,7 +1073,6 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
+From 27819a8a40b34b2db511181cfbfdf7f76281651d Mon Sep 17 00:00:00 2001
+From: Michael Bohan <mbohan@codeaurora.org>
+Date: Tue, 19 Mar 2013 19:19:25 -0700
+Subject: [PATCH 01/24] hrtimer: Don't reinitialize a cpu_base lock on CPU_UP
+
+commit 84cc8fd2fe65866e49d70b38b3fdf7219dd92fe0 upstream.
+
+The current code makes the assumption that a cpu_base lock won't be
+held if the CPU corresponding to that cpu_base is offline, which isn't
+always true.
+
+If a hrtimer is not queued, then it will not be migrated by
+migrate_hrtimers() when a CPU is offlined. Therefore, the hrtimer's
+cpu_base may still point to a CPU which has subsequently gone offline
+if the timer wasn't enqueued at the time the CPU went down.
+
+Normally this wouldn't be a problem, but a cpu_base's lock is blindly
+reinitialized each time a CPU is brought up. If a CPU is brought
+online during the period that another thread is performing a hrtimer
+operation on a stale hrtimer, then the lock will be reinitialized
+under its feet, and a SPIN_BUG() like the following will be observed:
+
+<0>[   28.082085] BUG: spinlock already unlocked on CPU#0, swapper/0/0
+<0>[   28.087078]  lock: 0xc4780b40, value 0x0 .magic: dead4ead, .owner: <none>/-1, .owner_cpu: -1
+<4>[   42.451150] [<c0014398>] (unwind_backtrace+0x0/0x120) from [<c0269220>] (do_raw_spin_unlock+0x44/0xdc)
+<4>[   42.460430] [<c0269220>] (do_raw_spin_unlock+0x44/0xdc) from [<c071b5bc>] (_raw_spin_unlock+0x8/0x30)
+<4>[   42.469632] [<c071b5bc>] (_raw_spin_unlock+0x8/0x30) from [<c00a9ce0>] (__hrtimer_start_range_ns+0x1e4/0x4f8)
+<4>[   42.479521] [<c00a9ce0>] (__hrtimer_start_range_ns+0x1e4/0x4f8) from [<c00aa014>] (hrtimer_start+0x20/0x28)
+<4>[   42.489247] [<c00aa014>] (hrtimer_start+0x20/0x28) from [<c00e6190>] (rcu_idle_enter_common+0x1ac/0x320)
+<4>[   42.498709] [<c00e6190>] (rcu_idle_enter_common+0x1ac/0x320) from [<c00e6440>] (rcu_idle_enter+0xa0/0xb8)
+<4>[   42.508259] [<c00e6440>] (rcu_idle_enter+0xa0/0xb8) from [<c000f268>] (cpu_idle+0x24/0xf0)
+<4>[   42.516503] [<c000f268>] (cpu_idle+0x24/0xf0) from [<c06ed3c0>] (rest_init+0x88/0xa0)
+<4>[   42.524319] [<c06ed3c0>] (rest_init+0x88/0xa0) from [<c0c00978>] (start_kernel+0x3d0/0x434)
+
+As an example, this particular crash occurred when hrtimer_start() was
+executed on CPU #0. The code locked the hrtimer's current cpu_base
+corresponding to CPU #1. CPU #0 then tried to switch the hrtimer's
+cpu_base to an optimal CPU which was online. In this case, it selected
+the cpu_base corresponding to CPU #3.
+
+Before it could proceed, CPU #1 came online and reinitialized the
+spinlock corresponding to its cpu_base. Thus now CPU #0 held a lock
+which was reinitialized. When CPU #0 finally ended up unlocking the
+old cpu_base corresponding to CPU #1 so that it could switch to CPU
+#3, we hit this SPIN_BUG() above while in switch_hrtimer_base().
+
+CPU #0                            CPU #1
+----                              ----
+...                               <offline>
+hrtimer_start()
+lock_hrtimer_base(base #1)
+...                               init_hrtimers_cpu()
+switch_hrtimer_base()             ...
+...                               raw_spin_lock_init(&cpu_base->lock)
+raw_spin_unlock(&cpu_base->lock)  ...
+<spin_bug>
+
+Solve this by statically initializing the lock.
+
+Signed-off-by: Michael Bohan <mbohan@codeaurora.org>
+Link: http://lkml.kernel.org/r/1363745965-23475-1-git-send-email-mbohan@codeaurora.org
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/hrtimer.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/kernel/hrtimer.c b/kernel/hrtimer.c
+index e079c3e42fac..3c5a22f83cc2 100644
+--- a/kernel/hrtimer.c
++++ b/kernel/hrtimer.c
+@@ -61,6 +61,7 @@
+ DEFINE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases) =
  {
- 	unsigned long flags;
- 	struct kvm_vcpu_arch *vcpu = &v->arch;
--	void *shared_kaddr;
- 	unsigned long this_tsc_khz;
- 	s64 kernel_ns, max_kernel_ns;
- 	u64 tsc_timestamp;
-@@ -1109,7 +1108,7 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
  
- 	local_irq_restore(flags);
++	.lock = __RAW_SPIN_LOCK_UNLOCKED(hrtimer_bases.lock),
+ 	.clock_base =
+ 	{
+ 		{
+@@ -1640,8 +1641,6 @@ static void __cpuinit init_hrtimers_cpu(int cpu)
+ 	struct hrtimer_cpu_base *cpu_base = &per_cpu(hrtimer_bases, cpu);
+ 	int i;
  
--	if (!vcpu->time_page)
-+	if (!vcpu->pv_time_enabled)
- 		return 0;
- 
- 	/*
-@@ -1167,14 +1166,9 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
- 	 */
- 	vcpu->hv_clock.version += 2;
- 
--	shared_kaddr = kmap_atomic(vcpu->time_page, KM_USER0);
+-	raw_spin_lock_init(&cpu_base->lock);
 -
--	memcpy(shared_kaddr + vcpu->time_offset, &vcpu->hv_clock,
--	       sizeof(vcpu->hv_clock));
--
--	kunmap_atomic(shared_kaddr, KM_USER0);
--
--	mark_page_dirty(v->kvm, vcpu->time >> PAGE_SHIFT);
-+	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
-+				&vcpu->hv_clock,
-+				sizeof(vcpu->hv_clock));
- 	return 0;
- }
+ 	for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++) {
+ 		cpu_base->clock_base[i].cpu_base = cpu_base;
+ 		timerqueue_init_head(&cpu_base->clock_base[i].active);
+-- 
+2.28.0
+
+
+From 80d98a915c07e6de6c3a2c08dea843f441273081 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Wed, 17 Apr 2013 09:50:59 -0700
+Subject: [PATCH 02/24] Revert "8021q: fix a potential use-after-free"
+
+This reverts commit 9829fe9806e22d7a822f4c947cc432c8d1774b54 which is
+upstream commit 4a7df340ed1bac190c124c1601bfc10cde9fb4fb
+
+It turns out this causes problems on the 3.0-stable release.
+
+Reported-by: Thomas Voegtle <tv@lio96.de>
+Acked-by: Cong Wang <amwang@redhat.com>
+Cc: Patrick McHardy <kaber@trash.net>
+Cc: "David S. Miller" <davem@davemloft.net>
+Cc: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/8021q/vlan.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/net/8021q/vlan.c b/net/8021q/vlan.c
+index 1e93a917b3df..917ecb93ea28 100644
+--- a/net/8021q/vlan.c
++++ b/net/8021q/vlan.c
+@@ -108,6 +108,13 @@ void unregister_vlan_dev(struct net_device *dev, struct list_head *head)
+ 	grp = rtnl_dereference(real_dev->vlgrp);
+ 	BUG_ON(!grp);
  
-@@ -1454,7 +1448,8 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
- 		return 0;
- 	}
- 
--	if (kvm_gfn_to_hva_cache_init(vcpu->kvm, &vcpu->arch.apf.data, gpa))
-+	if (kvm_gfn_to_hva_cache_init(vcpu->kvm, &vcpu->arch.apf.data, gpa,
-+					sizeof(u32)))
- 		return 1;
- 
- 	vcpu->arch.apf.send_user_only = !(data & KVM_ASYNC_PF_SEND_ALWAYS);
-@@ -1464,10 +1459,7 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
- 
- static void kvmclock_reset(struct kvm_vcpu *vcpu)
- {
--	if (vcpu->arch.time_page) {
--		kvm_release_page_dirty(vcpu->arch.time_page);
--		vcpu->arch.time_page = NULL;
--	}
-+	vcpu->arch.pv_time_enabled = false;
- }
- 
- int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
-@@ -1527,6 +1519,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
- 		break;
- 	case MSR_KVM_SYSTEM_TIME_NEW:
- 	case MSR_KVM_SYSTEM_TIME: {
-+		u64 gpa_offset;
- 		kvmclock_reset(vcpu);
- 
- 		vcpu->arch.time = data;
-@@ -1536,16 +1529,14 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
- 		if (!(data & 1))
- 			break;
- 
--		/* ...but clean it before doing the actual write */
--		vcpu->arch.time_offset = data & ~(PAGE_MASK | 1);
-+		gpa_offset = data & ~(PAGE_MASK | 1);
- 
--		vcpu->arch.time_page =
--				gfn_to_page(vcpu->kvm, data >> PAGE_SHIFT);
--
--		if (is_error_page(vcpu->arch.time_page)) {
--			kvm_release_page_clean(vcpu->arch.time_page);
--			vcpu->arch.time_page = NULL;
--		}
-+		if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
-+		     &vcpu->arch.pv_time, data & ~1ULL,
-+		     sizeof(struct pvclock_vcpu_time_info)))
-+			vcpu->arch.pv_time_enabled = false;
-+		else
-+			vcpu->arch.pv_time_enabled = true;
- 		break;
- 	}
- 	case MSR_KVM_ASYNC_PF_EN:
-@@ -6252,6 +6243,7 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
- 	if (!zalloc_cpumask_var(&vcpu->arch.wbinvd_dirty_mask, GFP_KERNEL))
- 		goto fail_free_mce_banks;
- 
-+	vcpu->arch.pv_time_enabled = false;
- 	kvm_async_pf_hash_reset(vcpu);
- 
- 	return 0;
-diff --git a/crypto/algif_hash.c b/crypto/algif_hash.c
-index 62122a1..fed2868 100644
---- a/crypto/algif_hash.c
-+++ b/crypto/algif_hash.c
-@@ -159,6 +159,8 @@ static int hash_recvmsg(struct kiocb *unused, struct socket *sock,
- 	else if (len < ds)
- 		msg->msg_flags |= MSG_TRUNC;
- 
-+	msg->msg_namelen = 0;
++	/* Take it out of our own structures, but be sure to interlock with
++	 * HW accelerating devices or SW vlan input packet processing if
++	 * VLAN is not 0 (leave it there for 802.1p).
++	 */
++	if (vlan_id && (real_dev->features & NETIF_F_HW_VLAN_FILTER))
++		ops->ndo_vlan_rx_kill_vid(real_dev, vlan_id);
 +
- 	lock_sock(sk);
- 	if (ctx->more) {
- 		ctx->more = 0;
-diff --git a/crypto/algif_skcipher.c b/crypto/algif_skcipher.c
-index 6a6dfc0..a1c4f0a 100644
---- a/crypto/algif_skcipher.c
-+++ b/crypto/algif_skcipher.c
-@@ -432,6 +432,7 @@ static int skcipher_recvmsg(struct kiocb *unused, struct socket *sock,
- 	long copied = 0;
+ 	grp->nr_vlans--;
  
- 	lock_sock(sk);
-+	msg->msg_namelen = 0;
- 	for (iov = msg->msg_iov, iovlen = msg->msg_iovlen; iovlen > 0;
- 	     iovlen--, iov++) {
- 		unsigned long seglen = iov->iov_len;
-diff --git a/drivers/char/hpet.c b/drivers/char/hpet.c
-index 34d6a1c..853f8e8 100644
---- a/drivers/char/hpet.c
-+++ b/drivers/char/hpet.c
-@@ -374,26 +374,14 @@ static int hpet_mmap(struct file *file, struct vm_area_struct *vma)
- 	struct hpet_dev *devp;
- 	unsigned long addr;
- 
--	if (((vma->vm_end - vma->vm_start) != PAGE_SIZE) || vma->vm_pgoff)
--		return -EINVAL;
--
- 	devp = file->private_data;
- 	addr = devp->hd_hpets->hp_hpet_phys;
- 
- 	if (addr & (PAGE_SIZE - 1))
- 		return -ENOSYS;
- 
--	vma->vm_flags |= VM_IO;
- 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
--
--	if (io_remap_pfn_range(vma, vma->vm_start, addr >> PAGE_SHIFT,
--					PAGE_SIZE, vma->vm_page_prot)) {
--		printk(KERN_ERR "%s: io_remap_pfn_range failed\n",
--			__func__);
--		return -EAGAIN;
--	}
--
--	return 0;
-+	return vm_iomap_memory(vma, addr, PAGE_SIZE);
- #else
- 	return -ENOSYS;
- #endif
-diff --git a/drivers/gpu/vga/vga_switcheroo.c b/drivers/gpu/vga/vga_switcheroo.c
-index 58434e8..37fe246 100644
---- a/drivers/gpu/vga/vga_switcheroo.c
-+++ b/drivers/gpu/vga/vga_switcheroo.c
-@@ -26,6 +26,7 @@
- #include <linux/fb.h>
- 
- #include <linux/pci.h>
-+#include <linux/console.h>
- #include <linux/vga_switcheroo.h>
- 
- struct vga_switcheroo_client {
-@@ -256,8 +257,10 @@ static int vga_switchto_stage2(struct vga_switcheroo_client *new_client)
- 
- 	if (new_client->fb_info) {
- 		struct fb_event event;
-+		console_lock();
- 		event.info = new_client->fb_info;
- 		fb_notifier_call_chain(FB_EVENT_REMAP_ALL_CONSOLE, &event);
-+		console_unlock();
+ 	if (vlan->flags & VLAN_FLAG_GVRP)
+@@ -132,13 +139,6 @@ void unregister_vlan_dev(struct net_device *dev, struct list_head *head)
+ 		call_rcu(&grp->rcu, vlan_rcu_free);
  	}
  
- 	ret = vgasr_priv.handler->switchto(new_client->id);
-diff --git a/drivers/mtd/mtdchar.c b/drivers/mtd/mtdchar.c
-index 9892dcc..72b788e 100644
---- a/drivers/mtd/mtdchar.c
-+++ b/drivers/mtd/mtdchar.c
-@@ -1100,45 +1100,17 @@ static int mtd_mmap(struct file *file, struct vm_area_struct *vma)
- 	struct mtd_file_info *mfi = file->private_data;
- 	struct mtd_info *mtd = mfi->mtd;
- 	struct map_info *map = mtd->priv;
--	resource_size_t start, off;
--	unsigned long len, vma_len;
- 
-         /* This is broken because it assumes the MTD device is map-based
- 	   and that mtd->priv is a valid struct map_info.  It should be
- 	   replaced with something that uses the mtd_get_unmapped_area()
- 	   operation properly. */
- 	if (0 /*mtd->type == MTD_RAM || mtd->type == MTD_ROM*/) {
--		off = get_vm_offset(vma);
--		start = map->phys;
--		len = PAGE_ALIGN((start & ~PAGE_MASK) + map->size);
--		start &= PAGE_MASK;
--		vma_len = get_vm_size(vma);
+-	/* Take it out of our own structures, but be sure to interlock with
+-	 * HW accelerating devices or SW vlan input packet processing if
+-	 * VLAN is not 0 (leave it there for 802.1p).
+-	 */
+-	if (vlan_id && (real_dev->features & NETIF_F_HW_VLAN_FILTER))
+-		ops->ndo_vlan_rx_kill_vid(real_dev, vlan_id);
 -
--		/* Overflow in off+len? */
--		if (vma_len + off < off)
--			return -EINVAL;
--		/* Does it fit in the mapping? */
--		if (vma_len + off > len)
--			return -EINVAL;
--
--		off += start;
--		/* Did that overflow? */
--		if (off < start)
--			return -EINVAL;
--		if (set_vm_offset(vma, off) < 0)
--			return -EINVAL;
--		vma->vm_flags |= VM_IO | VM_RESERVED;
--
- #ifdef pgprot_noncached
--		if (file->f_flags & O_DSYNC || off >= __pa(high_memory))
-+		if (file->f_flags & O_DSYNC || map->phys >= __pa(high_memory))
- 			vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
- #endif
--		if (io_remap_pfn_range(vma, vma->vm_start, off >> PAGE_SHIFT,
--				       vma->vm_end - vma->vm_start,
--				       vma->vm_page_prot))
--			return -EAGAIN;
--
--		return 0;
-+		return vm_iomap_memory(vma, map->phys, map->size);
- 	}
- 	return -ENOSYS;
- #else
+ 	/* Get rid of the vlan's reference to real_dev */
+ 	dev_put(real_dev);
+ }
+-- 
+2.28.0
+
+
+From 55fe10a686c3a8bce7bddc149e4ebb12f5a18c25 Mon Sep 17 00:00:00 2001
+From: Christoph Fritz <chf.fritz@googlemail.com>
+Date: Thu, 11 Apr 2013 21:32:57 +0200
+Subject: [PATCH 03/24] can: sja1000: fix handling on dt properties on little
+ endian systems
+
+commit 0443de5fbf224abf41f688d8487b0c307dc5a4b4 upstream.
+
+To get correct endianes on little endian cpus (like arm) while reading device
+tree properties, this patch replaces of_get_property() with
+of_property_read_u32(). While there use of_property_read_bool() for the
+handling of the boolean "nxp,no-comparator-bypass" property.
+
+Signed-off-by: Christoph Fritz <chf.fritz@googlemail.com>
+Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/can/sja1000/sja1000_of_platform.c | 31 +++++++++----------
+ 1 file changed, 15 insertions(+), 16 deletions(-)
+
 diff --git a/drivers/net/can/sja1000/sja1000_of_platform.c b/drivers/net/can/sja1000/sja1000_of_platform.c
-index 9793df6..877836f 100644
+index 9793df6e3455..877836ff7f0c 100644
 --- a/drivers/net/can/sja1000/sja1000_of_platform.c
 +++ b/drivers/net/can/sja1000/sja1000_of_platform.c
 @@ -93,8 +93,8 @@ static int __devinit sja1000_ofp_probe(struct platform_device *ofdev)
@@ -335,8 +231,631 @@ index 9793df6..877836f 100644
  		priv->cdr |= CDR_CBP; /* default */
  
  	priv->irq_flags = IRQF_SHARED;
+-- 
+2.28.0
+
+
+From 6cf9b8f1a9ae1640f73cf8804484530e74eb9d5d Mon Sep 17 00:00:00 2001
+From: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Date: Wed, 17 Apr 2013 15:58:30 -0700
+Subject: [PATCH 04/24] hugetlbfs: add swap entry check in
+ follow_hugetlb_page()
+
+commit 9cc3a5bd40067b9a0fbd49199d0780463fc2140f upstream.
+
+With applying the previous patch "hugetlbfs: stop setting VM_DONTDUMP in
+initializing vma(VM_HUGETLB)" to reenable hugepage coredump, if a memory
+error happens on a hugepage and the affected processes try to access the
+error hugepage, we hit VM_BUG_ON(atomic_read(&page->_count) <= 0) in
+get_page().
+
+The reason for this bug is that coredump-related code doesn't recognise
+"hugepage hwpoison entry" with which a pmd entry is replaced when a memory
+error occurs on a hugepage.
+
+In other words, physical address information is stored in different bit
+layout between hugepage hwpoison entry and pmd entry, so
+follow_hugetlb_page() which is called in get_dump_page() returns a wrong
+page from a given address.
+
+The expected behavior is like this:
+
+  absent   is_swap_pte   FOLL_DUMP   Expected behavior
+  -------------------------------------------------------------------
+   true     false         false       hugetlb_fault
+   false    true          false       hugetlb_fault
+   false    false         false       return page
+   true     false         true        skip page (to avoid allocation)
+   false    true          true        hugetlb_fault
+   false    false         true        return page
+
+With this patch, we can call hugetlb_fault() and take proper actions (we
+wait for migration entries, fail with VM_FAULT_HWPOISON_LARGE for
+hwpoisoned entries,) and as the result we can dump all hugepages except
+for hwpoisoned ones.
+
+Signed-off-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+Cc: Rik van Riel <riel@redhat.com>
+Acked-by: Michal Hocko <mhocko@suse.cz>
+Cc: HATAYAMA Daisuke <d.hatayama@jp.fujitsu.com>
+Acked-by: KOSAKI Motohiro <kosaki.motohiro@jp.fujitsu.com>
+Acked-by: David Rientjes <rientjes@google.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/hugetlb.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 2c56a533e4bc..14420ddbc142 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -2800,7 +2800,17 @@ int follow_hugetlb_page(struct mm_struct *mm, struct vm_area_struct *vma,
+ 			break;
+ 		}
+ 
+-		if (absent ||
++		/*
++		 * We need call hugetlb_fault for both hugepages under migration
++		 * (in which case hugetlb_fault waits for the migration,) and
++		 * hwpoisoned hugepages (in which case we need to prevent the
++		 * caller from accessing to them.) In order to do this, we use
++		 * here is_swap_pte instead of is_hugetlb_entry_migration and
++		 * is_hugetlb_entry_hwpoisoned. This is because it simply covers
++		 * both cases, and because we can't follow correct pages
++		 * directly from any kind of swap entries.
++		 */
++		if (absent || is_swap_pte(huge_ptep_get(pte)) ||
+ 		    ((flags & FOLL_WRITE) && !pte_write(huge_ptep_get(pte)))) {
+ 			int ret;
+ 
+-- 
+2.28.0
+
+
+From aab5c5ca241d159f81e002aebb828c3c75bf4682 Mon Sep 17 00:00:00 2001
+From: Emese Revfy <re.emese@gmail.com>
+Date: Wed, 17 Apr 2013 15:58:36 -0700
+Subject: [PATCH 05/24] kernel/signal.c: stop info leak via the tkill and the
+ tgkill syscalls
+
+commit b9e146d8eb3b9ecae5086d373b50fa0c1f3e7f0f upstream.
+
+This fixes a kernel memory contents leak via the tkill and tgkill syscalls
+for compat processes.
+
+This is visible in the siginfo_t->_sifields._rt.si_sigval.sival_ptr field
+when handling signals delivered from tkill.
+
+The place of the infoleak:
+
+int copy_siginfo_to_user32(compat_siginfo_t __user *to, siginfo_t *from)
+{
+        ...
+        put_user_ex(ptr_to_compat(from->si_ptr), &to->si_ptr);
+        ...
+}
+
+Signed-off-by: Emese Revfy <re.emese@gmail.com>
+Reviewed-by: PaX Team <pageexec@freemail.hu>
+Signed-off-by: Kees Cook <keescook@chromium.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+Cc: Serge Hallyn <serge.hallyn@canonical.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/signal.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/signal.c b/kernel/signal.c
+index b0c08874f09b..f15021b867fe 100644
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@ -2664,7 +2664,7 @@ do_send_specific(pid_t tgid, pid_t pid, int sig, struct siginfo *info)
+ 
+ static int do_tkill(pid_t tgid, pid_t pid, int sig)
+ {
+-	struct siginfo info;
++	struct siginfo info = {};
+ 
+ 	info.si_signo = sig;
+ 	info.si_errno = 0;
+-- 
+2.28.0
+
+
+From 7c72cbc040d7160849369d59166f7be32d1991fd Mon Sep 17 00:00:00 2001
+From: Vyacheslav Dubeyko <slava@dubeyko.com>
+Date: Wed, 17 Apr 2013 15:58:33 -0700
+Subject: [PATCH 06/24] hfsplus: fix potential overflow in
+ hfsplus_file_truncate()
+
+commit 12f267a20aecf8b84a2a9069b9011f1661c779b4 upstream.
+
+Change a u32 to loff_t hfsplus_file_truncate().
+
+Signed-off-by: Vyacheslav Dubeyko <slava@dubeyko.com>
+Cc: Christoph Hellwig <hch@infradead.org>
+Cc: Al Viro <viro@zeniv.linux.org.uk>
+Cc: Hin-Tak Leung <htl10@users.sourceforge.net>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/hfsplus/extents.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/fs/hfsplus/extents.c b/fs/hfsplus/extents.c
+index b1991a2a08e0..9d8c087ef4f4 100644
+--- a/fs/hfsplus/extents.c
++++ b/fs/hfsplus/extents.c
+@@ -499,7 +499,7 @@ void hfsplus_file_truncate(struct inode *inode)
+ 		struct address_space *mapping = inode->i_mapping;
+ 		struct page *page;
+ 		void *fsdata;
+-		u32 size = inode->i_size;
++		loff_t size = inode->i_size;
+ 		int res;
+ 
+ 		res = pagecache_write_begin(NULL, mapping, size, 0,
+-- 
+2.28.0
+
+
+From d7709255affba50d2ff4087d28308e03d1154afa Mon Sep 17 00:00:00 2001
+From: Andy Honig <ahonig@google.com>
+Date: Mon, 11 Mar 2013 09:34:52 -0700
+Subject: [PATCH 07/24] KVM: x86: fix for buffer overflow in handling of
+ MSR_KVM_SYSTEM_TIME (CVE-2013-1796)
+
+commit c300aa64ddf57d9c5d9c898a64b36877345dd4a9 upstream.
+
+If the guest sets the GPA of the time_page so that the request to update the
+time straddles a page then KVM will write onto an incorrect page.  The
+write is done byusing kmap atomic to get a pointer to the page for the time
+structure and then performing a memcpy to that page starting at an offset
+that the guest controls.  Well behaved guests always provide a 32-byte aligned
+address, however a malicious guest could use this to corrupt host kernel
+memory.
+
+Tested: Tested against kvmclock unit test.
+
+Signed-off-by: Andrew Honig <ahonig@google.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kvm/x86.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e329dc593441..e525b9e3009f 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1539,6 +1539,11 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ 		/* ...but clean it before doing the actual write */
+ 		vcpu->arch.time_offset = data & ~(PAGE_MASK | 1);
+ 
++		/* Check that the address is 32-byte aligned. */
++		if (vcpu->arch.time_offset &
++				(sizeof(struct pvclock_vcpu_time_info) - 1))
++			break;
++
+ 		vcpu->arch.time_page =
+ 				gfn_to_page(vcpu->kvm, data >> PAGE_SHIFT);
+ 
+-- 
+2.28.0
+
+
+From df0ed3450c217a1cd571c0d4efa4dc6c458894a9 Mon Sep 17 00:00:00 2001
+From: Andy Honig <ahonig@google.com>
+Date: Wed, 20 Feb 2013 14:48:10 -0800
+Subject: [PATCH 08/24] KVM: x86: Convert MSR_KVM_SYSTEM_TIME to use
+ gfn_to_hva_cache functions (CVE-2013-1797)
+
+commit 0b79459b482e85cb7426aa7da683a9f2c97aeae1 upstream.
+
+There is a potential use after free issue with the handling of
+MSR_KVM_SYSTEM_TIME.  If the guest specifies a GPA in a movable or removable
+memory such as frame buffers then KVM might continue to write to that
+address even after it's removed via KVM_SET_USER_MEMORY_REGION.  KVM pins
+the page in memory so it's unlikely to cause an issue, but if the user
+space component re-purposes the memory previously used for the guest, then
+the guest will be able to corrupt that memory.
+
+Tested: Tested against kvmclock unit test
+
+Signed-off-by: Andrew Honig <ahonig@google.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/include/asm/kvm_host.h |  4 ++--
+ arch/x86/kvm/x86.c              | 39 ++++++++++++---------------------
+ 2 files changed, 16 insertions(+), 27 deletions(-)
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index d2ac8e2ee897..1eb45de173cf 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -391,8 +391,8 @@ struct kvm_vcpu_arch {
+ 	gpa_t time;
+ 	struct pvclock_vcpu_time_info hv_clock;
+ 	unsigned int hw_tsc_khz;
+-	unsigned int time_offset;
+-	struct page *time_page;
++	struct gfn_to_hva_cache pv_time;
++	bool pv_time_enabled;
+ 	u64 last_guest_tsc;
+ 	u64 last_kernel_ns;
+ 	u64 last_tsc_nsec;
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index e525b9e3009f..b2d5baf86da6 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1073,7 +1073,6 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
+ {
+ 	unsigned long flags;
+ 	struct kvm_vcpu_arch *vcpu = &v->arch;
+-	void *shared_kaddr;
+ 	unsigned long this_tsc_khz;
+ 	s64 kernel_ns, max_kernel_ns;
+ 	u64 tsc_timestamp;
+@@ -1109,7 +1108,7 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
+ 
+ 	local_irq_restore(flags);
+ 
+-	if (!vcpu->time_page)
++	if (!vcpu->pv_time_enabled)
+ 		return 0;
+ 
+ 	/*
+@@ -1167,14 +1166,9 @@ static int kvm_guest_time_update(struct kvm_vcpu *v)
+ 	 */
+ 	vcpu->hv_clock.version += 2;
+ 
+-	shared_kaddr = kmap_atomic(vcpu->time_page, KM_USER0);
+-
+-	memcpy(shared_kaddr + vcpu->time_offset, &vcpu->hv_clock,
+-	       sizeof(vcpu->hv_clock));
+-
+-	kunmap_atomic(shared_kaddr, KM_USER0);
+-
+-	mark_page_dirty(v->kvm, vcpu->time >> PAGE_SHIFT);
++	kvm_write_guest_cached(v->kvm, &vcpu->pv_time,
++				&vcpu->hv_clock,
++				sizeof(vcpu->hv_clock));
+ 	return 0;
+ }
+ 
+@@ -1464,10 +1458,7 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
+ 
+ static void kvmclock_reset(struct kvm_vcpu *vcpu)
+ {
+-	if (vcpu->arch.time_page) {
+-		kvm_release_page_dirty(vcpu->arch.time_page);
+-		vcpu->arch.time_page = NULL;
+-	}
++	vcpu->arch.pv_time_enabled = false;
+ }
+ 
+ int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+@@ -1527,6 +1518,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ 		break;
+ 	case MSR_KVM_SYSTEM_TIME_NEW:
+ 	case MSR_KVM_SYSTEM_TIME: {
++		u64 gpa_offset;
+ 		kvmclock_reset(vcpu);
+ 
+ 		vcpu->arch.time = data;
+@@ -1536,21 +1528,17 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ 		if (!(data & 1))
+ 			break;
+ 
+-		/* ...but clean it before doing the actual write */
+-		vcpu->arch.time_offset = data & ~(PAGE_MASK | 1);
++		gpa_offset = data & ~(PAGE_MASK | 1);
+ 
+ 		/* Check that the address is 32-byte aligned. */
+-		if (vcpu->arch.time_offset &
+-				(sizeof(struct pvclock_vcpu_time_info) - 1))
++		if (gpa_offset & (sizeof(struct pvclock_vcpu_time_info) - 1))
+ 			break;
+ 
+-		vcpu->arch.time_page =
+-				gfn_to_page(vcpu->kvm, data >> PAGE_SHIFT);
+-
+-		if (is_error_page(vcpu->arch.time_page)) {
+-			kvm_release_page_clean(vcpu->arch.time_page);
+-			vcpu->arch.time_page = NULL;
+-		}
++		if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
++		     &vcpu->arch.pv_time, data & ~1ULL))
++			vcpu->arch.pv_time_enabled = false;
++		else
++			vcpu->arch.pv_time_enabled = true;
+ 		break;
+ 	}
+ 	case MSR_KVM_ASYNC_PF_EN:
+@@ -6257,6 +6245,7 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ 	if (!zalloc_cpumask_var(&vcpu->arch.wbinvd_dirty_mask, GFP_KERNEL))
+ 		goto fail_free_mce_banks;
+ 
++	vcpu->arch.pv_time_enabled = false;
+ 	kvm_async_pf_hash_reset(vcpu);
+ 
+ 	return 0;
+-- 
+2.28.0
+
+
+From 17f13c27702d90899081bf70134132ed5f25158e Mon Sep 17 00:00:00 2001
+From: Andy Honig <ahonig@google.com>
+Date: Wed, 20 Feb 2013 14:49:16 -0800
+Subject: [PATCH 09/24] KVM: Fix bounds checking in ioapic indirect register
+ reads (CVE-2013-1798)
+
+commit a2c118bfab8bc6b8bb213abfc35201e441693d55 upstream.
+
+If the guest specifies a IOAPIC_REG_SELECT with an invalid value and follows
+that with a read of the IOAPIC_REG_WINDOW KVM does not properly validate
+that request.  ioapic_read_indirect contains an
+ASSERT(redir_index < IOAPIC_NUM_PINS), but the ASSERT has no effect in
+non-debug builds.  In recent kernels this allows a guest to cause a kernel
+oops by reading invalid memory.  In older kernels (pre-3.3) this allows a
+guest to read from large ranges of host memory.
+
+Tested: tested against apic unit tests.
+
+Signed-off-by: Andrew Honig <ahonig@google.com>
+Signed-off-by: Marcelo Tosatti <mtosatti@redhat.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ virt/kvm/ioapic.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/virt/kvm/ioapic.c b/virt/kvm/ioapic.c
+index 8df1ca104a7f..e99257ccbe8a 100644
+--- a/virt/kvm/ioapic.c
++++ b/virt/kvm/ioapic.c
+@@ -73,9 +73,12 @@ static unsigned long ioapic_read_indirect(struct kvm_ioapic *ioapic,
+ 			u32 redir_index = (ioapic->ioregsel - 0x10) >> 1;
+ 			u64 redir_content;
+ 
+-			ASSERT(redir_index < IOAPIC_NUM_PINS);
++			if (redir_index < IOAPIC_NUM_PINS)
++				redir_content =
++					ioapic->redirtbl[redir_index].bits;
++			else
++				redir_content = ~0ULL;
+ 
+-			redir_content = ioapic->redirtbl[redir_index].bits;
+ 			result = (ioapic->ioregsel & 0x1) ?
+ 			    (redir_content >> 32) & 0xffffffff :
+ 			    redir_content & 0xffffffff;
+-- 
+2.28.0
+
+
+From d715cdddb8cdf1c17bf1c5ff8fcc9852cd6ba79e Mon Sep 17 00:00:00 2001
+From: Andrew Honig <ahonig@google.com>
+Date: Fri, 29 Mar 2013 09:35:21 -0700
+Subject: [PATCH 10/24] KVM: Allow cross page reads and writes from cached
+ translations.
+
+commit 8f964525a121f2ff2df948dac908dcc65be21b5b upstream.
+
+This patch adds support for kvm_gfn_to_hva_cache_init functions for
+reads and writes that will cross a page.  If the range falls within
+the same memslot, then this will be a fast operation.  If the range
+is split between two memslots, then the slower kvm_read_guest and
+kvm_write_guest are used.
+
+Tested: Test against kvm_clock unit tests.
+
+Signed-off-by: Andrew Honig <ahonig@google.com>
+Signed-off-by: Gleb Natapov <gleb@redhat.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kvm/x86.c        | 10 ++++------
+ include/linux/kvm_host.h  |  2 +-
+ include/linux/kvm_types.h |  1 +
+ virt/kvm/kvm_main.c       | 39 +++++++++++++++++++++++++++++++--------
+ 4 files changed, 37 insertions(+), 15 deletions(-)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b2d5baf86da6..15e79a613723 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1448,7 +1448,8 @@ static int kvm_pv_enable_async_pf(struct kvm_vcpu *vcpu, u64 data)
+ 		return 0;
+ 	}
+ 
+-	if (kvm_gfn_to_hva_cache_init(vcpu->kvm, &vcpu->arch.apf.data, gpa))
++	if (kvm_gfn_to_hva_cache_init(vcpu->kvm, &vcpu->arch.apf.data, gpa,
++					sizeof(u32)))
+ 		return 1;
+ 
+ 	vcpu->arch.apf.send_user_only = !(data & KVM_ASYNC_PF_SEND_ALWAYS);
+@@ -1530,12 +1531,9 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, u32 msr, u64 data)
+ 
+ 		gpa_offset = data & ~(PAGE_MASK | 1);
+ 
+-		/* Check that the address is 32-byte aligned. */
+-		if (gpa_offset & (sizeof(struct pvclock_vcpu_time_info) - 1))
+-			break;
+-
+ 		if (kvm_gfn_to_hva_cache_init(vcpu->kvm,
+-		     &vcpu->arch.pv_time, data & ~1ULL))
++		     &vcpu->arch.pv_time, data & ~1ULL,
++		     sizeof(struct pvclock_vcpu_time_info)))
+ 			vcpu->arch.pv_time_enabled = false;
+ 		else
+ 			vcpu->arch.pv_time_enabled = true;
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 8663a267ae33..8cd0f206dee0 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -388,7 +388,7 @@ int kvm_write_guest(struct kvm *kvm, gpa_t gpa, const void *data,
+ int kvm_write_guest_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 			   void *data, unsigned long len);
+ int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+-			      gpa_t gpa);
++			      gpa_t gpa, unsigned long len);
+ int kvm_clear_guest_page(struct kvm *kvm, gfn_t gfn, int offset, int len);
+ int kvm_clear_guest(struct kvm *kvm, gpa_t gpa, unsigned long len);
+ struct kvm_memory_slot *gfn_to_memslot(struct kvm *kvm, gfn_t gfn);
+diff --git a/include/linux/kvm_types.h b/include/linux/kvm_types.h
+index fa7cc7244cbd..b0bcce0ddc95 100644
+--- a/include/linux/kvm_types.h
++++ b/include/linux/kvm_types.h
+@@ -71,6 +71,7 @@ struct gfn_to_hva_cache {
+ 	u64 generation;
+ 	gpa_t gpa;
+ 	unsigned long hva;
++	unsigned long len;
+ 	struct kvm_memory_slot *memslot;
+ };
+ 
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 88dde44bc07b..caa3bb158d22 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -1375,20 +1375,38 @@ int kvm_write_guest(struct kvm *kvm, gpa_t gpa, const void *data,
+ }
+ 
+ int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+-			      gpa_t gpa)
++			      gpa_t gpa, unsigned long len)
+ {
+ 	struct kvm_memslots *slots = kvm_memslots(kvm);
+ 	int offset = offset_in_page(gpa);
+-	gfn_t gfn = gpa >> PAGE_SHIFT;
++	gfn_t start_gfn = gpa >> PAGE_SHIFT;
++	gfn_t end_gfn = (gpa + len - 1) >> PAGE_SHIFT;
++	gfn_t nr_pages_needed = end_gfn - start_gfn + 1;
++	gfn_t nr_pages_avail;
+ 
+ 	ghc->gpa = gpa;
+ 	ghc->generation = slots->generation;
+-	ghc->memslot = __gfn_to_memslot(slots, gfn);
+-	ghc->hva = gfn_to_hva_many(ghc->memslot, gfn, NULL);
+-	if (!kvm_is_error_hva(ghc->hva))
++	ghc->len = len;
++	ghc->memslot = gfn_to_memslot(kvm, start_gfn);
++	ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn, &nr_pages_avail);
++	if (!kvm_is_error_hva(ghc->hva) && nr_pages_avail >= nr_pages_needed) {
+ 		ghc->hva += offset;
+-	else
+-		return -EFAULT;
++	} else {
++		/*
++		 * If the requested region crosses two memslots, we still
++		 * verify that the entire region is valid here.
++		 */
++		while (start_gfn <= end_gfn) {
++			ghc->memslot = gfn_to_memslot(kvm, start_gfn);
++			ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn,
++						   &nr_pages_avail);
++			if (kvm_is_error_hva(ghc->hva))
++				return -EFAULT;
++			start_gfn += nr_pages_avail;
++		}
++		/* Use the slow path for cross page reads and writes. */
++		ghc->memslot = NULL;
++	}
+ 
+ 	return 0;
+ }
+@@ -1400,8 +1418,13 @@ int kvm_write_guest_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 	struct kvm_memslots *slots = kvm_memslots(kvm);
+ 	int r;
+ 
++	BUG_ON(len > ghc->len);
++
+ 	if (slots->generation != ghc->generation)
+-		kvm_gfn_to_hva_cache_init(kvm, ghc, ghc->gpa);
++		kvm_gfn_to_hva_cache_init(kvm, ghc, ghc->gpa, ghc->len);
++
++	if (unlikely(!ghc->memslot))
++		return kvm_write_guest(kvm, ghc->gpa, data, len);
+ 
+ 	if (kvm_is_error_hva(ghc->hva))
+ 		return -EFAULT;
+-- 
+2.28.0
+
+
+From cef72624c31364e7020450571393a4d5a0e44b34 Mon Sep 17 00:00:00 2001
+From: Illia Ragozin <illia.ragozin@grapecom.com>
+Date: Wed, 10 Apr 2013 19:43:34 +0100
+Subject: [PATCH 11/24] ARM: 7696/1: Fix kexec by setting outer_cache.inv_all
+ for Feroceon
+
+commit cd272d1ea71583170e95dde02c76166c7f9017e6 upstream.
+
+On Feroceon the L2 cache becomes non-coherent with the CPU
+when the L1 caches are disabled. Thus the L2 needs to be invalidated
+after both L1 caches are disabled.
+
+On kexec before the starting the code for relocation the kernel,
+the L1 caches are disabled in cpu_froc_fin (cpu_v7_proc_fin for Feroceon),
+but after L2 cache is never invalidated, because inv_all is not set
+in cache-feroceon-l2.c.
+So kernel relocation and decompression may has (and usually has) errors.
+Setting the function enables L2 invalidation and fixes the issue.
+
+Signed-off-by: Illia Ragozin <illia.ragozin@grapecom.com>
+Acked-by: Jason Cooper <jason@lakedaemon.net>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/mm/cache-feroceon-l2.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm/mm/cache-feroceon-l2.c b/arch/arm/mm/cache-feroceon-l2.c
+index e0b0e7a4ec68..09f885161b3f 100644
+--- a/arch/arm/mm/cache-feroceon-l2.c
++++ b/arch/arm/mm/cache-feroceon-l2.c
+@@ -342,6 +342,7 @@ void __init feroceon_l2_init(int __l2_wt_override)
+ 	outer_cache.inv_range = feroceon_l2_inv_range;
+ 	outer_cache.clean_range = feroceon_l2_clean_range;
+ 	outer_cache.flush_range = feroceon_l2_flush_range;
++	outer_cache.inv_all = l2_inv_all;
+ 
+ 	enable_l2();
+ 
+-- 
+2.28.0
+
+
+From 0a9cb8d371991dceed054aec71541653e330180f Mon Sep 17 00:00:00 2001
+From: Felix Fietkau <nbd@openwrt.org>
+Date: Sun, 7 Apr 2013 21:10:48 +0200
+Subject: [PATCH 12/24] ath9k_htc: accept 1.x firmware newer than 1.3
+
+commit 319e7bd96aca64a478f3aad40711c928405b8b77 upstream.
+
+Since the firmware has been open sourced, the minor version has been
+bumped to 1.4 and the API/ABI will stay compatible across further 1.x
+releases.
+
+Signed-off-by: Felix Fietkau <nbd@openwrt.org>
+Signed-off-by: John W. Linville <linville@tuxdriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/wireless/ath/ath9k/htc_drv_init.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
 diff --git a/drivers/net/wireless/ath/ath9k/htc_drv_init.c b/drivers/net/wireless/ath/ath9k/htc_drv_init.c
-index 61e6d39..4099712 100644
+index 61e6d3950718..409971284bc7 100644
 --- a/drivers/net/wireless/ath/ath9k/htc_drv_init.c
 +++ b/drivers/net/wireless/ath/ath9k/htc_drv_init.c
 @@ -823,7 +823,7 @@ static int ath9k_init_firmware_version(struct ath9k_htc_priv *priv)
@@ -348,8 +867,259 @@ index 61e6d39..4099712 100644
  		dev_err(priv->dev, "ath9k_htc: Please upgrade to FW version %d.%d\n",
  			MAJOR_VERSION_REQ, MINOR_VERSION_REQ);
  		return -EINVAL;
+-- 
+2.28.0
+
+
+From 55aa9556812fe10d71bfe82ff61058a3a03cb0f6 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Mon, 18 Mar 2013 12:22:34 -0700
+Subject: [PATCH 13/24] sched: Convert BUG_ON()s in try_to_wake_up_local() to
+ WARN_ON_ONCE()s
+
+commit 383efcd00053ec40023010ce5034bd702e7ab373 upstream.
+
+try_to_wake_up_local() should only be invoked to wake up another
+task in the same runqueue and BUG_ON()s are used to enforce the
+rule. Missing try_to_wake_up_local() can stall workqueue
+execution but such stalls are likely to be finite either by
+another work item being queued or the one blocked getting
+unblocked.  There's no reason to trigger BUG while holding rq
+lock crashing the whole system.
+
+Convert BUG_ON()s in try_to_wake_up_local() to WARN_ON_ONCE()s.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Acked-by: Steven Rostedt <rostedt@goodmis.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20130318192234.GD3042@htj.dyndns.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/sched.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/sched.c b/kernel/sched.c
+index cd2b7cb638fe..ce2ff4e2993e 100644
+--- a/kernel/sched.c
++++ b/kernel/sched.c
+@@ -2743,8 +2743,10 @@ static void try_to_wake_up_local(struct task_struct *p)
+ {
+ 	struct rq *rq = task_rq(p);
+ 
+-	BUG_ON(rq != this_rq());
+-	BUG_ON(p == current);
++	if (WARN_ON_ONCE(rq != this_rq()) ||
++	    WARN_ON_ONCE(p == current))
++		return;
++
+ 	lockdep_assert_held(&rq->lock);
+ 
+ 	if (!raw_spin_trylock(&p->pi_lock)) {
+-- 
+2.28.0
+
+
+From 0236d37edc0522f37b83eba35432815cd98789ff Mon Sep 17 00:00:00 2001
+From: Mathias Krause <minipli@googlemail.com>
+Date: Sun, 7 Apr 2013 14:05:39 +0200
+Subject: [PATCH 14/24] crypto: algif - suppress sending source address
+ information in recvmsg
+
+commit 72a763d805a48ac8c0bf48fdb510e84c12de51fe upstream.
+
+The current code does not set the msg_namelen member to 0 and therefore
+makes net/socket.c leak the local sockaddr_storage variable to userland
+-- 128 bytes of kernel stack memory. Fix that.
+
+Signed-off-by: Mathias Krause <minipli@googlemail.com>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ crypto/algif_hash.c     | 2 ++
+ crypto/algif_skcipher.c | 1 +
+ 2 files changed, 3 insertions(+)
+
+diff --git a/crypto/algif_hash.c b/crypto/algif_hash.c
+index 62122a1a2f7a..fed2868e504f 100644
+--- a/crypto/algif_hash.c
++++ b/crypto/algif_hash.c
+@@ -159,6 +159,8 @@ static int hash_recvmsg(struct kiocb *unused, struct socket *sock,
+ 	else if (len < ds)
+ 		msg->msg_flags |= MSG_TRUNC;
+ 
++	msg->msg_namelen = 0;
++
+ 	lock_sock(sk);
+ 	if (ctx->more) {
+ 		ctx->more = 0;
+diff --git a/crypto/algif_skcipher.c b/crypto/algif_skcipher.c
+index 6a6dfc062d2a..a1c4f0a55583 100644
+--- a/crypto/algif_skcipher.c
++++ b/crypto/algif_skcipher.c
+@@ -432,6 +432,7 @@ static int skcipher_recvmsg(struct kiocb *unused, struct socket *sock,
+ 	long copied = 0;
+ 
+ 	lock_sock(sk);
++	msg->msg_namelen = 0;
+ 	for (iov = msg->msg_iov, iovlen = msg->msg_iovlen; iovlen > 0;
+ 	     iovlen--, iov++) {
+ 		unsigned long seglen = iov->iov_len;
+-- 
+2.28.0
+
+
+From bb5489176fda28aff304b59e0405f7d7d4906224 Mon Sep 17 00:00:00 2001
+From: Jiri Kosina <jkosina@suse.cz>
+Date: Mon, 22 Apr 2013 15:40:15 +0200
+Subject: [PATCH 15/24] Revert "sysfs: fix race between readdir and lseek"
+
+This reverts commit 991f76f837bf22c5bb07261cfd86525a0a96650c in Linus'
+tree which is f366c8f271888f48e15cc7c0ab70f184c220c8a4 in
+linux-stable.git
+
+It depends on ef3d0fd27e90f ("vfs: do (nearly) lockless generic_file_llseek")
+which is available only in 3.2+.
+
+When applied on 3.0 codebase, it causes A-A deadlock, whenever anyone does
+seek() on sysfs, as both generic_file_llseek() and sysfs_dir_llseek() obtain
+i_mutex.
+
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+Cc: Jiri Slaby <jslaby@suse.cz>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/sysfs/dir.c | 14 +-------------
+ 1 file changed, 1 insertion(+), 13 deletions(-)
+
+diff --git a/fs/sysfs/dir.c b/fs/sysfs/dir.c
+index 7cbc5856feea..3ab78b873376 100644
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -959,21 +959,9 @@ static int sysfs_readdir(struct file * filp, void * dirent, filldir_t filldir)
+ 	return 0;
+ }
+ 
+-static loff_t sysfs_dir_llseek(struct file *file, loff_t offset, int whence)
+-{
+-	struct inode *inode = file->f_path.dentry->d_inode;
+-	loff_t ret;
+-
+-	mutex_lock(&inode->i_mutex);
+-	ret = generic_file_llseek(file, offset, whence);
+-	mutex_unlock(&inode->i_mutex);
+-
+-	return ret;
+-}
+-
+ const struct file_operations sysfs_dir_operations = {
+ 	.read		= generic_read_dir,
+ 	.readdir	= sysfs_readdir,
+ 	.release	= sysfs_dir_release,
+-	.llseek		= sysfs_dir_llseek,
++	.llseek		= generic_file_llseek,
+ };
+-- 
+2.28.0
+
+
+From 456edf57d7a6fe1b238ec708b19063d78cf4b250 Mon Sep 17 00:00:00 2001
+From: Tommi Rantala <tt.rantala@gmail.com>
+Date: Sat, 13 Apr 2013 22:49:14 +0300
+Subject: [PATCH 16/24] perf: Treat attr.config as u64 in perf_swevent_init()
+
+commit 8176cced706b5e5d15887584150764894e94e02f upstream.
+
+Trinity discovered that we fail to check all 64 bits of
+attr.config passed by user space, resulting to out-of-bounds
+access of the perf_swevent_enabled array in
+sw_perf_event_destroy().
+
+Introduced in commit b0a873ebb ("perf: Register PMU
+implementations").
+
+Signed-off-by: Tommi Rantala <tt.rantala@gmail.com>
+Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Cc: davej@redhat.com
+Cc: Paul Mackerras <paulus@samba.org>
+Cc: Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+Link: http://lkml.kernel.org/r/1365882554-30259-1-git-send-email-tt.rantala@gmail.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/events/core.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 7b344be88637..b5826507d1e9 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -5440,7 +5440,7 @@ static void sw_perf_event_destroy(struct perf_event *event)
+ 
+ static int perf_swevent_init(struct perf_event *event)
+ {
+-	int event_id = event->attr.config;
++	u64 event_id = event->attr.config;
+ 
+ 	if (event->attr.type != PERF_TYPE_SOFTWARE)
+ 		return -ENOENT;
+-- 
+2.28.0
+
+
+From 22fd0f0bb5e791b7cd5b5e0c7d4c2172c722844d Mon Sep 17 00:00:00 2001
+From: Dave Airlie <airlied@gmail.com>
+Date: Fri, 25 Jan 2013 11:38:56 +1000
+Subject: [PATCH 17/24] fbcon: fix locking harder
+
+commit 054430e773c9a1e26f38e30156eff02dedfffc17 upstream.
+
+Okay so Alan's patch handled the case where there was no registered fbcon,
+however the other path entered in set_con2fb_map pit.
+
+In there we called fbcon_takeover, but we also took the console lock in a couple
+of places. So push the console lock out to the callers of set_con2fb_map,
+
+this means fbmem and switcheroo needed to take the lock around the fb notifier
+entry points that lead to this.
+
+This should fix the efifb regression seen by Maarten.
+
+Tested-by: Maarten Lankhorst <maarten.lankhorst@canonical.com>
+Tested-by: Lu Hua <huax.lu@intel.com>
+Signed-off-by: Dave Airlie <airlied@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/vga/vga_switcheroo.c |  3 +++
+ drivers/video/console/fbcon.c    | 11 ++++++++---
+ drivers/video/fbmem.c            |  2 ++
+ 3 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/vga/vga_switcheroo.c b/drivers/gpu/vga/vga_switcheroo.c
+index 58434e804d91..37fe2463f9b0 100644
+--- a/drivers/gpu/vga/vga_switcheroo.c
++++ b/drivers/gpu/vga/vga_switcheroo.c
+@@ -26,6 +26,7 @@
+ #include <linux/fb.h>
+ 
+ #include <linux/pci.h>
++#include <linux/console.h>
+ #include <linux/vga_switcheroo.h>
+ 
+ struct vga_switcheroo_client {
+@@ -256,8 +257,10 @@ static int vga_switchto_stage2(struct vga_switcheroo_client *new_client)
+ 
+ 	if (new_client->fb_info) {
+ 		struct fb_event event;
++		console_lock();
+ 		event.info = new_client->fb_info;
+ 		fb_notifier_call_chain(FB_EVENT_REMAP_ALL_CONSOLE, &event);
++		console_unlock();
+ 	}
+ 
+ 	ret = vgasr_priv.handler->switchto(new_client->id);
 diff --git a/drivers/video/console/fbcon.c b/drivers/video/console/fbcon.c
-index 9b8bcab..7a36dff 100644
+index 9b8bcab0ae32..7a36dffb9573 100644
 --- a/drivers/video/console/fbcon.c
 +++ b/drivers/video/console/fbcon.c
 @@ -843,6 +843,8 @@ static void con2fb_init_display(struct vc_data *vc, struct fb_info *info,
@@ -427,7 +1197,7 @@ index 9b8bcab..7a36dff 100644
  		ret = set_con2fb_map(con2fb->console - 1,
  				     con2fb->framebuffer, 1);
 diff --git a/drivers/video/fbmem.c b/drivers/video/fbmem.c
-index c133dde..0a22808 100644
+index c133dde79cd3..babbb07f0302 100644
 --- a/drivers/video/fbmem.c
 +++ b/drivers/video/fbmem.c
 @@ -1154,8 +1154,10 @@ static long do_fb_ioctl(struct fb_info *info, unsigned int cmd,
@@ -441,7 +1211,193 @@ index c133dde..0a22808 100644
  		unlock_fb_info(info);
  		break;
  	case FBIOBLANK:
-@@ -1348,15 +1350,12 @@ fb_mmap(struct file *file, struct vm_area_struct * vma)
+-- 
+2.28.0
+
+
+From d1a01d18320e37367e23f006f0dfbd74ff32de68 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Tue, 16 Apr 2013 13:45:37 -0700
+Subject: [PATCH 18/24] vm: add vm_iomap_memory() helper function
+
+commit b4cbb197c7e7a68dbad0d491242e3ca67420c13e upstream.
+
+Various drivers end up replicating the code to mmap() their memory
+buffers into user space, and our core memory remapping function may be
+very flexible but it is unnecessarily complicated for the common cases
+to use.
+
+Our internal VM uses pfn's ("page frame numbers") which simplifies
+things for the VM, and allows us to pass physical addresses around in a
+denser and more efficient format than passing a "phys_addr_t" around,
+and having to shift it up and down by the page size.  But it just means
+that drivers end up doing that shifting instead at the interface level.
+
+It also means that drivers end up mucking around with internal VM things
+like the vma details (vm_pgoff, vm_start/end) way more than they really
+need to.
+
+So this just exports a function to map a certain physical memory range
+into user space (using a phys_addr_t based interface that is much more
+natural for a driver) and hides all the complexity from the driver.
+Some drivers will still end up tweaking the vm_page_prot details for
+things like prefetching or cacheability etc, but that's actually
+relevant to the driver, rather than caring about what the page offset of
+the mapping is into the particular IO memory region.
+
+Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+---
+ include/linux/mm.h |  2 ++
+ mm/memory.c        | 47 ++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+)
+
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index 18eea056b47d..f6e0b4bd1862 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -1542,6 +1542,8 @@ int vm_insert_pfn(struct vm_area_struct *vma, unsigned long addr,
+ 			unsigned long pfn);
+ int vm_insert_mixed(struct vm_area_struct *vma, unsigned long addr,
+ 			unsigned long pfn);
++int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long len);
++
+ 
+ struct page *follow_page(struct vm_area_struct *, unsigned long address,
+ 			unsigned int foll_flags);
+diff --git a/mm/memory.c b/mm/memory.c
+index 4da0f8ad1427..ac8d3a146805 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2317,6 +2317,53 @@ int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
+ }
+ EXPORT_SYMBOL(remap_pfn_range);
+ 
++/**
++ * vm_iomap_memory - remap memory to userspace
++ * @vma: user vma to map to
++ * @start: start of area
++ * @len: size of area
++ *
++ * This is a simplified io_remap_pfn_range() for common driver use. The
++ * driver just needs to give us the physical memory range to be mapped,
++ * we'll figure out the rest from the vma information.
++ *
++ * NOTE! Some drivers might want to tweak vma->vm_page_prot first to get
++ * whatever write-combining details or similar.
++ */
++int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long len)
++{
++	unsigned long vm_len, pfn, pages;
++
++	/* Check that the physical memory area passed in looks valid */
++	if (start + len < start)
++		return -EINVAL;
++	/*
++	 * You *really* shouldn't map things that aren't page-aligned,
++	 * but we've historically allowed it because IO memory might
++	 * just have smaller alignment.
++	 */
++	len += start & ~PAGE_MASK;
++	pfn = start >> PAGE_SHIFT;
++	pages = (len + ~PAGE_MASK) >> PAGE_SHIFT;
++	if (pfn + pages < pfn)
++		return -EINVAL;
++
++	/* We start the mapping 'vm_pgoff' pages into the area */
++	if (vma->vm_pgoff > pages)
++		return -EINVAL;
++	pfn += vma->vm_pgoff;
++	pages -= vma->vm_pgoff;
++
++	/* Can we fit all of the mapping? */
++	vm_len = vma->vm_end - vma->vm_start;
++	if (vm_len >> PAGE_SHIFT > pages)
++		return -EINVAL;
++
++	/* Ok, let it rip */
++	return io_remap_pfn_range(vma, vma->vm_start, pfn, vm_len, vma->vm_page_prot);
++}
++EXPORT_SYMBOL(vm_iomap_memory);
++
+ static int apply_to_pte_range(struct mm_struct *mm, pmd_t *pmd,
+ 				     unsigned long addr, unsigned long end,
+ 				     pte_fn_t fn, void *data)
+-- 
+2.28.0
+
+
+From 69c8dbb74ce747df83ad81ba73db965d7a716726 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Fri, 19 Apr 2013 10:01:04 -0700
+Subject: [PATCH 19/24] vm: convert snd_pcm_lib_mmap_iomem() to
+ vm_iomap_memory() helper
+
+commit 0fe09a45c4848b5b5607b968d959fdc1821c161d upstream.
+
+This is my example conversion of a few existing mmap users.  The pcm
+mmap case is one of the more straightforward ones.
+
+Acked-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ sound/core/pcm_native.c | 12 ++----------
+ 1 file changed, 2 insertions(+), 10 deletions(-)
+
+diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
+index 7393551a8c47..fbec3f514f21 100644
+--- a/sound/core/pcm_native.c
++++ b/sound/core/pcm_native.c
+@@ -3208,18 +3208,10 @@ static int snd_pcm_default_mmap(struct snd_pcm_substream *substream,
+ int snd_pcm_lib_mmap_iomem(struct snd_pcm_substream *substream,
+ 			   struct vm_area_struct *area)
+ {
+-	long size;
+-	unsigned long offset;
++	struct snd_pcm_runtime *runtime = substream->runtime;;
+ 
+ 	area->vm_page_prot = pgprot_noncached(area->vm_page_prot);
+-	area->vm_flags |= VM_IO;
+-	size = area->vm_end - area->vm_start;
+-	offset = area->vm_pgoff << PAGE_SHIFT;
+-	if (io_remap_pfn_range(area, area->vm_start,
+-				(substream->runtime->dma_addr + offset) >> PAGE_SHIFT,
+-				size, area->vm_page_prot))
+-		return -EAGAIN;
+-	return 0;
++	return vm_iomap_memory(area, runtime->dma_addr, runtime->dma_bytes);
+ }
+ 
+ EXPORT_SYMBOL(snd_pcm_lib_mmap_iomem);
+-- 
+2.28.0
+
+
+From 03a850de03bfed25270d20918ee02d9f0dbb1f21 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Fri, 19 Apr 2013 09:57:35 -0700
+Subject: [PATCH 20/24] vm: convert fb_mmap to vm_iomap_memory() helper
+
+commit fc9bbca8f650e5f738af8806317c0a041a48ae4a upstream.
+
+This is my example conversion of a few existing mmap users.  The
+fb_mmap() case is a good example because it is a bit more complicated
+than some: fb_mmap() mmaps one of two different memory areas depending
+on the page offset of the mmap (but happily there is never any mixing of
+the two, so the helper function still works).
+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/video/fbmem.c | 40 ++++++++++++++--------------------------
+ 1 file changed, 14 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/video/fbmem.c b/drivers/video/fbmem.c
+index babbb07f0302..0a22808229d6 100644
+--- a/drivers/video/fbmem.c
++++ b/drivers/video/fbmem.c
+@@ -1350,15 +1350,12 @@ fb_mmap(struct file *file, struct vm_area_struct * vma)
  {
  	struct fb_info *info = file_fb_info(file);
  	struct fb_ops *fb;
@@ -458,7 +1414,7 @@ index c133dde..0a22808 100644
  	fb = info->fbops;
  	if (!fb)
  		return -ENODEV;
-@@ -1368,33 +1367,24 @@ fb_mmap(struct file *file, struct vm_area_struct * vma)
+@@ -1370,33 +1367,24 @@ fb_mmap(struct file *file, struct vm_area_struct * vma)
  		return res;
  	}
  
@@ -505,8 +1461,167 @@ index c133dde..0a22808 100644
  }
  
  static int
+-- 
+2.28.0
+
+
+From 102fe50d961cf56eb764959783485193884ab1e6 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Fri, 19 Apr 2013 09:46:39 -0700
+Subject: [PATCH 21/24] vm: convert HPET mmap to vm_iomap_memory() helper
+
+commit 2323036dfec8ce3ce6e1c86a49a31b039f3300d1 upstream.
+
+This is my example conversion of a few existing mmap users.  The HPET
+case is simple, widely available, and easy to test (Clemens Ladisch sent
+a trivial test-program for it).
+
+Test-program-by: Clemens Ladisch <clemens@ladisch.de>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/char/hpet.c | 14 +-------------
+ 1 file changed, 1 insertion(+), 13 deletions(-)
+
+diff --git a/drivers/char/hpet.c b/drivers/char/hpet.c
+index 34d6a1cab8de..853f8e89df37 100644
+--- a/drivers/char/hpet.c
++++ b/drivers/char/hpet.c
+@@ -374,26 +374,14 @@ static int hpet_mmap(struct file *file, struct vm_area_struct *vma)
+ 	struct hpet_dev *devp;
+ 	unsigned long addr;
+ 
+-	if (((vma->vm_end - vma->vm_start) != PAGE_SIZE) || vma->vm_pgoff)
+-		return -EINVAL;
+-
+ 	devp = file->private_data;
+ 	addr = devp->hd_hpets->hp_hpet_phys;
+ 
+ 	if (addr & (PAGE_SIZE - 1))
+ 		return -ENOSYS;
+ 
+-	vma->vm_flags |= VM_IO;
+ 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+-
+-	if (io_remap_pfn_range(vma, vma->vm_start, addr >> PAGE_SHIFT,
+-					PAGE_SIZE, vma->vm_page_prot)) {
+-		printk(KERN_ERR "%s: io_remap_pfn_range failed\n",
+-			__func__);
+-		return -EAGAIN;
+-	}
+-
+-	return 0;
++	return vm_iomap_memory(vma, addr, PAGE_SIZE);
+ #else
+ 	return -ENOSYS;
+ #endif
+-- 
+2.28.0
+
+
+From 856398d852436111d5cdbf30374f576671903998 Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Fri, 19 Apr 2013 09:53:07 -0700
+Subject: [PATCH 22/24] vm: convert mtdchar mmap to vm_iomap_memory() helper
+
+commit 8558e4a26b00225efeb085725bc319f91201b239 upstream.
+
+This is my example conversion of a few existing mmap users.  The mtdchar
+case is actually disabled right now (and stays disabled), but I did it
+because it showed up on my "git grep", and I was familiar with the code
+due to fixing an overflow problem in the code in commit 9c603e53d380
+("mtdchar: fix offset overflow detection").
+
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mtd/mtdchar.c | 32 ++------------------------------
+ 1 file changed, 2 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/mtd/mtdchar.c b/drivers/mtd/mtdchar.c
+index 9892dcc8fc01..72b788e738ee 100644
+--- a/drivers/mtd/mtdchar.c
++++ b/drivers/mtd/mtdchar.c
+@@ -1100,45 +1100,17 @@ static int mtd_mmap(struct file *file, struct vm_area_struct *vma)
+ 	struct mtd_file_info *mfi = file->private_data;
+ 	struct mtd_info *mtd = mfi->mtd;
+ 	struct map_info *map = mtd->priv;
+-	resource_size_t start, off;
+-	unsigned long len, vma_len;
+ 
+         /* This is broken because it assumes the MTD device is map-based
+ 	   and that mtd->priv is a valid struct map_info.  It should be
+ 	   replaced with something that uses the mtd_get_unmapped_area()
+ 	   operation properly. */
+ 	if (0 /*mtd->type == MTD_RAM || mtd->type == MTD_ROM*/) {
+-		off = get_vm_offset(vma);
+-		start = map->phys;
+-		len = PAGE_ALIGN((start & ~PAGE_MASK) + map->size);
+-		start &= PAGE_MASK;
+-		vma_len = get_vm_size(vma);
+-
+-		/* Overflow in off+len? */
+-		if (vma_len + off < off)
+-			return -EINVAL;
+-		/* Does it fit in the mapping? */
+-		if (vma_len + off > len)
+-			return -EINVAL;
+-
+-		off += start;
+-		/* Did that overflow? */
+-		if (off < start)
+-			return -EINVAL;
+-		if (set_vm_offset(vma, off) < 0)
+-			return -EINVAL;
+-		vma->vm_flags |= VM_IO | VM_RESERVED;
+-
+ #ifdef pgprot_noncached
+-		if (file->f_flags & O_DSYNC || off >= __pa(high_memory))
++		if (file->f_flags & O_DSYNC || map->phys >= __pa(high_memory))
+ 			vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+ #endif
+-		if (io_remap_pfn_range(vma, vma->vm_start, off >> PAGE_SHIFT,
+-				       vma->vm_end - vma->vm_start,
+-				       vma->vm_page_prot))
+-			return -EAGAIN;
+-
+-		return 0;
++		return vm_iomap_memory(vma, map->phys, map->size);
+ 	}
+ 	return -ENOSYS;
+ #else
+-- 
+2.28.0
+
+
+From 7a860c4dfb8ebaf777a7df185df4436ea343189a Mon Sep 17 00:00:00 2001
+From: Josef Bacik <jbacik@fusionio.com>
+Date: Fri, 5 Apr 2013 20:50:09 +0000
+Subject: [PATCH 23/24] Btrfs: make sure nbytes are right after log replay
+
+commit 4bc4bee4595662d8bff92180d5c32e3313a704b0 upstream.
+
+While trying to track down a tree log replay bug I noticed that fsck was always
+complaining about nbytes not being right for our fsynced file.  That is because
+the new fsync stuff doesn't wait for ordered extents to complete, so the inodes
+nbytes are not necessarily updated properly when we log it.  So to fix this we
+need to set nbytes to whatever it is on the inode that is on disk, so when we
+replay the extents we can just add the bytes that are being added as we replay
+the extent.  This makes it work for the case that we have the wrong nbytes or
+the case that we logged everything and nbytes is actually correct.  With this
+I'm no longer getting nbytes errors out of btrfsck.
+
+Signed-off-by: Josef Bacik <jbacik@fusionio.com>
+Signed-off-by: Chris Mason <chris.mason@fusionio.com>
+Signed-off-by: Lingzhu Xiang <lxiang@redhat.com>
+Reviewed-by: CAI Qian <caiqian@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/btrfs/tree-log.c | 48 +++++++++++++++++++++++++++++++++++++++------
+ 1 file changed, 42 insertions(+), 6 deletions(-)
+
 diff --git a/fs/btrfs/tree-log.c b/fs/btrfs/tree-log.c
-index faf7d0b..88dec16 100644
+index faf7d0bc0a01..88dec16d0b15 100644
 --- a/fs/btrfs/tree-log.c
 +++ b/fs/btrfs/tree-log.c
 @@ -315,6 +315,7 @@ static noinline int overwrite_item(struct btrfs_trans_handle *trans,
@@ -607,367 +1722,31 @@ index faf7d0b..88dec16 100644
  	btrfs_update_inode(trans, root, inode);
  out:
  	if (inode)
-diff --git a/fs/hfsplus/extents.c b/fs/hfsplus/extents.c
-index b1991a2..9d8c087 100644
---- a/fs/hfsplus/extents.c
-+++ b/fs/hfsplus/extents.c
-@@ -499,7 +499,7 @@ void hfsplus_file_truncate(struct inode *inode)
- 		struct address_space *mapping = inode->i_mapping;
- 		struct page *page;
- 		void *fsdata;
--		u32 size = inode->i_size;
-+		loff_t size = inode->i_size;
- 		int res;
+-- 
+2.28.0
+
+
+From b47833937231eebab2fe46502426ea8158fae8d9 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Thu, 25 Apr 2013 21:24:11 -0700
+Subject: [PATCH 24/24] Linux 3.0.75
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 71e8efa47ae2..30ad2fed0b7a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 0
+-SUBLEVEL = 74
++SUBLEVEL = 75
+ EXTRAVERSION =
+ NAME = Sneaky Weasel
  
- 		res = pagecache_write_begin(NULL, mapping, size, 0,
-diff --git a/fs/sysfs/dir.c b/fs/sysfs/dir.c
-index 7cbc585..3ab78b8 100644
---- a/fs/sysfs/dir.c
-+++ b/fs/sysfs/dir.c
-@@ -959,21 +959,9 @@ static int sysfs_readdir(struct file * filp, void * dirent, filldir_t filldir)
- 	return 0;
- }
- 
--static loff_t sysfs_dir_llseek(struct file *file, loff_t offset, int whence)
--{
--	struct inode *inode = file->f_path.dentry->d_inode;
--	loff_t ret;
--
--	mutex_lock(&inode->i_mutex);
--	ret = generic_file_llseek(file, offset, whence);
--	mutex_unlock(&inode->i_mutex);
--
--	return ret;
--}
--
- const struct file_operations sysfs_dir_operations = {
- 	.read		= generic_read_dir,
- 	.readdir	= sysfs_readdir,
- 	.release	= sysfs_dir_release,
--	.llseek		= sysfs_dir_llseek,
-+	.llseek		= generic_file_llseek,
- };
-diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
-index 8663a26..8cd0f20 100644
---- a/include/linux/kvm_host.h
-+++ b/include/linux/kvm_host.h
-@@ -388,7 +388,7 @@ int kvm_write_guest(struct kvm *kvm, gpa_t gpa, const void *data,
- int kvm_write_guest_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
- 			   void *data, unsigned long len);
- int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
--			      gpa_t gpa);
-+			      gpa_t gpa, unsigned long len);
- int kvm_clear_guest_page(struct kvm *kvm, gfn_t gfn, int offset, int len);
- int kvm_clear_guest(struct kvm *kvm, gpa_t gpa, unsigned long len);
- struct kvm_memory_slot *gfn_to_memslot(struct kvm *kvm, gfn_t gfn);
-diff --git a/include/linux/kvm_types.h b/include/linux/kvm_types.h
-index fa7cc72..b0bcce0 100644
---- a/include/linux/kvm_types.h
-+++ b/include/linux/kvm_types.h
-@@ -71,6 +71,7 @@ struct gfn_to_hva_cache {
- 	u64 generation;
- 	gpa_t gpa;
- 	unsigned long hva;
-+	unsigned long len;
- 	struct kvm_memory_slot *memslot;
- };
- 
-diff --git a/include/linux/mm.h b/include/linux/mm.h
-index 18eea05..f6e0b4b 100644
---- a/include/linux/mm.h
-+++ b/include/linux/mm.h
-@@ -1542,6 +1542,8 @@ int vm_insert_pfn(struct vm_area_struct *vma, unsigned long addr,
- 			unsigned long pfn);
- int vm_insert_mixed(struct vm_area_struct *vma, unsigned long addr,
- 			unsigned long pfn);
-+int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long len);
-+
- 
- struct page *follow_page(struct vm_area_struct *, unsigned long address,
- 			unsigned int foll_flags);
-diff --git a/kernel/events/core.c b/kernel/events/core.c
-index 7b344be..b582650 100644
---- a/kernel/events/core.c
-+++ b/kernel/events/core.c
-@@ -5440,7 +5440,7 @@ static void sw_perf_event_destroy(struct perf_event *event)
- 
- static int perf_swevent_init(struct perf_event *event)
- {
--	int event_id = event->attr.config;
-+	u64 event_id = event->attr.config;
- 
- 	if (event->attr.type != PERF_TYPE_SOFTWARE)
- 		return -ENOENT;
-diff --git a/kernel/hrtimer.c b/kernel/hrtimer.c
-index e079c3e..3c5a22f 100644
---- a/kernel/hrtimer.c
-+++ b/kernel/hrtimer.c
-@@ -61,6 +61,7 @@
- DEFINE_PER_CPU(struct hrtimer_cpu_base, hrtimer_bases) =
- {
- 
-+	.lock = __RAW_SPIN_LOCK_UNLOCKED(hrtimer_bases.lock),
- 	.clock_base =
- 	{
- 		{
-@@ -1640,8 +1641,6 @@ static void __cpuinit init_hrtimers_cpu(int cpu)
- 	struct hrtimer_cpu_base *cpu_base = &per_cpu(hrtimer_bases, cpu);
- 	int i;
- 
--	raw_spin_lock_init(&cpu_base->lock);
--
- 	for (i = 0; i < HRTIMER_MAX_CLOCK_BASES; i++) {
- 		cpu_base->clock_base[i].cpu_base = cpu_base;
- 		timerqueue_init_head(&cpu_base->clock_base[i].active);
-diff --git a/kernel/sched.c b/kernel/sched.c
-index cd2b7cb..ce2ff4e 100644
---- a/kernel/sched.c
-+++ b/kernel/sched.c
-@@ -2743,8 +2743,10 @@ static void try_to_wake_up_local(struct task_struct *p)
- {
- 	struct rq *rq = task_rq(p);
- 
--	BUG_ON(rq != this_rq());
--	BUG_ON(p == current);
-+	if (WARN_ON_ONCE(rq != this_rq()) ||
-+	    WARN_ON_ONCE(p == current))
-+		return;
-+
- 	lockdep_assert_held(&rq->lock);
- 
- 	if (!raw_spin_trylock(&p->pi_lock)) {
-diff --git a/kernel/signal.c b/kernel/signal.c
-index b0c0887..f15021b8 100644
---- a/kernel/signal.c
-+++ b/kernel/signal.c
-@@ -2664,7 +2664,7 @@ do_send_specific(pid_t tgid, pid_t pid, int sig, struct siginfo *info)
- 
- static int do_tkill(pid_t tgid, pid_t pid, int sig)
- {
--	struct siginfo info;
-+	struct siginfo info = {};
- 
- 	info.si_signo = sig;
- 	info.si_errno = 0;
-diff --git a/mm/hugetlb.c b/mm/hugetlb.c
-index 2c56a53..14420dd 100644
---- a/mm/hugetlb.c
-+++ b/mm/hugetlb.c
-@@ -2800,7 +2800,17 @@ int follow_hugetlb_page(struct mm_struct *mm, struct vm_area_struct *vma,
- 			break;
- 		}
- 
--		if (absent ||
-+		/*
-+		 * We need call hugetlb_fault for both hugepages under migration
-+		 * (in which case hugetlb_fault waits for the migration,) and
-+		 * hwpoisoned hugepages (in which case we need to prevent the
-+		 * caller from accessing to them.) In order to do this, we use
-+		 * here is_swap_pte instead of is_hugetlb_entry_migration and
-+		 * is_hugetlb_entry_hwpoisoned. This is because it simply covers
-+		 * both cases, and because we can't follow correct pages
-+		 * directly from any kind of swap entries.
-+		 */
-+		if (absent || is_swap_pte(huge_ptep_get(pte)) ||
- 		    ((flags & FOLL_WRITE) && !pte_write(huge_ptep_get(pte)))) {
- 			int ret;
- 
-diff --git a/mm/memory.c b/mm/memory.c
-index 4da0f8a..ac8d3a1 100644
---- a/mm/memory.c
-+++ b/mm/memory.c
-@@ -2317,6 +2317,53 @@ int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr,
- }
- EXPORT_SYMBOL(remap_pfn_range);
- 
-+/**
-+ * vm_iomap_memory - remap memory to userspace
-+ * @vma: user vma to map to
-+ * @start: start of area
-+ * @len: size of area
-+ *
-+ * This is a simplified io_remap_pfn_range() for common driver use. The
-+ * driver just needs to give us the physical memory range to be mapped,
-+ * we'll figure out the rest from the vma information.
-+ *
-+ * NOTE! Some drivers might want to tweak vma->vm_page_prot first to get
-+ * whatever write-combining details or similar.
-+ */
-+int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long len)
-+{
-+	unsigned long vm_len, pfn, pages;
-+
-+	/* Check that the physical memory area passed in looks valid */
-+	if (start + len < start)
-+		return -EINVAL;
-+	/*
-+	 * You *really* shouldn't map things that aren't page-aligned,
-+	 * but we've historically allowed it because IO memory might
-+	 * just have smaller alignment.
-+	 */
-+	len += start & ~PAGE_MASK;
-+	pfn = start >> PAGE_SHIFT;
-+	pages = (len + ~PAGE_MASK) >> PAGE_SHIFT;
-+	if (pfn + pages < pfn)
-+		return -EINVAL;
-+
-+	/* We start the mapping 'vm_pgoff' pages into the area */
-+	if (vma->vm_pgoff > pages)
-+		return -EINVAL;
-+	pfn += vma->vm_pgoff;
-+	pages -= vma->vm_pgoff;
-+
-+	/* Can we fit all of the mapping? */
-+	vm_len = vma->vm_end - vma->vm_start;
-+	if (vm_len >> PAGE_SHIFT > pages)
-+		return -EINVAL;
-+
-+	/* Ok, let it rip */
-+	return io_remap_pfn_range(vma, vma->vm_start, pfn, vm_len, vma->vm_page_prot);
-+}
-+EXPORT_SYMBOL(vm_iomap_memory);
-+
- static int apply_to_pte_range(struct mm_struct *mm, pmd_t *pmd,
- 				     unsigned long addr, unsigned long end,
- 				     pte_fn_t fn, void *data)
-diff --git a/net/8021q/vlan.c b/net/8021q/vlan.c
-index 1e93a91..917ecb9 100644
---- a/net/8021q/vlan.c
-+++ b/net/8021q/vlan.c
-@@ -108,6 +108,13 @@ void unregister_vlan_dev(struct net_device *dev, struct list_head *head)
- 	grp = rtnl_dereference(real_dev->vlgrp);
- 	BUG_ON(!grp);
- 
-+	/* Take it out of our own structures, but be sure to interlock with
-+	 * HW accelerating devices or SW vlan input packet processing if
-+	 * VLAN is not 0 (leave it there for 802.1p).
-+	 */
-+	if (vlan_id && (real_dev->features & NETIF_F_HW_VLAN_FILTER))
-+		ops->ndo_vlan_rx_kill_vid(real_dev, vlan_id);
-+
- 	grp->nr_vlans--;
- 
- 	if (vlan->flags & VLAN_FLAG_GVRP)
-@@ -132,13 +139,6 @@ void unregister_vlan_dev(struct net_device *dev, struct list_head *head)
- 		call_rcu(&grp->rcu, vlan_rcu_free);
- 	}
- 
--	/* Take it out of our own structures, but be sure to interlock with
--	 * HW accelerating devices or SW vlan input packet processing if
--	 * VLAN is not 0 (leave it there for 802.1p).
--	 */
--	if (vlan_id && (real_dev->features & NETIF_F_HW_VLAN_FILTER))
--		ops->ndo_vlan_rx_kill_vid(real_dev, vlan_id);
--
- 	/* Get rid of the vlan's reference to real_dev */
- 	dev_put(real_dev);
- }
-diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
-index 7393551..fbec3f5 100644
---- a/sound/core/pcm_native.c
-+++ b/sound/core/pcm_native.c
-@@ -3208,18 +3208,10 @@ static int snd_pcm_default_mmap(struct snd_pcm_substream *substream,
- int snd_pcm_lib_mmap_iomem(struct snd_pcm_substream *substream,
- 			   struct vm_area_struct *area)
- {
--	long size;
--	unsigned long offset;
-+	struct snd_pcm_runtime *runtime = substream->runtime;;
- 
- 	area->vm_page_prot = pgprot_noncached(area->vm_page_prot);
--	area->vm_flags |= VM_IO;
--	size = area->vm_end - area->vm_start;
--	offset = area->vm_pgoff << PAGE_SHIFT;
--	if (io_remap_pfn_range(area, area->vm_start,
--				(substream->runtime->dma_addr + offset) >> PAGE_SHIFT,
--				size, area->vm_page_prot))
--		return -EAGAIN;
--	return 0;
-+	return vm_iomap_memory(area, runtime->dma_addr, runtime->dma_bytes);
- }
- 
- EXPORT_SYMBOL(snd_pcm_lib_mmap_iomem);
-diff --git a/virt/kvm/ioapic.c b/virt/kvm/ioapic.c
-index 8df1ca1..e99257c 100644
---- a/virt/kvm/ioapic.c
-+++ b/virt/kvm/ioapic.c
-@@ -73,9 +73,12 @@ static unsigned long ioapic_read_indirect(struct kvm_ioapic *ioapic,
- 			u32 redir_index = (ioapic->ioregsel - 0x10) >> 1;
- 			u64 redir_content;
- 
--			ASSERT(redir_index < IOAPIC_NUM_PINS);
-+			if (redir_index < IOAPIC_NUM_PINS)
-+				redir_content =
-+					ioapic->redirtbl[redir_index].bits;
-+			else
-+				redir_content = ~0ULL;
- 
--			redir_content = ioapic->redirtbl[redir_index].bits;
- 			result = (ioapic->ioregsel & 0x1) ?
- 			    (redir_content >> 32) & 0xffffffff :
- 			    redir_content & 0xffffffff;
-diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
-index 88dde44..caa3bb1 100644
---- a/virt/kvm/kvm_main.c
-+++ b/virt/kvm/kvm_main.c
-@@ -1375,20 +1375,38 @@ int kvm_write_guest(struct kvm *kvm, gpa_t gpa, const void *data,
- }
- 
- int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
--			      gpa_t gpa)
-+			      gpa_t gpa, unsigned long len)
- {
- 	struct kvm_memslots *slots = kvm_memslots(kvm);
- 	int offset = offset_in_page(gpa);
--	gfn_t gfn = gpa >> PAGE_SHIFT;
-+	gfn_t start_gfn = gpa >> PAGE_SHIFT;
-+	gfn_t end_gfn = (gpa + len - 1) >> PAGE_SHIFT;
-+	gfn_t nr_pages_needed = end_gfn - start_gfn + 1;
-+	gfn_t nr_pages_avail;
- 
- 	ghc->gpa = gpa;
- 	ghc->generation = slots->generation;
--	ghc->memslot = __gfn_to_memslot(slots, gfn);
--	ghc->hva = gfn_to_hva_many(ghc->memslot, gfn, NULL);
--	if (!kvm_is_error_hva(ghc->hva))
-+	ghc->len = len;
-+	ghc->memslot = gfn_to_memslot(kvm, start_gfn);
-+	ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn, &nr_pages_avail);
-+	if (!kvm_is_error_hva(ghc->hva) && nr_pages_avail >= nr_pages_needed) {
- 		ghc->hva += offset;
--	else
--		return -EFAULT;
-+	} else {
-+		/*
-+		 * If the requested region crosses two memslots, we still
-+		 * verify that the entire region is valid here.
-+		 */
-+		while (start_gfn <= end_gfn) {
-+			ghc->memslot = gfn_to_memslot(kvm, start_gfn);
-+			ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn,
-+						   &nr_pages_avail);
-+			if (kvm_is_error_hva(ghc->hva))
-+				return -EFAULT;
-+			start_gfn += nr_pages_avail;
-+		}
-+		/* Use the slow path for cross page reads and writes. */
-+		ghc->memslot = NULL;
-+	}
- 
- 	return 0;
- }
-@@ -1400,8 +1418,13 @@ int kvm_write_guest_cached(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
- 	struct kvm_memslots *slots = kvm_memslots(kvm);
- 	int r;
- 
-+	BUG_ON(len > ghc->len);
-+
- 	if (slots->generation != ghc->generation)
--		kvm_gfn_to_hva_cache_init(kvm, ghc, ghc->gpa);
-+		kvm_gfn_to_hva_cache_init(kvm, ghc, ghc->gpa, ghc->len);
-+
-+	if (unlikely(!ghc->memslot))
-+		return kvm_write_guest(kvm, ghc->gpa, data, len);
- 
- 	if (kvm_is_error_hva(ghc->hva))
- 		return -EFAULT;
+-- 
+2.28.0
+

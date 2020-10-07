@@ -1,109 +1,125 @@
-diff --git a/Makefile b/Makefile
-index 8d67c849c7e8..5f9f8b3c9214 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 16
--SUBLEVEL = 63
-+SUBLEVEL = 64
- EXTRAVERSION =
- NAME = Museum of Fishiegoodies
- 
-diff --git a/arch/arm/kvm/arm.c b/arch/arm/kvm/arm.c
-index 03ab35a58836..5dcac8df0a85 100644
---- a/arch/arm/kvm/arm.c
-+++ b/arch/arm/kvm/arm.c
-@@ -799,10 +799,13 @@ long kvm_arch_vm_ioctl(struct file *filp,
- 
- 	switch (ioctl) {
- 	case KVM_CREATE_IRQCHIP: {
--		if (vgic_present)
--			return kvm_vgic_create(kvm);
--		else
-+		int ret;
-+		if (!vgic_present)
- 			return -ENXIO;
-+		mutex_lock(&kvm->lock);
-+		ret = kvm_vgic_create(kvm);
-+		mutex_unlock(&kvm->lock);
-+		return ret;
- 	}
- 	case KVM_ARM_SET_DEVICE_ADDR: {
- 		struct kvm_arm_device_addr dev_addr;
-diff --git a/arch/powerpc/kvm/book3s_xics.c b/arch/powerpc/kvm/book3s_xics.c
-index d1acd32a64c0..6be2830c8753 100644
---- a/arch/powerpc/kvm/book3s_xics.c
-+++ b/arch/powerpc/kvm/book3s_xics.c
-@@ -1239,20 +1239,16 @@ static int kvmppc_xics_create(struct kvm_device *dev, u32 type)
- 	xics->kvm = kvm;
- 
- 	/* Already there ? */
--	mutex_lock(&kvm->lock);
- 	if (kvm->arch.xics)
- 		ret = -EEXIST;
- 	else
- 		kvm->arch.xics = xics;
--	mutex_unlock(&kvm->lock);
- 
- 	if (ret) {
- 		kfree(xics);
- 		return ret;
- 	}
- 
--	xics_debugfs_init(xics);
--
- #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
- 	if (cpu_has_feature(CPU_FTR_ARCH_206)) {
- 		/* Enable real mode support */
-@@ -1264,9 +1260,17 @@ static int kvmppc_xics_create(struct kvm_device *dev, u32 type)
- 	return 0;
- }
- 
-+static void kvmppc_xics_init(struct kvm_device *dev)
-+{
-+	struct kvmppc_xics *xics = (struct kvmppc_xics *)dev->private;
-+
-+	xics_debugfs_init(xics);
-+}
-+
- struct kvm_device_ops kvm_xics_ops = {
- 	.name = "kvm-xics",
- 	.create = kvmppc_xics_create,
-+	.init = kvmppc_xics_init,
- 	.destroy = kvmppc_xics_free,
- 	.set_attr = xics_set_attr,
- 	.get_attr = xics_get_attr,
-diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
-index d3f1873eafc4..70c3146fe6ca 100644
---- a/arch/x86/kvm/vmx.c
-+++ b/arch/x86/kvm/vmx.c
-@@ -6169,6 +6169,7 @@ static void free_nested(struct vcpu_vmx *vmx)
- {
- 	if (!vmx->nested.vmxon)
- 		return;
-+	hrtimer_cancel(&vmx->nested.preemption_timer);
- 	vmx->nested.vmxon = false;
- 	if (vmx->nested.current_vmptr != -1ull) {
- 		nested_release_vmcs12(vmx);
-diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index ffb64cfc7989..6babfe32e04b 100644
---- a/arch/x86/kvm/x86.c
-+++ b/arch/x86/kvm/x86.c
-@@ -4208,6 +4208,13 @@ int kvm_read_guest_virt(struct kvm_vcpu *vcpu,
- {
- 	u32 access = (kvm_x86_ops->get_cpl(vcpu) == 3) ? PFERR_USER_MASK : 0;
+From 96cbb7e99d66cef46c62dc691664d38d5ae2cd8d Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Tue, 8 Nov 2016 12:54:14 +1100
+Subject: [PATCH 01/17] xfs: don't BUG() on mixed direct and mapped I/O
+
+commit 04197b341f23b908193308b8d63d17ff23232598 upstream.
+
+We've had reports of generic/095 causing XFS to BUG() in
+__xfs_get_blocks() due to the existence of delalloc blocks on a
+direct I/O read. generic/095 issues a mix of various types of I/O,
+including direct and memory mapped I/O to a single file. This is
+clearly not supported behavior and is known to lead to such
+problems. E.g., the lack of exclusion between the direct I/O and
+write fault paths means that a write fault can allocate delalloc
+blocks in a region of a file that was previously a hole after the
+direct read has attempted to flush/inval the file range, but before
+it actually reads the block mapping. In turn, the direct read
+discovers a delalloc extent and cannot proceed.
+
+While the appropriate solution here is to not mix direct and memory
+mapped I/O to the same regions of the same file, the current
+BUG_ON() behavior is probably overkill as it can crash the entire
+system.  Instead, localize the failure to the I/O in question by
+returning an error for a direct I/O that cannot be handled safely
+due to delalloc blocks. Be careful to allow the case of a direct
+write to post-eof delalloc blocks. This can occur due to speculative
+preallocation and is safe as post-eof blocks are not accompanied by
+dirty pages in pagecache (conversely, preallocation within eof must
+have been zeroed, and thus dirtied, before the inode size could have
+been increased beyond said blocks).
+
+Finally, provide an additional warning if a direct I/O write occurs
+while the file is memory mapped. This may not catch all problematic
+scenarios, but provides a hint that some known-to-be-problematic I/O
+methods are in use.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Dave Chinner <dchinner@redhat.com>
+Signed-off-by: Dave Chinner <david@fromorbit.com>
+[bwh: Backported to 3.16:
+ - Assign positive error code to error variable
+ - Adjust context]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ fs/xfs/xfs_aops.c | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
+index 3fc699ea7ba0..91b3106fda9b 100644
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@ -1300,6 +1300,26 @@ __xfs_get_blocks(
+ 	if (error)
+ 		goto out_unlock;
  
 +	/*
-+	 * FIXME: this should call handle_emulation_failure if X86EMUL_IO_NEEDED
-+	 * is returned, but our callers are not ready for that and they blindly
-+	 * call kvm_inject_page_fault.  Ensure that they at least do not leak
-+	 * uninitialized kernel stack memory into cr2 and error code.
++	 * The only time we can ever safely find delalloc blocks on direct I/O
++	 * is a dio write to post-eof speculative preallocation. All other
++	 * scenarios are indicative of a problem or misuse (such as mixing
++	 * direct and mapped I/O).
++	 *
++	 * The file may be unmapped by the time we get here so we cannot
++	 * reliably fail the I/O based on mapping. Instead, fail the I/O if this
++	 * is a read or a write within eof. Otherwise, carry on but warn as a
++	 * precuation if the file happens to be mapped.
 +	 */
-+	memset(exception, 0, sizeof(*exception));
- 	return kvm_read_guest_virt_helper(addr, val, bytes, vcpu, access,
- 					  exception);
- }
++	if (direct && imap.br_startblock == DELAYSTARTBLOCK) {
++		if (!create || offset < i_size_read(VFS_I(ip))) {
++			WARN_ON_ONCE(1);
++			error = EIO;
++			goto out_unlock;
++		}
++		WARN_ON_ONCE(mapping_mapped(VFS_I(ip)->i_mapping));
++	}
++
+ 	if (create &&
+ 	    (!nimaps ||
+ 	     (imap.br_startblock == HOLESTARTBLOCK ||
+@@ -1383,7 +1403,6 @@ __xfs_get_blocks(
+ 		set_buffer_new(bh_result);
+ 
+ 	if (imap.br_startblock == DELAYSTARTBLOCK) {
+-		BUG_ON(direct);
+ 		if (create) {
+ 			set_buffer_uptodate(bh_result);
+ 			set_buffer_mapped(bh_result);
+-- 
+2.28.0
+
+
+From cc12c0099168b416f6c3eff1cd560a771f4b7c3f Mon Sep 17 00:00:00 2001
+From: Rohit Vaswani <rvaswani@codeaurora.org>
+Date: Thu, 22 Oct 2015 13:32:11 -0700
+Subject: [PATCH 02/17] mm: cma: fix incorrect type conversion for size during
+ dma allocation
+
+commit 67a2e213e7e937c41c52ab5bc46bf3f4de469f6e upstream.
+
+This was found during userspace fuzzing test when a large size dma cma
+allocation is made by driver(like ion) through userspace.
+
+  show_stack+0x10/0x1c
+  dump_stack+0x74/0xc8
+  kasan_report_error+0x2b0/0x408
+  kasan_report+0x34/0x40
+  __asan_storeN+0x15c/0x168
+  memset+0x20/0x44
+  __dma_alloc_coherent+0x114/0x18c
+
+Signed-off-by: Rohit Vaswani <rvaswani@codeaurora.org>
+Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+[bwh: Backported to 3.16: cma_alloc() does not exist so only
+ dma_alloc_from_contiguous() needs to be changed]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ drivers/base/dma-contiguous.c  | 4 ++--
+ include/linux/dma-contiguous.h | 4 ++--
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
 diff --git a/drivers/base/dma-contiguous.c b/drivers/base/dma-contiguous.c
 index 6467c919c509..8d6abb35ae55 100644
 --- a/drivers/base/dma-contiguous.c
@@ -126,8 +142,604 @@ index 6467c919c509..8d6abb35ae55 100644
  		 count, align);
  
  	if (!count)
+diff --git a/include/linux/dma-contiguous.h b/include/linux/dma-contiguous.h
+index 772eab5d524a..5e3f5863b5e3 100644
+--- a/include/linux/dma-contiguous.h
++++ b/include/linux/dma-contiguous.h
+@@ -116,7 +116,7 @@ static inline int dma_declare_contiguous(struct device *dev, phys_addr_t size,
+ 	return ret;
+ }
+ 
+-struct page *dma_alloc_from_contiguous(struct device *dev, int count,
++struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
+ 				       unsigned int order);
+ bool dma_release_from_contiguous(struct device *dev, struct page *pages,
+ 				 int count);
+@@ -151,7 +151,7 @@ int dma_declare_contiguous(struct device *dev, phys_addr_t size,
+ }
+ 
+ static inline
+-struct page *dma_alloc_from_contiguous(struct device *dev, int count,
++struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
+ 				       unsigned int order)
+ {
+ 	return NULL;
+-- 
+2.28.0
+
+
+From 9ebdc41f7115c2fb37da946dd50e531d00533ca1 Mon Sep 17 00:00:00 2001
+From: Kees Cook <keescook@chromium.org>
+Date: Tue, 10 Jul 2018 16:22:22 -0700
+Subject: [PATCH 03/17] swiotlb: clean up reporting
+
+commit 7d63fb3af87aa67aa7d24466e792f9d7c57d8e79 upstream.
+
+This removes needless use of '%p', and refactors the printk calls to
+use pr_*() helpers instead.
+
+Signed-off-by: Kees Cook <keescook@chromium.org>
+Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+Signed-off-by: Christoph Hellwig <hch@lst.de>
+[bwh: Backported to 3.16: adjust filename]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ lib/swiotlb.c | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/lib/swiotlb.c b/lib/swiotlb.c
+index 4abda074ea45..54179db71ab4 100644
+--- a/lib/swiotlb.c
++++ b/lib/swiotlb.c
+@@ -17,6 +17,8 @@
+  * 08/12/11 beckyb	Add highmem support
+  */
+ 
++#define pr_fmt(fmt) "software IO TLB: " fmt
++
+ #include <linux/cache.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/mm.h>
+@@ -143,20 +145,16 @@ static bool no_iotlb_memory;
+ void swiotlb_print_info(void)
+ {
+ 	unsigned long bytes = io_tlb_nslabs << IO_TLB_SHIFT;
+-	unsigned char *vstart, *vend;
+ 
+ 	if (no_iotlb_memory) {
+-		pr_warn("software IO TLB: No low mem\n");
++		pr_warn("No low mem\n");
+ 		return;
+ 	}
+ 
+-	vstart = phys_to_virt(io_tlb_start);
+-	vend = phys_to_virt(io_tlb_end);
+-
+-	printk(KERN_INFO "software IO TLB [mem %#010llx-%#010llx] (%luMB) mapped at [%p-%p]\n",
++	pr_info("mapped [mem %#010llx-%#010llx] (%luMB)\n",
+ 	       (unsigned long long)io_tlb_start,
+ 	       (unsigned long long)io_tlb_end,
+-	       bytes >> 20, vstart, vend - 1);
++	       bytes >> 20);
+ }
+ 
+ int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
+@@ -230,7 +228,7 @@ swiotlb_init(int verbose)
+ 	if (io_tlb_start)
+ 		memblock_free_early(io_tlb_start,
+ 				    PAGE_ALIGN(io_tlb_nslabs << IO_TLB_SHIFT));
+-	pr_warn("Cannot allocate SWIOTLB buffer");
++	pr_warn("Cannot allocate buffer");
+ 	no_iotlb_memory = true;
+ }
+ 
+@@ -272,8 +270,8 @@ swiotlb_late_init_with_default_size(size_t default_size)
+ 		return -ENOMEM;
+ 	}
+ 	if (order != get_order(bytes)) {
+-		printk(KERN_WARNING "Warning: only able to allocate %ld MB "
+-		       "for software IO TLB\n", (PAGE_SIZE << order) >> 20);
++		pr_warn("only able to allocate %ld MB\n",
++			(PAGE_SIZE << order) >> 20);
+ 		io_tlb_nslabs = SLABS_PER_PAGE << order;
+ 	}
+ 	rc = swiotlb_late_init_with_tbl(vstart, io_tlb_nslabs);
+-- 
+2.28.0
+
+
+From 801f9d2fb42e450a67f83c18fd5d8450ad29224f Mon Sep 17 00:00:00 2001
+From: Vasily Averin <vvs@virtuozzo.com>
+Date: Mon, 24 Dec 2018 14:44:52 +0300
+Subject: [PATCH 04/17] sunrpc: use-after-free in svc_process_common()
+
+commit d4b09acf924b84bae77cad090a9d108e70b43643 upstream.
+
+if node have NFSv41+ mounts inside several net namespaces
+it can lead to use-after-free in svc_process_common()
+
+svc_process_common()
+        /* Setup reply header */
+        rqstp->rq_xprt->xpt_ops->xpo_prep_reply_hdr(rqstp); <<< HERE
+
+svc_process_common() can use incorrect rqstp->rq_xprt,
+its caller function bc_svc_process() takes it from serv->sv_bc_xprt.
+The problem is that serv is global structure but sv_bc_xprt
+is assigned per-netnamespace.
+
+According to Trond, the whole "let's set up rqstp->rq_xprt
+for the back channel" is nothing but a giant hack in order
+to work around the fact that svc_process_common() uses it
+to find the xpt_ops, and perform a couple of (meaningless
+for the back channel) tests of xpt_flags.
+
+All we really need in svc_process_common() is to be able to run
+rqstp->rq_xprt->xpt_ops->xpo_prep_reply_hdr()
+
+Bruce J Fields points that this xpo_prep_reply_hdr() call
+is an awfully roundabout way just to do "svc_putnl(resv, 0);"
+in the tcp case.
+
+This patch does not initialiuze rqstp->rq_xprt in bc_svc_process(),
+now it calls svc_process_common() with rqstp->rq_xprt = NULL.
+
+To adjust reply header svc_process_common() just check
+rqstp->rq_prot and calls svc_tcp_prep_reply_hdr() for tcp case.
+
+To handle rqstp->rq_xprt = NULL case in functions called from
+svc_process_common() patch intruduces net namespace pointer
+svc_rqst->rq_bc_net and adjust SVC_NET() definition.
+Some other function was also adopted to properly handle described case.
+
+Signed-off-by: Vasily Averin <vvs@virtuozzo.com>
+Fixes: 23c20ecd4475 ("NFS: callback up - users counting cleanup")
+Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+v2: - added lost extern svc_tcp_prep_reply_hdr()
+    - context changes in svc_process_common()
+    - dropped trace_svc_process() changes
+Signed-off-by: Vasily Averin <vvs@virtuozzo.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ include/linux/sunrpc/svc.h |  5 ++++-
+ net/sunrpc/svc.c           | 10 +++++++---
+ net/sunrpc/svc_xprt.c      |  5 +++--
+ net/sunrpc/svcsock.c       |  2 +-
+ 4 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/include/linux/sunrpc/svc.h b/include/linux/sunrpc/svc.h
+index 1bc7cd05b22e..999a9911d7bd 100644
+--- a/include/linux/sunrpc/svc.h
++++ b/include/linux/sunrpc/svc.h
+@@ -282,9 +282,12 @@ struct svc_rqst {
+ 						 * cache pages */
+ 	wait_queue_head_t	rq_wait;	/* synchronization */
+ 	struct task_struct	*rq_task;	/* service thread */
++	struct net		*rq_bc_net;	/* pointer to backchannel's
++						 * net namespace
++						 */
+ };
+ 
+-#define SVC_NET(svc_rqst)	(svc_rqst->rq_xprt->xpt_net)
++#define SVC_NET(rqst) (rqst->rq_xprt ? rqst->rq_xprt->xpt_net : rqst->rq_bc_net)
+ 
+ /*
+  * Rigorous type checking on sockaddr type conversions
+diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
+index a7e5624a1cf2..e9b2eaedbdf7 100644
+--- a/net/sunrpc/svc.c
++++ b/net/sunrpc/svc.c
+@@ -1063,6 +1063,8 @@ void svc_printk(struct svc_rqst *rqstp, const char *fmt, ...)
+ static __printf(2,3) void svc_printk(struct svc_rqst *rqstp, const char *fmt, ...) {}
+ #endif
+ 
++extern void svc_tcp_prep_reply_hdr(struct svc_rqst *);
++
+ /*
+  * Common routine for processing the RPC request.
+  */
+@@ -1092,7 +1094,8 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
+ 	rqstp->rq_dropme = false;
+ 
+ 	/* Setup reply header */
+-	rqstp->rq_xprt->xpt_ops->xpo_prep_reply_hdr(rqstp);
++	if (rqstp->rq_prot == IPPROTO_TCP)
++		svc_tcp_prep_reply_hdr(rqstp);
+ 
+ 	svc_putu32(resv, rqstp->rq_xid);
+ 
+@@ -1139,7 +1142,8 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
+ 	case SVC_DENIED:
+ 		goto err_bad_auth;
+ 	case SVC_CLOSE:
+-		if (test_bit(XPT_TEMP, &rqstp->rq_xprt->xpt_flags))
++		if (rqstp->rq_xprt &&
++		    test_bit(XPT_TEMP, &rqstp->rq_xprt->xpt_flags))
+ 			svc_close_xprt(rqstp->rq_xprt);
+ 	case SVC_DROP:
+ 		goto dropit;
+@@ -1354,10 +1358,10 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
+ 	struct kvec	*resv = &rqstp->rq_res.head[0];
+ 
+ 	/* Build the svc_rqst used by the common processing routine */
+-	rqstp->rq_xprt = serv->sv_bc_xprt;
+ 	rqstp->rq_xid = req->rq_xid;
+ 	rqstp->rq_prot = req->rq_xprt->prot;
+ 	rqstp->rq_server = serv;
++	rqstp->rq_bc_net = req->rq_xprt->xprt_net;
+ 
+ 	rqstp->rq_addrlen = sizeof(req->rq_xprt->addr);
+ 	memcpy(&rqstp->rq_addr, &req->rq_xprt->addr, rqstp->rq_addrlen);
+diff --git a/net/sunrpc/svc_xprt.c b/net/sunrpc/svc_xprt.c
+index de5e3636d5ad..c7ae9ec430b8 100644
+--- a/net/sunrpc/svc_xprt.c
++++ b/net/sunrpc/svc_xprt.c
+@@ -432,10 +432,11 @@ static struct svc_xprt *svc_xprt_dequeue(struct svc_pool *pool)
+  */
+ void svc_reserve(struct svc_rqst *rqstp, int space)
+ {
++	struct svc_xprt *xprt = rqstp->rq_xprt;
++
+ 	space += rqstp->rq_res.head[0].iov_len;
+ 
+-	if (space < rqstp->rq_reserved) {
+-		struct svc_xprt *xprt = rqstp->rq_xprt;
++	if (xprt && space < rqstp->rq_reserved) {
+ 		atomic_sub((rqstp->rq_reserved - space), &xprt->xpt_reserved);
+ 		rqstp->rq_reserved = space;
+ 
+diff --git a/net/sunrpc/svcsock.c b/net/sunrpc/svcsock.c
+index 89a4db5be155..d4991f2b0dc8 100644
+--- a/net/sunrpc/svcsock.c
++++ b/net/sunrpc/svcsock.c
+@@ -1195,7 +1195,7 @@ static int svc_tcp_sendto(struct svc_rqst *rqstp)
+ /*
+  * Setup response header. TCP has a 4B record length field.
+  */
+-static void svc_tcp_prep_reply_hdr(struct svc_rqst *rqstp)
++void svc_tcp_prep_reply_hdr(struct svc_rqst *rqstp)
+ {
+ 	struct kvec *resv = &rqstp->rq_res.head[0];
+ 
+-- 
+2.28.0
+
+
+From 2d955f32f4ab31294447a01cf401cec2cef9013e Mon Sep 17 00:00:00 2001
+From: Hui Peng <benquike@gmail.com>
+Date: Wed, 12 Dec 2018 12:42:24 +0100
+Subject: [PATCH 05/17] USB: hso: Fix OOB memory access in
+ hso_probe/hso_get_config_data
+
+commit 5146f95df782b0ac61abde36567e718692725c89 upstream.
+
+The function hso_probe reads if_num from the USB device (as an u8) and uses
+it without a length check to index an array, resulting in an OOB memory read
+in hso_probe or hso_get_config_data.
+
+Add a length check for both locations and updated hso_probe to bail on
+error.
+
+This issue has been assigned CVE-2018-19985.
+
+Reported-by: Hui Peng <benquike@gmail.com>
+Reported-by: Mathias Payer <mathias.payer@nebelwelt.net>
+Signed-off-by: Hui Peng <benquike@gmail.com>
+Signed-off-by: Mathias Payer <mathias.payer@nebelwelt.net>
+Reviewed-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ drivers/net/usb/hso.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/usb/hso.c b/drivers/net/usb/hso.c
+index a4272ed62da8..142fada0b1e8 100644
+--- a/drivers/net/usb/hso.c
++++ b/drivers/net/usb/hso.c
+@@ -2812,6 +2812,12 @@ static int hso_get_config_data(struct usb_interface *interface)
+ 		return -EIO;
+ 	}
+ 
++	/* check if we have a valid interface */
++	if (if_num > 16) {
++		kfree(config_data);
++		return -EINVAL;
++	}
++
+ 	switch (config_data[if_num]) {
+ 	case 0x0:
+ 		result = 0;
+@@ -2882,10 +2888,18 @@ static int hso_probe(struct usb_interface *interface,
+ 
+ 	/* Get the interface/port specification from either driver_info or from
+ 	 * the device itself */
+-	if (id->driver_info)
++	if (id->driver_info) {
++		/* if_num is controlled by the device, driver_info is a 0 terminated
++		 * array. Make sure, the access is in bounds! */
++		for (i = 0; i <= if_num; ++i)
++			if (((u32 *)(id->driver_info))[i] == 0)
++				goto exit;
+ 		port_spec = ((u32 *)(id->driver_info))[if_num];
+-	else
++	} else {
+ 		port_spec = hso_get_config_data(interface);
++		if (port_spec < 0)
++			goto exit;
++	}
+ 
+ 	/* Check if we need to switch to alt interfaces prior to port
+ 	 * configuration */
+-- 
+2.28.0
+
+
+From 0c4d7b52773b227211d311858f3c3b56f7c44874 Mon Sep 17 00:00:00 2001
+From: Willy Tarreau <w@1wt.eu>
+Date: Wed, 12 Sep 2018 07:36:35 +0200
+Subject: [PATCH 06/17] net/appletalk: fix minor pointer leak to userspace in
+ SIOCFINDIPDDPRT
+
+commit 9824dfae5741275473a23a7ed5756c7b6efacc9d upstream.
+
+Fields ->dev and ->next of struct ipddp_route may be copied to
+userspace on the SIOCFINDIPDDPRT ioctl. This is only accessible
+to CAP_NET_ADMIN though. Let's manually copy the relevant fields
+instead of using memcpy().
+
+BugLink: http://blog.infosectcbr.com.au/2018/09/linux-kernel-infoleaks.html
+Cc: Jann Horn <jannh@google.com>
+Signed-off-by: Willy Tarreau <w@1wt.eu>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ drivers/net/appletalk/ipddp.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/appletalk/ipddp.c b/drivers/net/appletalk/ipddp.c
+index 10d0dba572c2..4d4476ce8799 100644
+--- a/drivers/net/appletalk/ipddp.c
++++ b/drivers/net/appletalk/ipddp.c
+@@ -284,8 +284,12 @@ static int ipddp_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+                 case SIOCFINDIPDDPRT:
+ 			spin_lock_bh(&ipddp_route_lock);
+ 			rp = __ipddp_find_route(&rcp);
+-			if (rp)
+-				memcpy(&rcp2, rp, sizeof(rcp2));
++			if (rp) {
++				memset(&rcp2, 0, sizeof(rcp2));
++				rcp2.ip    = rp->ip;
++				rcp2.at    = rp->at;
++				rcp2.flags = rp->flags;
++			}
+ 			spin_unlock_bh(&ipddp_route_lock);
+ 
+ 			if (rp) {
+-- 
+2.28.0
+
+
+From 1c7dcfd106f42f09e3b7520c26e6eee70a939928 Mon Sep 17 00:00:00 2001
+From: Oliver Hartkopp <socketcan@hartkopp.net>
+Date: Fri, 4 Jan 2019 15:55:26 +0100
+Subject: [PATCH 07/17] can: gw: ensure DLC boundaries after CAN frame
+ modification
+
+commit 0aaa81377c5a01f686bcdb8c7a6929a7bf330c68 upstream.
+
+Muyu Yu provided a POC where user root with CAP_NET_ADMIN can create a CAN
+frame modification rule that makes the data length code a higher value than
+the available CAN frame data size. In combination with a configured checksum
+calculation where the result is stored relatively to the end of the data
+(e.g. cgw_csum_xor_rel) the tail of the skb (e.g. frag_list pointer in
+skb_shared_info) can be rewritten which finally can cause a system crash.
+
+Michael Kubecek suggested to drop frames that have a DLC exceeding the
+available space after the modification process and provided a patch that can
+handle CAN FD frames too. Within this patch we also limit the length for the
+checksum calculations to the maximum of Classic CAN data length (8).
+
+CAN frames that are dropped by these additional checks are counted with the
+CGW_DELETED counter which indicates misconfigurations in can-gw rules.
+
+This fixes CVE-2019-3701.
+
+Reported-by: Muyu Yu <ieatmuttonchuan@gmail.com>
+Reported-by: Marcus Meissner <meissner@suse.de>
+Suggested-by: Michal Kubecek <mkubecek@suse.cz>
+Tested-by: Muyu Yu <ieatmuttonchuan@gmail.com>
+Tested-by: Oliver Hartkopp <socketcan@hartkopp.net>
+Signed-off-by: Oliver Hartkopp <socketcan@hartkopp.net>
+Signed-off-by: Marc Kleine-Budde <mkl@pengutronix.de>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ net/can/gw.c | 30 +++++++++++++++++++++++++++---
+ 1 file changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/net/can/gw.c b/net/can/gw.c
+index d4921582d3bd..4ccaf10bb658 100644
+--- a/net/can/gw.c
++++ b/net/can/gw.c
+@@ -417,13 +417,29 @@ static void can_can_gw_rcv(struct sk_buff *skb, void *data)
+ 	while (modidx < MAX_MODFUNCTIONS && gwj->mod.modfunc[modidx])
+ 		(*gwj->mod.modfunc[modidx++])(cf, &gwj->mod);
+ 
+-	/* check for checksum updates when the CAN frame has been modified */
++	/* Has the CAN frame been modified? */
+ 	if (modidx) {
+-		if (gwj->mod.csumfunc.crc8)
++		/* get available space for the processed CAN frame type */
++		int max_len = nskb->len - offsetof(struct can_frame, data);
++
++		/* dlc may have changed, make sure it fits to the CAN frame */
++		if (cf->can_dlc > max_len)
++			goto out_delete;
++
++		/* check for checksum updates in classic CAN length only */
++		if (gwj->mod.csumfunc.crc8) {
++			if (cf->can_dlc > 8)
++				goto out_delete;
++
+ 			(*gwj->mod.csumfunc.crc8)(cf, &gwj->mod.csum.crc8);
++		}
++
++		if (gwj->mod.csumfunc.xor) {
++			if (cf->can_dlc > 8)
++				goto out_delete;
+ 
+-		if (gwj->mod.csumfunc.xor)
+ 			(*gwj->mod.csumfunc.xor)(cf, &gwj->mod.csum.xor);
++		}
+ 	}
+ 
+ 	/* clear the skb timestamp if not configured the other way */
+@@ -435,6 +451,14 @@ static void can_can_gw_rcv(struct sk_buff *skb, void *data)
+ 		gwj->dropped_frames++;
+ 	else
+ 		gwj->handled_frames++;
++
++	return;
++
++ out_delete:
++	/* delete frame due to misconfiguration */
++	gwj->deleted_frames++;
++	kfree_skb(nskb);
++	return;
+ }
+ 
+ static inline int cgw_register_filter(struct cgw_job *gwj)
+-- 
+2.28.0
+
+
+From f9d19815c8092240f168275e29bd16ad321eeee8 Mon Sep 17 00:00:00 2001
+From: Jiri Kosina <jkosina@suse.cz>
+Date: Thu, 9 Apr 2015 13:32:35 +0200
+Subject: [PATCH 08/17] HID: debug: fix error handling in
+ hid_debug_events_read()
+
+commit 8fec02a73e31407e14986fca67dab48d4f777f0e upstream.
+
+In the unlikely case of hdev vanishing while hid_debug_events_read() was
+sleeping, we can't really break out of the case switch as with other cases,
+as on the way out we'll try to remove ourselves from the hdev waitqueue.
+
+Fix this by taking a shortcut exit path and avoiding cleanup that doesn't
+make sense in case hdev doesn't exist any more anyway.
+
+Reported-by: Jiri Slaby <jslaby@suse.cz>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ drivers/hid/hid-debug.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
 diff --git a/drivers/hid/hid-debug.c b/drivers/hid/hid-debug.c
-index 7192fa1d2786..d5eaf5b8460e 100644
+index 7192fa1d2786..3f6019dc190b 100644
+--- a/drivers/hid/hid-debug.c
++++ b/drivers/hid/hid-debug.c
+@@ -1127,7 +1127,8 @@ static ssize_t hid_debug_events_read(struct file *file, char __user *buffer,
+ 
+ 				if (!list->hdev || !list->hdev->debug) {
+ 					ret = -EIO;
+-					break;
++					set_current_state(TASK_RUNNING);
++					goto out;
+ 				}
+ 
+ 				/* allow O_NONBLOCK from other threads */
+-- 
+2.28.0
+
+
+From 9e23e2c5535a8e7c77ab3a01f92fa4ab5f15e91e Mon Sep 17 00:00:00 2001
+From: Rasmus Villemoes <linux@rasmusvillemoes.dk>
+Date: Tue, 24 Nov 2015 13:33:47 +0100
+Subject: [PATCH 09/17] HID: debug: improve hid_debug_event()
+
+commit 92529623d242cea4440958d7bcebdf291f4ab15e upstream.
+
+The code in hid_debug_event() causes horrible code generation. First,
+we do a strlen() call for every byte we copy (we're doing a store to
+global memory, so gcc has no way of proving that strlen(buf) doesn't
+change). Second, since both i, list->tail and HID_DEBUG_BUFSIZE have
+signed type, the modulo computation has to take into account the
+possibility that list->tail+i is negative, so it's not just a simple
+and.
+
+Fix the former by simply not doing strlen() at all (we have to load
+buf[i] anyway, so testing it is almost free) and the latter by
+changing i to unsigned. This cuts 29% (69 bytes) of the size of the
+function.
+
+Signed-off-by: Rasmus Villemoes <linux@rasmusvillemoes.dk>
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ drivers/hid/hid-debug.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/hid/hid-debug.c b/drivers/hid/hid-debug.c
+index 3f6019dc190b..c243ead44fd7 100644
+--- a/drivers/hid/hid-debug.c
++++ b/drivers/hid/hid-debug.c
+@@ -658,13 +658,13 @@ EXPORT_SYMBOL_GPL(hid_dump_device);
+ /* enqueue string to 'events' ring buffer */
+ void hid_debug_event(struct hid_device *hdev, char *buf)
+ {
+-	int i;
++	unsigned i;
+ 	struct hid_debug_list *list;
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&hdev->debug_list_lock, flags);
+ 	list_for_each_entry(list, &hdev->debug_list, node) {
+-		for (i = 0; i < strlen(buf); i++)
++		for (i = 0; buf[i]; i++)
+ 			list->hid_debug_buf[(list->tail + i) % HID_DEBUG_BUFSIZE] =
+ 				buf[i];
+ 		list->tail = (list->tail + i) % HID_DEBUG_BUFSIZE;
+-- 
+2.28.0
+
+
+From 7c7839e0f66ae0119b2e4d3d9465adbaba1df4b4 Mon Sep 17 00:00:00 2001
+From: Vladis Dronov <vdronov@redhat.com>
+Date: Tue, 29 Jan 2019 11:58:35 +0100
+Subject: [PATCH 10/17] HID: debug: fix the ring buffer implementation
+
+commit 13054abbaa4f1fd4e6f3b4b63439ec033b4c8035 upstream.
+
+Ring buffer implementation in hid_debug_event() and hid_debug_events_read()
+is strange allowing lost or corrupted data. After commit 717adfdaf147
+("HID: debug: check length before copy_to_user()") it is possible to enter
+an infinite loop in hid_debug_events_read() by providing 0 as count, this
+locks up a system. Fix this by rewriting the ring buffer implementation
+with kfifo and simplify the code.
+
+This fixes CVE-2019-3819.
+
+v2: fix an execution logic and add a comment
+v3: use __set_current_state() instead of set_current_state()
+
+Link: https://bugzilla.redhat.com/show_bug.cgi?id=1669187
+Fixes: cd667ce24796 ("HID: use debugfs for events/reports dumping")
+Fixes: 717adfdaf147 ("HID: debug: check length before copy_to_user()")
+Signed-off-by: Vladis Dronov <vdronov@redhat.com>
+Reviewed-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+[bwh: Backported to 3.16: adjust context]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ drivers/hid/hid-debug.c   | 120 +++++++++++++++-----------------------
+ include/linux/hid-debug.h |   9 ++-
+ 2 files changed, 51 insertions(+), 78 deletions(-)
+
+diff --git a/drivers/hid/hid-debug.c b/drivers/hid/hid-debug.c
+index c243ead44fd7..d5eaf5b8460e 100644
 --- a/drivers/hid/hid-debug.c
 +++ b/drivers/hid/hid-debug.c
 @@ -30,6 +30,7 @@
@@ -142,13 +754,13 @@ index 7192fa1d2786..d5eaf5b8460e 100644
  /* enqueue string to 'events' ring buffer */
  void hid_debug_event(struct hid_device *hdev, char *buf)
  {
--	int i;
+-	unsigned i;
  	struct hid_debug_list *list;
  	unsigned long flags;
  
  	spin_lock_irqsave(&hdev->debug_list_lock, flags);
 -	list_for_each_entry(list, &hdev->debug_list, node) {
--		for (i = 0; i < strlen(buf); i++)
+-		for (i = 0; buf[i]; i++)
 -			list->hid_debug_buf[(list->tail + i) % HID_DEBUG_BUFSIZE] =
 -				buf[i];
 -		list->tail = (list->tail + i) % HID_DEBUG_BUFSIZE;
@@ -179,7 +791,7 @@ index 7192fa1d2786..d5eaf5b8460e 100644
  		kfree(list);
  		goto out;
  	}
-@@ -1106,76 +1101,57 @@ static ssize_t hid_debug_events_read(struct file *file, char __user *buffer,
+@@ -1106,77 +1101,57 @@ static ssize_t hid_debug_events_read(struct file *file, char __user *buffer,
  		size_t count, loff_t *ppos)
  {
  	struct hid_debug_list *list = file->private_data;
@@ -214,7 +826,8 @@ index 7192fa1d2786..d5eaf5b8460e 100644
  
 -				if (!list->hdev || !list->hdev->debug) {
 -					ret = -EIO;
--					break;
+-					set_current_state(TASK_RUNNING);
+-					goto out;
 -				}
 +			if (signal_pending(current)) {
 +				ret = -ERESTARTSYS;
@@ -295,7 +908,7 @@ index 7192fa1d2786..d5eaf5b8460e 100644
  out:
  	mutex_unlock(&list->read_mutex);
  	return ret;
-@@ -1186,7 +1162,7 @@ static unsigned int hid_debug_events_poll(struct file *file, poll_table *wait)
+@@ -1187,7 +1162,7 @@ static unsigned int hid_debug_events_poll(struct file *file, poll_table *wait)
  	struct hid_debug_list *list = file->private_data;
  
  	poll_wait(file, &list->hdev->debug_wait, wait);
@@ -304,7 +917,7 @@ index 7192fa1d2786..d5eaf5b8460e 100644
  		return POLLIN | POLLRDNORM;
  	if (!list->hdev->debug)
  		return POLLERR | POLLHUP;
-@@ -1201,7 +1177,7 @@ static int hid_debug_events_release(struct inode *inode, struct file *file)
+@@ -1202,7 +1177,7 @@ static int hid_debug_events_release(struct inode *inode, struct file *file)
  	spin_lock_irqsave(&list->hdev->debug_list_lock, flags);
  	list_del(&list->node);
  	spin_unlock_irqrestore(&list->hdev->debug_list_lock, flags);
@@ -313,129 +926,11 @@ index 7192fa1d2786..d5eaf5b8460e 100644
  	kfree(list);
  
  	return 0;
-@@ -1252,4 +1228,3 @@ void hid_debug_exit(void)
+@@ -1253,4 +1228,3 @@ void hid_debug_exit(void)
  {
  	debugfs_remove_recursive(hid_debug_root);
  }
 -
-diff --git a/drivers/net/appletalk/ipddp.c b/drivers/net/appletalk/ipddp.c
-index 10d0dba572c2..4d4476ce8799 100644
---- a/drivers/net/appletalk/ipddp.c
-+++ b/drivers/net/appletalk/ipddp.c
-@@ -284,8 +284,12 @@ static int ipddp_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
-                 case SIOCFINDIPDDPRT:
- 			spin_lock_bh(&ipddp_route_lock);
- 			rp = __ipddp_find_route(&rcp);
--			if (rp)
--				memcpy(&rcp2, rp, sizeof(rcp2));
-+			if (rp) {
-+				memset(&rcp2, 0, sizeof(rcp2));
-+				rcp2.ip    = rp->ip;
-+				rcp2.at    = rp->at;
-+				rcp2.flags = rp->flags;
-+			}
- 			spin_unlock_bh(&ipddp_route_lock);
- 
- 			if (rp) {
-diff --git a/drivers/net/usb/hso.c b/drivers/net/usb/hso.c
-index a4272ed62da8..142fada0b1e8 100644
---- a/drivers/net/usb/hso.c
-+++ b/drivers/net/usb/hso.c
-@@ -2812,6 +2812,12 @@ static int hso_get_config_data(struct usb_interface *interface)
- 		return -EIO;
- 	}
- 
-+	/* check if we have a valid interface */
-+	if (if_num > 16) {
-+		kfree(config_data);
-+		return -EINVAL;
-+	}
-+
- 	switch (config_data[if_num]) {
- 	case 0x0:
- 		result = 0;
-@@ -2882,10 +2888,18 @@ static int hso_probe(struct usb_interface *interface,
- 
- 	/* Get the interface/port specification from either driver_info or from
- 	 * the device itself */
--	if (id->driver_info)
-+	if (id->driver_info) {
-+		/* if_num is controlled by the device, driver_info is a 0 terminated
-+		 * array. Make sure, the access is in bounds! */
-+		for (i = 0; i <= if_num; ++i)
-+			if (((u32 *)(id->driver_info))[i] == 0)
-+				goto exit;
- 		port_spec = ((u32 *)(id->driver_info))[if_num];
--	else
-+	} else {
- 		port_spec = hso_get_config_data(interface);
-+		if (port_spec < 0)
-+			goto exit;
-+	}
- 
- 	/* Check if we need to switch to alt interfaces prior to port
- 	 * configuration */
-diff --git a/fs/xfs/xfs_aops.c b/fs/xfs/xfs_aops.c
-index 3fc699ea7ba0..91b3106fda9b 100644
---- a/fs/xfs/xfs_aops.c
-+++ b/fs/xfs/xfs_aops.c
-@@ -1300,6 +1300,26 @@ __xfs_get_blocks(
- 	if (error)
- 		goto out_unlock;
- 
-+	/*
-+	 * The only time we can ever safely find delalloc blocks on direct I/O
-+	 * is a dio write to post-eof speculative preallocation. All other
-+	 * scenarios are indicative of a problem or misuse (such as mixing
-+	 * direct and mapped I/O).
-+	 *
-+	 * The file may be unmapped by the time we get here so we cannot
-+	 * reliably fail the I/O based on mapping. Instead, fail the I/O if this
-+	 * is a read or a write within eof. Otherwise, carry on but warn as a
-+	 * precuation if the file happens to be mapped.
-+	 */
-+	if (direct && imap.br_startblock == DELAYSTARTBLOCK) {
-+		if (!create || offset < i_size_read(VFS_I(ip))) {
-+			WARN_ON_ONCE(1);
-+			error = EIO;
-+			goto out_unlock;
-+		}
-+		WARN_ON_ONCE(mapping_mapped(VFS_I(ip)->i_mapping));
-+	}
-+
- 	if (create &&
- 	    (!nimaps ||
- 	     (imap.br_startblock == HOLESTARTBLOCK ||
-@@ -1383,7 +1403,6 @@ __xfs_get_blocks(
- 		set_buffer_new(bh_result);
- 
- 	if (imap.br_startblock == DELAYSTARTBLOCK) {
--		BUG_ON(direct);
- 		if (create) {
- 			set_buffer_uptodate(bh_result);
- 			set_buffer_mapped(bh_result);
-diff --git a/include/linux/dma-contiguous.h b/include/linux/dma-contiguous.h
-index 772eab5d524a..5e3f5863b5e3 100644
---- a/include/linux/dma-contiguous.h
-+++ b/include/linux/dma-contiguous.h
-@@ -116,7 +116,7 @@ static inline int dma_declare_contiguous(struct device *dev, phys_addr_t size,
- 	return ret;
- }
- 
--struct page *dma_alloc_from_contiguous(struct device *dev, int count,
-+struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
- 				       unsigned int order);
- bool dma_release_from_contiguous(struct device *dev, struct page *pages,
- 				 int count);
-@@ -151,7 +151,7 @@ int dma_declare_contiguous(struct device *dev, phys_addr_t size,
- }
- 
- static inline
--struct page *dma_alloc_from_contiguous(struct device *dev, int count,
-+struct page *dma_alloc_from_contiguous(struct device *dev, size_t count,
- 				       unsigned int order)
- {
- 	return NULL;
 diff --git a/include/linux/hid-debug.h b/include/linux/hid-debug.h
 index 8663f216c563..2d6100edf204 100644
 --- a/include/linux/hid-debug.h
@@ -469,20 +964,75 @@ index 8663f216c563..2d6100edf204 100644
  
  #endif
 -
+-- 
+2.28.0
+
+
+From 199883f7dc5f2a89f1e393debfabcdb536b2579d Mon Sep 17 00:00:00 2001
+From: Christoffer Dall <christoffer.dall@linaro.org>
+Date: Tue, 9 Aug 2016 19:13:00 +0200
+Subject: [PATCH 11/17] KVM: PPC: Move xics_debugfs_init out of create
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 023e9fddc3616b005c3753fc1bb6526388cd7a30 upstream.
+
+As we are about to hold the kvm->lock during the create operation on KVM
+devices, we should move the call to xics_debugfs_init into its own
+function, since holding a mutex over extended amounts of time might not
+be a good idea.
+
+Introduce an init operation on the kvm_device_ops struct which cannot
+fail and call this, if configured, after the device has been created.
+
+Signed-off-by: Christoffer Dall <christoffer.dall@linaro.org>
+Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ arch/powerpc/kvm/book3s_xics.c | 10 ++++++++--
+ include/linux/kvm_host.h       |  6 ++++++
+ virt/kvm/kvm_main.c            |  3 +++
+ 3 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/arch/powerpc/kvm/book3s_xics.c b/arch/powerpc/kvm/book3s_xics.c
+index d1acd32a64c0..6d35d7baa8e1 100644
+--- a/arch/powerpc/kvm/book3s_xics.c
++++ b/arch/powerpc/kvm/book3s_xics.c
+@@ -1251,8 +1251,6 @@ static int kvmppc_xics_create(struct kvm_device *dev, u32 type)
+ 		return ret;
+ 	}
+ 
+-	xics_debugfs_init(xics);
+-
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+ 	if (cpu_has_feature(CPU_FTR_ARCH_206)) {
+ 		/* Enable real mode support */
+@@ -1264,9 +1262,17 @@ static int kvmppc_xics_create(struct kvm_device *dev, u32 type)
+ 	return 0;
+ }
+ 
++static void kvmppc_xics_init(struct kvm_device *dev)
++{
++	struct kvmppc_xics *xics = (struct kvmppc_xics *)dev->private;
++
++	xics_debugfs_init(xics);
++}
++
+ struct kvm_device_ops kvm_xics_ops = {
+ 	.name = "kvm-xics",
+ 	.create = kvmppc_xics_create,
++	.init = kvmppc_xics_init,
+ 	.destroy = kvmppc_xics_free,
+ 	.set_attr = xics_set_attr,
+ 	.get_attr = xics_get_attr,
 diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
-index 0b9b56809dab..4f10dcf3e76b 100644
+index 0b9b56809dab..95e87f8ab351 100644
 --- a/include/linux/kvm_host.h
 +++ b/include/linux/kvm_host.h
-@@ -1059,8 +1059,20 @@ struct kvm_device {
- /* create, destroy, and name are mandatory */
- struct kvm_device_ops {
+@@ -1061,6 +1061,12 @@ struct kvm_device_ops {
  	const char *name;
-+
-+	/*
-+	 * create is called holding kvm->lock and any operations not suitable
-+	 * to do while holding the lock should be deferred to init (see
-+	 * below).
-+	 */
  	int (*create)(struct kvm_device *dev, u32 type);
  
 +	/*
@@ -494,209 +1044,119 @@ index 0b9b56809dab..4f10dcf3e76b 100644
  	/*
  	 * Destroy is responsible for freeing dev.
  	 *
-diff --git a/include/linux/sunrpc/svc.h b/include/linux/sunrpc/svc.h
-index 1bc7cd05b22e..999a9911d7bd 100644
---- a/include/linux/sunrpc/svc.h
-+++ b/include/linux/sunrpc/svc.h
-@@ -282,9 +282,12 @@ struct svc_rqst {
- 						 * cache pages */
- 	wait_queue_head_t	rq_wait;	/* synchronization */
- 	struct task_struct	*rq_task;	/* service thread */
-+	struct net		*rq_bc_net;	/* pointer to backchannel's
-+						 * net namespace
-+						 */
- };
- 
--#define SVC_NET(svc_rqst)	(svc_rqst->rq_xprt->xpt_net)
-+#define SVC_NET(rqst) (rqst->rq_xprt ? rqst->rq_xprt->xpt_net : rqst->rq_bc_net)
- 
- /*
-  * Rigorous type checking on sockaddr type conversions
-diff --git a/lib/swiotlb.c b/lib/swiotlb.c
-index 4abda074ea45..54179db71ab4 100644
---- a/lib/swiotlb.c
-+++ b/lib/swiotlb.c
-@@ -17,6 +17,8 @@
-  * 08/12/11 beckyb	Add highmem support
-  */
- 
-+#define pr_fmt(fmt) "software IO TLB: " fmt
-+
- #include <linux/cache.h>
- #include <linux/dma-mapping.h>
- #include <linux/mm.h>
-@@ -143,20 +145,16 @@ static bool no_iotlb_memory;
- void swiotlb_print_info(void)
- {
- 	unsigned long bytes = io_tlb_nslabs << IO_TLB_SHIFT;
--	unsigned char *vstart, *vend;
- 
- 	if (no_iotlb_memory) {
--		pr_warn("software IO TLB: No low mem\n");
-+		pr_warn("No low mem\n");
- 		return;
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 1cfe0c62b128..d98e6cf1e781 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -2328,6 +2328,9 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
+ 		return ret;
  	}
  
--	vstart = phys_to_virt(io_tlb_start);
--	vend = phys_to_virt(io_tlb_end);
--
--	printk(KERN_INFO "software IO TLB [mem %#010llx-%#010llx] (%luMB) mapped at [%p-%p]\n",
-+	pr_info("mapped [mem %#010llx-%#010llx] (%luMB)\n",
- 	       (unsigned long long)io_tlb_start,
- 	       (unsigned long long)io_tlb_end,
--	       bytes >> 20, vstart, vend - 1);
-+	       bytes >> 20);
- }
++	if (ops->init)
++		ops->init(dev);
++
+ 	ret = anon_inode_getfd(ops->name, &kvm_device_fops, dev, O_RDWR | O_CLOEXEC);
+ 	if (ret < 0) {
+ 		ops->destroy(dev);
+-- 
+2.28.0
+
+
+From b68bf84b71970ef6eb32bd10d924d3edfa73d872 Mon Sep 17 00:00:00 2001
+From: Christoffer Dall <christoffer.dall@linaro.org>
+Date: Tue, 9 Aug 2016 19:13:01 +0200
+Subject: [PATCH 12/17] KVM: Protect device ops->create and list_add with
+ kvm->lock
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit a28ebea2adc4a2bef5989a5a181ec238f59fbcad upstream.
+
+KVM devices were manipulating list data structures without any form of
+synchronization, and some implementations of the create operations also
+suffered from a lack of synchronization.
+
+Now when we've split the xics create operation into create and init, we
+can hold the kvm->lock mutex while calling the create operation and when
+manipulating the devices list.
+
+The error path in the generic code gets slightly ugly because we have to
+take the mutex again and delete the device from the list, but holding
+the mutex during anon_inode_getfd or releasing/locking the mutex in the
+common non-error path seemed wrong.
+
+Signed-off-by: Christoffer Dall <christoffer.dall@linaro.org>
+Reviewed-by: Paolo Bonzini <pbonzini@redhat.com>
+Acked-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+[bwh: Backported to 3.16:
+ - Drop change to a failure path that doesn't exist in kvm_vgic_create()
+ - Adjust filename, context]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ arch/arm/kvm/arm.c             |  9 ++++++---
+ arch/powerpc/kvm/book3s_xics.c |  2 --
+ include/linux/kvm_host.h       |  6 ++++++
+ virt/kvm/arm/vgic.c            | 11 ++---------
+ virt/kvm/kvm_main.c            | 13 ++++++++++++-
+ 5 files changed, 26 insertions(+), 15 deletions(-)
+
+diff --git a/arch/arm/kvm/arm.c b/arch/arm/kvm/arm.c
+index 03ab35a58836..5dcac8df0a85 100644
+--- a/arch/arm/kvm/arm.c
++++ b/arch/arm/kvm/arm.c
+@@ -799,10 +799,13 @@ long kvm_arch_vm_ioctl(struct file *filp,
  
- int __init swiotlb_init_with_tbl(char *tlb, unsigned long nslabs, int verbose)
-@@ -230,7 +228,7 @@ swiotlb_init(int verbose)
- 	if (io_tlb_start)
- 		memblock_free_early(io_tlb_start,
- 				    PAGE_ALIGN(io_tlb_nslabs << IO_TLB_SHIFT));
--	pr_warn("Cannot allocate SWIOTLB buffer");
-+	pr_warn("Cannot allocate buffer");
- 	no_iotlb_memory = true;
- }
- 
-@@ -272,8 +270,8 @@ swiotlb_late_init_with_default_size(size_t default_size)
- 		return -ENOMEM;
+ 	switch (ioctl) {
+ 	case KVM_CREATE_IRQCHIP: {
+-		if (vgic_present)
+-			return kvm_vgic_create(kvm);
+-		else
++		int ret;
++		if (!vgic_present)
+ 			return -ENXIO;
++		mutex_lock(&kvm->lock);
++		ret = kvm_vgic_create(kvm);
++		mutex_unlock(&kvm->lock);
++		return ret;
  	}
- 	if (order != get_order(bytes)) {
--		printk(KERN_WARNING "Warning: only able to allocate %ld MB "
--		       "for software IO TLB\n", (PAGE_SIZE << order) >> 20);
-+		pr_warn("only able to allocate %ld MB\n",
-+			(PAGE_SIZE << order) >> 20);
- 		io_tlb_nslabs = SLABS_PER_PAGE << order;
- 	}
- 	rc = swiotlb_late_init_with_tbl(vstart, io_tlb_nslabs);
-diff --git a/net/can/gw.c b/net/can/gw.c
-index d4921582d3bd..4ccaf10bb658 100644
---- a/net/can/gw.c
-+++ b/net/can/gw.c
-@@ -417,13 +417,29 @@ static void can_can_gw_rcv(struct sk_buff *skb, void *data)
- 	while (modidx < MAX_MODFUNCTIONS && gwj->mod.modfunc[modidx])
- 		(*gwj->mod.modfunc[modidx++])(cf, &gwj->mod);
+ 	case KVM_ARM_SET_DEVICE_ADDR: {
+ 		struct kvm_arm_device_addr dev_addr;
+diff --git a/arch/powerpc/kvm/book3s_xics.c b/arch/powerpc/kvm/book3s_xics.c
+index 6d35d7baa8e1..6be2830c8753 100644
+--- a/arch/powerpc/kvm/book3s_xics.c
++++ b/arch/powerpc/kvm/book3s_xics.c
+@@ -1239,12 +1239,10 @@ static int kvmppc_xics_create(struct kvm_device *dev, u32 type)
+ 	xics->kvm = kvm;
  
--	/* check for checksum updates when the CAN frame has been modified */
-+	/* Has the CAN frame been modified? */
- 	if (modidx) {
--		if (gwj->mod.csumfunc.crc8)
-+		/* get available space for the processed CAN frame type */
-+		int max_len = nskb->len - offsetof(struct can_frame, data);
-+
-+		/* dlc may have changed, make sure it fits to the CAN frame */
-+		if (cf->can_dlc > max_len)
-+			goto out_delete;
-+
-+		/* check for checksum updates in classic CAN length only */
-+		if (gwj->mod.csumfunc.crc8) {
-+			if (cf->can_dlc > 8)
-+				goto out_delete;
-+
- 			(*gwj->mod.csumfunc.crc8)(cf, &gwj->mod.csum.crc8);
-+		}
-+
-+		if (gwj->mod.csumfunc.xor) {
-+			if (cf->can_dlc > 8)
-+				goto out_delete;
- 
--		if (gwj->mod.csumfunc.xor)
- 			(*gwj->mod.csumfunc.xor)(cf, &gwj->mod.csum.xor);
-+		}
- 	}
- 
- 	/* clear the skb timestamp if not configured the other way */
-@@ -435,6 +451,14 @@ static void can_can_gw_rcv(struct sk_buff *skb, void *data)
- 		gwj->dropped_frames++;
+ 	/* Already there ? */
+-	mutex_lock(&kvm->lock);
+ 	if (kvm->arch.xics)
+ 		ret = -EEXIST;
  	else
- 		gwj->handled_frames++;
+ 		kvm->arch.xics = xics;
+-	mutex_unlock(&kvm->lock);
+ 
+ 	if (ret) {
+ 		kfree(xics);
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 95e87f8ab351..4f10dcf3e76b 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -1059,6 +1059,12 @@ struct kvm_device {
+ /* create, destroy, and name are mandatory */
+ struct kvm_device_ops {
+ 	const char *name;
 +
-+	return;
-+
-+ out_delete:
-+	/* delete frame due to misconfiguration */
-+	gwj->deleted_frames++;
-+	kfree_skb(nskb);
-+	return;
- }
++	/*
++	 * create is called holding kvm->lock and any operations not suitable
++	 * to do while holding the lock should be deferred to init (see
++	 * below).
++	 */
+ 	int (*create)(struct kvm_device *dev, u32 type);
  
- static inline int cgw_register_filter(struct cgw_job *gwj)
-diff --git a/net/sunrpc/svc.c b/net/sunrpc/svc.c
-index a7e5624a1cf2..e9b2eaedbdf7 100644
---- a/net/sunrpc/svc.c
-+++ b/net/sunrpc/svc.c
-@@ -1063,6 +1063,8 @@ void svc_printk(struct svc_rqst *rqstp, const char *fmt, ...)
- static __printf(2,3) void svc_printk(struct svc_rqst *rqstp, const char *fmt, ...) {}
- #endif
- 
-+extern void svc_tcp_prep_reply_hdr(struct svc_rqst *);
-+
- /*
-  * Common routine for processing the RPC request.
-  */
-@@ -1092,7 +1094,8 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
- 	rqstp->rq_dropme = false;
- 
- 	/* Setup reply header */
--	rqstp->rq_xprt->xpt_ops->xpo_prep_reply_hdr(rqstp);
-+	if (rqstp->rq_prot == IPPROTO_TCP)
-+		svc_tcp_prep_reply_hdr(rqstp);
- 
- 	svc_putu32(resv, rqstp->rq_xid);
- 
-@@ -1139,7 +1142,8 @@ svc_process_common(struct svc_rqst *rqstp, struct kvec *argv, struct kvec *resv)
- 	case SVC_DENIED:
- 		goto err_bad_auth;
- 	case SVC_CLOSE:
--		if (test_bit(XPT_TEMP, &rqstp->rq_xprt->xpt_flags))
-+		if (rqstp->rq_xprt &&
-+		    test_bit(XPT_TEMP, &rqstp->rq_xprt->xpt_flags))
- 			svc_close_xprt(rqstp->rq_xprt);
- 	case SVC_DROP:
- 		goto dropit;
-@@ -1354,10 +1358,10 @@ bc_svc_process(struct svc_serv *serv, struct rpc_rqst *req,
- 	struct kvec	*resv = &rqstp->rq_res.head[0];
- 
- 	/* Build the svc_rqst used by the common processing routine */
--	rqstp->rq_xprt = serv->sv_bc_xprt;
- 	rqstp->rq_xid = req->rq_xid;
- 	rqstp->rq_prot = req->rq_xprt->prot;
- 	rqstp->rq_server = serv;
-+	rqstp->rq_bc_net = req->rq_xprt->xprt_net;
- 
- 	rqstp->rq_addrlen = sizeof(req->rq_xprt->addr);
- 	memcpy(&rqstp->rq_addr, &req->rq_xprt->addr, rqstp->rq_addrlen);
-diff --git a/net/sunrpc/svc_xprt.c b/net/sunrpc/svc_xprt.c
-index de5e3636d5ad..c7ae9ec430b8 100644
---- a/net/sunrpc/svc_xprt.c
-+++ b/net/sunrpc/svc_xprt.c
-@@ -432,10 +432,11 @@ static struct svc_xprt *svc_xprt_dequeue(struct svc_pool *pool)
-  */
- void svc_reserve(struct svc_rqst *rqstp, int space)
- {
-+	struct svc_xprt *xprt = rqstp->rq_xprt;
-+
- 	space += rqstp->rq_res.head[0].iov_len;
- 
--	if (space < rqstp->rq_reserved) {
--		struct svc_xprt *xprt = rqstp->rq_xprt;
-+	if (xprt && space < rqstp->rq_reserved) {
- 		atomic_sub((rqstp->rq_reserved - space), &xprt->xpt_reserved);
- 		rqstp->rq_reserved = space;
- 
-diff --git a/net/sunrpc/svcsock.c b/net/sunrpc/svcsock.c
-index 89a4db5be155..d4991f2b0dc8 100644
---- a/net/sunrpc/svcsock.c
-+++ b/net/sunrpc/svcsock.c
-@@ -1195,7 +1195,7 @@ static int svc_tcp_sendto(struct svc_rqst *rqstp)
- /*
-  * Setup response header. TCP has a 4B record length field.
-  */
--static void svc_tcp_prep_reply_hdr(struct svc_rqst *rqstp)
-+void svc_tcp_prep_reply_hdr(struct svc_rqst *rqstp)
- {
- 	struct kvec *resv = &rqstp->rq_res.head[0];
- 
+ 	/*
 diff --git a/virt/kvm/arm/vgic.c b/virt/kvm/arm/vgic.c
 index 24ac123f4ad8..7b490485712c 100644
 --- a/virt/kvm/arm/vgic.c
@@ -727,7 +1187,7 @@ index 24ac123f4ad8..7b490485712c 100644
  }
  
 diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
-index 1cfe0c62b128..111663da72ad 100644
+index d98e6cf1e781..f8cbf5ba6136 100644
 --- a/virt/kvm/kvm_main.c
 +++ b/virt/kvm/kvm_main.c
 @@ -587,6 +587,11 @@ static void kvm_destroy_devices(struct kvm *kvm)
@@ -742,7 +1202,7 @@ index 1cfe0c62b128..111663da72ad 100644
  	list_for_each_safe(node, tmp, &kvm->devices) {
  		struct kvm_device *dev =
  			list_entry(node, struct kvm_device, vm_node);
-@@ -2322,20 +2327,30 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
+@@ -2322,11 +2327,15 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
  	dev->ops = ops;
  	dev->kvm = kvm;
  
@@ -755,23 +1215,245 @@ index 1cfe0c62b128..111663da72ad 100644
  	}
 +	list_add(&dev->vm_node, &kvm->devices);
 +	mutex_unlock(&kvm->lock);
-+
-+	if (ops->init)
-+		ops->init(dev);
+ 
+ 	if (ops->init)
+ 		ops->init(dev);
+@@ -2334,10 +2343,12 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
+ 	ret = anon_inode_getfd(ops->name, &kvm_device_fops, dev, O_RDWR | O_CLOEXEC);
+ 	if (ret < 0) {
+ 		ops->destroy(dev);
++		mutex_lock(&kvm->lock);
++		list_del(&dev->vm_node);
++		mutex_unlock(&kvm->lock);
+ 		return ret;
+ 	}
+ 
+-	list_add(&dev->vm_node, &kvm->devices);
+ 	kvm_get_kvm(kvm);
+ 	cd->fd = ret;
+ 	return 0;
+-- 
+2.28.0
+
+
+From b95f1ba83c427b38ed91e2ce39f81e5e2e04e654 Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@oracle.com>
+Date: Wed, 30 Nov 2016 22:21:05 +0300
+Subject: [PATCH 13/17] KVM: use after free in kvm_ioctl_create_device()
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit a0f1d21c1ccb1da66629627a74059dd7f5ac9c61 upstream.
+
+We should move the ops->destroy(dev) after the list_del(&dev->vm_node)
+so that we don't use "dev" after freeing it.
+
+Fixes: a28ebea2adc4 ("KVM: Protect device ops->create and list_add with kvm->lock")
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Reviewed-by: David Hildenbrand <david@redhat.com>
+Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ virt/kvm/kvm_main.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index f8cbf5ba6136..ec170a4900cd 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -2342,10 +2342,10 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
+ 
+ 	ret = anon_inode_getfd(ops->name, &kvm_device_fops, dev, O_RDWR | O_CLOEXEC);
+ 	if (ret < 0) {
+-		ops->destroy(dev);
+ 		mutex_lock(&kvm->lock);
+ 		list_del(&dev->vm_node);
+ 		mutex_unlock(&kvm->lock);
++		ops->destroy(dev);
+ 		return ret;
+ 	}
+ 
+-- 
+2.28.0
+
+
+From 2aa9f75791601aab7bd02b8783aa9a8f5105f68f Mon Sep 17 00:00:00 2001
+From: Jann Horn <jannh@google.com>
+Date: Sat, 26 Jan 2019 01:54:33 +0100
+Subject: [PATCH 14/17] kvm: fix kvm_ioctl_create_device() reference counting
+ (CVE-2019-6974)
+
+commit cfa39381173d5f969daf43582c95ad679189cbc9 upstream.
+
+kvm_ioctl_create_device() does the following:
+
+1. creates a device that holds a reference to the VM object (with a borrowed
+   reference, the VM's refcount has not been bumped yet)
+2. initializes the device
+3. transfers the reference to the device to the caller's file descriptor table
+4. calls kvm_get_kvm() to turn the borrowed reference to the VM into a real
+   reference
+
+The ownership transfer in step 3 must not happen before the reference to the VM
+becomes a proper, non-borrowed reference, which only happens in step 4.
+After step 3, an attacker can close the file descriptor and drop the borrowed
+reference, which can cause the refcount of the kvm object to drop to zero.
+
+This means that we need to grab a reference for the device before
+anon_inode_getfd(), otherwise the VM can disappear from under us.
+
+Fixes: 852b6d57dc7f ("kvm: add device control API")
+Signed-off-by: Jann Horn <jannh@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ virt/kvm/kvm_main.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index ec170a4900cd..111663da72ad 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -2340,8 +2340,10 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
+ 	if (ops->init)
+ 		ops->init(dev);
  
 +	kvm_get_kvm(kvm);
  	ret = anon_inode_getfd(ops->name, &kvm_device_fops, dev, O_RDWR | O_CLOEXEC);
  	if (ret < 0) {
 +		kvm_put_kvm(kvm);
-+		mutex_lock(&kvm->lock);
-+		list_del(&dev->vm_node);
-+		mutex_unlock(&kvm->lock);
- 		ops->destroy(dev);
+ 		mutex_lock(&kvm->lock);
+ 		list_del(&dev->vm_node);
+ 		mutex_unlock(&kvm->lock);
+@@ -2349,7 +2351,6 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
  		return ret;
  	}
  
--	list_add(&dev->vm_node, &kvm->devices);
 -	kvm_get_kvm(kvm);
  	cd->fd = ret;
  	return 0;
  }
+-- 
+2.28.0
+
+
+From 69c7b3bb99c621f44fb46c20ccef737e86e1c5c8 Mon Sep 17 00:00:00 2001
+From: Peter Shier <pshier@google.com>
+Date: Thu, 11 Oct 2018 11:46:46 -0700
+Subject: [PATCH 15/17] KVM: nVMX: unconditionally cancel preemption timer in
+ free_nested (CVE-2019-7221)
+
+commit ecec76885bcfe3294685dc363fd1273df0d5d65f upstream.
+
+Bugzilla: 1671904
+
+There are multiple code paths where an hrtimer may have been started to
+emulate an L1 VMX preemption timer that can result in a call to free_nested
+without an intervening L2 exit where the hrtimer is normally
+cancelled. Unconditionally cancel in free_nested to cover all cases.
+
+Embargoed until Feb 7th 2019.
+
+Signed-off-by: Peter Shier <pshier@google.com>
+Reported-by: Jim Mattson <jmattson@google.com>
+Reviewed-by: Jim Mattson <jmattson@google.com>
+Reported-by: Felix Wilhelm <fwilhelm@google.com>
+Message-Id: <20181011184646.154065-1-pshier@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+[bwh: Backported to 3.16: adjust filename, context]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ arch/x86/kvm/vmx.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index d3f1873eafc4..70c3146fe6ca 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -6169,6 +6169,7 @@ static void free_nested(struct vcpu_vmx *vmx)
+ {
+ 	if (!vmx->nested.vmxon)
+ 		return;
++	hrtimer_cancel(&vmx->nested.preemption_timer);
+ 	vmx->nested.vmxon = false;
+ 	if (vmx->nested.current_vmptr != -1ull) {
+ 		nested_release_vmcs12(vmx);
+-- 
+2.28.0
+
+
+From 234a2dee1b06502face184e241e03582d7946f80 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 29 Jan 2019 18:41:16 +0100
+Subject: [PATCH 16/17] KVM: x86: work around leak of uninitialized stack
+ contents (CVE-2019-7222)
+
+commit 353c0956a618a07ba4bbe7ad00ff29fe70e8412a upstream.
+
+Bugzilla: 1671930
+
+Emulation of certain instructions (VMXON, VMCLEAR, VMPTRLD, VMWRITE with
+memory operand, INVEPT, INVVPID) can incorrectly inject a page fault
+when passed an operand that points to an MMIO address.  The page fault
+will use uninitialized kernel stack memory as the CR2 and error code.
+
+The right behavior would be to abort the VM with a KVM_EXIT_INTERNAL_ERROR
+exit to userspace; however, it is not an easy fix, so for now just
+ensure that the error code and CR2 are zero.
+
+Embargoed until Feb 7th 2019.
+
+Reported-by: Felix Wilhelm <fwilhelm@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+---
+ arch/x86/kvm/x86.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index ffb64cfc7989..6babfe32e04b 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4208,6 +4208,13 @@ int kvm_read_guest_virt(struct kvm_vcpu *vcpu,
+ {
+ 	u32 access = (kvm_x86_ops->get_cpl(vcpu) == 3) ? PFERR_USER_MASK : 0;
+ 
++	/*
++	 * FIXME: this should call handle_emulation_failure if X86EMUL_IO_NEEDED
++	 * is returned, but our callers are not ready for that and they blindly
++	 * call kvm_inject_page_fault.  Ensure that they at least do not leak
++	 * uninitialized kernel stack memory into cr2 and error code.
++	 */
++	memset(exception, 0, sizeof(*exception));
+ 	return kvm_read_guest_virt_helper(addr, val, bytes, vcpu, access,
+ 					  exception);
+ }
+-- 
+2.28.0
+
+
+From b0b28dc25ad57b77f6b69b40619364188e0f1354 Mon Sep 17 00:00:00 2001
+From: Ben Hutchings <ben@decadent.org.uk>
+Date: Mon, 25 Mar 2019 17:32:37 +0000
+Subject: [PATCH 17/17] Linux 3.16.64
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 8d67c849c7e8..5f9f8b3c9214 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 16
+-SUBLEVEL = 63
++SUBLEVEL = 64
+ EXTRAVERSION =
+ NAME = Museum of Fishiegoodies
+ 
+-- 
+2.28.0
+

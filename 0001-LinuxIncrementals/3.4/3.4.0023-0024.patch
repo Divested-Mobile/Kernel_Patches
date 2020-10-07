@@ -1,17 +1,309 @@
-diff --git a/Makefile b/Makefile
-index bf1df55..a3e12e6 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 4
--SUBLEVEL = 23
-+SUBLEVEL = 24
- EXTRAVERSION =
- NAME = Saber-toothed Squirrel
+From 78a685beb044864de000a6f7339bce57513172bb Mon Sep 17 00:00:00 2001
+From: Mel Gorman <mgorman@suse.de>
+Date: Wed, 5 Dec 2012 14:01:41 -0800
+Subject: [PATCH 01/29] tmpfs: fix shared mempolicy leak
+
+commit 18a2f371f5edf41810f6469cb9be39931ef9deb9 upstream.
+
+This fixes a regression in 3.7-rc, which has since gone into stable.
+
+Commit 00442ad04a5e ("mempolicy: fix a memory corruption by refcount
+imbalance in alloc_pages_vma()") changed get_vma_policy() to raise the
+refcount on a shmem shared mempolicy; whereas shmem_alloc_page() went
+on expecting alloc_page_vma() to drop the refcount it had acquired.
+This deserves a rework: but for now fix the leak in shmem_alloc_page().
+
+Hugh: shmem_swapin() did not need a fix, but surely it's clearer to use
+the same refcounting there as in shmem_alloc_page(), delete its onstack
+mempolicy, and the strange mpol_cond_copy() and __mpol_cond_copy() -
+those were invented to let swapin_readahead() make an unknown number of
+calls to alloc_pages_vma() with one mempolicy; but since 00442ad04a5e,
+alloc_pages_vma() has kept refcount in balance, so now no problem.
+
+Reported-and-tested-by: Tommi Rantala <tt.rantala@gmail.com>
+Signed-off-by: Mel Gorman <mgorman@suse.de>
+Signed-off-by: Hugh Dickins <hughd@google.com>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/mempolicy.h | 16 ----------------
+ mm/mempolicy.c            | 22 ----------------------
+ mm/shmem.c                | 26 ++++++++++++++++----------
+ 3 files changed, 16 insertions(+), 48 deletions(-)
+
+diff --git a/include/linux/mempolicy.h b/include/linux/mempolicy.h
+index 0abf1d436b12..fe07e5a90569 100644
+--- a/include/linux/mempolicy.h
++++ b/include/linux/mempolicy.h
+@@ -137,16 +137,6 @@ static inline void mpol_cond_put(struct mempolicy *pol)
+ 		__mpol_put(pol);
+ }
  
+-extern struct mempolicy *__mpol_cond_copy(struct mempolicy *tompol,
+-					  struct mempolicy *frompol);
+-static inline struct mempolicy *mpol_cond_copy(struct mempolicy *tompol,
+-						struct mempolicy *frompol)
+-{
+-	if (!frompol)
+-		return frompol;
+-	return __mpol_cond_copy(tompol, frompol);
+-}
+-
+ extern struct mempolicy *__mpol_dup(struct mempolicy *pol);
+ static inline struct mempolicy *mpol_dup(struct mempolicy *pol)
+ {
+@@ -270,12 +260,6 @@ static inline void mpol_cond_put(struct mempolicy *pol)
+ {
+ }
+ 
+-static inline struct mempolicy *mpol_cond_copy(struct mempolicy *to,
+-						struct mempolicy *from)
+-{
+-	return from;
+-}
+-
+ static inline void mpol_get(struct mempolicy *pol)
+ {
+ }
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index d1e4beffbe1f..458dedef9ee5 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -2009,28 +2009,6 @@ struct mempolicy *__mpol_dup(struct mempolicy *old)
+ 	return new;
+ }
+ 
+-/*
+- * If *frompol needs [has] an extra ref, copy *frompol to *tompol ,
+- * eliminate the * MPOL_F_* flags that require conditional ref and
+- * [NOTE!!!] drop the extra ref.  Not safe to reference *frompol directly
+- * after return.  Use the returned value.
+- *
+- * Allows use of a mempolicy for, e.g., multiple allocations with a single
+- * policy lookup, even if the policy needs/has extra ref on lookup.
+- * shmem_readahead needs this.
+- */
+-struct mempolicy *__mpol_cond_copy(struct mempolicy *tompol,
+-						struct mempolicy *frompol)
+-{
+-	if (!mpol_needs_cond_ref(frompol))
+-		return frompol;
+-
+-	*tompol = *frompol;
+-	tompol->flags &= ~MPOL_F_SHARED;	/* copy doesn't need unref */
+-	__mpol_put(frompol);
+-	return tompol;
+-}
+-
+ /* Slow path of a mempolicy comparison */
+ bool __mpol_equal(struct mempolicy *a, struct mempolicy *b)
+ {
+diff --git a/mm/shmem.c b/mm/shmem.c
+index a859b06d573f..a409bd817819 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -798,24 +798,28 @@ static struct mempolicy *shmem_get_sbmpol(struct shmem_sb_info *sbinfo)
+ static struct page *shmem_swapin(swp_entry_t swap, gfp_t gfp,
+ 			struct shmem_inode_info *info, pgoff_t index)
+ {
+-	struct mempolicy mpol, *spol;
+ 	struct vm_area_struct pvma;
+-
+-	spol = mpol_cond_copy(&mpol,
+-			mpol_shared_policy_lookup(&info->policy, index));
++	struct page *page;
+ 
+ 	/* Create a pseudo vma that just contains the policy */
+ 	pvma.vm_start = 0;
+ 	pvma.vm_pgoff = index;
+ 	pvma.vm_ops = NULL;
+-	pvma.vm_policy = spol;
+-	return swapin_readahead(swap, gfp, &pvma, 0);
++	pvma.vm_policy = mpol_shared_policy_lookup(&info->policy, index);
++
++	page = swapin_readahead(swap, gfp, &pvma, 0);
++
++	/* Drop reference taken by mpol_shared_policy_lookup() */
++	mpol_cond_put(pvma.vm_policy);
++
++	return page;
+ }
+ 
+ static struct page *shmem_alloc_page(gfp_t gfp,
+ 			struct shmem_inode_info *info, pgoff_t index)
+ {
+ 	struct vm_area_struct pvma;
++	struct page *page;
+ 
+ 	/* Create a pseudo vma that just contains the policy */
+ 	pvma.vm_start = 0;
+@@ -823,10 +827,12 @@ static struct page *shmem_alloc_page(gfp_t gfp,
+ 	pvma.vm_ops = NULL;
+ 	pvma.vm_policy = mpol_shared_policy_lookup(&info->policy, index);
+ 
+-	/*
+-	 * alloc_page_vma() will drop the shared policy reference
+-	 */
+-	return alloc_page_vma(gfp, &pvma, 0);
++	page = alloc_page_vma(gfp, &pvma, 0);
++
++	/* Drop reference taken by mpol_shared_policy_lookup() */
++	mpol_cond_put(pvma.vm_policy);
++
++	return page;
+ }
+ #else /* !CONFIG_NUMA */
+ #ifdef CONFIG_TMPFS
+-- 
+2.28.0
+
+
+From e07aa3cc22bef722b29b247287d8e47d4c6c2b22 Mon Sep 17 00:00:00 2001
+From: Chris Ball <cjb@laptop.org>
+Date: Mon, 3 Dec 2012 09:17:19 -0500
+Subject: [PATCH 02/29] Revert misapplied "mmc: sh-mmcif: avoid oops on
+ spurious interrupts"
+
+commit 6984f3c31bb57cb7491dbec1be44b74bd00f4648 upstream.
+
+This reverts commit 8464dd52d3198dd05, which was a misapplied debugging
+version of the patch, not the final patch itself.
+
+Signed-off-by: Chris Ball <cjb@laptop.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mmc/host/sh_mmcif.c | 4 ----
+ 1 file changed, 4 deletions(-)
+
+diff --git a/drivers/mmc/host/sh_mmcif.c b/drivers/mmc/host/sh_mmcif.c
+index 3b8236bedee5..724b35e85a26 100644
+--- a/drivers/mmc/host/sh_mmcif.c
++++ b/drivers/mmc/host/sh_mmcif.c
+@@ -1191,10 +1191,6 @@ static irqreturn_t sh_mmcif_intr(int irq, void *dev_id)
+ 		host->sd_error = true;
+ 		dev_dbg(&host->pd->dev, "int err state = %08x\n", state);
+ 	}
+-	if (host->state == STATE_IDLE) {
+-		dev_info(&host->pd->dev, "Spurious IRQ status 0x%x", state);
+-		return IRQ_HANDLED;
+-	}
+ 	if (state & ~(INT_CMD12RBE | INT_CMD12CRE)) {
+ 		if (!host->dma_active)
+ 			return IRQ_WAKE_THREAD;
+-- 
+2.28.0
+
+
+From 47dc7057a276a3394c94803dd66b395664ebc8f0 Mon Sep 17 00:00:00 2001
+From: Guennadi Liakhovetski <g.liakhovetski@gmx.de>
+Date: Wed, 22 Aug 2012 06:49:47 +0000
+Subject: [PATCH 03/29] mmc: sh-mmcif: avoid oops on spurious interrupts
+ (second try)
+
+commit 91ab252ac5a5c3461dd6910797611e9172626aed upstream.
+
+On some systems, e.g., kzm9g, MMCIF interfaces can produce spurious
+interrupts without any active request. To prevent the Oops, that results
+in such cases, don't dereference the mmc request pointer until we make
+sure, that we are indeed processing such a request.
+
+Reported-by: Tetsuyuki Kobayashi <koba@kmckk.co.jp>
+Signed-off-by: Guennadi Liakhovetski <g.liakhovetski@gmx.de>
+Tested-by: Tetsuyuki Kobayashi <koba@kmckk.co.jp>
+Signed-off-by: Chris Ball <cjb@laptop.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mmc/host/sh_mmcif.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/mmc/host/sh_mmcif.c b/drivers/mmc/host/sh_mmcif.c
+index 724b35e85a26..a5786a837a29 100644
+--- a/drivers/mmc/host/sh_mmcif.c
++++ b/drivers/mmc/host/sh_mmcif.c
+@@ -1066,7 +1066,6 @@ static irqreturn_t sh_mmcif_irqt(int irq, void *dev_id)
+ {
+ 	struct sh_mmcif_host *host = dev_id;
+ 	struct mmc_request *mrq = host->mrq;
+-	struct mmc_data *data = mrq->data;
+ 
+ 	cancel_delayed_work_sync(&host->timeout_work);
+ 
+@@ -1114,13 +1113,14 @@ static irqreturn_t sh_mmcif_irqt(int irq, void *dev_id)
+ 	case MMCIF_WAIT_FOR_READ_END:
+ 	case MMCIF_WAIT_FOR_WRITE_END:
+ 		if (host->sd_error)
+-			data->error = sh_mmcif_error_manage(host);
++			mrq->data->error = sh_mmcif_error_manage(host);
+ 		break;
+ 	default:
+ 		BUG();
+ 	}
+ 
+ 	if (host->wait_for != MMCIF_WAIT_FOR_STOP) {
++		struct mmc_data *data = mrq->data;
+ 		if (!mrq->cmd->error && data && !data->error)
+ 			data->bytes_xfered =
+ 				data->blocks * data->blksz;
+-- 
+2.28.0
+
+
+From 1b59789b7d3aca70cca0a7b66e57a4a78fcd12d4 Mon Sep 17 00:00:00 2001
+From: Paul Walmsley <paul@pwsan.com>
+Date: Tue, 23 Oct 2012 20:32:59 +0100
+Subject: [PATCH 04/29] ARM: 7566/1: vfp: fix save and restore when running on
+ pre-VFPv3 and CONFIG_VFPv3 set
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 39141ddfb63a664f26d3f42f64ee386e879b492c upstream.
+
+After commit 846a136881b8f73c1f74250bf6acfaa309cab1f2 ("ARM: vfp: fix
+saving d16-d31 vfp registers on v6+ kernels"), the OMAP 2430SDP board
+started crashing during boot with omap2plus_defconfig:
+
+[    3.875122] mmcblk0: mmc0:e624 SD04G 3.69 GiB
+[    3.915954]  mmcblk0: p1
+[    4.086639] Internal error: Oops - undefined instruction: 0 [#1] SMP ARM
+[    4.093719] Modules linked in:
+[    4.096954] CPU: 0    Not tainted  (3.6.0-02232-g759e00b #570)
+[    4.103149] PC is at vfp_reload_hw+0x1c/0x44
+[    4.107666] LR is at __und_usr_fault_32+0x0/0x8
+
+It turns out that the context save/restore fix unmasked a latent bug
+in commit 5aaf254409f8d58229107b59507a8235b715a960 ("ARM: 6203/1: Make
+VFPv3 usable on ARMv6").  When CONFIG_VFPv3 is set, but the kernel is
+booted on a pre-VFPv3 core, the code attempts to save and restore the
+d16-d31 VFP registers.  These are only present on non-D16 VFPv3+, so
+this results in an undefined instruction exception.  The code didn't
+crash before commit 846a136 because the save and restore code was
+only touching d0-d15, present on all VFP.
+
+Fix by implementing a request from Russell King to add a new HWCAP
+flag that affirmatively indicates the presence of the d16-d31
+registers:
+
+   http://marc.info/?l=linux-arm-kernel&m=135013547905283&w=2
+
+and some feedback from Måns to clarify the name of the HWCAP flag.
+
+Signed-off-by: Paul Walmsley <paul@pwsan.com>
+Cc: Tony Lindgren <tony@atomide.com>
+Cc: Catalin Marinas <catalin.marinas@arm.com>
+Cc: Dave Martin <dave.martin@linaro.org>
+Cc: Måns Rullgård <mans.rullgard@linaro.org>
+Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/include/asm/hwcap.h     |  3 ++-
+ arch/arm/include/asm/vfpmacros.h | 12 ++++++------
+ arch/arm/vfp/vfpmodule.c         |  9 ++++++---
+ 3 files changed, 14 insertions(+), 10 deletions(-)
+
 diff --git a/arch/arm/include/asm/hwcap.h b/arch/arm/include/asm/hwcap.h
-index 9176261..a2fe893 100644
+index 917626128a1d..a2fe893802a6 100644
 --- a/arch/arm/include/asm/hwcap.h
 +++ b/arch/arm/include/asm/hwcap.h
 @@ -18,11 +18,12 @@
@@ -29,7 +321,7 @@ index 9176261..a2fe893 100644
  
  #if defined(__KERNEL__)
 diff --git a/arch/arm/include/asm/vfpmacros.h b/arch/arm/include/asm/vfpmacros.h
-index bf53047..c49c8f7 100644
+index bf5304797c76..c49c8f778b5d 100644
 --- a/arch/arm/include/asm/vfpmacros.h
 +++ b/arch/arm/include/asm/vfpmacros.h
 @@ -27,9 +27,9 @@
@@ -59,7 +351,7 @@ index bf53047..c49c8f7 100644
  	VFPFMRX	\tmp, MVFR0			    @ Media and VFP Feature Register 0
  	and	\tmp, \tmp, #MVFR0_A_SIMD_MASK	    @ A_SIMD field
 diff --git a/arch/arm/vfp/vfpmodule.c b/arch/arm/vfp/vfpmodule.c
-index 1f8241d..3b36062 100644
+index 1f8241da03be..3b360625af75 100644
 --- a/arch/arm/vfp/vfpmodule.c
 +++ b/arch/arm/vfp/vfpmodule.c
 @@ -701,11 +701,14 @@ static int __init vfp_init(void)
@@ -80,8 +372,495 @@ index 1f8241d..3b36062 100644
  		}
  #endif
  		/*
+-- 
+2.28.0
+
+
+From a11bf0aa146b60e917dc30348e301d6a7d13dcbd Mon Sep 17 00:00:00 2001
+From: Peter Ujfalusi <peter.ujfalusi@ti.com>
+Date: Mon, 1 Oct 2012 12:29:26 +0300
+Subject: [PATCH 05/29] ASoC: dmaengine: Correct Makefile when sound is built
+ as module
+
+commit 961a7aeafab477f63d9eef26afde9cbb8badcd0f upstream.
+
+soc-dmaengine-pcm library need to be part of the snd-soc-core in order to
+be able to compile ASoC as modules when dmaengine is enabled on the platform.
+
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@ti.com>
+Signed-off-by: Mark Brown <broonie@opensource.wolfsonmicro.com>
+Cc: Florian Fainelli <florian@openwrt.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ sound/soc/Makefile | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/sound/soc/Makefile b/sound/soc/Makefile
+index 2feaf376e94b..0f370861bbae 100644
+--- a/sound/soc/Makefile
++++ b/sound/soc/Makefile
+@@ -1,8 +1,9 @@
+ snd-soc-core-objs := soc-core.o soc-dapm.o soc-jack.o soc-cache.o soc-utils.o
+ snd-soc-core-objs += soc-pcm.o soc-io.o
+ 
+-snd-soc-dmaengine-pcm-objs := soc-dmaengine-pcm.o
+-obj-$(CONFIG_SND_SOC_DMAENGINE_PCM) += snd-soc-dmaengine-pcm.o
++ifneq ($(CONFIG_SND_SOC_DMAENGINE_PCM),)
++snd-soc-core-objs += soc-dmaengine-pcm.o
++endif
+ 
+ obj-$(CONFIG_SND_SOC)	+= snd-soc-core.o
+ obj-$(CONFIG_SND_SOC)	+= codecs/
+-- 
+2.28.0
+
+
+From 4afca924c03e95345be979bfb7abbfa85963fada Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Tue, 4 Dec 2012 07:40:39 -0800
+Subject: [PATCH 06/29] workqueue: convert BUG_ON()s in __queue_delayed_work()
+ to WARN_ON_ONCE()s
+
+commit fc4b514f2727f74a4587c31db87e0e93465518c3 upstream.
+
+8852aac25e ("workqueue: mod_delayed_work_on() shouldn't queue timer on
+0 delay") unexpectedly uncovered a very nasty abuse of delayed_work in
+megaraid - it allocated work_struct, casted it to delayed_work and
+then pass that into queue_delayed_work().
+
+Previously, this was okay because 0 @delay short-circuited to
+queue_work() before doing anything with delayed_work.  8852aac25e
+moved 0 @delay test into __queue_delayed_work() after sanity check on
+delayed_work making megaraid trigger BUG_ON().
+
+Although megaraid is already fixed by c1d390d8e6 ("megaraid: fix
+BUG_ON() from incorrect use of delayed work"), this patch converts
+BUG_ON()s in __queue_delayed_work() to WARN_ON_ONCE()s so that such
+abusers, if there are more, trigger warning but don't crash the
+machine.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Cc: Xiaotian Feng <xtfeng@gmail.com>
+Signed-off-by: Shuah Khan <shuah.khan@hp.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/workqueue.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/kernel/workqueue.c b/kernel/workqueue.c
+index bcb9d342714b..a64b94e3c27c 100644
+--- a/kernel/workqueue.c
++++ b/kernel/workqueue.c
+@@ -1141,8 +1141,8 @@ int queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
+ 	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+ 		unsigned int lcpu;
+ 
+-		BUG_ON(timer_pending(timer));
+-		BUG_ON(!list_empty(&work->entry));
++		WARN_ON_ONCE(timer_pending(timer));
++		WARN_ON_ONCE(!list_empty(&work->entry));
+ 
+ 		timer_stats_timer_set_start_info(&dwork->timer);
+ 
+-- 
+2.28.0
+
+
+From 11b73096b67cde81ba05125cecb06fe9884e4cb7 Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Mon, 12 Nov 2012 14:33:44 +0200
+Subject: [PATCH 07/29] drm/i915: do not ignore eDP bpc settings from vbt
+
+commit 2f4f649a69a9eb51f6e98130e19dd90a260a4145 upstream.
+
+There are laptops out there that need the eDP bpc from VBT. This is
+effectively a revert of
+
+commit 4344b813f105a19f793f1fd93ad775b784648b95
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Fri Aug 10 11:10:20 2012 +0200
+
+    drm/i915: ignore eDP bpc settings from vbt
+
+but putting the VBT check after the EDID check to see them both in dmesg if
+this clamps more than the EDID. We have enough history with bpc clamping to
+warrant the extra debug info.
+
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=47641
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=56401
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/i915/intel_display.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index f3b06f04e011..c9ea4fba4479 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -4996,6 +4996,17 @@ static bool intel_choose_pipe_bpp_dither(struct drm_crtc *crtc,
+ 			}
+ 		}
+ 
++		if (intel_encoder->type == INTEL_OUTPUT_EDP) {
++			/* Use VBT settings if we have an eDP panel */
++			unsigned int edp_bpc = dev_priv->edp.bpp / 3;
++
++			if (edp_bpc < display_bpc) {
++				DRM_DEBUG_KMS("clamping display bpc (was %d) to eDP (%d)\n", display_bpc, edp_bpc);
++				display_bpc = edp_bpc;
++			}
++			continue;
++		}
++
+ 		/*
+ 		 * HDMI is either 12 or 8, so if the display lets 10bpc sneak
+ 		 * through, clamp it down.  (Note: >12bpc will be caught below.)
+-- 
+2.28.0
+
+
+From d7ba8dff3e8afc83efe19c52ac7bd9ee2b65720b Mon Sep 17 00:00:00 2001
+From: Jani Nikula <jani.nikula@intel.com>
+Date: Mon, 12 Nov 2012 14:33:45 +0200
+Subject: [PATCH 08/29] drm/i915: do not default to 18 bpp for eDP if missing
+ from VBT
+
+commit 9a30a61f3516871c5c638fd7c025fbaa11ddf7fe upstream.
+
+commit 500a8cc466a24e2fbc4c86ef9c6467ae2ffdeb0c
+Author: Zhenyu Wang <zhenyuw@linux.intel.com>
+Date:   Wed Jan 13 11:19:52 2010 +0800
+
+    drm/i915: parse eDP panel color depth from VBT block
+
+originally introduced parsing bpp for eDP from VBT, with a default of 18
+bpp if the eDP BIOS data block is not present. Turns out that default seems
+to break the Macbook Pro with retina display, as noted in
+
+commit 4344b813f105a19f793f1fd93ad775b784648b95
+Author: Daniel Vetter <daniel.vetter@ffwll.ch>
+Date:   Fri Aug 10 11:10:20 2012 +0200
+
+    drm/i915: ignore eDP bpc settings from vbt
+
+Since we can't ignore bpc settings from VBT completely after all, get rid
+of the default. Do not clamp eDP to 18 bpp by default if the eDP BDB is
+missing from VBT.
+
+Signed-off-by: Jani Nikula <jani.nikula@intel.com>
+Tested-by: Henrik Rydberg <rydberg@euromail.se>
+[danvet: paste in the updated commit message from irc.]
+Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/i915/intel_bios.c    | 11 ++---------
+ drivers/gpu/drm/i915/intel_display.c |  2 +-
+ 2 files changed, 3 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/gpu/drm/i915/intel_bios.c b/drivers/gpu/drm/i915/intel_bios.c
+index b48fc2a8410c..3fe05245d3fc 100644
+--- a/drivers/gpu/drm/i915/intel_bios.c
++++ b/drivers/gpu/drm/i915/intel_bios.c
+@@ -459,12 +459,8 @@ parse_edp(struct drm_i915_private *dev_priv, struct bdb_header *bdb)
+ 
+ 	edp = find_section(bdb, BDB_EDP);
+ 	if (!edp) {
+-		if (SUPPORTS_EDP(dev_priv->dev) && dev_priv->edp.support) {
+-			DRM_DEBUG_KMS("No eDP BDB found but eDP panel "
+-				      "supported, assume %dbpp panel color "
+-				      "depth.\n",
+-				      dev_priv->edp.bpp);
+-		}
++		if (SUPPORTS_EDP(dev_priv->dev) && dev_priv->edp.support)
++			DRM_DEBUG_KMS("No eDP BDB found but eDP panel supported.\n");
+ 		return;
+ 	}
+ 
+@@ -617,9 +613,6 @@ init_vbt_defaults(struct drm_i915_private *dev_priv)
+ 	dev_priv->lvds_use_ssc = 1;
+ 	dev_priv->lvds_ssc_freq = intel_bios_ssc_frequency(dev, 1);
+ 	DRM_DEBUG_KMS("Set default to SSC at %dMHz\n", dev_priv->lvds_ssc_freq);
+-
+-	/* eDP data */
+-	dev_priv->edp.bpp = 18;
+ }
+ 
+ static int __init intel_no_opregion_vbt_callback(const struct dmi_system_id *id)
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index c9ea4fba4479..dd3e7e44023e 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -5000,7 +5000,7 @@ static bool intel_choose_pipe_bpp_dither(struct drm_crtc *crtc,
+ 			/* Use VBT settings if we have an eDP panel */
+ 			unsigned int edp_bpc = dev_priv->edp.bpp / 3;
+ 
+-			if (edp_bpc < display_bpc) {
++			if (edp_bpc && edp_bpc < display_bpc) {
+ 				DRM_DEBUG_KMS("clamping display bpc (was %d) to eDP (%d)\n", display_bpc, edp_bpc);
+ 				display_bpc = edp_bpc;
+ 			}
+-- 
+2.28.0
+
+
+From ead8c6b3697c9d45c16ecad17e5b4101573767f9 Mon Sep 17 00:00:00 2001
+From: Marek Szyprowski <m.szyprowski@samsung.com>
+Date: Wed, 7 Nov 2012 15:37:07 +0100
+Subject: [PATCH 09/29] mm: dmapool: use provided gfp flags for all
+ dma_alloc_coherent() calls
+
+commit 387870f2d6d679746020fa8e25ef786ff338dc98 upstream.
+
+dmapool always calls dma_alloc_coherent() with GFP_ATOMIC flag,
+regardless the flags provided by the caller. This causes excessive
+pruning of emergency memory pools without any good reason. Additionaly,
+on ARM architecture any driver which is using dmapools will sooner or
+later  trigger the following error:
+"ERROR: 256 KiB atomic DMA coherent pool is too small!
+Please increase it with coherent_pool= kernel parameter!".
+Increasing the coherent pool size usually doesn't help much and only
+delays such error, because all GFP_ATOMIC DMA allocations are always
+served from the special, very limited memory pool.
+
+This patch changes the dmapool code to correctly use gfp flags provided
+by the dmapool caller.
+
+Reported-by: Soeren Moch <smoch@web.de>
+Reported-by: Thomas Petazzoni <thomas.petazzoni@free-electrons.com>
+Signed-off-by: Marek Szyprowski <m.szyprowski@samsung.com>
+Tested-by: Andrew Lunn <andrew@lunn.ch>
+Tested-by: Soeren Moch <smoch@web.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/dmapool.c | 31 +++++++------------------------
+ 1 file changed, 7 insertions(+), 24 deletions(-)
+
+diff --git a/mm/dmapool.c b/mm/dmapool.c
+index c5ab33bca0a8..da1b0f0b8709 100644
+--- a/mm/dmapool.c
++++ b/mm/dmapool.c
+@@ -50,7 +50,6 @@ struct dma_pool {		/* the pool */
+ 	size_t allocation;
+ 	size_t boundary;
+ 	char name[32];
+-	wait_queue_head_t waitq;
+ 	struct list_head pools;
+ };
+ 
+@@ -62,8 +61,6 @@ struct dma_page {		/* cacheable header for 'allocation' bytes */
+ 	unsigned int offset;
+ };
+ 
+-#define	POOL_TIMEOUT_JIFFIES	((100 /* msec */ * HZ) / 1000)
+-
+ static DEFINE_MUTEX(pools_lock);
+ 
+ static ssize_t
+@@ -172,7 +169,6 @@ struct dma_pool *dma_pool_create(const char *name, struct device *dev,
+ 	retval->size = size;
+ 	retval->boundary = boundary;
+ 	retval->allocation = allocation;
+-	init_waitqueue_head(&retval->waitq);
+ 
+ 	if (dev) {
+ 		int ret;
+@@ -227,7 +223,6 @@ static struct dma_page *pool_alloc_page(struct dma_pool *pool, gfp_t mem_flags)
+ 		memset(page->vaddr, POOL_POISON_FREED, pool->allocation);
+ #endif
+ 		pool_initialise_page(pool, page);
+-		list_add(&page->page_list, &pool->page_list);
+ 		page->in_use = 0;
+ 		page->offset = 0;
+ 	} else {
+@@ -315,30 +310,21 @@ void *dma_pool_alloc(struct dma_pool *pool, gfp_t mem_flags,
+ 	might_sleep_if(mem_flags & __GFP_WAIT);
+ 
+ 	spin_lock_irqsave(&pool->lock, flags);
+- restart:
+ 	list_for_each_entry(page, &pool->page_list, page_list) {
+ 		if (page->offset < pool->allocation)
+ 			goto ready;
+ 	}
+-	page = pool_alloc_page(pool, GFP_ATOMIC);
+-	if (!page) {
+-		if (mem_flags & __GFP_WAIT) {
+-			DECLARE_WAITQUEUE(wait, current);
+ 
+-			__set_current_state(TASK_UNINTERRUPTIBLE);
+-			__add_wait_queue(&pool->waitq, &wait);
+-			spin_unlock_irqrestore(&pool->lock, flags);
++	/* pool_alloc_page() might sleep, so temporarily drop &pool->lock */
++	spin_unlock_irqrestore(&pool->lock, flags);
+ 
+-			schedule_timeout(POOL_TIMEOUT_JIFFIES);
++	page = pool_alloc_page(pool, mem_flags);
++	if (!page)
++		return NULL;
+ 
+-			spin_lock_irqsave(&pool->lock, flags);
+-			__remove_wait_queue(&pool->waitq, &wait);
+-			goto restart;
+-		}
+-		retval = NULL;
+-		goto done;
+-	}
++	spin_lock_irqsave(&pool->lock, flags);
+ 
++	list_add(&page->page_list, &pool->page_list);
+  ready:
+ 	page->in_use++;
+ 	offset = page->offset;
+@@ -348,7 +334,6 @@ void *dma_pool_alloc(struct dma_pool *pool, gfp_t mem_flags,
+ #ifdef	DMAPOOL_DEBUG
+ 	memset(retval, POOL_POISON_ALLOCATED, pool->size);
+ #endif
+- done:
+ 	spin_unlock_irqrestore(&pool->lock, flags);
+ 	return retval;
+ }
+@@ -435,8 +420,6 @@ void dma_pool_free(struct dma_pool *pool, void *vaddr, dma_addr_t dma)
+ 	page->in_use--;
+ 	*(int *)vaddr = page->offset;
+ 	page->offset = offset;
+-	if (waitqueue_active(&pool->waitq))
+-		wake_up_locked(&pool->waitq);
+ 	/*
+ 	 * Resist a temptation to do
+ 	 *    if (!is_page_busy(page)) pool_free_page(pool, page);
+-- 
+2.28.0
+
+
+From 5678ad746ce7654007d3fd521015ff93ef907747 Mon Sep 17 00:00:00 2001
+From: Boris Ostrovsky <boris.ostrovsky@amd.com>
+Date: Wed, 5 Dec 2012 06:12:42 -0500
+Subject: [PATCH 10/29] x86,AMD: Power driver support for AMD's family 16h
+ processors
+
+commit 22e32f4f57778ebc6e17812fa3008361c05d64f9 upstream.
+
+Add family 16h PCI ID to AMD's power driver to allow it report
+power consumption on these processors.
+
+Signed-off-by: Boris Ostrovsky <boris.ostrovsky@amd.com>
+Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/hwmon/fam15h_power.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/hwmon/fam15h_power.c b/drivers/hwmon/fam15h_power.c
+index ac2d6cb39e7d..770e95951a56 100644
+--- a/drivers/hwmon/fam15h_power.c
++++ b/drivers/hwmon/fam15h_power.c
+@@ -31,6 +31,9 @@ MODULE_DESCRIPTION("AMD Family 15h CPU processor power monitor");
+ MODULE_AUTHOR("Andreas Herrmann <andreas.herrmann3@amd.com>");
+ MODULE_LICENSE("GPL");
+ 
++/* Family 16h Northbridge's function 4 PCI ID */
++#define PCI_DEVICE_ID_AMD_16H_NB_F4	0x1534
++
+ /* D18F3 */
+ #define REG_NORTHBRIDGE_CAP		0xe8
+ 
+@@ -256,6 +259,7 @@ static void __devexit fam15h_power_remove(struct pci_dev *pdev)
+ 
+ static DEFINE_PCI_DEVICE_TABLE(fam15h_power_id_table) = {
+ 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_15H_NB_F4) },
++	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_16H_NB_F4) },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(pci, fam15h_power_id_table);
+-- 
+2.28.0
+
+
+From 2ee75ba7f69754ee04e723b037b15715c0483d50 Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@oracle.com>
+Date: Mon, 3 Dec 2012 22:05:12 +0300
+Subject: [PATCH 11/29] telephony: ijx: buffer overflow in ixj_write_cid()
+
+[Not needed in 3.8 or newer as this driver is removed there. - gregkh]
+
+We get this from user space and nothing has been done to ensure that
+these strings are NUL terminated.
+
+Reported-by: Chen Gang <gang.chen@asianux.com>
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/staging/telephony/ixj.c | 24 ++++++++++++------------
+ 1 file changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/staging/telephony/ixj.c b/drivers/staging/telephony/ixj.c
+index f96027921f60..638d2b8c687c 100644
+--- a/drivers/staging/telephony/ixj.c
++++ b/drivers/staging/telephony/ixj.c
+@@ -3190,12 +3190,12 @@ static void ixj_write_cid(IXJ *j)
+ 
+ 	ixj_fsk_alloc(j);
+ 
+-	strcpy(sdmf1, j->cid_send.month);
+-	strcat(sdmf1, j->cid_send.day);
+-	strcat(sdmf1, j->cid_send.hour);
+-	strcat(sdmf1, j->cid_send.min);
+-	strcpy(sdmf2, j->cid_send.number);
+-	strcpy(sdmf3, j->cid_send.name);
++	strlcpy(sdmf1, j->cid_send.month, sizeof(sdmf1));
++	strlcat(sdmf1, j->cid_send.day, sizeof(sdmf1));
++	strlcat(sdmf1, j->cid_send.hour, sizeof(sdmf1));
++	strlcat(sdmf1, j->cid_send.min, sizeof(sdmf1));
++	strlcpy(sdmf2, j->cid_send.number, sizeof(sdmf2));
++	strlcpy(sdmf3, j->cid_send.name, sizeof(sdmf3));
+ 
+ 	len1 = strlen(sdmf1);
+ 	len2 = strlen(sdmf2);
+@@ -3340,12 +3340,12 @@ static void ixj_write_cidcw(IXJ *j)
+ 		ixj_pre_cid(j);
+ 	}
+ 	j->flags.cidcw_ack = 0;
+-	strcpy(sdmf1, j->cid_send.month);
+-	strcat(sdmf1, j->cid_send.day);
+-	strcat(sdmf1, j->cid_send.hour);
+-	strcat(sdmf1, j->cid_send.min);
+-	strcpy(sdmf2, j->cid_send.number);
+-	strcpy(sdmf3, j->cid_send.name);
++	strlcpy(sdmf1, j->cid_send.month, sizeof(sdmf1));
++	strlcat(sdmf1, j->cid_send.day, sizeof(sdmf1));
++	strlcat(sdmf1, j->cid_send.hour, sizeof(sdmf1));
++	strlcat(sdmf1, j->cid_send.min, sizeof(sdmf1));
++	strlcpy(sdmf2, j->cid_send.number, sizeof(sdmf2));
++	strlcpy(sdmf3, j->cid_send.name, sizeof(sdmf3));
+ 
+ 	len1 = strlen(sdmf1);
+ 	len2 = strlen(sdmf2);
+-- 
+2.28.0
+
+
+From 280c7a49c54e1191ddff18db0f44f1f404408829 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <JBeulich@suse.com>
+Date: Fri, 2 Nov 2012 14:02:40 +0000
+Subject: [PATCH 12/29] x86: hpet: Fix masking of MSI interrupts
+
+commit 6acf5a8c931da9d26c8dd77d784daaf07fa2bff0 upstream.
+
+HPET_TN_FSB is not a proper mask bit; it merely toggles between MSI and
+legacy interrupt delivery. The proper mask bit is HPET_TN_ENABLE, so
+use both bits when (un)masking the interrupt.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Link: http://lkml.kernel.org/r/5093E09002000078000A60E6@nat28.tlf.novell.com
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/hpet.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
 diff --git a/arch/x86/kernel/hpet.c b/arch/x86/kernel/hpet.c
-index ad0de0c..2861b4c 100644
+index ad0de0c2714e..2861b4cafd2e 100644
 --- a/arch/x86/kernel/hpet.c
 +++ b/arch/x86/kernel/hpet.c
 @@ -431,7 +431,7 @@ void hpet_msi_unmask(struct irq_data *data)
@@ -102,8 +881,403 @@ index ad0de0c..2861b4c 100644
  	hpet_writel(cfg, HPET_Tn_CFG(hdev->num));
  }
  
+-- 
+2.28.0
+
+
+From d1687be63d3037bd98ab8e0e5e34fc724f0863a1 Mon Sep 17 00:00:00 2001
+From: "li.rui27@zte.com.cn" <li.rui27@zte.com.cn>
+Date: Tue, 20 Nov 2012 14:31:47 +0800
+Subject: [PATCH 13/29] USB: add new zte 3g-dongle's pid to option.c
+
+commit 31b6a1048b7292efff8b5b53ae3d9d29adde385e upstream.
+
+Signed-off-by: Rui li <li.rui27@zte.com.cn>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/option.c | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index 43aa36bcd396..329fe2b8e538 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -883,6 +883,10 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0126, 0xff, 0xff, 0xff),
+ 		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0128, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0135, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0136, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0137, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0139, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0142, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0143, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0144, 0xff, 0xff, 0xff) },
+@@ -903,20 +907,34 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0165, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0167, 0xff, 0xff, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0189, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0191, 0xff, 0xff, 0xff), /* ZTE EuFi890 */
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0196, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0197, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0199, 0xff, 0xff, 0xff), /* ZTE MF820S */
+ 	  .driver_info = (kernel_ulong_t)&net_intf1_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0200, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0201, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0254, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0257, 0xff, 0xff, 0xff), /* ZTE MF821 */
+ 	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0265, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0284, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0317, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0326, 0xff, 0xff, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0330, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0395, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0414, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0417, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1008, 0xff, 0xff, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1010, 0xff, 0xff, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1012, 0xff, 0xff, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1018, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1021, 0xff, 0xff, 0xff),
+ 	  .driver_info = (kernel_ulong_t)&net_intf2_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1057, 0xff, 0xff, 0xff) },
+@@ -1096,6 +1114,10 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1298, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1299, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1300, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1301, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1302, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1303, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1333, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1401, 0xff, 0xff, 0xff),
+ 		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1402, 0xff, 0xff, 0xff),
+-- 
+2.28.0
+
+
+From 249d474cd9320f25ab04832e5b03b98462930362 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Bj=C3=B8rn=20Mork?= <bjorn@mork.no>
+Date: Sun, 25 Nov 2012 17:05:10 +0100
+Subject: [PATCH 14/29] USB: option: blacklist network interface on Huawei E173
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit f36446cf9bbebaa03a80d95cfeeafbaf68218249 upstream.
+
+The Huawei E173 will normally appear as 12d1:1436 in Linux.  But
+the modem has another mode with different device ID and a slightly
+different set of descriptors. This is the mode used by Windows like
+this:
+
+  3Modem:      USB\VID_12D1&PID_140C&MI_00\6&3A1D2012&0&0000
+  Networkcard: USB\VID_12D1&PID_140C&MI_01\6&3A1D2012&0&0001
+  Appli.Inter: USB\VID_12D1&PID_140C&MI_02\6&3A1D2012&0&0002
+  PC UI Inter: USB\VID_12D1&PID_140C&MI_03\6&3A1D2012&0&0003
+
+All interfaces have the same ff/ff/ff class codes in this mode.
+Blacklisting the network interface to allow it to be picked up by
+the network driver.
+
+Reported-by: Thomas Schäfer <tschaefer@t-online.de>
+Signed-off-by: Bjørn Mork <bjorn@mork.no>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/option.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index 329fe2b8e538..0c3d29034816 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -80,6 +80,7 @@ static void option_instat_callback(struct urb *urb);
+ #define OPTION_PRODUCT_GTM380_MODEM		0x7201
+ 
+ #define HUAWEI_VENDOR_ID			0x12D1
++#define HUAWEI_PRODUCT_E173			0x140C
+ #define HUAWEI_PRODUCT_K4505			0x1464
+ #define HUAWEI_PRODUCT_K3765			0x1465
+ #define HUAWEI_PRODUCT_K4605			0x14C6
+@@ -552,6 +553,8 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(QUANTA_VENDOR_ID, QUANTA_PRODUCT_GLX) },
+ 	{ USB_DEVICE(QUANTA_VENDOR_ID, QUANTA_PRODUCT_GKE) },
+ 	{ USB_DEVICE(QUANTA_VENDOR_ID, QUANTA_PRODUCT_GLE) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_E173, 0xff, 0xff, 0xff),
++		.driver_info = (kernel_ulong_t) &net_intf1_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K4505, 0xff, 0xff, 0xff),
+ 		.driver_info = (kernel_ulong_t) &huawei_cdc12_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K3765, 0xff, 0xff, 0xff),
+-- 
+2.28.0
+
+
+From c36337a3562352a753995cb220b58f81f5e81e74 Mon Sep 17 00:00:00 2001
+From: Martin Teichmann <lkb.teichmann@gmail.com>
+Date: Wed, 21 Nov 2012 16:45:07 +0100
+Subject: [PATCH 15/29] USB: ftdi_sio: Add support for Newport AGILIS motor
+ drivers
+
+commit d7e14b375b40c04cd735b115713043b69a2c68ac upstream.
+
+The Newport AGILIS model AG-UC8 compact piezo motor controller
+(http://search.newport.com/?q=*&x2=sku&q2=AG-UC8)
+is yet another device using an FTDI USB-to-serial chip. It works
+fine with the ftdi_sio driver when adding
+
+  options ftdi-sio product=0x3000 vendor=0x104d
+
+to modprobe.d. udevadm reports "Newport" as the manufacturer,
+and "Agilis" as the product name.
+
+Signed-off-by: Martin Teichmann <lkb.teichmann@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/ftdi_sio.c     | 1 +
+ drivers/usb/serial/ftdi_sio_ids.h | 6 ++++++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
+index 25bb93503963..dd6b0270f68e 100644
+--- a/drivers/usb/serial/ftdi_sio.c
++++ b/drivers/usb/serial/ftdi_sio.c
+@@ -197,6 +197,7 @@ static struct usb_device_id id_table_combined [] = {
+ 	{ USB_DEVICE(FTDI_VID, FTDI_OPENDCC_THROTTLE_PID) },
+ 	{ USB_DEVICE(FTDI_VID, FTDI_OPENDCC_GATEWAY_PID) },
+ 	{ USB_DEVICE(FTDI_VID, FTDI_OPENDCC_GBM_PID) },
++	{ USB_DEVICE(NEWPORT_VID, NEWPORT_AGILIS_PID) },
+ 	{ USB_DEVICE(INTERBIOMETRICS_VID, INTERBIOMETRICS_IOBOARD_PID) },
+ 	{ USB_DEVICE(INTERBIOMETRICS_VID, INTERBIOMETRICS_MINI_IOBOARD_PID) },
+ 	{ USB_DEVICE(FTDI_VID, FTDI_SPROG_II) },
+diff --git a/drivers/usb/serial/ftdi_sio_ids.h b/drivers/usb/serial/ftdi_sio_ids.h
+index 57c12ef6625e..049b6e715fa4 100644
+--- a/drivers/usb/serial/ftdi_sio_ids.h
++++ b/drivers/usb/serial/ftdi_sio_ids.h
+@@ -752,6 +752,12 @@
+ #define TTI_VID			0x103E	/* Vendor Id */
+ #define TTI_QL355P_PID		0x03E8	/* TTi QL355P power supply */
+ 
++/*
++ * Newport Cooperation (www.newport.com)
++ */
++#define NEWPORT_VID			0x104D
++#define NEWPORT_AGILIS_PID		0x3000
++
+ /* Interbiometrics USB I/O Board */
+ /* Developed for Interbiometrics by Rudolf Gugler */
+ #define INTERBIOMETRICS_VID              0x1209
+-- 
+2.28.0
+
+
+From 73b01ef413e7311e5dff622a1e50fe86d7253273 Mon Sep 17 00:00:00 2001
+From: Peter Korsgaard <jacmet@sunsite.dk>
+Date: Thu, 22 Nov 2012 16:30:46 +0100
+Subject: [PATCH 16/29] usb: ftdi_sio: fixup BeagleBone A5+ quirk
+
+commit 1a88d5eee2ef2ad1d3c4e32043e9c4c5347d4fc1 upstream.
+
+BeagleBone A5+ devices ended up getting shipped with the
+'BeagleBone/XDS100V2' product string, and not XDS100 like it
+was agreed, so adjust the quirk to match.
+
+For details, see the thread on the beagle list:
+
+https://groups.google.com/forum/#!msg/beagleboard/zrFPew9_Wvo/ibWr1-eE8JwJ
+
+Signed-off-by: Peter Korsgaard <jacmet@sunsite.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/ftdi_sio.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
+index dd6b0270f68e..25903f54c1d2 100644
+--- a/drivers/usb/serial/ftdi_sio.c
++++ b/drivers/usb/serial/ftdi_sio.c
+@@ -1811,7 +1811,7 @@ static int ftdi_8u2232c_probe(struct usb_serial *serial)
+ 	dbg("%s", __func__);
+ 
+ 	if ((udev->manufacturer && !strcmp(udev->manufacturer, "CALAO Systems")) ||
+-	    (udev->product && !strcmp(udev->product, "BeagleBone/XDS100")))
++	    (udev->product && !strcmp(udev->product, "BeagleBone/XDS100V2")))
+ 		return ftdi_jtag_probe(serial);
+ 
+ 	return 0;
+-- 
+2.28.0
+
+
+From 7052793cd192c09b47c4fb307bc3c2afbdf3c5df Mon Sep 17 00:00:00 2001
+From: Markus Becker <mab@comnets.uni-bremen.de>
+Date: Thu, 22 Nov 2012 09:41:23 +0100
+Subject: [PATCH 17/29] USB: cp210x: add Virtenio Preon32 device id
+
+commit 356fe44f4b8ece867bdb9876b1854d7adbef9de2 upstream.
+
+Signed-off-by: Markus Becker <mab@comnets.uni-bremen.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/cp210x.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
+index 53e7e692d616..f38a27831466 100644
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@ -120,6 +120,7 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x10C4, 0x8477) }, /* Balluff RFID */
+ 	{ USB_DEVICE(0x10C4, 0x85EA) }, /* AC-Services IBUS-IF */
+ 	{ USB_DEVICE(0x10C4, 0x85EB) }, /* AC-Services CIS-IBUS */
++	{ USB_DEVICE(0x10C4, 0x85F8) }, /* Virtenio Preon32 */
+ 	{ USB_DEVICE(0x10C4, 0x8664) }, /* AC-Services CAN-IF */
+ 	{ USB_DEVICE(0x10C4, 0x8665) }, /* AC-Services OBD-IF */
+ 	{ USB_DEVICE(0x10C4, 0xEA60) }, /* Silicon Labs factory default */
+-- 
+2.28.0
+
+
+From 46c117c706ef4f4086cbe24d24fd0f19551e96bd Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Wed, 28 Nov 2012 10:19:16 -0800
+Subject: [PATCH 18/29] USB: mark uas driver as BROKEN
+
+commit fb37ef98015f864d22be223a0e0d93547cd1d4ef upstream.
+
+As reported https://bugzilla.kernel.org/show_bug.cgi?id=51031, the UAS
+driver causes problems and has been asked to be not built into any of
+the major distributions.  To prevent users from running into problems
+with it, and for distros that were not notified, just mark the whole
+thing as broken.
+
+Acked-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/storage/Kconfig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/usb/storage/Kconfig b/drivers/usb/storage/Kconfig
+index 7691c866637b..685edc872654 100644
+--- a/drivers/usb/storage/Kconfig
++++ b/drivers/usb/storage/Kconfig
+@@ -203,7 +203,7 @@ config USB_STORAGE_ENE_UB6250
+ 
+ config USB_UAS
+ 	tristate "USB Attached SCSI"
+-	depends on USB && SCSI
++	depends on USB && SCSI && BROKEN
+ 	help
+ 	  The USB Attached SCSI protocol is supported by some USB
+ 	  storage devices.  It permits higher performance by supporting
+-- 
+2.28.0
+
+
+From b49dc13a7f10e003e176263215411ccea99380f1 Mon Sep 17 00:00:00 2001
+From: Kamil Iskra <kamil@iskra.name>
+Date: Fri, 16 Nov 2012 22:28:58 +0100
+Subject: [PATCH 19/29] ACPI / battery: Correct battery capacity values on
+ Thinkpads
+
+commit 4000e626156935dfb626321ce09cae2c833eabbb upstream.
+
+Add a quirk to correctly report battery capacity on 2010 and 2011
+Lenovo Thinkpad models.
+
+The affected models that I tested (x201, t410, t410s, and x220)
+exhibit a problem where, when battery capacity reporting unit is mAh,
+the values being reported are wrong.  Pre-2010 and 2012 models appear
+to always report in mWh and are thus unaffected.  Also, in mid-2012
+Lenovo issued a BIOS update for the 2011 models that fixes the issue
+(tested on x220 with a post-1.29 BIOS).  No such update is available
+for the 2010 models, so those still need this patch.
+
+Problem description: for some reason, the affected Thinkpads switch
+the reporting unit between mAh and mWh; generally, mAh is used when a
+laptop is plugged in and mWh when it's unplugged, although a
+suspend/resume or rmmod/modprobe is needed for the switch to take
+effect.  The values reported in mAh are *always* wrong.  This does
+not appear to be a kernel regression; I believe that the values were
+never reported correctly.  I tested back to kernel 2.6.34, with
+multiple machines and BIOS versions.
+
+Simply plugging a laptop into mains before turning it on is enough to
+reproduce the problem.  Here's a sample /proc/acpi/battery/BAT0/info
+from Thinkpad x220 (before a BIOS update) with a 4-cell battery:
+
+present:                 yes
+design capacity:         2886 mAh
+last full capacity:      2909 mAh
+battery technology:      rechargeable
+design voltage:          14800 mV
+design capacity warning: 145 mAh
+design capacity low:     13 mAh
+cycle count:              0
+capacity granularity 1:  1 mAh
+capacity granularity 2:  1 mAh
+model number:            42T4899
+serial number:           21064
+battery type:            LION
+OEM info:                SANYO
+
+Once the laptop switches the unit to mWh (unplug from mains, suspend,
+resume), the output changes to:
+
+present:                 yes
+design capacity:         28860 mWh
+last full capacity:      29090 mWh
+battery technology:      rechargeable
+design voltage:          14800 mV
+design capacity warning: 1454 mWh
+design capacity low:     200 mWh
+cycle count:              0
+capacity granularity 1:  1 mWh
+capacity granularity 2:  1 mWh
+model number:            42T4899
+serial number:           21064
+battery type:            LION
+OEM info:                SANYO
+
+Can you see how the values for "design capacity", etc., differ by a
+factor of 10 instead of 14.8 (the design voltage of this battery)?
+On the battery itself it says: 14.8V, 1.95Ah, 29Wh, so clearly the
+values reported in mWh are correct and the ones in mAh are not.
+
+My guess is that this problem has been around ever since those
+machines were released, but because the most common Thinkpad
+batteries are rated at 10.8V, the error (8%) is small enough that it
+simply hasn't been noticed or at least nobody could be bothered to
+look into it.
+
+My patch works around the problem by adjusting the incorrectly
+reported mAh values by "10000 / design_voltage".  The patch also has
+code to figure out if it should be activated or not.  It only
+activates on Lenovo Thinkpads, only when the unit is mAh, and, as an
+extra precaution, only when the battery capacity reported through
+ACPI does not match what is reported through DMI (I've never
+encountered a machine where the first two conditions would be true
+but the last would not, but better safe than sorry).
+
+I've been using this patch for close to a year on several systems
+without any problems.
+
+References: https://bugzilla.kernel.org/show_bug.cgi?id=41062
+Acked-by: Henrique de Moraes Holschuh <hmh@hmh.eng.br>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/acpi/battery.c | 77 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 77 insertions(+)
+
 diff --git a/drivers/acpi/battery.c b/drivers/acpi/battery.c
-index 7dd3f9f..6ea287e2 100644
+index 7dd3f9fb9f3f..6ea287e22296 100644
 --- a/drivers/acpi/battery.c
 +++ b/drivers/acpi/battery.c
 @@ -34,6 +34,7 @@
@@ -225,8 +1399,34 @@ index 7dd3f9f..6ea287e2 100644
  }
  
  static int acpi_battery_update(struct acpi_battery *battery)
+-- 
+2.28.0
+
+
+From b54b1f3b656a93e874b38d88c513769c2f29bf6b Mon Sep 17 00:00:00 2001
+From: Lan Tianyu <tianyu.lan@intel.com>
+Date: Wed, 21 Nov 2012 23:12:12 +0100
+Subject: [PATCH 20/29] ACPI / PM: Add Sony Vaio VPCEB1S1E to nonvs blacklist.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 876ab79055019e248508cfd0dee7caa3c0c831ed upstream.
+
+Sony Vaio VPCEB1S1E does not resume correctly without
+acpi_sleep=nonvs, so add it to the ACPI sleep blacklist.
+
+References: https://bugzilla.kernel.org/show_bug.cgi?id=48781
+Reported-by: Sébastien Wilmet <swilmet@gnome.org>
+Signed-off-by: Lan Tianyu <tianyu.lan@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/acpi/sleep.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
 diff --git a/drivers/acpi/sleep.c b/drivers/acpi/sleep.c
-index 2377445..480b648 100644
+index 2377445f4a3d..480b648b9a1d 100644
 --- a/drivers/acpi/sleep.c
 +++ b/drivers/acpi/sleep.c
 @@ -508,6 +508,14 @@ static struct dmi_system_id __initdata acpisleep_dmi_table[] = {
@@ -244,8 +1444,84 @@ index 2377445..480b648 100644
  	.ident = "Sony Vaio VGN-FW520F",
  	.matches = {
  		DMI_MATCH(DMI_SYS_VENDOR, "Sony Corporation"),
+-- 
+2.28.0
+
+
+From fe1fa6761bdc53fd7be7524436ad00907100c054 Mon Sep 17 00:00:00 2001
+From: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
+Date: Fri, 30 Nov 2012 13:05:05 +0100
+Subject: [PATCH 21/29] ACPI / PNP: Do not crash due to stale pointer use
+ during system resume
+
+commit a6b5e88c0e42093b9057856f35770966c8c591e3 upstream.
+
+During resume from system suspend the 'data' field of
+struct pnp_dev in pnpacpi_set_resources() may be a stale pointer,
+due to removal of the associated ACPI device node object in the
+previous suspend-resume cycle.  This happens, for example, if a
+dockable machine is booted in the docking station and then suspended
+and resumed and suspended again.  If that happens,
+pnpacpi_build_resource_template() called from pnpacpi_set_resources()
+attempts to use that pointer and crashes.
+
+However, pnpacpi_set_resources() actually checks the device's ACPI
+handle, attempts to find the ACPI device node object attached to it
+and returns an error code if that fails, so in fact it knows what the
+correct value of dev->data should be.  Use this observation to update
+dev->data with the correct value if necessary and dump a call trace
+if that's the case (once).
+
+We still need to fix the root cause of this issue, but preventing
+systems from crashing because of it is an improvement too.
+
+Reported-and-tested-by: Zdenek Kabelac <zdenek.kabelac@gmail.com>
+References: https://bugzilla.kernel.org/show_bug.cgi?id=51071
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/pnp/pnpacpi/core.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/pnp/pnpacpi/core.c b/drivers/pnp/pnpacpi/core.c
+index d21e8f59c84e..e3537888db7e 100644
+--- a/drivers/pnp/pnpacpi/core.c
++++ b/drivers/pnp/pnpacpi/core.c
+@@ -95,6 +95,9 @@ static int pnpacpi_set_resources(struct pnp_dev *dev)
+ 		return -ENODEV;
+ 	}
+ 
++	if (WARN_ON_ONCE(acpi_dev != dev->data))
++		dev->data = acpi_dev;
++
+ 	ret = pnpacpi_build_resource_template(dev, &buffer);
+ 	if (ret)
+ 		return ret;
+-- 
+2.28.0
+
+
+From a5e247e527586e4edee5f24d5e8f85ecf1905ea7 Mon Sep 17 00:00:00 2001
+From: Zhang Rui <rui.zhang@intel.com>
+Date: Tue, 4 Dec 2012 23:30:19 +0100
+Subject: [PATCH 22/29] ACPI / video: ignore BIOS initial backlight value for
+ HP Folio 13-2000
+
+commit 129ff8f8d58297b04f47b5d6fad81aa2d08404e1 upstream.
+
+Or else the laptop will boot with a dimmed screen.
+
+References: https://bugzilla.kernel.org/show_bug.cgi?id=51141
+Tested-by: Stefan Nagy <public@stefan-nagy.at>
+Signed-off-by: Zhang Rui <rui.zhang@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/acpi/video.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
 diff --git a/drivers/acpi/video.c b/drivers/acpi/video.c
-index 62d9ee6..91357e1 100644
+index 62d9ee6d077a..91357e1a1a88 100644
 --- a/drivers/acpi/video.c
 +++ b/drivers/acpi/video.c
 @@ -389,6 +389,12 @@ static int __init video_set_bqc_offset(const struct dmi_system_id *d)
@@ -276,176 +1552,227 @@ index 62d9ee6..91357e1 100644
  	{}
  };
  
-diff --git a/drivers/gpu/drm/i915/intel_bios.c b/drivers/gpu/drm/i915/intel_bios.c
-index b48fc2a..3fe0524 100644
---- a/drivers/gpu/drm/i915/intel_bios.c
-+++ b/drivers/gpu/drm/i915/intel_bios.c
-@@ -459,12 +459,8 @@ parse_edp(struct drm_i915_private *dev_priv, struct bdb_header *bdb)
+-- 
+2.28.0
+
+
+From 96d791a8023037c312072a5a9d735417a07a6c5a Mon Sep 17 00:00:00 2001
+From: Alan Stern <stern@rowland.harvard.edu>
+Date: Mon, 26 Nov 2012 12:36:21 -0500
+Subject: [PATCH 23/29] USB: OHCI: workaround for hardware bug: retired TDs not
+ added to the Done Queue
+
+commit 50ce5c0683aa83eb161624ea89daa5a9eee0c2ce upstream.
+
+This patch (as1636) is a partial workaround for a hardware bug
+affecting OHCI controllers by NVIDIA at least, maybe others too.  When
+the controller retires a Transfer Descriptor, it is supposed to add
+the TD onto the Done Queue.  But sometimes this doesn't happen, with
+the result that ohci-hcd never realizes the corresponding transfer has
+finished.  Symptoms can vary; a typical result is that USB audio stops
+working after a while.
+
+The patch works around the problem by recognizing that TDs are always
+processed in order.  Therefore, if a later TD is found on the Done
+Queue than all the earlier TDs for the same endpoint must be finished
+as well.
+
+Unfortunately this won't solve the problem in cases where the missing
+TD is the last one in the endpoint's queue.  A complete fix would
+require a signficant amount of change to the driver.
+
+Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
+Tested-by: Oliver Neukum <oneukum@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/host/ohci-q.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/drivers/usb/host/ohci-q.c b/drivers/usb/host/ohci-q.c
+index c5a1ea9145fa..9d00d4721bca 100644
+--- a/drivers/usb/host/ohci-q.c
++++ b/drivers/usb/host/ohci-q.c
+@@ -1128,6 +1128,25 @@ dl_done_list (struct ohci_hcd *ohci)
  
- 	edp = find_section(bdb, BDB_EDP);
- 	if (!edp) {
--		if (SUPPORTS_EDP(dev_priv->dev) && dev_priv->edp.support) {
--			DRM_DEBUG_KMS("No eDP BDB found but eDP panel "
--				      "supported, assume %dbpp panel color "
--				      "depth.\n",
--				      dev_priv->edp.bpp);
--		}
-+		if (SUPPORTS_EDP(dev_priv->dev) && dev_priv->edp.support)
-+			DRM_DEBUG_KMS("No eDP BDB found but eDP panel supported.\n");
- 		return;
- 	}
- 
-@@ -617,9 +613,6 @@ init_vbt_defaults(struct drm_i915_private *dev_priv)
- 	dev_priv->lvds_use_ssc = 1;
- 	dev_priv->lvds_ssc_freq = intel_bios_ssc_frequency(dev, 1);
- 	DRM_DEBUG_KMS("Set default to SSC at %dMHz\n", dev_priv->lvds_ssc_freq);
--
--	/* eDP data */
--	dev_priv->edp.bpp = 18;
- }
- 
- static int __init intel_no_opregion_vbt_callback(const struct dmi_system_id *id)
-diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
-index f3b06f0..dd3e7e4 100644
---- a/drivers/gpu/drm/i915/intel_display.c
-+++ b/drivers/gpu/drm/i915/intel_display.c
-@@ -4996,6 +4996,17 @@ static bool intel_choose_pipe_bpp_dither(struct drm_crtc *crtc,
- 			}
- 		}
- 
-+		if (intel_encoder->type == INTEL_OUTPUT_EDP) {
-+			/* Use VBT settings if we have an eDP panel */
-+			unsigned int edp_bpc = dev_priv->edp.bpp / 3;
+ 	while (td) {
+ 		struct td	*td_next = td->next_dl_td;
++		struct ed	*ed = td->ed;
 +
-+			if (edp_bpc && edp_bpc < display_bpc) {
-+				DRM_DEBUG_KMS("clamping display bpc (was %d) to eDP (%d)\n", display_bpc, edp_bpc);
-+				display_bpc = edp_bpc;
-+			}
-+			continue;
++		/*
++		 * Some OHCI controllers (NVIDIA for sure, maybe others)
++		 * occasionally forget to add TDs to the done queue.  Since
++		 * TDs for a given endpoint are always processed in order,
++		 * if we find a TD on the donelist then all of its
++		 * predecessors must be finished as well.
++		 */
++		for (;;) {
++			struct td	*td2;
++
++			td2 = list_first_entry(&ed->td_list, struct td,
++					td_list);
++			if (td2 == td)
++				break;
++			takeback_td(ohci, td2);
 +		}
 +
- 		/*
- 		 * HDMI is either 12 or 8, so if the display lets 10bpc sneak
- 		 * through, clamp it down.  (Note: >12bpc will be caught below.)
-diff --git a/drivers/hwmon/fam15h_power.c b/drivers/hwmon/fam15h_power.c
-index ac2d6cb..770e959 100644
---- a/drivers/hwmon/fam15h_power.c
-+++ b/drivers/hwmon/fam15h_power.c
-@@ -31,6 +31,9 @@ MODULE_DESCRIPTION("AMD Family 15h CPU processor power monitor");
- MODULE_AUTHOR("Andreas Herrmann <andreas.herrmann3@amd.com>");
- MODULE_LICENSE("GPL");
+ 		takeback_td(ohci, td);
+ 		td = td_next;
+ 	}
+-- 
+2.28.0
+
+
+From 31fdb19eb968995b3c5f4337918bd51442f992ec Mon Sep 17 00:00:00 2001
+From: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Date: Wed, 17 Oct 2012 13:44:06 -0700
+Subject: [PATCH 24/29] xhci: Extend Fresco Logic MSI quirk.
+
+commit bba18e33f25072ebf70fd8f7f0cdbf8cdb59a746 upstream.
+
+Ali reports that plugging a device into the Fresco Logic xHCI host with
+PCI device ID 1400 produces an IRQ error:
+
+ do_IRQ: 3.176 No irq handler for vector (irq -1)
+
+Other early Fresco Logic host revisions don't support MSI, even though
+their PCI config space claims they do.  Extend the quirk to disabling
+MSI to this chipset revision.  Also enable the short transfer quirk,
+since it's likely this revision also has that quirk, and it should be
+harmless to enable.
+
+04:00.0 0c03: 1b73:1400 (rev 01) (prog-if 30 [XHCI])
+        Subsystem: 1d5c:1000
+        Physical Slot: 3
+        Control: I/O+ Mem+ BusMaster+ SpecCycle- MemWINV- VGASnoop- ParErr- Stepping- SERR- FastB2B- DisINTx+
+        Status: Cap+ 66MHz- UDF- FastB2B- ParErr- DEVSEL=fast >TAbort- <TAbort- <MAbort- >SERR- <PERR- INTx-
+        Latency: 0, Cache Line Size: 64 bytes
+        Interrupt: pin A routed to IRQ 51
+        Region 0: Memory at d4600000 (32-bit, non-prefetchable) [size=64K]
+        Capabilities: [50] Power Management version 3
+                Flags: PMEClk- DSI- D1- D2- AuxCurrent=0mA PME(D0+,D1-,D2-,D3hot+,D3cold-)
+                Status: D0 NoSoftRst- PME-Enable- DSel=0 DScale=0 PME-
+        Capabilities: [68] MSI: Enable+ Count=1/1 Maskable- 64bit+
+                Address: 00000000feeff00c  Data: 41b1
+        Capabilities: [80] Express (v1) Endpoint, MSI 00
+                DevCap: MaxPayload 128 bytes, PhantFunc 0, Latency L0s <2us, L1 <32us
+                        ExtTag- AttnBtn- AttnInd- PwrInd- RBE+ FLReset-
+                DevCtl: Report errors: Correctable- Non-Fatal- Fatal- Unsupported-
+                        RlxdOrd+ ExtTag- PhantFunc- AuxPwr- NoSnoop+
+                        MaxPayload 128 bytes, MaxReadReq 512 bytes
+                DevSta: CorrErr- UncorrErr- FatalErr- UnsuppReq- AuxPwr- TransPend-
+                LnkCap: Port #0, Speed 2.5GT/s, Width x1, ASPM L0s L1, Latency L0 unlimited, L1 unlimited
+                        ClockPM- Surprise- LLActRep- BwNot-
+                LnkCtl: ASPM Disabled; RCB 64 bytes Disabled- Retrain- CommClk+
+                        ExtSynch- ClockPM- AutWidDis- BWInt- AutBWInt-
+                LnkSta: Speed 2.5GT/s, Width x1, TrErr- Train- SlotClk+ DLActive- BWMgmt- ABWMgmt-
+        Kernel driver in use: xhci_hcd
+
+This patch should be backported to stable kernels as old as 2.6.36, that
+contain the commit f5182b4155b9d686c5540a6822486400e34ddd98 "xhci:
+Disable MSI for some Fresco Logic hosts."
+
+Signed-off-by: Sarah Sharp <sarah.a.sharp@linux.intel.com>
+Reported-by: A Sh <smr.ash1991@gmail.com>
+Tested-by: A Sh <smr.ash1991@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/host/xhci-pci.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index 4211017b8892..84e82dc7b794 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -29,6 +29,7 @@
+ /* Device for a quirk */
+ #define PCI_VENDOR_ID_FRESCO_LOGIC	0x1b73
+ #define PCI_DEVICE_ID_FRESCO_LOGIC_PDK	0x1000
++#define PCI_DEVICE_ID_FRESCO_LOGIC_FL1400	0x1400
  
-+/* Family 16h Northbridge's function 4 PCI ID */
-+#define PCI_DEVICE_ID_AMD_16H_NB_F4	0x1534
-+
- /* D18F3 */
- #define REG_NORTHBRIDGE_CAP		0xe8
+ #define PCI_VENDOR_ID_ETRON		0x1b6f
+ #define PCI_DEVICE_ID_ASROCK_P67	0x7023
+@@ -58,8 +59,10 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
  
-@@ -256,6 +259,7 @@ static void __devexit fam15h_power_remove(struct pci_dev *pdev)
- 
- static DEFINE_PCI_DEVICE_TABLE(fam15h_power_id_table) = {
- 	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_15H_NB_F4) },
-+	{ PCI_VDEVICE(AMD, PCI_DEVICE_ID_AMD_16H_NB_F4) },
- 	{}
- };
- MODULE_DEVICE_TABLE(pci, fam15h_power_id_table);
-diff --git a/drivers/mmc/host/sh_mmcif.c b/drivers/mmc/host/sh_mmcif.c
-index 3b8236b..a5786a8 100644
---- a/drivers/mmc/host/sh_mmcif.c
-+++ b/drivers/mmc/host/sh_mmcif.c
-@@ -1066,7 +1066,6 @@ static irqreturn_t sh_mmcif_irqt(int irq, void *dev_id)
+ 	/* Look for vendor-specific quirks */
+ 	if (pdev->vendor == PCI_VENDOR_ID_FRESCO_LOGIC &&
+-			pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK) {
+-		if (pdev->revision == 0x0) {
++			(pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK ||
++			 pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_FL1400)) {
++		if (pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK &&
++				pdev->revision == 0x0) {
+ 			xhci->quirks |= XHCI_RESET_EP_QUIRK;
+ 			xhci_dbg(xhci, "QUIRK: Fresco Logic xHC needs configure"
+ 					" endpoint cmd after reset endpoint\n");
+-- 
+2.28.0
+
+
+From 455d8953951baf0d38673b010100241e508b765c Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@oracle.com>
+Date: Sat, 9 Jun 2012 19:10:27 +0300
+Subject: [PATCH 25/29] ftrace: Clear bits properly in reset_iter_read()
+
+commit 70f77b3f7ec010ff9624c1f2e39a81babc9e2429 upstream.
+
+There is a typo here where '&' is used instead of '|' and it turns the
+statement into a noop.  The original code is equivalent to:
+
+	iter->flags &= ~((1 << 2) & (1 << 4));
+
+Link: http://lkml.kernel.org/r/20120609161027.GD6488@elgon.mountain
+
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/trace/ftrace.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index 0fa92f677c92..100b7fd1a64b 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -2368,7 +2368,7 @@ static void reset_iter_read(struct ftrace_iterator *iter)
  {
- 	struct sh_mmcif_host *host = dev_id;
- 	struct mmc_request *mrq = host->mrq;
--	struct mmc_data *data = mrq->data;
+ 	iter->pos = 0;
+ 	iter->func_pos = 0;
+-	iter->flags &= ~(FTRACE_ITER_PRINTALL & FTRACE_ITER_HASH);
++	iter->flags &= ~(FTRACE_ITER_PRINTALL | FTRACE_ITER_HASH);
+ }
  
- 	cancel_delayed_work_sync(&host->timeout_work);
- 
-@@ -1114,13 +1113,14 @@ static irqreturn_t sh_mmcif_irqt(int irq, void *dev_id)
- 	case MMCIF_WAIT_FOR_READ_END:
- 	case MMCIF_WAIT_FOR_WRITE_END:
- 		if (host->sd_error)
--			data->error = sh_mmcif_error_manage(host);
-+			mrq->data->error = sh_mmcif_error_manage(host);
- 		break;
- 	default:
- 		BUG();
- 	}
- 
- 	if (host->wait_for != MMCIF_WAIT_FOR_STOP) {
-+		struct mmc_data *data = mrq->data;
- 		if (!mrq->cmd->error && data && !data->error)
- 			data->bytes_xfered =
- 				data->blocks * data->blksz;
-@@ -1191,10 +1191,6 @@ static irqreturn_t sh_mmcif_intr(int irq, void *dev_id)
- 		host->sd_error = true;
- 		dev_dbg(&host->pd->dev, "int err state = %08x\n", state);
- 	}
--	if (host->state == STATE_IDLE) {
--		dev_info(&host->pd->dev, "Spurious IRQ status 0x%x", state);
--		return IRQ_HANDLED;
--	}
- 	if (state & ~(INT_CMD12RBE | INT_CMD12CRE)) {
- 		if (!host->dma_active)
- 			return IRQ_WAKE_THREAD;
-diff --git a/drivers/pnp/pnpacpi/core.c b/drivers/pnp/pnpacpi/core.c
-index d21e8f5..e353788 100644
---- a/drivers/pnp/pnpacpi/core.c
-+++ b/drivers/pnp/pnpacpi/core.c
-@@ -95,6 +95,9 @@ static int pnpacpi_set_resources(struct pnp_dev *dev)
- 		return -ENODEV;
- 	}
- 
-+	if (WARN_ON_ONCE(acpi_dev != dev->data))
-+		dev->data = acpi_dev;
-+
- 	ret = pnpacpi_build_resource_template(dev, &buffer);
- 	if (ret)
- 		return ret;
-diff --git a/drivers/staging/telephony/ixj.c b/drivers/staging/telephony/ixj.c
-index f960279..638d2b8 100644
---- a/drivers/staging/telephony/ixj.c
-+++ b/drivers/staging/telephony/ixj.c
-@@ -3190,12 +3190,12 @@ static void ixj_write_cid(IXJ *j)
- 
- 	ixj_fsk_alloc(j);
- 
--	strcpy(sdmf1, j->cid_send.month);
--	strcat(sdmf1, j->cid_send.day);
--	strcat(sdmf1, j->cid_send.hour);
--	strcat(sdmf1, j->cid_send.min);
--	strcpy(sdmf2, j->cid_send.number);
--	strcpy(sdmf3, j->cid_send.name);
-+	strlcpy(sdmf1, j->cid_send.month, sizeof(sdmf1));
-+	strlcat(sdmf1, j->cid_send.day, sizeof(sdmf1));
-+	strlcat(sdmf1, j->cid_send.hour, sizeof(sdmf1));
-+	strlcat(sdmf1, j->cid_send.min, sizeof(sdmf1));
-+	strlcpy(sdmf2, j->cid_send.number, sizeof(sdmf2));
-+	strlcpy(sdmf3, j->cid_send.name, sizeof(sdmf3));
- 
- 	len1 = strlen(sdmf1);
- 	len2 = strlen(sdmf2);
-@@ -3340,12 +3340,12 @@ static void ixj_write_cidcw(IXJ *j)
- 		ixj_pre_cid(j);
- 	}
- 	j->flags.cidcw_ack = 0;
--	strcpy(sdmf1, j->cid_send.month);
--	strcat(sdmf1, j->cid_send.day);
--	strcat(sdmf1, j->cid_send.hour);
--	strcat(sdmf1, j->cid_send.min);
--	strcpy(sdmf2, j->cid_send.number);
--	strcpy(sdmf3, j->cid_send.name);
-+	strlcpy(sdmf1, j->cid_send.month, sizeof(sdmf1));
-+	strlcat(sdmf1, j->cid_send.day, sizeof(sdmf1));
-+	strlcat(sdmf1, j->cid_send.hour, sizeof(sdmf1));
-+	strlcat(sdmf1, j->cid_send.min, sizeof(sdmf1));
-+	strlcpy(sdmf2, j->cid_send.number, sizeof(sdmf2));
-+	strlcpy(sdmf3, j->cid_send.name, sizeof(sdmf3));
- 
- 	len1 = strlen(sdmf1);
- 	len2 = strlen(sdmf2);
+ static void *t_start(struct seq_file *m, loff_t *pos)
+-- 
+2.28.0
+
+
+From 1229a83d1ea3d11b4433f7080825d05044af45a9 Mon Sep 17 00:00:00 2001
+From: Dan Williams <dcbw@redhat.com>
+Date: Thu, 8 Nov 2012 12:47:41 -0600
+Subject: [PATCH 26/29] cdc-acm: implement TIOCSSERIAL to avoid blocking
+ close(2)
+
+commit ba2d8ce9db0a61505362bb17b8899df3d3326146 upstream.
+
+Some devices (ex Nokia C7) simply don't respond at all when data is sent
+to some of their USB interfaces.  The data gets stuck in the TTYs queue
+and sits there until close(2), which them blocks because closing_wait
+defaults to 30 seconds (even though the fd is O_NONBLOCK).  This is
+rarely desired.  Implement the standard mechanism to adjust closing_wait
+and let applications handle it how they want to.
+
+See also 02303f73373aa1da19dbec510ec5a4e2576f9610 for usb_wwan.c.
+
+Signed-off-by: Dan Williams <dcbw@redhat.com>
+Acked-by: Oliver Neukum <oneukum@suse.de>
+Tested-by: Aleksander Morgado <aleksander@gnu.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/class/cdc-acm.c | 38 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
 diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
-index c5f7eae..b4e87cf 100644
+index c5f7eae429e8..b4e87cfa73a7 100644
 --- a/drivers/usb/class/cdc-acm.c
 +++ b/drivers/usb/class/cdc-acm.c
 @@ -788,6 +788,10 @@ static int get_serial_info(struct acm *acm, struct serial_struct __user *info)
@@ -507,496 +1834,67 @@ index c5f7eae..b4e87cf 100644
  	}
  
  	return rv;
-diff --git a/drivers/usb/host/ohci-q.c b/drivers/usb/host/ohci-q.c
-index c5a1ea9..9d00d47 100644
---- a/drivers/usb/host/ohci-q.c
-+++ b/drivers/usb/host/ohci-q.c
-@@ -1128,6 +1128,25 @@ dl_done_list (struct ohci_hcd *ohci)
- 
- 	while (td) {
- 		struct td	*td_next = td->next_dl_td;
-+		struct ed	*ed = td->ed;
-+
-+		/*
-+		 * Some OHCI controllers (NVIDIA for sure, maybe others)
-+		 * occasionally forget to add TDs to the done queue.  Since
-+		 * TDs for a given endpoint are always processed in order,
-+		 * if we find a TD on the donelist then all of its
-+		 * predecessors must be finished as well.
-+		 */
-+		for (;;) {
-+			struct td	*td2;
-+
-+			td2 = list_first_entry(&ed->td_list, struct td,
-+					td_list);
-+			if (td2 == td)
-+				break;
-+			takeback_td(ohci, td2);
-+		}
-+
- 		takeback_td(ohci, td);
- 		td = td_next;
- 	}
-diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
-index 4211017..84e82dc 100644
---- a/drivers/usb/host/xhci-pci.c
-+++ b/drivers/usb/host/xhci-pci.c
-@@ -29,6 +29,7 @@
- /* Device for a quirk */
- #define PCI_VENDOR_ID_FRESCO_LOGIC	0x1b73
- #define PCI_DEVICE_ID_FRESCO_LOGIC_PDK	0x1000
-+#define PCI_DEVICE_ID_FRESCO_LOGIC_FL1400	0x1400
- 
- #define PCI_VENDOR_ID_ETRON		0x1b6f
- #define PCI_DEVICE_ID_ASROCK_P67	0x7023
-@@ -58,8 +59,10 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
- 
- 	/* Look for vendor-specific quirks */
- 	if (pdev->vendor == PCI_VENDOR_ID_FRESCO_LOGIC &&
--			pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK) {
--		if (pdev->revision == 0x0) {
-+			(pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK ||
-+			 pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_FL1400)) {
-+		if (pdev->device == PCI_DEVICE_ID_FRESCO_LOGIC_PDK &&
-+				pdev->revision == 0x0) {
- 			xhci->quirks |= XHCI_RESET_EP_QUIRK;
- 			xhci_dbg(xhci, "QUIRK: Fresco Logic xHC needs configure"
- 					" endpoint cmd after reset endpoint\n");
-diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
-index 53e7e69..f38a278 100644
---- a/drivers/usb/serial/cp210x.c
-+++ b/drivers/usb/serial/cp210x.c
-@@ -120,6 +120,7 @@ static const struct usb_device_id id_table[] = {
- 	{ USB_DEVICE(0x10C4, 0x8477) }, /* Balluff RFID */
- 	{ USB_DEVICE(0x10C4, 0x85EA) }, /* AC-Services IBUS-IF */
- 	{ USB_DEVICE(0x10C4, 0x85EB) }, /* AC-Services CIS-IBUS */
-+	{ USB_DEVICE(0x10C4, 0x85F8) }, /* Virtenio Preon32 */
- 	{ USB_DEVICE(0x10C4, 0x8664) }, /* AC-Services CAN-IF */
- 	{ USB_DEVICE(0x10C4, 0x8665) }, /* AC-Services OBD-IF */
- 	{ USB_DEVICE(0x10C4, 0xEA60) }, /* Silicon Labs factory default */
-diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
-index 25bb935..25903f5 100644
---- a/drivers/usb/serial/ftdi_sio.c
-+++ b/drivers/usb/serial/ftdi_sio.c
-@@ -197,6 +197,7 @@ static struct usb_device_id id_table_combined [] = {
- 	{ USB_DEVICE(FTDI_VID, FTDI_OPENDCC_THROTTLE_PID) },
- 	{ USB_DEVICE(FTDI_VID, FTDI_OPENDCC_GATEWAY_PID) },
- 	{ USB_DEVICE(FTDI_VID, FTDI_OPENDCC_GBM_PID) },
-+	{ USB_DEVICE(NEWPORT_VID, NEWPORT_AGILIS_PID) },
- 	{ USB_DEVICE(INTERBIOMETRICS_VID, INTERBIOMETRICS_IOBOARD_PID) },
- 	{ USB_DEVICE(INTERBIOMETRICS_VID, INTERBIOMETRICS_MINI_IOBOARD_PID) },
- 	{ USB_DEVICE(FTDI_VID, FTDI_SPROG_II) },
-@@ -1810,7 +1811,7 @@ static int ftdi_8u2232c_probe(struct usb_serial *serial)
- 	dbg("%s", __func__);
- 
- 	if ((udev->manufacturer && !strcmp(udev->manufacturer, "CALAO Systems")) ||
--	    (udev->product && !strcmp(udev->product, "BeagleBone/XDS100")))
-+	    (udev->product && !strcmp(udev->product, "BeagleBone/XDS100V2")))
- 		return ftdi_jtag_probe(serial);
- 
- 	return 0;
-diff --git a/drivers/usb/serial/ftdi_sio_ids.h b/drivers/usb/serial/ftdi_sio_ids.h
-index 57c12ef..049b6e7 100644
---- a/drivers/usb/serial/ftdi_sio_ids.h
-+++ b/drivers/usb/serial/ftdi_sio_ids.h
-@@ -752,6 +752,12 @@
- #define TTI_VID			0x103E	/* Vendor Id */
- #define TTI_QL355P_PID		0x03E8	/* TTi QL355P power supply */
- 
-+/*
-+ * Newport Cooperation (www.newport.com)
-+ */
-+#define NEWPORT_VID			0x104D
-+#define NEWPORT_AGILIS_PID		0x3000
-+
- /* Interbiometrics USB I/O Board */
- /* Developed for Interbiometrics by Rudolf Gugler */
- #define INTERBIOMETRICS_VID              0x1209
-diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
-index 43aa36b..0c3d290 100644
---- a/drivers/usb/serial/option.c
-+++ b/drivers/usb/serial/option.c
-@@ -80,6 +80,7 @@ static void option_instat_callback(struct urb *urb);
- #define OPTION_PRODUCT_GTM380_MODEM		0x7201
- 
- #define HUAWEI_VENDOR_ID			0x12D1
-+#define HUAWEI_PRODUCT_E173			0x140C
- #define HUAWEI_PRODUCT_K4505			0x1464
- #define HUAWEI_PRODUCT_K3765			0x1465
- #define HUAWEI_PRODUCT_K4605			0x14C6
-@@ -552,6 +553,8 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE(QUANTA_VENDOR_ID, QUANTA_PRODUCT_GLX) },
- 	{ USB_DEVICE(QUANTA_VENDOR_ID, QUANTA_PRODUCT_GKE) },
- 	{ USB_DEVICE(QUANTA_VENDOR_ID, QUANTA_PRODUCT_GLE) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_E173, 0xff, 0xff, 0xff),
-+		.driver_info = (kernel_ulong_t) &net_intf1_blacklist },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K4505, 0xff, 0xff, 0xff),
- 		.driver_info = (kernel_ulong_t) &huawei_cdc12_blacklist },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(HUAWEI_VENDOR_ID, HUAWEI_PRODUCT_K3765, 0xff, 0xff, 0xff),
-@@ -883,6 +886,10 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0126, 0xff, 0xff, 0xff),
- 		.driver_info = (kernel_ulong_t)&net_intf5_blacklist },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0128, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0135, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0136, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0137, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0139, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0142, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0143, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0144, 0xff, 0xff, 0xff) },
-@@ -903,20 +910,34 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0165, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0167, 0xff, 0xff, 0xff),
- 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0189, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0191, 0xff, 0xff, 0xff), /* ZTE EuFi890 */
- 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0196, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0197, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0199, 0xff, 0xff, 0xff), /* ZTE MF820S */
- 	  .driver_info = (kernel_ulong_t)&net_intf1_blacklist },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0200, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0201, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0254, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0257, 0xff, 0xff, 0xff), /* ZTE MF821 */
- 	  .driver_info = (kernel_ulong_t)&net_intf3_blacklist },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0265, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0284, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0317, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0326, 0xff, 0xff, 0xff),
- 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0330, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0395, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0414, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0417, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1008, 0xff, 0xff, 0xff),
- 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1010, 0xff, 0xff, 0xff),
- 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1012, 0xff, 0xff, 0xff),
- 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1018, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1021, 0xff, 0xff, 0xff),
- 	  .driver_info = (kernel_ulong_t)&net_intf2_blacklist },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1057, 0xff, 0xff, 0xff) },
-@@ -1096,6 +1117,10 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1298, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1299, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1300, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1301, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1302, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1303, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1333, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1401, 0xff, 0xff, 0xff),
- 		.driver_info = (kernel_ulong_t)&net_intf2_blacklist },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1402, 0xff, 0xff, 0xff),
-diff --git a/drivers/usb/storage/Kconfig b/drivers/usb/storage/Kconfig
-index 7691c86..685edc8 100644
---- a/drivers/usb/storage/Kconfig
-+++ b/drivers/usb/storage/Kconfig
-@@ -203,7 +203,7 @@ config USB_STORAGE_ENE_UB6250
- 
- config USB_UAS
- 	tristate "USB Attached SCSI"
--	depends on USB && SCSI
-+	depends on USB && SCSI && BROKEN
- 	help
- 	  The USB Attached SCSI protocol is supported by some USB
- 	  storage devices.  It permits higher performance by supporting
-diff --git a/include/linux/mempolicy.h b/include/linux/mempolicy.h
-index 0abf1d4..fe07e5a 100644
---- a/include/linux/mempolicy.h
-+++ b/include/linux/mempolicy.h
-@@ -137,16 +137,6 @@ static inline void mpol_cond_put(struct mempolicy *pol)
- 		__mpol_put(pol);
- }
- 
--extern struct mempolicy *__mpol_cond_copy(struct mempolicy *tompol,
--					  struct mempolicy *frompol);
--static inline struct mempolicy *mpol_cond_copy(struct mempolicy *tompol,
--						struct mempolicy *frompol)
--{
--	if (!frompol)
--		return frompol;
--	return __mpol_cond_copy(tompol, frompol);
--}
--
- extern struct mempolicy *__mpol_dup(struct mempolicy *pol);
- static inline struct mempolicy *mpol_dup(struct mempolicy *pol)
- {
-@@ -270,12 +260,6 @@ static inline void mpol_cond_put(struct mempolicy *pol)
- {
- }
- 
--static inline struct mempolicy *mpol_cond_copy(struct mempolicy *to,
--						struct mempolicy *from)
--{
--	return from;
--}
--
- static inline void mpol_get(struct mempolicy *pol)
- {
- }
-diff --git a/kernel/rcutree.c b/kernel/rcutree.c
-index 4eec66e..62c5e9c 100644
---- a/kernel/rcutree.c
-+++ b/kernel/rcutree.c
-@@ -202,13 +202,13 @@ DEFINE_PER_CPU(struct rcu_dynticks, rcu_dynticks) = {
- 	.dynticks = ATOMIC_INIT(1),
- };
- 
--static int blimit = 10;		/* Maximum callbacks per rcu_do_batch. */
--static int qhimark = 10000;	/* If this many pending, ignore blimit. */
--static int qlowmark = 100;	/* Once only this many pending, use blimit. */
-+static long blimit = 10;	/* Maximum callbacks per rcu_do_batch. */
-+static long qhimark = 10000;	/* If this many pending, ignore blimit. */
-+static long qlowmark = 100;	/* Once only this many pending, use blimit. */
- 
--module_param(blimit, int, 0);
--module_param(qhimark, int, 0);
--module_param(qlowmark, int, 0);
-+module_param(blimit, long, 0);
-+module_param(qhimark, long, 0);
-+module_param(qlowmark, long, 0);
- 
- int rcu_cpu_stall_suppress __read_mostly; /* 1 = suppress stall warnings. */
- int rcu_cpu_stall_timeout __read_mostly = CONFIG_RCU_CPU_STALL_TIMEOUT;
-@@ -1476,7 +1476,7 @@ static void rcu_do_batch(struct rcu_state *rsp, struct rcu_data *rdp)
- {
- 	unsigned long flags;
- 	struct rcu_head *next, *list, **tail;
--	int bl, count, count_lazy;
-+	long bl, count, count_lazy;
- 
- 	/* If no callbacks are ready, just return.*/
- 	if (!cpu_has_callbacks_ready_to_invoke(rdp)) {
-diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
-index 0fa92f6..100b7fd 100644
---- a/kernel/trace/ftrace.c
-+++ b/kernel/trace/ftrace.c
-@@ -2368,7 +2368,7 @@ static void reset_iter_read(struct ftrace_iterator *iter)
- {
- 	iter->pos = 0;
- 	iter->func_pos = 0;
--	iter->flags &= ~(FTRACE_ITER_PRINTALL & FTRACE_ITER_HASH);
-+	iter->flags &= ~(FTRACE_ITER_PRINTALL | FTRACE_ITER_HASH);
- }
- 
- static void *t_start(struct seq_file *m, loff_t *pos)
-diff --git a/kernel/workqueue.c b/kernel/workqueue.c
-index bcb9d34..a64b94e 100644
---- a/kernel/workqueue.c
-+++ b/kernel/workqueue.c
-@@ -1141,8 +1141,8 @@ int queue_delayed_work_on(int cpu, struct workqueue_struct *wq,
- 	if (!test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
- 		unsigned int lcpu;
- 
--		BUG_ON(timer_pending(timer));
--		BUG_ON(!list_empty(&work->entry));
-+		WARN_ON_ONCE(timer_pending(timer));
-+		WARN_ON_ONCE(!list_empty(&work->entry));
- 
- 		timer_stats_timer_set_start_info(&dwork->timer);
- 
-diff --git a/mm/dmapool.c b/mm/dmapool.c
-index c5ab33b..da1b0f0 100644
---- a/mm/dmapool.c
-+++ b/mm/dmapool.c
-@@ -50,7 +50,6 @@ struct dma_pool {		/* the pool */
- 	size_t allocation;
- 	size_t boundary;
- 	char name[32];
--	wait_queue_head_t waitq;
- 	struct list_head pools;
- };
- 
-@@ -62,8 +61,6 @@ struct dma_page {		/* cacheable header for 'allocation' bytes */
- 	unsigned int offset;
- };
- 
--#define	POOL_TIMEOUT_JIFFIES	((100 /* msec */ * HZ) / 1000)
--
- static DEFINE_MUTEX(pools_lock);
- 
- static ssize_t
-@@ -172,7 +169,6 @@ struct dma_pool *dma_pool_create(const char *name, struct device *dev,
- 	retval->size = size;
- 	retval->boundary = boundary;
- 	retval->allocation = allocation;
--	init_waitqueue_head(&retval->waitq);
- 
- 	if (dev) {
- 		int ret;
-@@ -227,7 +223,6 @@ static struct dma_page *pool_alloc_page(struct dma_pool *pool, gfp_t mem_flags)
- 		memset(page->vaddr, POOL_POISON_FREED, pool->allocation);
- #endif
- 		pool_initialise_page(pool, page);
--		list_add(&page->page_list, &pool->page_list);
- 		page->in_use = 0;
- 		page->offset = 0;
- 	} else {
-@@ -315,30 +310,21 @@ void *dma_pool_alloc(struct dma_pool *pool, gfp_t mem_flags,
- 	might_sleep_if(mem_flags & __GFP_WAIT);
- 
- 	spin_lock_irqsave(&pool->lock, flags);
-- restart:
- 	list_for_each_entry(page, &pool->page_list, page_list) {
- 		if (page->offset < pool->allocation)
- 			goto ready;
- 	}
--	page = pool_alloc_page(pool, GFP_ATOMIC);
--	if (!page) {
--		if (mem_flags & __GFP_WAIT) {
--			DECLARE_WAITQUEUE(wait, current);
- 
--			__set_current_state(TASK_UNINTERRUPTIBLE);
--			__add_wait_queue(&pool->waitq, &wait);
--			spin_unlock_irqrestore(&pool->lock, flags);
-+	/* pool_alloc_page() might sleep, so temporarily drop &pool->lock */
-+	spin_unlock_irqrestore(&pool->lock, flags);
- 
--			schedule_timeout(POOL_TIMEOUT_JIFFIES);
-+	page = pool_alloc_page(pool, mem_flags);
-+	if (!page)
-+		return NULL;
- 
--			spin_lock_irqsave(&pool->lock, flags);
--			__remove_wait_queue(&pool->waitq, &wait);
--			goto restart;
--		}
--		retval = NULL;
--		goto done;
--	}
-+	spin_lock_irqsave(&pool->lock, flags);
- 
-+	list_add(&page->page_list, &pool->page_list);
-  ready:
- 	page->in_use++;
- 	offset = page->offset;
-@@ -348,7 +334,6 @@ void *dma_pool_alloc(struct dma_pool *pool, gfp_t mem_flags,
- #ifdef	DMAPOOL_DEBUG
- 	memset(retval, POOL_POISON_ALLOCATED, pool->size);
- #endif
-- done:
- 	spin_unlock_irqrestore(&pool->lock, flags);
- 	return retval;
- }
-@@ -435,8 +420,6 @@ void dma_pool_free(struct dma_pool *pool, void *vaddr, dma_addr_t dma)
- 	page->in_use--;
- 	*(int *)vaddr = page->offset;
- 	page->offset = offset;
--	if (waitqueue_active(&pool->waitq))
--		wake_up_locked(&pool->waitq);
- 	/*
- 	 * Resist a temptation to do
- 	 *    if (!is_page_busy(page)) pool_free_page(pool, page);
-diff --git a/mm/mempolicy.c b/mm/mempolicy.c
-index d1e4bef..458dede 100644
---- a/mm/mempolicy.c
-+++ b/mm/mempolicy.c
-@@ -2009,28 +2009,6 @@ struct mempolicy *__mpol_dup(struct mempolicy *old)
- 	return new;
- }
- 
--/*
-- * If *frompol needs [has] an extra ref, copy *frompol to *tompol ,
-- * eliminate the * MPOL_F_* flags that require conditional ref and
-- * [NOTE!!!] drop the extra ref.  Not safe to reference *frompol directly
-- * after return.  Use the returned value.
-- *
-- * Allows use of a mempolicy for, e.g., multiple allocations with a single
-- * policy lookup, even if the policy needs/has extra ref on lookup.
-- * shmem_readahead needs this.
-- */
--struct mempolicy *__mpol_cond_copy(struct mempolicy *tompol,
--						struct mempolicy *frompol)
--{
--	if (!mpol_needs_cond_ref(frompol))
--		return frompol;
--
--	*tompol = *frompol;
--	tompol->flags &= ~MPOL_F_SHARED;	/* copy doesn't need unref */
--	__mpol_put(frompol);
--	return tompol;
--}
--
- /* Slow path of a mempolicy comparison */
- bool __mpol_equal(struct mempolicy *a, struct mempolicy *b)
- {
-diff --git a/mm/shmem.c b/mm/shmem.c
-index a859b06..a409bd8 100644
---- a/mm/shmem.c
-+++ b/mm/shmem.c
-@@ -798,24 +798,28 @@ static struct mempolicy *shmem_get_sbmpol(struct shmem_sb_info *sbinfo)
- static struct page *shmem_swapin(swp_entry_t swap, gfp_t gfp,
- 			struct shmem_inode_info *info, pgoff_t index)
- {
--	struct mempolicy mpol, *spol;
- 	struct vm_area_struct pvma;
--
--	spol = mpol_cond_copy(&mpol,
--			mpol_shared_policy_lookup(&info->policy, index));
-+	struct page *page;
- 
- 	/* Create a pseudo vma that just contains the policy */
- 	pvma.vm_start = 0;
- 	pvma.vm_pgoff = index;
- 	pvma.vm_ops = NULL;
--	pvma.vm_policy = spol;
--	return swapin_readahead(swap, gfp, &pvma, 0);
-+	pvma.vm_policy = mpol_shared_policy_lookup(&info->policy, index);
-+
-+	page = swapin_readahead(swap, gfp, &pvma, 0);
-+
-+	/* Drop reference taken by mpol_shared_policy_lookup() */
-+	mpol_cond_put(pvma.vm_policy);
-+
-+	return page;
- }
- 
- static struct page *shmem_alloc_page(gfp_t gfp,
- 			struct shmem_inode_info *info, pgoff_t index)
- {
- 	struct vm_area_struct pvma;
-+	struct page *page;
- 
- 	/* Create a pseudo vma that just contains the policy */
- 	pvma.vm_start = 0;
-@@ -823,10 +827,12 @@ static struct page *shmem_alloc_page(gfp_t gfp,
- 	pvma.vm_ops = NULL;
- 	pvma.vm_policy = mpol_shared_policy_lookup(&info->policy, index);
- 
--	/*
--	 * alloc_page_vma() will drop the shared policy reference
--	 */
--	return alloc_page_vma(gfp, &pvma, 0);
-+	page = alloc_page_vma(gfp, &pvma, 0);
-+
-+	/* Drop reference taken by mpol_shared_policy_lookup() */
-+	mpol_cond_put(pvma.vm_policy);
-+
-+	return page;
- }
- #else /* !CONFIG_NUMA */
- #ifdef CONFIG_TMPFS
-diff --git a/sound/soc/Makefile b/sound/soc/Makefile
-index 2feaf37..0f37086 100644
---- a/sound/soc/Makefile
-+++ b/sound/soc/Makefile
-@@ -1,8 +1,9 @@
- snd-soc-core-objs := soc-core.o soc-dapm.o soc-jack.o soc-cache.o soc-utils.o
- snd-soc-core-objs += soc-pcm.o soc-io.o
- 
--snd-soc-dmaengine-pcm-objs := soc-dmaengine-pcm.o
--obj-$(CONFIG_SND_SOC_DMAENGINE_PCM) += snd-soc-dmaengine-pcm.o
-+ifneq ($(CONFIG_SND_SOC_DMAENGINE_PCM),)
-+snd-soc-core-objs += soc-dmaengine-pcm.o
-+endif
- 
- obj-$(CONFIG_SND_SOC)	+= snd-soc-core.o
- obj-$(CONFIG_SND_SOC)	+= codecs/
+-- 
+2.28.0
+
+
+From d5a79aa30b7e6cd68dfee6a76acbe6c7f7905f51 Mon Sep 17 00:00:00 2001
+From: Zheng Liu <gnehzuil.liu@gmail.com>
+Date: Thu, 8 Nov 2012 16:58:46 -0800
+Subject: [PATCH 27/29] perf test: fix a build error on builtin-test
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 12f8f74b2a4d26c4facfa7ef99487cf0930f6ef7 upstream.
+
+Recently I build perf and get a build error on builtin-test.c. The error is as
+following:
+
+$ make
+    CC perf.o
+    CC builtin-test.o
+cc1: warnings being treated as errors
+builtin-test.c: In function ‘sched__get_first_possible_cpu’:
+builtin-test.c:977: warning: implicit declaration of function ‘CPU_ALLOC’
+builtin-test.c:977: warning: nested extern declaration of ‘CPU_ALLOC’
+builtin-test.c:977: warning: assignment makes pointer from integer without a cast
+builtin-test.c:978: warning: implicit declaration of function ‘CPU_ALLOC_SIZE’
+builtin-test.c:978: warning: nested extern declaration of ‘CPU_ALLOC_SIZE’
+builtin-test.c:979: warning: implicit declaration of function ‘CPU_ZERO_S’
+builtin-test.c:979: warning: nested extern declaration of ‘CPU_ZERO_S’
+builtin-test.c:982: warning: implicit declaration of function ‘CPU_FREE’
+builtin-test.c:982: warning: nested extern declaration of ‘CPU_FREE’
+builtin-test.c:992: warning: implicit declaration of function ‘CPU_ISSET_S’
+builtin-test.c:992: warning: nested extern declaration of ‘CPU_ISSET_S’
+builtin-test.c:998: warning: implicit declaration of function ‘CPU_CLR_S’
+builtin-test.c:998: warning: nested extern declaration of ‘CPU_CLR_S’
+make: *** [builtin-test.o] Error 1
+
+This problem is introduced in 3e7c439a. CPU_ALLOC and related macros are
+missing in sched__get_first_possible_cpu function. In 54489c18, commiter
+mentioned that CPU_ALLOC has been removed. So CPU_ALLOC calls in this
+function are removed to let perf to be built.
+
+Signed-off-by: Vinson Lee <vlee@twitter.com>
+Signed-off-by: Zheng Liu <wenqing.lz@taobao.com>
+Cc: David Ahern <dsahern@gmail.com>
+Cc: Frederic Weisbecker <fweisbec@gmail.com>
+Cc: Mike Galbraith <efault@gmx.de>
+Cc: Paul Mackerras <paulus@samba.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Stephane Eranian <eranian@google.com>
+Cc: Vinson Lee <vlee@twitter.com>
+Cc: Zheng Liu <wenqing.lz@taobao.com>
+Link: http://lkml.kernel.org/r/1352422726-31114-1-git-send-email-vlee@twitter.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ tools/perf/builtin-test.c | 38 ++++++++++++--------------------------
+ 1 file changed, 12 insertions(+), 26 deletions(-)
+
 diff --git a/tools/perf/builtin-test.c b/tools/perf/builtin-test.c
-index 223ffdc..3487b4b 100644
+index 223ffdcc0fd8..3487b4b42114 100644
 --- a/tools/perf/builtin-test.c
 +++ b/tools/perf/builtin-test.c
 @@ -1154,19 +1154,13 @@ static int test__parse_events(void)
@@ -1088,3 +1986,96 @@ index 223ffdc..3487b4b 100644
  out_delete_evlist:
  	perf_evlist__delete(evlist);
  out:
+-- 
+2.28.0
+
+
+From 29251de53e1712158c29b3626a008d8b93a6e024 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Thu, 18 Oct 2012 04:55:36 -0700
+Subject: [PATCH 28/29] rcu: Fix batch-limit size problem
+
+commit 878d7439d0f45a95869e417576774673d1fa243f upstream.
+
+Commit 29c00b4a1d9e27 (rcu: Add event-tracing for RCU callback
+invocation) added a regression in rcu_do_batch()
+
+Under stress, RCU is supposed to allow to process all items in queue,
+instead of a batch of 10 items (blimit), but an integer overflow makes
+the effective limit being 1.  So, unless there is frequent idle periods
+(during which RCU ignores batch limits), RCU can be forced into a
+state where it cannot keep up with the callback-generation rate,
+eventually resulting in OOM.
+
+This commit therefore converts a few variables in rcu_do_batch() from
+int to long to fix this problem, along with the module parameters
+controlling the batch limits.
+
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/rcutree.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/kernel/rcutree.c b/kernel/rcutree.c
+index 4eec66e0350d..62c5e9cf6fcb 100644
+--- a/kernel/rcutree.c
++++ b/kernel/rcutree.c
+@@ -202,13 +202,13 @@ DEFINE_PER_CPU(struct rcu_dynticks, rcu_dynticks) = {
+ 	.dynticks = ATOMIC_INIT(1),
+ };
+ 
+-static int blimit = 10;		/* Maximum callbacks per rcu_do_batch. */
+-static int qhimark = 10000;	/* If this many pending, ignore blimit. */
+-static int qlowmark = 100;	/* Once only this many pending, use blimit. */
++static long blimit = 10;	/* Maximum callbacks per rcu_do_batch. */
++static long qhimark = 10000;	/* If this many pending, ignore blimit. */
++static long qlowmark = 100;	/* Once only this many pending, use blimit. */
+ 
+-module_param(blimit, int, 0);
+-module_param(qhimark, int, 0);
+-module_param(qlowmark, int, 0);
++module_param(blimit, long, 0);
++module_param(qhimark, long, 0);
++module_param(qlowmark, long, 0);
+ 
+ int rcu_cpu_stall_suppress __read_mostly; /* 1 = suppress stall warnings. */
+ int rcu_cpu_stall_timeout __read_mostly = CONFIG_RCU_CPU_STALL_TIMEOUT;
+@@ -1476,7 +1476,7 @@ static void rcu_do_batch(struct rcu_state *rsp, struct rcu_data *rdp)
+ {
+ 	unsigned long flags;
+ 	struct rcu_head *next, *list, **tail;
+-	int bl, count, count_lazy;
++	long bl, count, count_lazy;
+ 
+ 	/* If no callbacks are ready, just return.*/
+ 	if (!cpu_has_callbacks_ready_to_invoke(rdp)) {
+-- 
+2.28.0
+
+
+From e56f8b7aeb0b8135ee29b0612b192a784450739e Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Mon, 17 Dec 2012 10:38:05 -0800
+Subject: [PATCH 29/29] Linux 3.4.24
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index bf1df55f4f97..a3e12e687c67 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 4
+-SUBLEVEL = 23
++SUBLEVEL = 24
+ EXTRAVERSION =
+ NAME = Saber-toothed Squirrel
+ 
+-- 
+2.28.0
+

@@ -1,37 +1,1436 @@
-diff --git a/Makefile b/Makefile
-index 0309acc34472..ec52973043f6 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 4
--SUBLEVEL = 62
-+SUBLEVEL = 63
- EXTRAVERSION =
- NAME = Blurry Fish Butt
+From 3144d81a77352a3934ff0f60dccb38dbf462da39 Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Thu, 16 Mar 2017 16:54:24 -0400
+Subject: [PATCH 01/46] cgroup, kthread: close race window where new kthreads
+ can be migrated to non-root cgroups
+
+commit 77f88796cee819b9c4562b0b6b44691b3b7755b1 upstream.
+
+Creation of a kthread goes through a couple interlocked stages between
+the kthread itself and its creator.  Once the new kthread starts
+running, it initializes itself and wakes up the creator.  The creator
+then can further configure the kthread and then let it start doing its
+job by waking it up.
+
+In this configuration-by-creator stage, the creator is the only one
+that can wake it up but the kthread is visible to userland.  When
+altering the kthread's attributes from userland is allowed, this is
+fine; however, for cases where CPU affinity is critical,
+kthread_bind() is used to first disable affinity changes from userland
+and then set the affinity.  This also prevents the kthread from being
+migrated into non-root cgroups as that can affect the CPU affinity and
+many other things.
+
+Unfortunately, the cgroup side of protection is racy.  While the
+PF_NO_SETAFFINITY flag prevents further migrations, userland can win
+the race before the creator sets the flag with kthread_bind() and put
+the kthread in a non-root cgroup, which can lead to all sorts of
+problems including incorrect CPU affinity and starvation.
+
+This bug got triggered by userland which periodically tries to migrate
+all processes in the root cpuset cgroup to a non-root one.  Per-cpu
+workqueue workers got caught while being created and ended up with
+incorrected CPU affinity breaking concurrency management and sometimes
+stalling workqueue execution.
+
+This patch adds task->no_cgroup_migration which disallows the task to
+be migrated by userland.  kthreadd starts with the flag set making
+every child kthread start in the root cgroup with migration
+disallowed.  The flag is cleared after the kthread finishes
+initialization by which time PF_NO_SETAFFINITY is set if the kthread
+should stay in the root cgroup.
+
+It'd be better to wait for the initialization instead of failing but I
+couldn't think of a way of implementing that without adding either a
+new PF flag, or sleeping and retrying from waiting side.  Even if
+userland depends on changing cgroup membership of a kthread, it either
+has to be synchronized with kthread_create() or periodically repeat,
+so it's unlikely that this would break anything.
+
+v2: Switch to a simpler implementation using a new task_struct bit
+    field suggested by Oleg.
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Suggested-by: Oleg Nesterov <oleg@redhat.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Reported-and-debugged-by: Chris Mason <clm@fb.com>
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/cgroup.h | 21 +++++++++++++++++++++
+ include/linux/sched.h  |  4 ++++
+ kernel/cgroup.c        |  9 +++++----
+ kernel/kthread.c       |  3 +++
+ 4 files changed, 33 insertions(+), 4 deletions(-)
+
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index cb91b44f5f78..ad2bcf647b9a 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -528,6 +528,25 @@ static inline void pr_cont_cgroup_path(struct cgroup *cgrp)
+ 	pr_cont_kernfs_path(cgrp->kn);
+ }
  
-diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
-index d5cfa937d622..8b0424abc84c 100644
---- a/arch/mips/Kconfig
-+++ b/arch/mips/Kconfig
-@@ -1413,7 +1413,7 @@ config CPU_MIPS32_R6
- 	select CPU_SUPPORTS_MSA
- 	select GENERIC_CSUM
- 	select HAVE_KVM
--	select MIPS_O32_FP64_SUPPORT if 32BIT
-+	select MIPS_O32_FP64_SUPPORT
- 	help
- 	  Choose this option to build a kernel for release 6 or later of the
- 	  MIPS32 architecture.  New MIPS processors, starting with the Warrior
-@@ -1464,7 +1464,7 @@ config CPU_MIPS64_R6
- 	select CPU_SUPPORTS_HIGHMEM
- 	select CPU_SUPPORTS_MSA
- 	select GENERIC_CSUM
--	select MIPS_O32_FP64_SUPPORT if MIPS32_O32
-+	select MIPS_O32_FP64_SUPPORT if 32BIT || MIPS32_O32
- 	help
- 	  Choose this option to build a kernel for release 6 or later of the
- 	  MIPS64 architecture.  New MIPS processors, starting with the Warrior
++static inline void cgroup_init_kthreadd(void)
++{
++	/*
++	 * kthreadd is inherited by all kthreads, keep it in the root so
++	 * that the new kthreads are guaranteed to stay in the root until
++	 * initialization is finished.
++	 */
++	current->no_cgroup_migration = 1;
++}
++
++static inline void cgroup_kthread_ready(void)
++{
++	/*
++	 * This kthread finished initialization.  The creator should have
++	 * set PF_NO_SETAFFINITY if this kthread should stay in the root.
++	 */
++	current->no_cgroup_migration = 0;
++}
++
+ #else /* !CONFIG_CGROUPS */
+ 
+ struct cgroup_subsys_state;
+@@ -551,6 +570,8 @@ static inline void cgroup_free(struct task_struct *p) {}
+ 
+ static inline int cgroup_init_early(void) { return 0; }
+ static inline int cgroup_init(void) { return 0; }
++static inline void cgroup_init_kthreadd(void) {}
++static inline void cgroup_kthread_ready(void) {}
+ 
+ #endif /* !CONFIG_CGROUPS */
+ 
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ce0f61dcd887..352213b360d7 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1475,6 +1475,10 @@ struct task_struct {
+ #ifdef CONFIG_COMPAT_BRK
+ 	unsigned brk_randomized:1;
+ #endif
++#ifdef CONFIG_CGROUPS
++	/* disallow userland-initiated cgroup migration */
++	unsigned no_cgroup_migration:1;
++#endif
+ 
+ 	unsigned long atomic_flags; /* Flags needing atomic access. */
+ 
+diff --git a/kernel/cgroup.c b/kernel/cgroup.c
+index 127c63e02d52..4cb94b678e9f 100644
+--- a/kernel/cgroup.c
++++ b/kernel/cgroup.c
+@@ -2752,11 +2752,12 @@ static ssize_t __cgroup_procs_write(struct kernfs_open_file *of, char *buf,
+ 		tsk = tsk->group_leader;
+ 
+ 	/*
+-	 * Workqueue threads may acquire PF_NO_SETAFFINITY and become
+-	 * trapped in a cpuset, or RT worker may be born in a cgroup
+-	 * with no rt_runtime allocated.  Just say no.
++	 * kthreads may acquire PF_NO_SETAFFINITY during initialization.
++	 * If userland migrates such a kthread to a non-root cgroup, it can
++	 * become trapped in a cpuset, or RT kthread may be born in a
++	 * cgroup with no rt_runtime allocated.  Just say no.
+ 	 */
+-	if (tsk == kthreadd_task || (tsk->flags & PF_NO_SETAFFINITY)) {
++	if (tsk->no_cgroup_migration || (tsk->flags & PF_NO_SETAFFINITY)) {
+ 		ret = -EINVAL;
+ 		goto out_unlock_rcu;
+ 	}
+diff --git a/kernel/kthread.c b/kernel/kthread.c
+index 9ff173dca1ae..850b255649a2 100644
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@ -18,6 +18,7 @@
+ #include <linux/freezer.h>
+ #include <linux/ptrace.h>
+ #include <linux/uaccess.h>
++#include <linux/cgroup.h>
+ #include <trace/events/sched.h>
+ 
+ static DEFINE_SPINLOCK(kthread_create_lock);
+@@ -205,6 +206,7 @@ static int kthread(void *_create)
+ 	ret = -EINTR;
+ 
+ 	if (!test_bit(KTHREAD_SHOULD_STOP, &self.flags)) {
++		cgroup_kthread_ready();
+ 		__kthread_parkme(&self);
+ 		ret = threadfn(data);
+ 	}
+@@ -510,6 +512,7 @@ int kthreadd(void *unused)
+ 	set_mems_allowed(node_states[N_MEMORY]);
+ 
+ 	current->flags |= PF_NOFREEZE;
++	cgroup_init_kthreadd();
+ 
+ 	for (;;) {
+ 		set_current_state(TASK_INTERRUPTIBLE);
+-- 
+2.28.0
+
+
+From ef4c962825c08609d8077c00cf73f26fbdc638cc Mon Sep 17 00:00:00 2001
+From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+Date: Thu, 13 Apr 2017 14:56:28 -0700
+Subject: [PATCH 02/46] thp: fix MADV_DONTNEED vs clear soft dirty race
+
+commit 5b7abeae3af8c08c577e599dd0578b9e3ee6687b upstream.
+
+Yet another instance of the same race.
+
+Fix is identical to change_huge_pmd().
+
+See "thp: fix MADV_DONTNEED vs.  numa balancing race" for more details.
+
+Link: http://lkml.kernel.org/r/20170302151034.27829-5-kirill.shutemov@linux.intel.com
+Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+Cc: Andrea Arcangeli <aarcange@redhat.com>
+Cc: Hillf Danton <hillf.zj@alibaba-inc.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/proc/task_mmu.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index d598b9c809c1..db1a1427c27a 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -803,7 +803,14 @@ static inline void clear_soft_dirty(struct vm_area_struct *vma,
+ static inline void clear_soft_dirty_pmd(struct vm_area_struct *vma,
+ 		unsigned long addr, pmd_t *pmdp)
+ {
+-	pmd_t pmd = pmdp_huge_get_and_clear(vma->vm_mm, addr, pmdp);
++	pmd_t pmd = *pmdp;
++
++	/* See comment in change_huge_pmd() */
++	pmdp_invalidate(vma, addr, pmdp);
++	if (pmd_dirty(*pmdp))
++		pmd = pmd_mkdirty(pmd);
++	if (pmd_young(*pmdp))
++		pmd = pmd_mkyoung(pmd);
+ 
+ 	pmd = pmd_wrprotect(pmd);
+ 	pmd = pmd_clear_soft_dirty(pmd);
+-- 
+2.28.0
+
+
+From a737abe4d09af3d461f0661ccde8ccec007a2db9 Mon Sep 17 00:00:00 2001
+From: Ilia Mirkin <imirkin@alum.mit.edu>
+Date: Sat, 18 Mar 2017 21:53:05 -0400
+Subject: [PATCH 03/46] drm/nouveau/mpeg: mthd returns true on success now
+
+commit 83bce9c2baa51e439480a713119a73d3c8b61083 upstream.
+
+Signed-off-by: Ilia Mirkin <imirkin@alum.mit.edu>
+Fixes: 590801c1a3 ("drm/nouveau/mpeg: remove dependence on namedb/engctx lookup")
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c | 2 +-
+ drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
+index d4d8942b1347..e55f8302d08a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
+@@ -198,7 +198,7 @@ nv31_mpeg_intr(struct nvkm_engine *engine)
+ 		}
+ 
+ 		if (type == 0x00000010) {
+-			if (!nv31_mpeg_mthd(mpeg, mthd, data))
++			if (nv31_mpeg_mthd(mpeg, mthd, data))
+ 				show &= ~0x01000000;
+ 		}
+ 	}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
+index d433cfa4a8ab..36af0a8927fc 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
+@@ -172,7 +172,7 @@ nv44_mpeg_intr(struct nvkm_engine *engine)
+ 		}
+ 
+ 		if (type == 0x00000010) {
+-			if (!nv44_mpeg_mthd(subdev->device, mthd, data))
++			if (nv44_mpeg_mthd(subdev->device, mthd, data))
+ 				show &= ~0x01000000;
+ 		}
+ 	}
+-- 
+2.28.0
+
+
+From a11ab9dd4b789f5b7ecfc069a73cde2bd826f6ec Mon Sep 17 00:00:00 2001
+From: Ilia Mirkin <imirkin@alum.mit.edu>
+Date: Sat, 18 Mar 2017 16:23:10 -0400
+Subject: [PATCH 04/46] drm/nouveau/mmu/nv4a: use nv04 mmu rather than the nv44
+ one
+
+commit f94773b9f5ecd1df7c88c2e921924dd41d2020cc upstream.
+
+The NV4A (aka NV44A) is an oddity in the family. It only comes in AGP
+and PCI varieties, rather than a core PCIE chip with a bridge for
+AGP/PCI as necessary. As a result, it appears that the MMU is also
+non-functional. For AGP cards, the vast majority of the NV4A lineup,
+this worked out since we force AGP cards to use the nv04 mmu. However
+for PCI variants, this did not work.
+
+Switching to the NV04 MMU makes it work like a charm. Thanks to mwk for
+the suggestion. This should be a no-op for NV4A AGP boards, as they were
+using it already.
+
+Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=70388
+Signed-off-by: Ilia Mirkin <imirkin@alum.mit.edu>
+Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/nouveau/nvkm/engine/device/base.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+index ece9f4102c0e..7f8acb3ebfcd 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
++++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
+@@ -714,7 +714,7 @@ nv4a_chipset = {
+ 	.i2c = nv04_i2c_new,
+ 	.imem = nv40_instmem_new,
+ 	.mc = nv44_mc_new,
+-	.mmu = nv44_mmu_new,
++	.mmu = nv04_mmu_new,
+ 	.pci = nv40_pci_new,
+ 	.therm = nv40_therm_new,
+ 	.timer = nv41_timer_new,
+-- 
+2.28.0
+
+
+From f0899d0e1e9ea7b71a3b05889c047d74b729dbf6 Mon Sep 17 00:00:00 2001
+From: Germano Percossi <germano.percossi@citrix.com>
+Date: Fri, 7 Apr 2017 12:29:38 +0100
+Subject: [PATCH 05/46] CIFS: store results of cifs_reopen_file to avoid
+ infinite wait
+
+commit 1fa839b4986d648b907d117275869a0e46c324b9 upstream.
+
+This fixes Continuous Availability when errors during
+file reopen are encountered.
+
+cifs_user_readv and cifs_user_writev would wait for ever if
+results of cifs_reopen_file are not stored and for later inspection.
+
+In fact, results are checked and, in case of errors, a chain
+of function calls leading to reads and writes to be scheduled in
+a separate thread is skipped.
+These threads will wake up the corresponding waiters once reads
+and writes are done.
+
+However, given the return value is not stored, when rc is checked
+for errors a previous one (always zero) is inspected instead.
+This leads to pending reads/writes added to the list, making
+cifs_user_readv and cifs_user_writev wait for ever.
+
+Signed-off-by: Germano Percossi <germano.percossi@citrix.com>
+Reviewed-by: Pavel Shilovsky <pshilov@microsoft.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/cifs/file.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/fs/cifs/file.c b/fs/cifs/file.c
+index 72f270d4bd17..a0c0a49b6620 100644
+--- a/fs/cifs/file.c
++++ b/fs/cifs/file.c
+@@ -2545,7 +2545,7 @@ cifs_write_from_iter(loff_t offset, size_t len, struct iov_iter *from,
+ 		wdata->credits = credits;
+ 
+ 		if (!wdata->cfile->invalidHandle ||
+-		    !cifs_reopen_file(wdata->cfile, false))
++		    !(rc = cifs_reopen_file(wdata->cfile, false)))
+ 			rc = server->ops->async_writev(wdata,
+ 					cifs_uncached_writedata_release);
+ 		if (rc) {
+@@ -2958,7 +2958,7 @@ cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
+ 		rdata->credits = credits;
+ 
+ 		if (!rdata->cfile->invalidHandle ||
+-		    !cifs_reopen_file(rdata->cfile, true))
++		    !(rc = cifs_reopen_file(rdata->cfile, true)))
+ 			rc = server->ops->async_readv(rdata);
+ error:
+ 		if (rc) {
+@@ -3544,7 +3544,7 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
+ 		}
+ 
+ 		if (!rdata->cfile->invalidHandle ||
+-		    !cifs_reopen_file(rdata->cfile, true))
++		    !(rc = cifs_reopen_file(rdata->cfile, true)))
+ 			rc = server->ops->async_readv(rdata);
+ 		if (rc) {
+ 			add_credits_and_wake_if(server, rdata->credits, 0);
+-- 
+2.28.0
+
+
+From a5e2f803b891f00d6019d727a6eb548c91a70b62 Mon Sep 17 00:00:00 2001
+From: Cameron Gutman <aicommander@gmail.com>
+Date: Mon, 10 Apr 2017 20:44:25 -0700
+Subject: [PATCH 06/46] Input: xpad - add support for Razer Wildcat gamepad
+
+commit 5376366886251e2f8f248704adb620a4bc4c0937 upstream.
+
+Signed-off-by: Cameron Gutman <aicommander@gmail.com>
+Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/input/joystick/xpad.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/input/joystick/xpad.c b/drivers/input/joystick/xpad.c
+index 16f000a76de5..3258baf3282e 100644
+--- a/drivers/input/joystick/xpad.c
++++ b/drivers/input/joystick/xpad.c
+@@ -189,6 +189,7 @@ static const struct xpad_device {
+ 	{ 0x1430, 0x8888, "TX6500+ Dance Pad (first generation)", MAP_DPAD_TO_BUTTONS, XTYPE_XBOX },
+ 	{ 0x146b, 0x0601, "BigBen Interactive XBOX 360 Controller", 0, XTYPE_XBOX360 },
+ 	{ 0x1532, 0x0037, "Razer Sabertooth", 0, XTYPE_XBOX360 },
++	{ 0x1532, 0x0a03, "Razer Wildcat", 0, XTYPE_XBOXONE },
+ 	{ 0x15e4, 0x3f00, "Power A Mini Pro Elite", 0, XTYPE_XBOX360 },
+ 	{ 0x15e4, 0x3f0a, "Xbox Airflo wired controller", 0, XTYPE_XBOX360 },
+ 	{ 0x15e4, 0x3f10, "Batarang Xbox 360 controller", 0, XTYPE_XBOX360 },
+@@ -310,6 +311,7 @@ static struct usb_device_id xpad_table[] = {
+ 	XPAD_XBOX360_VENDOR(0x1689),		/* Razer Onza */
+ 	XPAD_XBOX360_VENDOR(0x24c6),		/* PowerA Controllers */
+ 	XPAD_XBOX360_VENDOR(0x1532),		/* Razer Sabertooth */
++	XPAD_XBOXONE_VENDOR(0x1532),		/* Razer Wildcat */
+ 	XPAD_XBOX360_VENDOR(0x15e4),		/* Numark X-Box 360 controllers */
+ 	XPAD_XBOX360_VENDOR(0x162e),		/* Joytech X-Box 360 controllers */
+ 	{ }
+-- 
+2.28.0
+
+
+From f42be33fe976d4c0812fb2f697543e1b5ac073be Mon Sep 17 00:00:00 2001
+From: Peter Zijlstra <peterz@infradead.org>
+Date: Tue, 11 Apr 2017 10:10:28 +0200
+Subject: [PATCH 07/46] perf/x86: Avoid exposing wrong/stale data in
+ intel_pmu_lbr_read_32()
+
+commit f2200ac311302fcdca6556fd0c5127eab6c65a3e upstream.
+
+When the perf_branch_entry::{in_tx,abort,cycles} fields were added,
+intel_pmu_lbr_read_32() wasn't updated to initialize them.
+
+Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: linux-kernel@vger.kernel.org
+Fixes: 135c5612c460 ("perf/x86/intel: Support Haswell/v4 LBR format")
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/cpu/perf_event_intel_lbr.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/arch/x86/kernel/cpu/perf_event_intel_lbr.c b/arch/x86/kernel/cpu/perf_event_intel_lbr.c
+index 659f01e165d5..8900400230c6 100644
+--- a/arch/x86/kernel/cpu/perf_event_intel_lbr.c
++++ b/arch/x86/kernel/cpu/perf_event_intel_lbr.c
+@@ -410,6 +410,9 @@ static void intel_pmu_lbr_read_32(struct cpu_hw_events *cpuc)
+ 		cpuc->lbr_entries[i].to		= msr_lastbranch.to;
+ 		cpuc->lbr_entries[i].mispred	= 0;
+ 		cpuc->lbr_entries[i].predicted	= 0;
++		cpuc->lbr_entries[i].in_tx	= 0;
++		cpuc->lbr_entries[i].abort	= 0;
++		cpuc->lbr_entries[i].cycles	= 0;
+ 		cpuc->lbr_entries[i].reserved	= 0;
+ 	}
+ 	cpuc->lbr_stack.nr = i;
+-- 
+2.28.0
+
+
+From f1c5d01635862fb7b8b394fc1b6a1187751ce98e Mon Sep 17 00:00:00 2001
+From: Mathias Krause <minipli@googlemail.com>
+Date: Mon, 10 Apr 2017 17:14:27 +0200
+Subject: [PATCH 08/46] x86/vdso: Ensure vdso32_enabled gets set to valid
+ values only
+
+commit c06989da39cdb10604d572c8c7ea8c8c97f3c483 upstream.
+
+vdso_enabled can be set to arbitrary integer values via the kernel command
+line 'vdso32=' parameter or via 'sysctl abi.vsyscall32'.
+
+load_vdso32() only maps VDSO if vdso_enabled == 1, but ARCH_DLINFO_IA32
+merily checks for vdso_enabled != 0. As a consequence the AT_SYSINFO_EHDR
+auxiliary vector for the VDSO_ENTRY is emitted with a NULL pointer which
+causes a segfault when the application tries to use the VDSO.
+
+Restrict the valid arguments on the command line and the sysctl to 0 and 1.
+
+Fixes: b0b49f2673f0 ("x86, vdso: Remove compat vdso support")
+Signed-off-by: Mathias Krause <minipli@googlemail.com>
+Acked-by: Andy Lutomirski <luto@amacapital.net>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Roland McGrath <roland@redhat.com>
+Link: http://lkml.kernel.org/r/1491424561-7187-1-git-send-email-minipli@googlemail.com
+Link: http://lkml.kernel.org/r/20170410151723.518412863@linutronix.de
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/entry/vdso/vdso32-setup.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/arch/x86/entry/vdso/vdso32-setup.c b/arch/x86/entry/vdso/vdso32-setup.c
+index 08a317a9ae4b..a7508d7e20b7 100644
+--- a/arch/x86/entry/vdso/vdso32-setup.c
++++ b/arch/x86/entry/vdso/vdso32-setup.c
+@@ -31,8 +31,10 @@ static int __init vdso32_setup(char *s)
+ {
+ 	vdso32_enabled = simple_strtoul(s, NULL, 0);
+ 
+-	if (vdso32_enabled > 1)
++	if (vdso32_enabled > 1) {
+ 		pr_warn("vdso32 values other than 0 and 1 are no longer allowed; vdso disabled\n");
++		vdso32_enabled = 0;
++	}
+ 
+ 	return 1;
+ }
+@@ -63,13 +65,18 @@ subsys_initcall(sysenter_setup);
+ /* Register vsyscall32 into the ABI table */
+ #include <linux/sysctl.h>
+ 
++static const int zero;
++static const int one = 1;
++
+ static struct ctl_table abi_table2[] = {
+ 	{
+ 		.procname	= "vsyscall32",
+ 		.data		= &vdso32_enabled,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+-		.proc_handler	= proc_dointvec
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= (int *)&zero,
++		.extra2		= (int *)&one,
+ 	},
+ 	{}
+ };
+-- 
+2.28.0
+
+
+From ec3978e10ecc61834c9f57dd9d00492b137fa01c Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Mon, 10 Apr 2017 17:14:28 +0200
+Subject: [PATCH 09/46] x86/vdso: Plug race between mapping and ELF header
+ setup
+
+commit 6fdc6dd90272ce7e75d744f71535cfbd8d77da81 upstream.
+
+The vsyscall32 sysctl can racy against a concurrent fork when it switches
+from disabled to enabled:
+
+    arch_setup_additional_pages()
+	if (vdso32_enabled)
+           --> No mapping
+                                        sysctl.vsysscall32()
+                                          --> vdso32_enabled = true
+    create_elf_tables()
+      ARCH_DLINFO_IA32
+        if (vdso32_enabled) {
+           --> Add VDSO entry with NULL pointer
+
+Make ARCH_DLINFO_IA32 check whether the VDSO mapping has been set up for
+the newly forked process or not.
+
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Andy Lutomirski <luto@amacapital.net>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Mathias Krause <minipli@googlemail.com>
+Link: http://lkml.kernel.org/r/20170410151723.602367196@linutronix.de
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/include/asm/elf.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
+index 1514753fd435..d262f985bbc8 100644
+--- a/arch/x86/include/asm/elf.h
++++ b/arch/x86/include/asm/elf.h
+@@ -278,7 +278,7 @@ struct task_struct;
+ 
+ #define	ARCH_DLINFO_IA32						\
+ do {									\
+-	if (vdso32_enabled) {						\
++	if (VDSO_CURRENT_BASE) {					\
+ 		NEW_AUX_ENT(AT_SYSINFO,	VDSO_ENTRY);			\
+ 		NEW_AUX_ENT(AT_SYSINFO_EHDR, VDSO_CURRENT_BASE);	\
+ 	}								\
+-- 
+2.28.0
+
+
+From 074bcc1302fd4357fa30c167bb20f684998b025f Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Mon, 27 Mar 2017 21:53:38 -0700
+Subject: [PATCH 10/46] acpi, nfit, libnvdimm: fix interleave set cookie
+ calculation (64-bit comparison)
+
+commit b03b99a329a14b7302f37c3ea6da3848db41c8c5 upstream.
+
+While reviewing the -stable patch for commit 86ef58a4e35e "nfit,
+libnvdimm: fix interleave set cookie calculation" Ben noted:
+
+    "This is returning an int, thus it's effectively doing a 32-bit
+     comparison and not the 64-bit comparison you say is needed."
+
+Update the compare operation to be immune to this integer demotion problem.
+
+Cc: Nicholas Moulin <nicholas.w.moulin@linux.intel.com>
+Fixes: 86ef58a4e35e ("nfit, libnvdimm: fix interleave set cookie calculation")
+Reported-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/acpi/nfit.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/acpi/nfit.c b/drivers/acpi/nfit.c
+index 14c2a07c9f3f..67d7489ced01 100644
+--- a/drivers/acpi/nfit.c
++++ b/drivers/acpi/nfit.c
+@@ -979,7 +979,11 @@ static int cmp_map(const void *m0, const void *m1)
+ 	const struct nfit_set_info_map *map0 = m0;
+ 	const struct nfit_set_info_map *map1 = m1;
+ 
+-	return map0->region_offset - map1->region_offset;
++	if (map0->region_offset < map1->region_offset)
++		return -1;
++	else if (map0->region_offset > map1->region_offset)
++		return 1;
++	return 0;
+ }
+ 
+ /* Retrieve the nth entry referencing this spa */
+-- 
+2.28.0
+
+
+From 05c5dd75d77c8176c2beef56471868e29c19b47c Mon Sep 17 00:00:00 2001
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Thu, 23 Mar 2017 17:19:24 -0700
+Subject: [PATCH 11/46] iscsi-target: Fix TMR reference leak during session
+ shutdown
+
+commit efb2ea770bb3b0f40007530bc8b0c22f36e1c5eb upstream.
+
+This patch fixes a iscsi-target specific TMR reference leak
+during session shutdown, that could occur when a TMR was
+quiesced before the hand-off back to iscsi-target code
+via transport_cmd_check_stop_to_fabric().
+
+The reference leak happens because iscsit_free_cmd() was
+incorrectly skipping the final target_put_sess_cmd() for
+TMRs when transport_generic_free_cmd() returned zero because
+the se_cmd->cmd_kref did not reach zero, due to the missing
+se_cmd assignment in original code.
+
+The result was iscsi_cmd and it's associated se_cmd memory
+would be freed once se_sess->sess_cmd_map where released,
+but the associated se_tmr_req was leaked and remained part
+of se_device->dev_tmr_list.
+
+This bug would manfiest itself as kernel paging request
+OOPsen in core_tmr_lun_reset(), when a left-over se_tmr_req
+attempted to dereference it's se_cmd pointer that had
+already been released during normal session shutdown.
+
+To address this bug, go ahead and treat ISCSI_OP_SCSI_CMD
+and ISCSI_OP_SCSI_TMFUNC the same when there is an extra
+se_cmd->cmd_kref to drop in iscsit_free_cmd(), and use
+op_scsi to signal __iscsit_free_cmd() when the former
+needs to clear any further iscsi related I/O state.
+
+Reported-by: Rob Millner <rlm@daterainc.com>
+Cc: Rob Millner <rlm@daterainc.com>
+Reported-by: Chu Yuan Lin <cyl@datera.io>
+Cc: Chu Yuan Lin <cyl@datera.io>
+Tested-by: Chu Yuan Lin <cyl@datera.io>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/target/iscsi/iscsi_target_util.c | 12 +++++++-----
+ 1 file changed, 7 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/target/iscsi/iscsi_target_util.c b/drivers/target/iscsi/iscsi_target_util.c
+index 428b0d9e3dba..93590521ae33 100644
+--- a/drivers/target/iscsi/iscsi_target_util.c
++++ b/drivers/target/iscsi/iscsi_target_util.c
+@@ -731,21 +731,23 @@ void iscsit_free_cmd(struct iscsi_cmd *cmd, bool shutdown)
+ {
+ 	struct se_cmd *se_cmd = NULL;
+ 	int rc;
++	bool op_scsi = false;
+ 	/*
+ 	 * Determine if a struct se_cmd is associated with
+ 	 * this struct iscsi_cmd.
+ 	 */
+ 	switch (cmd->iscsi_opcode) {
+ 	case ISCSI_OP_SCSI_CMD:
+-		se_cmd = &cmd->se_cmd;
+-		__iscsit_free_cmd(cmd, true, shutdown);
++		op_scsi = true;
+ 		/*
+ 		 * Fallthrough
+ 		 */
+ 	case ISCSI_OP_SCSI_TMFUNC:
+-		rc = transport_generic_free_cmd(&cmd->se_cmd, shutdown);
+-		if (!rc && shutdown && se_cmd && se_cmd->se_sess) {
+-			__iscsit_free_cmd(cmd, true, shutdown);
++		se_cmd = &cmd->se_cmd;
++		__iscsit_free_cmd(cmd, op_scsi, shutdown);
++		rc = transport_generic_free_cmd(se_cmd, shutdown);
++		if (!rc && shutdown && se_cmd->se_sess) {
++			__iscsit_free_cmd(cmd, op_scsi, shutdown);
+ 			target_put_sess_cmd(se_cmd);
+ 		}
+ 		break;
+-- 
+2.28.0
+
+
+From 1e1de2e841e141991250d7c0ac79c5877a43b6a4 Mon Sep 17 00:00:00 2001
+From: Nicholas Bellinger <nab@linux-iscsi.org>
+Date: Sun, 2 Apr 2017 13:36:44 -0700
+Subject: [PATCH 12/46] iscsi-target: Drop work-around for legacy GlobalSAN
+ initiator
+
+commit 1c99de981f30b3e7868b8d20ce5479fa1c0fea46 upstream.
+
+Once upon a time back in 2009, a work-around was added to support
+the GlobalSAN iSCSI initiator v3.3 for MacOSX, which during login
+did not propose nor respond to MaxBurstLength, FirstBurstLength,
+DefaultTime2Wait and DefaultTime2Retain keys.
+
+The work-around in iscsi_check_proposer_for_optional_reply()
+allowed the missing keys to be proposed, but did not require
+waiting for a response before moving to full feature phase
+operation.  This allowed GlobalSAN v3.3 to work out-of-the
+box, and for many years we didn't run into login interopt
+issues with any other initiators..
+
+Until recently, when Martin tried a QLogic 57840S iSCSI Offload
+HBA on Windows 2016 which completed login, but subsequently
+failed with:
+
+    Got unknown iSCSI OpCode: 0x43
+
+The issue was QLogic MSFT side did not propose DefaultTime2Wait +
+DefaultTime2Retain, so LIO proposes them itself, and immediately
+transitions to full feature phase because of the GlobalSAN hack.
+However, the QLogic MSFT side still attempts to respond to
+DefaultTime2Retain + DefaultTime2Wait, even though LIO has set
+ISCSI_FLAG_LOGIN_NEXT_STAGE3 + ISCSI_FLAG_LOGIN_TRANSIT
+in last login response.
+
+So while the QLogic MSFT side should have been proposing these
+two keys to start, it was doing the correct thing per RFC-3720
+attempting to respond to proposed keys before transitioning to
+full feature phase.
+
+All that said, recent versions of GlobalSAN iSCSI (v5.3.0.541)
+does correctly propose the four keys during login, making the
+original work-around moot.
+
+So in order to allow QLogic MSFT to run unmodified as-is, go
+ahead and drop this long standing work-around.
+
+Reported-by: Martin Svec <martin.svec@zoner.cz>
+Cc: Martin Svec <martin.svec@zoner.cz>
+Cc: Himanshu Madhani <Himanshu.Madhani@cavium.com>
+Cc: Arun Easi <arun.easi@cavium.com>
+Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/target/iscsi/iscsi_target_parameters.c | 16 ----------------
+ 1 file changed, 16 deletions(-)
+
+diff --git a/drivers/target/iscsi/iscsi_target_parameters.c b/drivers/target/iscsi/iscsi_target_parameters.c
+index 2cbea2af7cd0..6d1b0acbc5b3 100644
+--- a/drivers/target/iscsi/iscsi_target_parameters.c
++++ b/drivers/target/iscsi/iscsi_target_parameters.c
+@@ -780,22 +780,6 @@ static void iscsi_check_proposer_for_optional_reply(struct iscsi_param *param)
+ 	} else if (IS_TYPE_NUMBER(param)) {
+ 		if (!strcmp(param->name, MAXRECVDATASEGMENTLENGTH))
+ 			SET_PSTATE_REPLY_OPTIONAL(param);
+-		/*
+-		 * The GlobalSAN iSCSI Initiator for MacOSX does
+-		 * not respond to MaxBurstLength, FirstBurstLength,
+-		 * DefaultTime2Wait or DefaultTime2Retain parameter keys.
+-		 * So, we set them to 'reply optional' here, and assume the
+-		 * the defaults from iscsi_parameters.h if the initiator
+-		 * is not RFC compliant and the keys are not negotiated.
+-		 */
+-		if (!strcmp(param->name, MAXBURSTLENGTH))
+-			SET_PSTATE_REPLY_OPTIONAL(param);
+-		if (!strcmp(param->name, FIRSTBURSTLENGTH))
+-			SET_PSTATE_REPLY_OPTIONAL(param);
+-		if (!strcmp(param->name, DEFAULTTIME2WAIT))
+-			SET_PSTATE_REPLY_OPTIONAL(param);
+-		if (!strcmp(param->name, DEFAULTTIME2RETAIN))
+-			SET_PSTATE_REPLY_OPTIONAL(param);
+ 		/*
+ 		 * Required for gPXE iSCSI boot client
+ 		 */
+-- 
+2.28.0
+
+
+From 925adae6664c0b9f5193876e9aeb2640a7e977d5 Mon Sep 17 00:00:00 2001
+From: "Martin K. Petersen" <martin.petersen@oracle.com>
+Date: Fri, 17 Mar 2017 08:47:14 -0400
+Subject: [PATCH 13/46] scsi: sr: Sanity check returned mode data
+
+commit a00a7862513089f17209b732f230922f1942e0b9 upstream.
+
+Kefeng Wang discovered that old versions of the QEMU CD driver would
+return mangled mode data causing us to walk off the end of the buffer in
+an attempt to parse it. Sanity check the returned mode sense data.
+
+Reported-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Tested-by: Kefeng Wang <wangkefeng.wang@huawei.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/scsi/sr.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/scsi/sr.c b/drivers/scsi/sr.c
+index 64c867405ad4..804586aeaffe 100644
+--- a/drivers/scsi/sr.c
++++ b/drivers/scsi/sr.c
+@@ -834,6 +834,7 @@ static void get_capabilities(struct scsi_cd *cd)
+ 	unsigned char *buffer;
+ 	struct scsi_mode_data data;
+ 	struct scsi_sense_hdr sshdr;
++	unsigned int ms_len = 128;
+ 	int rc, n;
+ 
+ 	static const char *loadmech[] =
+@@ -860,10 +861,11 @@ static void get_capabilities(struct scsi_cd *cd)
+ 	scsi_test_unit_ready(cd->device, SR_TIMEOUT, MAX_RETRIES, &sshdr);
+ 
+ 	/* ask for mode page 0x2a */
+-	rc = scsi_mode_sense(cd->device, 0, 0x2a, buffer, 128,
++	rc = scsi_mode_sense(cd->device, 0, 0x2a, buffer, ms_len,
+ 			     SR_TIMEOUT, 3, &data, NULL);
+ 
+-	if (!scsi_status_is_good(rc)) {
++	if (!scsi_status_is_good(rc) || data.length > ms_len ||
++	    data.header_length + data.block_descriptor_length > data.length) {
+ 		/* failed, drive doesn't have capabilities mode page */
+ 		cd->cdi.speed = 1;
+ 		cd->cdi.mask |= (CDC_CD_R | CDC_CD_RW | CDC_DVD_R |
+-- 
+2.28.0
+
+
+From 448961955592c46f1490fb6ca8d3e52ce17e6222 Mon Sep 17 00:00:00 2001
+From: Fam Zheng <famz@redhat.com>
+Date: Tue, 28 Mar 2017 12:41:26 +0800
+Subject: [PATCH 14/46] scsi: sd: Consider max_xfer_blocks if opt_xfer_blocks
+ is unusable
+
+commit 6780414519f91c2a84da9baa963a940ac916f803 upstream.
+
+If device reports a small max_xfer_blocks and a zero opt_xfer_blocks, we
+end up using BLK_DEF_MAX_SECTORS, which is wrong and r/w of that size
+may get error.
+
+[mkp: tweaked to avoid setting rw_max twice and added typecast]
+
+Fixes: ca369d51b3e ("block/sd: Fix device-imposed transfer length limits")
+Signed-off-by: Fam Zheng <famz@redhat.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/scsi/sd.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index 78430ef28ea4..d2877d713b62 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -2888,7 +2888,8 @@ static int sd_revalidate_disk(struct gendisk *disk)
+ 		q->limits.io_opt = logical_to_bytes(sdp, sdkp->opt_xfer_blocks);
+ 		rw_max = logical_to_sectors(sdp, sdkp->opt_xfer_blocks);
+ 	} else
+-		rw_max = BLK_DEF_MAX_SECTORS;
++		rw_max = min_not_zero(logical_to_sectors(sdp, dev_max),
++				      (sector_t)BLK_DEF_MAX_SECTORS);
+ 
+ 	/* Combine with controller limits */
+ 	q->limits.max_sectors = min(rw_max, queue_max_hw_sectors(q));
+-- 
+2.28.0
+
+
+From b689dfbed8c8432a18c73fc261c030d8b3e24e00 Mon Sep 17 00:00:00 2001
+From: "Martin K. Petersen" <martin.petersen@oracle.com>
+Date: Tue, 4 Apr 2017 10:42:30 -0400
+Subject: [PATCH 15/46] scsi: sd: Fix capacity calculation with 32-bit sector_t
+
+commit 7c856152cb92f8eee2df29ef325a1b1f43161aff upstream.
+
+We previously made sure that the reported disk capacity was less than
+0xffffffff blocks when the kernel was not compiled with large sector_t
+support (CONFIG_LBDAF). However, this check assumed that the capacity
+was reported in units of 512 bytes.
+
+Add a sanity check function to ensure that we only enable disks if the
+entire reported capacity can be expressed in terms of sector_t.
+
+Reported-by: Steve Magnani <steve.magnani@digidescorp.com>
+Cc: Bart Van Assche <Bart.VanAssche@sandisk.com>
+Reviewed-by: Bart Van Assche <Bart.VanAssche@sandisk.com>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/scsi/sd.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index d2877d713b62..4d5207dff960 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -2051,6 +2051,22 @@ static void read_capacity_error(struct scsi_disk *sdkp, struct scsi_device *sdp,
+ 
+ #define READ_CAPACITY_RETRIES_ON_RESET	10
+ 
++/*
++ * Ensure that we don't overflow sector_t when CONFIG_LBDAF is not set
++ * and the reported logical block size is bigger than 512 bytes. Note
++ * that last_sector is a u64 and therefore logical_to_sectors() is not
++ * applicable.
++ */
++static bool sd_addressable_capacity(u64 lba, unsigned int sector_size)
++{
++	u64 last_sector = (lba + 1ULL) << (ilog2(sector_size) - 9);
++
++	if (sizeof(sector_t) == 4 && last_sector > U32_MAX)
++		return false;
++
++	return true;
++}
++
+ static int read_capacity_16(struct scsi_disk *sdkp, struct scsi_device *sdp,
+ 						unsigned char *buffer)
+ {
+@@ -2116,7 +2132,7 @@ static int read_capacity_16(struct scsi_disk *sdkp, struct scsi_device *sdp,
+ 		return -ENODEV;
+ 	}
+ 
+-	if ((sizeof(sdkp->capacity) == 4) && (lba >= 0xffffffffULL)) {
++	if (!sd_addressable_capacity(lba, sector_size)) {
+ 		sd_printk(KERN_ERR, sdkp, "Too big for this kernel. Use a "
+ 			"kernel compiled with support for large block "
+ 			"devices.\n");
+@@ -2202,7 +2218,7 @@ static int read_capacity_10(struct scsi_disk *sdkp, struct scsi_device *sdp,
+ 		return sector_size;
+ 	}
+ 
+-	if ((sizeof(sdkp->capacity) == 4) && (lba == 0xffffffff)) {
++	if (!sd_addressable_capacity(lba, sector_size)) {
+ 		sd_printk(KERN_ERR, sdkp, "Too big for this kernel. Use a "
+ 			"kernel compiled with support for large block "
+ 			"devices.\n");
+-- 
+2.28.0
+
+
+From 6058cf9929d9bbeb4a781c51e91866716cb5277f Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Fri, 7 Apr 2017 17:28:23 +0200
+Subject: [PATCH 16/46] xen, fbfront: fix connecting to backend
+
+commit 9121b15b5628b38b4695282dc18c553440e0f79b upstream.
+
+Connecting to the backend isn't working reliably in xen-fbfront: in
+case XenbusStateInitWait of the backend has been missed the backend
+transition to XenbusStateConnected will trigger the connected state
+only without doing the actions required when the backend has
+connected.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Signed-off-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/video/fbdev/xen-fbfront.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/video/fbdev/xen-fbfront.c b/drivers/video/fbdev/xen-fbfront.c
+index 0567d517eed3..ea2f19f5fbde 100644
+--- a/drivers/video/fbdev/xen-fbfront.c
++++ b/drivers/video/fbdev/xen-fbfront.c
+@@ -644,7 +644,6 @@ static void xenfb_backend_changed(struct xenbus_device *dev,
+ 		break;
+ 
+ 	case XenbusStateInitWait:
+-InitWait:
+ 		xenbus_switch_state(dev, XenbusStateConnected);
+ 		break;
+ 
+@@ -655,7 +654,8 @@ InitWait:
+ 		 * get Connected twice here.
+ 		 */
+ 		if (dev->state != XenbusStateConnected)
+-			goto InitWait; /* no InitWait seen yet, fudge it */
++			/* no InitWait seen yet, fudge it */
++			xenbus_switch_state(dev, XenbusStateConnected);
+ 
+ 		if (xenbus_scanf(XBT_NIL, info->xbdev->otherend,
+ 				 "request-update", "%d", &val) < 0)
+-- 
+2.28.0
+
+
+From 66b531d3ff113d1e440bde5cd167ed49063fd070 Mon Sep 17 00:00:00 2001
+From: Dan Williams <dan.j.williams@intel.com>
+Date: Fri, 7 Apr 2017 09:47:24 -0700
+Subject: [PATCH 17/46] libnvdimm: fix reconfig_mutex, mmap_sem, and
+ jbd2_handle lockdep splat
+
+commit 0beb2012a1722633515c8aaa263c73449636c893 upstream.
+
+Holding the reconfig_mutex over a potential userspace fault sets up a
+lockdep dependency chain between filesystem-DAX and the libnvdimm ioctl
+path. Move the user access outside of the lock.
+
+     [ INFO: possible circular locking dependency detected ]
+     4.11.0-rc3+ #13 Tainted: G        W  O
+     -------------------------------------------------------
+     fallocate/16656 is trying to acquire lock:
+      (&nvdimm_bus->reconfig_mutex){+.+.+.}, at: [<ffffffffa00080b1>] nvdimm_bus_lock+0x21/0x30 [libnvdimm]
+     but task is already holding lock:
+      (jbd2_handle){++++..}, at: [<ffffffff813b4944>] start_this_handle+0x104/0x460
+
+    which lock already depends on the new lock.
+
+    the existing dependency chain (in reverse order) is:
+
+    -> #2 (jbd2_handle){++++..}:
+            lock_acquire+0xbd/0x200
+            start_this_handle+0x16a/0x460
+            jbd2__journal_start+0xe9/0x2d0
+            __ext4_journal_start_sb+0x89/0x1c0
+            ext4_dirty_inode+0x32/0x70
+            __mark_inode_dirty+0x235/0x670
+            generic_update_time+0x87/0xd0
+            touch_atime+0xa9/0xd0
+            ext4_file_mmap+0x90/0xb0
+            mmap_region+0x370/0x5b0
+            do_mmap+0x415/0x4f0
+            vm_mmap_pgoff+0xd7/0x120
+            SyS_mmap_pgoff+0x1c5/0x290
+            SyS_mmap+0x22/0x30
+            entry_SYSCALL_64_fastpath+0x1f/0xc2
+
+    -> #1 (&mm->mmap_sem){++++++}:
+            lock_acquire+0xbd/0x200
+            __might_fault+0x70/0xa0
+            __nd_ioctl+0x683/0x720 [libnvdimm]
+            nvdimm_ioctl+0x8b/0xe0 [libnvdimm]
+            do_vfs_ioctl+0xa8/0x740
+            SyS_ioctl+0x79/0x90
+            do_syscall_64+0x6c/0x200
+            return_from_SYSCALL_64+0x0/0x7a
+
+    -> #0 (&nvdimm_bus->reconfig_mutex){+.+.+.}:
+            __lock_acquire+0x16b6/0x1730
+            lock_acquire+0xbd/0x200
+            __mutex_lock+0x88/0x9b0
+            mutex_lock_nested+0x1b/0x20
+            nvdimm_bus_lock+0x21/0x30 [libnvdimm]
+            nvdimm_forget_poison+0x25/0x50 [libnvdimm]
+            nvdimm_clear_poison+0x106/0x140 [libnvdimm]
+            pmem_do_bvec+0x1c2/0x2b0 [nd_pmem]
+            pmem_make_request+0xf9/0x270 [nd_pmem]
+            generic_make_request+0x118/0x3b0
+            submit_bio+0x75/0x150
+
+Fixes: 62232e45f4a2 ("libnvdimm: control (ioctl) messages for nvdimm_bus and nvdimm devices")
+Cc: Dave Jiang <dave.jiang@intel.com>
+Reported-by: Vishal Verma <vishal.l.verma@intel.com>
+Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/nvdimm/bus.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/nvdimm/bus.c b/drivers/nvdimm/bus.c
+index 5f47356d6942..254b0ee37039 100644
+--- a/drivers/nvdimm/bus.c
++++ b/drivers/nvdimm/bus.c
+@@ -590,8 +590,14 @@ static int __nd_ioctl(struct nvdimm_bus *nvdimm_bus, struct nvdimm *nvdimm,
+ 	rc = nd_desc->ndctl(nd_desc, nvdimm, cmd, buf, buf_len);
+ 	if (rc < 0)
+ 		goto out_unlock;
++	nvdimm_bus_unlock(&nvdimm_bus->dev);
++
+ 	if (copy_to_user(p, buf, buf_len))
+ 		rc = -EFAULT;
++
++	vfree(buf);
++	return rc;
++
+  out_unlock:
+ 	nvdimm_bus_unlock(&nvdimm_bus->dev);
+  out:
+-- 
+2.28.0
+
+
+From c51451e43bf19bb36fa50d81ae736dd9e7d66d4a Mon Sep 17 00:00:00 2001
+From: Tyler Baker <tyler.baker@linaro.org>
+Date: Thu, 13 Apr 2017 15:27:31 -0700
+Subject: [PATCH 18/46] irqchip/irq-imx-gpcv2: Fix spinlock initialization
+
+commit 75eb5e1e7b4edbc8e8f930de59004d21cb46961f upstream.
+
+The raw_spinlock in the IMX GPCV2 interupt chip is not initialized before
+usage. That results in a lockdep splat:
+
+  INFO: trying to register non-static key.
+  the code is fine but needs lockdep annotation.
+  turning off the locking correctness validator.
+
+Add the missing raw_spin_lock_init() to the setup code.
+
+Fixes: e324c4dc4a59 ("irqchip/imx-gpcv2: IMX GPCv2 driver for wakeup sources")
+Signed-off-by: Tyler Baker <tyler.baker@linaro.org>
+Reviewed-by: Fabio Estevam <fabio.estevam@nxp.com>
+Cc: jason@lakedaemon.net
+Cc: marc.zyngier@arm.com
+Cc: shawnguo@kernel.org
+Cc: andrew.smirnov@gmail.com
+Cc: linux-arm-kernel@lists.infradead.org
+Link: http://lkml.kernel.org/r/20170413222731.5917-1-tyler.baker@linaro.org
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/irqchip/irq-imx-gpcv2.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/irqchip/irq-imx-gpcv2.c b/drivers/irqchip/irq-imx-gpcv2.c
+index 15af9a9753e5..2d203b422129 100644
+--- a/drivers/irqchip/irq-imx-gpcv2.c
++++ b/drivers/irqchip/irq-imx-gpcv2.c
+@@ -230,6 +230,8 @@ static int __init imx_gpcv2_irqchip_init(struct device_node *node,
+ 		return -ENOMEM;
+ 	}
+ 
++	raw_spin_lock_init(&cd->rlock);
++
+ 	cd->gpc_base = of_iomap(node, 0);
+ 	if (!cd->gpc_base) {
+ 		pr_err("fsl-gpcv2: unable to map gpc registers\n");
+-- 
+2.28.0
+
+
+From 7fe57118a7c002c59e4087806f8f5a9f4a0b037f Mon Sep 17 00:00:00 2001
+From: "Steven Rostedt (VMware)" <rostedt@goodmis.org>
+Date: Fri, 14 Apr 2017 17:45:45 -0400
+Subject: [PATCH 19/46] ftrace: Fix removing of second function probe
+
+commit 82cc4fc2e70ec5baeff8f776f2773abc8b2cc0ae upstream.
+
+When two function probes are added to set_ftrace_filter, and then one of
+them is removed, the update to the function locations is not performed, and
+the record keeping of the function states are corrupted, and causes an
+ftrace_bug() to occur.
+
+This is easily reproducable by adding two probes, removing one, and then
+adding it back again.
+
+ # cd /sys/kernel/debug/tracing
+ # echo schedule:traceoff > set_ftrace_filter
+ # echo do_IRQ:traceoff > set_ftrace_filter
+ # echo \!do_IRQ:traceoff > /debug/tracing/set_ftrace_filter
+ # echo do_IRQ:traceoff > set_ftrace_filter
+
+Causes:
+ ------------[ cut here ]------------
+ WARNING: CPU: 2 PID: 1098 at kernel/trace/ftrace.c:2369 ftrace_get_addr_curr+0x143/0x220
+ Modules linked in: [...]
+ CPU: 2 PID: 1098 Comm: bash Not tainted 4.10.0-test+ #405
+ Hardware name: Hewlett-Packard HP Compaq Pro 6300 SFF/339A, BIOS K01 v02.05 05/07/2012
+ Call Trace:
+  dump_stack+0x68/0x9f
+  __warn+0x111/0x130
+  ? trace_irq_work_interrupt+0xa0/0xa0
+  warn_slowpath_null+0x1d/0x20
+  ftrace_get_addr_curr+0x143/0x220
+  ? __fentry__+0x10/0x10
+  ftrace_replace_code+0xe3/0x4f0
+  ? ftrace_int3_handler+0x90/0x90
+  ? printk+0x99/0xb5
+  ? 0xffffffff81000000
+  ftrace_modify_all_code+0x97/0x110
+  arch_ftrace_update_code+0x10/0x20
+  ftrace_run_update_code+0x1c/0x60
+  ftrace_run_modify_code.isra.48.constprop.62+0x8e/0xd0
+  register_ftrace_function_probe+0x4b6/0x590
+  ? ftrace_startup+0x310/0x310
+  ? debug_lockdep_rcu_enabled.part.4+0x1a/0x30
+  ? update_stack_state+0x88/0x110
+  ? ftrace_regex_write.isra.43.part.44+0x1d3/0x320
+  ? preempt_count_sub+0x18/0xd0
+  ? mutex_lock_nested+0x104/0x800
+  ? ftrace_regex_write.isra.43.part.44+0x1d3/0x320
+  ? __unwind_start+0x1c0/0x1c0
+  ? _mutex_lock_nest_lock+0x800/0x800
+  ftrace_trace_probe_callback.isra.3+0xc0/0x130
+  ? func_set_flag+0xe0/0xe0
+  ? __lock_acquire+0x642/0x1790
+  ? __might_fault+0x1e/0x20
+  ? trace_get_user+0x398/0x470
+  ? strcmp+0x35/0x60
+  ftrace_trace_onoff_callback+0x48/0x70
+  ftrace_regex_write.isra.43.part.44+0x251/0x320
+  ? match_records+0x420/0x420
+  ftrace_filter_write+0x2b/0x30
+  __vfs_write+0xd7/0x330
+  ? do_loop_readv_writev+0x120/0x120
+  ? locks_remove_posix+0x90/0x2f0
+  ? do_lock_file_wait+0x160/0x160
+  ? __lock_is_held+0x93/0x100
+  ? rcu_read_lock_sched_held+0x5c/0xb0
+  ? preempt_count_sub+0x18/0xd0
+  ? __sb_start_write+0x10a/0x230
+  ? vfs_write+0x222/0x240
+  vfs_write+0xef/0x240
+  SyS_write+0xab/0x130
+  ? SyS_read+0x130/0x130
+  ? trace_hardirqs_on_caller+0x182/0x280
+  ? trace_hardirqs_on_thunk+0x1a/0x1c
+  entry_SYSCALL_64_fastpath+0x18/0xad
+ RIP: 0033:0x7fe61c157c30
+ RSP: 002b:00007ffe87890258 EFLAGS: 00000246 ORIG_RAX: 0000000000000001
+ RAX: ffffffffffffffda RBX: ffffffff8114a410 RCX: 00007fe61c157c30
+ RDX: 0000000000000010 RSI: 000055814798f5e0 RDI: 0000000000000001
+ RBP: ffff8800c9027f98 R08: 00007fe61c422740 R09: 00007fe61ca53700
+ R10: 0000000000000073 R11: 0000000000000246 R12: 0000558147a36400
+ R13: 00007ffe8788f160 R14: 0000000000000024 R15: 00007ffe8788f15c
+  ? trace_hardirqs_off_caller+0xc0/0x110
+ ---[ end trace 99fa09b3d9869c2c ]---
+ Bad trampoline accounting at: ffffffff81cc3b00 (do_IRQ+0x0/0x150)
+
+Fixes: 59df055f1991 ("ftrace: trace different functions with a different tracer")
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/trace/ftrace.c | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index 3f743b147247..34b2a0d5cf1a 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -3677,23 +3677,24 @@ static void __enable_ftrace_function_probe(struct ftrace_ops_hash *old_hash)
+ 	ftrace_probe_registered = 1;
+ }
+ 
+-static void __disable_ftrace_function_probe(void)
++static bool __disable_ftrace_function_probe(void)
+ {
+ 	int i;
+ 
+ 	if (!ftrace_probe_registered)
+-		return;
++		return false;
+ 
+ 	for (i = 0; i < FTRACE_FUNC_HASHSIZE; i++) {
+ 		struct hlist_head *hhd = &ftrace_func_hash[i];
+ 		if (hhd->first)
+-			return;
++			return false;
+ 	}
+ 
+ 	/* no more funcs left */
+ 	ftrace_shutdown(&trace_probe_ops, 0);
+ 
+ 	ftrace_probe_registered = 0;
++	return true;
+ }
+ 
+ 
+@@ -3820,6 +3821,7 @@ static void
+ __unregister_ftrace_function_probe(char *glob, struct ftrace_probe_ops *ops,
+ 				  void *data, int flags)
+ {
++	struct ftrace_ops_hash old_hash_ops;
+ 	struct ftrace_func_entry *rec_entry;
+ 	struct ftrace_func_probe *entry;
+ 	struct ftrace_func_probe *p;
+@@ -3831,6 +3833,7 @@ __unregister_ftrace_function_probe(char *glob, struct ftrace_probe_ops *ops,
+ 	struct hlist_node *tmp;
+ 	char str[KSYM_SYMBOL_LEN];
+ 	int i, ret;
++	bool disabled;
+ 
+ 	if (glob && (strcmp(glob, "*") == 0 || !strlen(glob)))
+ 		func_g.search = NULL;
+@@ -3849,6 +3852,10 @@ __unregister_ftrace_function_probe(char *glob, struct ftrace_probe_ops *ops,
+ 
+ 	mutex_lock(&trace_probe_ops.func_hash->regex_lock);
+ 
++	old_hash_ops.filter_hash = old_hash;
++	/* Probes only have filters */
++	old_hash_ops.notrace_hash = NULL;
++
+ 	hash = alloc_and_copy_ftrace_hash(FTRACE_HASH_DEFAULT_BITS, *orig_hash);
+ 	if (!hash)
+ 		/* Hmm, should report this somehow */
+@@ -3886,12 +3893,17 @@ __unregister_ftrace_function_probe(char *glob, struct ftrace_probe_ops *ops,
+ 		}
+ 	}
+ 	mutex_lock(&ftrace_lock);
+-	__disable_ftrace_function_probe();
++	disabled = __disable_ftrace_function_probe();
+ 	/*
+ 	 * Remove after the disable is called. Otherwise, if the last
+ 	 * probe is removed, a null hash means *all enabled*.
+ 	 */
+ 	ret = ftrace_hash_move(&trace_probe_ops, 1, orig_hash, hash);
++
++	/* still need to update the function call sites */
++	if (ftrace_enabled && !disabled)
++		ftrace_run_modify_code(&trace_probe_ops, FTRACE_UPDATE_CALLS,
++				       &old_hash_ops);
+ 	synchronize_sched();
+ 	if (!ret)
+ 		free_ftrace_hash_rcu(old_hash);
+-- 
+2.28.0
+
+
+From 0a6aa0d1cf27e9ca7b309cc86aa6b100754f88a4 Mon Sep 17 00:00:00 2001
+From: Geert Uytterhoeven <geert@linux-m68k.org>
+Date: Mon, 11 Apr 2016 10:40:55 +0200
+Subject: [PATCH 20/46] char: Drop bogus dependency of DEVPORT on !M68K
+
+commit 309124e2648d668a0c23539c5078815660a4a850 upstream.
+
+According to full-history-linux commit d3794f4fa7c3edc3 ("[PATCH] M68k
+update (part 25)"), port operations are allowed on m68k if CONFIG_ISA is
+defined.
+
+However, commit 153dcc54df826d2f ("[PATCH] mem driver: fix conditional
+on isa i/o support") accidentally changed an "||" into an "&&",
+disabling it completely on m68k. This logic was retained when
+introducing the DEVPORT symbol in commit 4f911d64e04a44c4 ("Make
+/dev/port conditional on config symbol").
+
+Drop the bogus dependency on !M68K to fix this.
+
+Fixes: 153dcc54df826d2f ("[PATCH] mem driver: fix conditional on isa i/o support")
+Signed-off-by: Geert Uytterhoeven <geert@linux-m68k.org>
+Tested-by: Al Stone <ahs3@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/char/Kconfig | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/drivers/char/Kconfig b/drivers/char/Kconfig
+index a043107da2af..b130d38cf55c 100644
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -584,7 +584,6 @@ config TELCLOCK
+ 
+ config DEVPORT
+ 	bool
+-	depends on !M68K
+ 	depends on ISA || PCI
+ 	default y
+ 
+-- 
+2.28.0
+
+
+From a32c5331b462670093ec809ec063ad7d28f47126 Mon Sep 17 00:00:00 2001
+From: Max Bires <jbires@google.com>
+Date: Tue, 3 Jan 2017 08:18:07 -0800
+Subject: [PATCH 21/46] char: lack of bool string made CONFIG_DEVPORT always on
+
+commit f2cfa58b136e4b06a9b9db7af5ef62fbb5992f62 upstream.
+
+Without a bool string present, using "# CONFIG_DEVPORT is not set" in
+defconfig files would not actually unset devport. This esnured that
+/dev/port was always on, but there are reasons a user may wish to
+disable it (smaller kernel, attack surface reduction) if it's not being
+used. Adding a message here in order to make this user visible.
+
+Signed-off-by: Max Bires <jbires@google.com>
+Acked-by: Arnd Bergmann <arnd@arndb.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/char/Kconfig | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/char/Kconfig b/drivers/char/Kconfig
+index b130d38cf55c..3143db57ce44 100644
+--- a/drivers/char/Kconfig
++++ b/drivers/char/Kconfig
+@@ -583,9 +583,12 @@ config TELCLOCK
+ 	  controlling the behavior of this hardware.
+ 
+ config DEVPORT
+-	bool
++	bool "/dev/port character device"
+ 	depends on ISA || PCI
+ 	default y
++	help
++	  Say Y here if you want to support the /dev/port device. The /dev/port
++	  device is similar to /dev/mem, but for I/O ports.
+ 
+ source "drivers/s390/char/Kconfig"
+ 
+-- 
+2.28.0
+
+
+From 98c953a0a51fffa0904e143694222b213fa3c68f Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Tue, 18 Apr 2017 16:16:57 +0200
+Subject: [PATCH 22/46] Revert "MIPS: Lantiq: Fix cascaded IRQ setup"
+
+This reverts commit 6280ac931a23d3fa40cd26057576abcf90a4f22d which is
+commit 6c356eda225e3ee134ed4176b9ae3a76f793f4dd upstream.
+
+It shouldn't have been included in a stable release.
+
+Reported-by: Amit Pundir <amit.pundir@linaro.org>
+Cc: Felix Fietkau <nbd@nbd.name>
+Cc: John Crispin <john@phrozen.org>
+Cc: James Hogan <james.hogan@imgtec.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/mips/lantiq/irq.c | 38 +++++++++++++++++++++-----------------
+ 1 file changed, 21 insertions(+), 17 deletions(-)
+
 diff --git a/arch/mips/lantiq/irq.c b/arch/mips/lantiq/irq.c
 index 51cdc46a87e2..2e7f60c9fc5d 100644
 --- a/arch/mips/lantiq/irq.c
@@ -104,89 +1503,31 @@ index 51cdc46a87e2..2e7f60c9fc5d 100644
  
  	if (cpu_has_vint) {
  		pr_info("Setting up vectored interrupts\n");
-diff --git a/arch/powerpc/kernel/setup_64.c b/arch/powerpc/kernel/setup_64.c
-index 5c03a6a9b054..a20823210ac0 100644
---- a/arch/powerpc/kernel/setup_64.c
-+++ b/arch/powerpc/kernel/setup_64.c
-@@ -220,6 +220,15 @@ static void cpu_ready_for_interrupts(void)
- 		unsigned long lpcr = mfspr(SPRN_LPCR);
- 		mtspr(SPRN_LPCR, lpcr | LPCR_AIL_3);
- 	}
-+
-+	/*
-+	 * Fixup HFSCR:TM based on CPU features. The bit is set by our
-+	 * early asm init because at that point we haven't updated our
-+	 * CPU features from firmware and device-tree. Here we have,
-+	 * so let's do it.
-+	 */
-+	if (cpu_has_feature(CPU_FTR_HVMODE) && !cpu_has_feature(CPU_FTR_TM_COMP))
-+		mtspr(SPRN_HFSCR, mfspr(SPRN_HFSCR) & ~HFSCR_TM);
- }
- 
- /*
-diff --git a/arch/x86/entry/vdso/vdso32-setup.c b/arch/x86/entry/vdso/vdso32-setup.c
-index 08a317a9ae4b..a7508d7e20b7 100644
---- a/arch/x86/entry/vdso/vdso32-setup.c
-+++ b/arch/x86/entry/vdso/vdso32-setup.c
-@@ -31,8 +31,10 @@ static int __init vdso32_setup(char *s)
- {
- 	vdso32_enabled = simple_strtoul(s, NULL, 0);
- 
--	if (vdso32_enabled > 1)
-+	if (vdso32_enabled > 1) {
- 		pr_warn("vdso32 values other than 0 and 1 are no longer allowed; vdso disabled\n");
-+		vdso32_enabled = 0;
-+	}
- 
- 	return 1;
- }
-@@ -63,13 +65,18 @@ subsys_initcall(sysenter_setup);
- /* Register vsyscall32 into the ABI table */
- #include <linux/sysctl.h>
- 
-+static const int zero;
-+static const int one = 1;
-+
- static struct ctl_table abi_table2[] = {
- 	{
- 		.procname	= "vsyscall32",
- 		.data		= &vdso32_enabled,
- 		.maxlen		= sizeof(int),
- 		.mode		= 0644,
--		.proc_handler	= proc_dointvec
-+		.proc_handler	= proc_dointvec_minmax,
-+		.extra1		= (int *)&zero,
-+		.extra2		= (int *)&one,
- 	},
- 	{}
- };
-diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
-index 1514753fd435..d262f985bbc8 100644
---- a/arch/x86/include/asm/elf.h
-+++ b/arch/x86/include/asm/elf.h
-@@ -278,7 +278,7 @@ struct task_struct;
- 
- #define	ARCH_DLINFO_IA32						\
- do {									\
--	if (vdso32_enabled) {						\
-+	if (VDSO_CURRENT_BASE) {					\
- 		NEW_AUX_ENT(AT_SYSINFO,	VDSO_ENTRY);			\
- 		NEW_AUX_ENT(AT_SYSINFO_EHDR, VDSO_CURRENT_BASE);	\
- 	}								\
-diff --git a/arch/x86/kernel/cpu/perf_event_intel_lbr.c b/arch/x86/kernel/cpu/perf_event_intel_lbr.c
-index 659f01e165d5..8900400230c6 100644
---- a/arch/x86/kernel/cpu/perf_event_intel_lbr.c
-+++ b/arch/x86/kernel/cpu/perf_event_intel_lbr.c
-@@ -410,6 +410,9 @@ static void intel_pmu_lbr_read_32(struct cpu_hw_events *cpuc)
- 		cpuc->lbr_entries[i].to		= msr_lastbranch.to;
- 		cpuc->lbr_entries[i].mispred	= 0;
- 		cpuc->lbr_entries[i].predicted	= 0;
-+		cpuc->lbr_entries[i].in_tx	= 0;
-+		cpuc->lbr_entries[i].abort	= 0;
-+		cpuc->lbr_entries[i].cycles	= 0;
- 		cpuc->lbr_entries[i].reserved	= 0;
- 	}
- 	cpuc->lbr_stack.nr = i;
+-- 
+2.28.0
+
+
+From c1fc1d2f214e33f91565a65ad1b4c09dae618d84 Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 24 Jan 2017 11:56:21 +0100
+Subject: [PATCH 23/46] kvm: fix page struct leak in handle_vmon
+
+commit 06ce521af9558814b8606c0476c54497cf83a653 upstream.
+
+handle_vmon gets a reference on VMXON region page,
+but does not release it. Release the reference.
+
+Found by syzkaller; based on a patch by Dmitry.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+[bwh: Backported to 3.16: use skip_emulated_instruction()]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kvm/vmx.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
 diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
 index 3a7ae80dc49d..0a472e9865c5 100644
 --- a/arch/x86/kvm/vmx.c
@@ -214,62 +1555,185 @@ index 3a7ae80dc49d..0a472e9865c5 100644
  		vmx->nested.vmxon_ptr = vmptr;
  		break;
  	case EXIT_REASON_VMCLEAR:
-diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
-index 493f54172b4a..3aebbd6c6f5f 100644
---- a/arch/x86/mm/init.c
-+++ b/arch/x86/mm/init.c
-@@ -628,21 +628,40 @@ void __init init_mem_mapping(void)
-  * devmem_is_allowed() checks to see if /dev/mem access to a certain address
-  * is valid. The argument is a physical page number.
-  *
-- *
-- * On x86, access has to be given to the first megabyte of ram because that area
-- * contains BIOS code and data regions used by X and dosemu and similar apps.
-- * Access has to be given to non-kernel-ram areas as well, these contain the PCI
-- * mmio resources as well as potential bios/acpi data regions.
-+ * On x86, access has to be given to the first megabyte of RAM because that
-+ * area traditionally contains BIOS code and data regions used by X, dosemu,
-+ * and similar apps. Since they map the entire memory range, the whole range
-+ * must be allowed (for mapping), but any areas that would otherwise be
-+ * disallowed are flagged as being "zero filled" instead of rejected.
-+ * Access has to be given to non-kernel-ram areas as well, these contain the
-+ * PCI mmio resources as well as potential bios/acpi data regions.
-  */
- int devmem_is_allowed(unsigned long pagenr)
- {
--	if (pagenr < 256)
--		return 1;
--	if (iomem_is_exclusive(pagenr << PAGE_SHIFT))
-+	if (page_is_ram(pagenr)) {
-+		/*
-+		 * For disallowed memory regions in the low 1MB range,
-+		 * request that the page be shown as all zeros.
-+		 */
-+		if (pagenr < 256)
-+			return 2;
-+
-+		return 0;
-+	}
+-- 
+2.28.0
+
+
+From 9286385a3452d7eeb01bfb94676389bba6f59ebd Mon Sep 17 00:00:00 2001
+From: Minchan Kim <minchan@kernel.org>
+Date: Thu, 13 Apr 2017 14:56:37 -0700
+Subject: [PATCH 24/46] zram: do not use copy_page with non-page aligned
+ address
+
+commit d72e9a7a93e4f8e9e52491921d99e0c8aa89eb4e upstream.
+
+The copy_page is optimized memcpy for page-alinged address.  If it is
+used with non-page aligned address, it can corrupt memory which means
+system corruption.  With zram, it can happen with
+
+1. 64K architecture
+2. partial IO
+3. slub debug
+
+Partial IO need to allocate a page and zram allocates it via kmalloc.
+With slub debug, kmalloc(PAGE_SIZE) doesn't return page-size aligned
+address.  And finally, copy_page(mem, cmem) corrupts memory.
+
+So, this patch changes it to memcpy.
+
+Actuaully, we don't need to change zram_bvec_write part because zsmalloc
+returns page-aligned address in case of PAGE_SIZE class but it's not
+good to rely on the internal of zsmalloc.
+
+Note:
+ When this patch is merged to stable, clear_page should be fixed, too.
+ Unfortunately, recent zram removes it by "same page merge" feature so
+ it's hard to backport this patch to -stable tree.
+
+I will handle it when I receive the mail from stable tree maintainer to
+merge this patch to backport.
+
+Fixes: 42e99bd ("zram: optimize memory operations with clear_page()/copy_page()")
+Link: http://lkml.kernel.org/r/1492042622-12074-2-git-send-email-minchan@kernel.org
+Signed-off-by: Minchan Kim <minchan@kernel.org>
+Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/block/zram/zram_drv.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
+index 1648de80e230..62a93b685c54 100644
+--- a/drivers/block/zram/zram_drv.c
++++ b/drivers/block/zram/zram_drv.c
+@@ -574,13 +574,13 @@ static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
+ 
+ 	if (!handle || zram_test_flag(meta, index, ZRAM_ZERO)) {
+ 		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
+-		clear_page(mem);
++		memset(mem, 0, PAGE_SIZE);
+ 		return 0;
+ 	}
+ 
+ 	cmem = zs_map_object(meta->mem_pool, handle, ZS_MM_RO);
+ 	if (size == PAGE_SIZE)
+-		copy_page(mem, cmem);
++		memcpy(mem, cmem, PAGE_SIZE);
+ 	else
+ 		ret = zcomp_decompress(zram->comp, cmem, size, mem);
+ 	zs_unmap_object(meta->mem_pool, handle);
+@@ -738,7 +738,7 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
+ 
+ 	if ((clen == PAGE_SIZE) && !is_partial_io(bvec)) {
+ 		src = kmap_atomic(page);
+-		copy_page(cmem, src);
++		memcpy(cmem, src, PAGE_SIZE);
+ 		kunmap_atomic(src);
+ 	} else {
+ 		memcpy(cmem, src, clen);
+-- 
+2.28.0
+
+
+From 70e55aaf9f8cb4a74ca2744457b1d817353090e3 Mon Sep 17 00:00:00 2001
+From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Date: Mon, 20 Mar 2017 17:49:03 +1100
+Subject: [PATCH 25/46] powerpc: Disable HFSCR[TM] if TM is not supported
+
+commit 7ed23e1bae8bf7e37fd555066550a00b95a3a98b upstream.
+
+On Power8 & Power9 the early CPU inititialisation in __init_HFSCR()
+turns on HFSCR[TM] (Hypervisor Facility Status and Control Register
+[Transactional Memory]), but that doesn't take into account that TM
+might be disabled by CPU features, or disabled by the kernel being built
+with CONFIG_PPC_TRANSACTIONAL_MEM=n.
+
+So later in boot, when we have setup the CPU features, clear HSCR[TM] if
+the TM CPU feature has been disabled. We use CPU_FTR_TM_COMP to account
+for the CONFIG_PPC_TRANSACTIONAL_MEM=n case.
+
+Without this a KVM guest might try use TM, even if told not to, and
+cause an oops in the host kernel. Typically the oops is seen in
+__kvmppc_vcore_entry() and may or may not be fatal to the host, but is
+always bad news.
+
+In practice all shipping CPU revisions do support TM, and all host
+kernels we are aware of build with TM support enabled, so no one should
+actually be able to hit this in the wild.
+
+Fixes: 2a3563b023e5 ("powerpc: Setup in HFSCR for POWER8")
+Cc: stable@vger.kernel.org # v3.10+
+Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+Tested-by: Sam Bobroff <sam.bobroff@au1.ibm.com>
+[mpe: Rewrite change log with input from Sam, add Fixes/stable]
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+[sb: Backported to linux-4.4.y: adjusted context]
+Signed-off-by: Sam Bobroff <sam.bobroff@au1.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/powerpc/kernel/setup_64.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/arch/powerpc/kernel/setup_64.c b/arch/powerpc/kernel/setup_64.c
+index 5c03a6a9b054..a20823210ac0 100644
+--- a/arch/powerpc/kernel/setup_64.c
++++ b/arch/powerpc/kernel/setup_64.c
+@@ -220,6 +220,15 @@ static void cpu_ready_for_interrupts(void)
+ 		unsigned long lpcr = mfspr(SPRN_LPCR);
+ 		mtspr(SPRN_LPCR, lpcr | LPCR_AIL_3);
+ 	}
 +
 +	/*
-+	 * This must follow RAM test, since System RAM is considered a
-+	 * restricted resource under CONFIG_STRICT_IOMEM.
++	 * Fixup HFSCR:TM based on CPU features. The bit is set by our
++	 * early asm init because at that point we haven't updated our
++	 * CPU features from firmware and device-tree. Here we have,
++	 * so let's do it.
 +	 */
-+	if (iomem_is_exclusive(pagenr << PAGE_SHIFT)) {
-+		/* Low 1MB bypasses iomem restrictions. */
-+		if (pagenr < 256)
-+			return 1;
-+
- 		return 0;
--	if (!page_is_ram(pagenr))
--		return 1;
--	return 0;
-+	}
-+
-+	return 1;
++	if (cpu_has_feature(CPU_FTR_HVMODE) && !cpu_has_feature(CPU_FTR_TM_COMP))
++		mtspr(SPRN_HFSCR, mfspr(SPRN_HFSCR) & ~HFSCR_TM);
  }
  
- void free_init_pages(char *what, unsigned long begin, unsigned long end)
+ /*
+-- 
+2.28.0
+
+
+From 2673d1c5122ee2492e24d9a135e230b2d0b2e630 Mon Sep 17 00:00:00 2001
+From: Herbert Xu <herbert@gondor.apana.org.au>
+Date: Mon, 10 Apr 2017 17:27:57 +0800
+Subject: [PATCH 26/46] crypto: ahash - Fix EINPROGRESS notification callback
+
+commit ef0579b64e93188710d48667cb5e014926af9f1b upstream.
+
+The ahash API modifies the request's callback function in order
+to clean up after itself in some corner cases (unaligned final
+and missing finup).
+
+When the request is complete ahash will restore the original
+callback and everything is fine.  However, when the request gets
+an EBUSY on a full queue, an EINPROGRESS callback is made while
+the request is still ongoing.
+
+In this case the ahash API will incorrectly call its own callback.
+
+This patch fixes the problem by creating a temporary request
+object on the stack which is used to relay EINPROGRESS back to
+the original completion function.
+
+This patch also adds code to preserve the original flags value.
+
+Fixes: ab6bf4e5e5e4 ("crypto: hash - Fix the pointer voodoo in...")
+Reported-by: Sabrina Dubroca <sd@queasysnail.net>
+Tested-by: Sabrina Dubroca <sd@queasysnail.net>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ crypto/ahash.c                 | 79 +++++++++++++++++++++-------------
+ include/crypto/internal/hash.h | 10 +++++
+ 2 files changed, 60 insertions(+), 29 deletions(-)
+
 diff --git a/crypto/ahash.c b/crypto/ahash.c
 index dac1c24e9c3e..f9caf0f74199 100644
 --- a/crypto/ahash.c
@@ -446,71 +1910,524 @@ index dac1c24e9c3e..f9caf0f74199 100644
  	return ahash_def_finup_finish1(req, err);
  }
  
-diff --git a/drivers/acpi/nfit.c b/drivers/acpi/nfit.c
-index 14c2a07c9f3f..67d7489ced01 100644
---- a/drivers/acpi/nfit.c
-+++ b/drivers/acpi/nfit.c
-@@ -979,7 +979,11 @@ static int cmp_map(const void *m0, const void *m1)
- 	const struct nfit_set_info_map *map0 = m0;
- 	const struct nfit_set_info_map *map1 = m1;
- 
--	return map0->region_offset - map1->region_offset;
-+	if (map0->region_offset < map1->region_offset)
-+		return -1;
-+	else if (map0->region_offset > map1->region_offset)
-+		return 1;
-+	return 0;
+diff --git a/include/crypto/internal/hash.h b/include/crypto/internal/hash.h
+index 3b4af1d7c7e9..a25414ce2898 100644
+--- a/include/crypto/internal/hash.h
++++ b/include/crypto/internal/hash.h
+@@ -173,6 +173,16 @@ static inline struct ahash_instance *ahash_alloc_instance(
+ 	return crypto_alloc_instance2(name, alg, ahash_instance_headroom());
  }
  
- /* Retrieve the nth entry referencing this spa */
-diff --git a/drivers/block/zram/zram_drv.c b/drivers/block/zram/zram_drv.c
-index 1648de80e230..62a93b685c54 100644
---- a/drivers/block/zram/zram_drv.c
-+++ b/drivers/block/zram/zram_drv.c
-@@ -574,13 +574,13 @@ static int zram_decompress_page(struct zram *zram, char *mem, u32 index)
- 
- 	if (!handle || zram_test_flag(meta, index, ZRAM_ZERO)) {
- 		bit_spin_unlock(ZRAM_ACCESS, &meta->table[index].value);
--		clear_page(mem);
-+		memset(mem, 0, PAGE_SIZE);
++static inline void ahash_request_complete(struct ahash_request *req, int err)
++{
++	req->base.complete(&req->base, err);
++}
++
++static inline u32 ahash_request_flags(struct ahash_request *req)
++{
++	return req->base.flags;
++}
++
+ static inline struct crypto_ahash *crypto_spawn_ahash(
+ 	struct crypto_ahash_spawn *spawn)
+ {
+-- 
+2.28.0
+
+
+From ea6d8d67001a40c74f4a732f897c28440a5e8dfd Mon Sep 17 00:00:00 2001
+From: Miaoqing Pan <miaoqing@codeaurora.org>
+Date: Wed, 16 Nov 2016 17:23:08 +0800
+Subject: [PATCH 27/46] ath9k: fix NULL pointer dereference
+
+commit 40bea976c72b9ee60f8d097852deb53ccbeaffbe upstream.
+
+relay_open() may return NULL, check the return value to avoid the crash.
+
+BUG: unable to handle kernel NULL pointer dereference at 0000000000000040
+IP: [<ffffffffa01a95c5>] ath_cmn_process_fft+0xd5/0x700 [ath9k_common]
+PGD 41cf28067 PUD 41be92067 PMD 0
+Oops: 0000 [#1] SMP
+CPU: 0 PID: 0 Comm: swapper/0 Not tainted 4.8.6+ #35
+Hardware name: Hewlett-Packard h8-1080t/2A86, BIOS 6.15    07/04/2011
+task: ffffffff81e0c4c0 task.stack: ffffffff81e00000
+RIP: 0010:[<ffffffffa01a95c5>] [<ffffffffa01a95c5>] ath_cmn_process_fft+0xd5/0x700 [ath9k_common]
+RSP: 0018:ffff88041f203ca0 EFLAGS: 00010293
+RAX: 0000000000000000 RBX: 000000000000059f RCX: 0000000000000000
+RDX: 0000000000000000 RSI: 0000000000000040 RDI: ffffffff81f0ca98
+RBP: ffff88041f203dc8 R08: ffffffffffffffff R09: 00000000000000ff
+R10: 0000000000000000 R11: 0000000000000000 R12: 0000000000000000
+R13: ffffffff81f0ca98 R14: 0000000000000000 R15: 0000000000000000
+FS:  0000000000000000(0000) GS:ffff88041f200000(0000) knlGS:0000000000000000
+CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+CR2: 0000000000000040 CR3: 000000041b6ec000 CR4: 00000000000006f0
+Stack:
+0000000000000363 00000000000003f3 00000000000003f3 00000000000001f9
+000000000000049a 0000000001252c04 ffff88041f203e44 ffff880417b4bfd0
+0000000000000008 ffff88041785b9c0 0000000000000002 ffff88041613dc60
+
+Call Trace:
+<IRQ>
+[<ffffffffa01b6441>] ath9k_tasklet+0x1b1/0x220 [ath9k]
+[<ffffffff8105d8dd>] tasklet_action+0x4d/0xf0
+[<ffffffff8105dde2>] __do_softirq+0x92/0x2a0
+
+Reported-by: Devin Tuchsen <devin.tuchsen@gmail.com>
+Tested-by: Devin Tuchsen <devin.tuchsen@gmail.com>
+Signed-off-by: Miaoqing Pan <miaoqing@codeaurora.org>
+Signed-off-by: Kalle Valo <kvalo@qca.qualcomm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/wireless/ath/ath9k/common-spectral.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/ath/ath9k/common-spectral.c b/drivers/net/wireless/ath/ath9k/common-spectral.c
+index a8762711ad74..03945731eb65 100644
+--- a/drivers/net/wireless/ath/ath9k/common-spectral.c
++++ b/drivers/net/wireless/ath/ath9k/common-spectral.c
+@@ -528,6 +528,9 @@ int ath_cmn_process_fft(struct ath_spec_scan_priv *spec_priv, struct ieee80211_h
+ 	if (!(radar_info->pulse_bw_info & SPECTRAL_SCAN_BITMASK))
  		return 0;
+ 
++	if (!spec_priv->rfs_chan_spec_scan)
++		return 1;
++
+ 	/* Output buffers are full, no need to process anything
+ 	 * since there is no space to put the result anyway
+ 	 */
+@@ -1072,7 +1075,7 @@ static struct rchan_callbacks rfs_spec_scan_cb = {
+ 
+ void ath9k_cmn_spectral_deinit_debug(struct ath_spec_scan_priv *spec_priv)
+ {
+-	if (config_enabled(CONFIG_ATH9K_DEBUGFS)) {
++	if (config_enabled(CONFIG_ATH9K_DEBUGFS) && spec_priv->rfs_chan_spec_scan) {
+ 		relay_close(spec_priv->rfs_chan_spec_scan);
+ 		spec_priv->rfs_chan_spec_scan = NULL;
+ 	}
+@@ -1086,6 +1089,9 @@ void ath9k_cmn_spectral_init_debug(struct ath_spec_scan_priv *spec_priv,
+ 					    debugfs_phy,
+ 					    1024, 256, &rfs_spec_scan_cb,
+ 					    NULL);
++	if (!spec_priv->rfs_chan_spec_scan)
++		return;
++
+ 	debugfs_create_file("spectral_scan_ctl",
+ 			    S_IRUSR | S_IWUSR,
+ 			    debugfs_phy, spec_priv,
+-- 
+2.28.0
+
+
+From 0cb03b6e7086e59647cf6eb79fec646cdec69691 Mon Sep 17 00:00:00 2001
+From: Arnd Bergmann <arnd@arndb.de>
+Date: Thu, 2 Feb 2017 12:36:01 -0200
+Subject: [PATCH 28/46] dvb-usb-v2: avoid use-after-free
+
+commit 005145378c9ad7575a01b6ce1ba118fb427f583a upstream.
+
+I ran into a stack frame size warning because of the on-stack copy of
+the USB device structure:
+
+drivers/media/usb/dvb-usb-v2/dvb_usb_core.c: In function 'dvb_usbv2_disconnect':
+drivers/media/usb/dvb-usb-v2/dvb_usb_core.c:1029:1: error: the frame size of 1104 bytes is larger than 1024 bytes [-Werror=frame-larger-than=]
+
+Copying a device structure like this is wrong for a number of other reasons
+too aside from the possible stack overflow. One of them is that the
+dev_info() call will print the name of the device later, but AFAICT
+we have only copied a pointer to the name earlier and the actual name
+has been freed by the time it gets printed.
+
+This removes the on-stack copy of the device and instead copies the
+device name using kstrdup(). I'm ignoring the possible failure here
+as both printk() and kfree() are able to deal with NULL pointers.
+
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/media/usb/dvb-usb-v2/dvb_usb_core.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/media/usb/dvb-usb-v2/dvb_usb_core.c b/drivers/media/usb/dvb-usb-v2/dvb_usb_core.c
+index f5df9eaba04f..9757f35cd5f5 100644
+--- a/drivers/media/usb/dvb-usb-v2/dvb_usb_core.c
++++ b/drivers/media/usb/dvb-usb-v2/dvb_usb_core.c
+@@ -1010,8 +1010,8 @@ EXPORT_SYMBOL(dvb_usbv2_probe);
+ void dvb_usbv2_disconnect(struct usb_interface *intf)
+ {
+ 	struct dvb_usb_device *d = usb_get_intfdata(intf);
+-	const char *name = d->name;
+-	struct device dev = d->udev->dev;
++	const char *devname = kstrdup(dev_name(&d->udev->dev), GFP_KERNEL);
++	const char *drvname = d->name;
+ 
+ 	dev_dbg(&d->udev->dev, "%s: bInterfaceNumber=%d\n", __func__,
+ 			intf->cur_altsetting->desc.bInterfaceNumber);
+@@ -1021,8 +1021,9 @@ void dvb_usbv2_disconnect(struct usb_interface *intf)
+ 
+ 	dvb_usbv2_exit(d);
+ 
+-	dev_info(&dev, "%s: '%s' successfully deinitialized and disconnected\n",
+-			KBUILD_MODNAME, name);
++	pr_info("%s: '%s:%s' successfully deinitialized and disconnected\n",
++		KBUILD_MODNAME, drvname, devname);
++	kfree(devname);
+ }
+ EXPORT_SYMBOL(dvb_usbv2_disconnect);
+ 
+-- 
+2.28.0
+
+
+From 51f8d95c89b4aa74e591015d076d2775d9286704 Mon Sep 17 00:00:00 2001
+From: Daeho Jeong <daeho.jeong@samsung.com>
+Date: Thu, 1 Dec 2016 11:49:12 -0500
+Subject: [PATCH 29/46] ext4: fix inode checksum calculation problem if
+ i_extra_size is small
+
+commit 05ac5aa18abd7db341e54df4ae2b4c98ea0e43b7 upstream.
+
+We've fixed the race condition problem in calculating ext4 checksum
+value in commit b47820edd163 ("ext4: avoid modifying checksum fields
+directly during checksum veficationon"). However, by this change,
+when calculating the checksum value of inode whose i_extra_size is
+less than 4, we couldn't calculate the checksum value in a proper way.
+This problem was found and reported by Nix, Thank you.
+
+Reported-by: Nix <nix@esperi.org.uk>
+Signed-off-by: Daeho Jeong <daeho.jeong@samsung.com>
+Signed-off-by: Youngjin Gil <youngjin.gil@samsung.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ext4/inode.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 7dcc97eadb12..817a937de733 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -71,10 +71,9 @@ static __u32 ext4_inode_csum(struct inode *inode, struct ext4_inode *raw,
+ 			csum = ext4_chksum(sbi, csum, (__u8 *)&dummy_csum,
+ 					   csum_size);
+ 			offset += csum_size;
+-			csum = ext4_chksum(sbi, csum, (__u8 *)raw + offset,
+-					   EXT4_INODE_SIZE(inode->i_sb) -
+-					   offset);
+ 		}
++		csum = ext4_chksum(sbi, csum, (__u8 *)raw + offset,
++				   EXT4_INODE_SIZE(inode->i_sb) - offset);
  	}
  
- 	cmem = zs_map_object(meta->mem_pool, handle, ZS_MM_RO);
- 	if (size == PAGE_SIZE)
--		copy_page(mem, cmem);
-+		memcpy(mem, cmem, PAGE_SIZE);
- 	else
- 		ret = zcomp_decompress(zram->comp, cmem, size, mem);
- 	zs_unmap_object(meta->mem_pool, handle);
-@@ -738,7 +738,7 @@ static int zram_bvec_write(struct zram *zram, struct bio_vec *bvec, u32 index,
+ 	return csum;
+-- 
+2.28.0
+
+
+From ccf0904c49b1bc2234dbde4978eaf1c384da11bf Mon Sep 17 00:00:00 2001
+From: "Lee, Chun-Yi" <joeyli.kernel@gmail.com>
+Date: Thu, 3 Nov 2016 08:18:52 +0800
+Subject: [PATCH 30/46] platform/x86: acer-wmi: setup accelerometer when
+ machine has appropriate notify event
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 98d610c3739ac354319a6590b915f4624d9151e6 upstream.
+
+The accelerometer event relies on the ACERWMID_EVENT_GUID notify.
+So, this patch changes the codes to setup accelerometer input device
+when detected ACERWMID_EVENT_GUID. It avoids that the accel input
+device created on every Acer machines.
+
+In addition, patch adds a clearly parsing logic of accelerometer hid
+to acer_wmi_get_handle_cb callback function. It is positive matching
+the "SENR" name with "BST0001" device to avoid non-supported hardware.
+
+Reported-by: Bjørn Mork <bjorn@mork.no>
+Cc: Darren Hart <dvhart@infradead.org>
+Signed-off-by: Lee, Chun-Yi <jlee@suse.com>
+[andy: slightly massage commit message]
+Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/platform/x86/acer-wmi.c | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index 1062fa42ff26..b2cdc1a1ad4f 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -1816,11 +1816,24 @@ static int __init acer_wmi_enable_lm(void)
+ 	return status;
+ }
  
- 	if ((clen == PAGE_SIZE) && !is_partial_io(bvec)) {
- 		src = kmap_atomic(page);
--		copy_page(cmem, src);
-+		memcpy(cmem, src, PAGE_SIZE);
- 		kunmap_atomic(src);
- 	} else {
- 		memcpy(cmem, src, clen);
-diff --git a/drivers/char/Kconfig b/drivers/char/Kconfig
-index a043107da2af..3143db57ce44 100644
---- a/drivers/char/Kconfig
-+++ b/drivers/char/Kconfig
-@@ -583,10 +583,12 @@ config TELCLOCK
- 	  controlling the behavior of this hardware.
++#define ACER_WMID_ACCEL_HID	"BST0001"
++
+ static acpi_status __init acer_wmi_get_handle_cb(acpi_handle ah, u32 level,
+ 						void *ctx, void **retval)
+ {
++	struct acpi_device *dev;
++
++	if (!strcmp(ctx, "SENR")) {
++		if (acpi_bus_get_device(ah, &dev))
++			return AE_OK;
++		if (!strcmp(ACER_WMID_ACCEL_HID, acpi_device_hid(dev)))
++			return AE_OK;
++	} else
++		return AE_OK;
++
+ 	*(acpi_handle *)retval = ah;
+-	return AE_OK;
++
++	return AE_CTRL_TERMINATE;
+ }
  
- config DEVPORT
--	bool
--	depends on !M68K
-+	bool "/dev/port character device"
- 	depends on ISA || PCI
- 	default y
-+	help
-+	  Say Y here if you want to support the /dev/port device. The /dev/port
-+	  device is similar to /dev/mem, but for I/O ports.
+ static int __init acer_wmi_get_handle(const char *name, const char *prop,
+@@ -1847,7 +1860,7 @@ static int __init acer_wmi_accel_setup(void)
+ {
+ 	int err;
  
- source "drivers/s390/char/Kconfig"
+-	err = acer_wmi_get_handle("SENR", "BST0001", &gsensor_handle);
++	err = acer_wmi_get_handle("SENR", ACER_WMID_ACCEL_HID, &gsensor_handle);
+ 	if (err)
+ 		return err;
  
+@@ -2185,10 +2198,11 @@ static int __init acer_wmi_init(void)
+ 		err = acer_wmi_input_setup();
+ 		if (err)
+ 			return err;
++		err = acer_wmi_accel_setup();
++		if (err)
++			return err;
+ 	}
+ 
+-	acer_wmi_accel_setup();
+-
+ 	err = platform_driver_register(&acer_platform_driver);
+ 	if (err) {
+ 		pr_err("Unable to register platform driver\n");
+-- 
+2.28.0
+
+
+From ba02781392fa1b934e41785a5301ca21ad44708b Mon Sep 17 00:00:00 2001
+From: Thierry Reding <treding@nvidia.com>
+Date: Thu, 12 Jan 2017 17:07:43 +0100
+Subject: [PATCH 31/46] rtc: tegra: Implement clock handling
+
+commit 5fa4086987506b2ab8c92f8f99f2295db9918856 upstream.
+
+Accessing the registers of the RTC block on Tegra requires the module
+clock to be enabled. This only works because the RTC module clock will
+be enabled by default during early boot. However, because the clock is
+unused, the CCF will disable it at late_init time. This causes the RTC
+to become unusable afterwards. This can easily be reproduced by trying
+to use the RTC:
+
+	$ hwclock --rtc /dev/rtc1
+
+This will hang the system. I ran into this by following up on a report
+by Martin Michlmayr that reboot wasn't working on Tegra210 systems. It
+turns out that the rtc-tegra driver's ->shutdown() implementation will
+hang the CPU, because of the disabled clock, before the system can be
+rebooted.
+
+What confused me for a while is that the same driver is used on prior
+Tegra generations where the hang can not be observed. However, as Peter
+De Schrijver pointed out, this is because on 32-bit Tegra chips the RTC
+clock is enabled by the tegra20_timer.c clocksource driver, which uses
+the RTC to provide a persistent clock. This code is never enabled on
+64-bit Tegra because the persistent clock infrastructure does not exist
+on 64-bit ARM.
+
+The proper fix for this is to add proper clock handling to the RTC
+driver in order to ensure that the clock is enabled when the driver
+requires it. All device trees contain the clock already, therefore
+no additional changes are required.
+
+Reported-by: Martin Michlmayr <tbm@cyrius.com>
+Acked-By Peter De Schrijver <pdeschrijver@nvidia.com>
+Signed-off-by: Thierry Reding <treding@nvidia.com>
+Signed-off-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+[bwh: Backported to 4.9: adjust context]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/rtc/rtc-tegra.c | 28 ++++++++++++++++++++++++++--
+ 1 file changed, 26 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/rtc/rtc-tegra.c b/drivers/rtc/rtc-tegra.c
+index 60232bd366ef..71216aa68905 100644
+--- a/drivers/rtc/rtc-tegra.c
++++ b/drivers/rtc/rtc-tegra.c
+@@ -18,6 +18,7 @@
+  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+  */
+ #include <linux/kernel.h>
++#include <linux/clk.h>
+ #include <linux/init.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
+@@ -59,6 +60,7 @@ struct tegra_rtc_info {
+ 	struct platform_device	*pdev;
+ 	struct rtc_device	*rtc_dev;
+ 	void __iomem		*rtc_base; /* NULL if not initialized. */
++	struct clk		*clk;
+ 	int			tegra_rtc_irq; /* alarm and periodic irq */
+ 	spinlock_t		tegra_rtc_lock;
+ };
+@@ -332,6 +334,14 @@ static int __init tegra_rtc_probe(struct platform_device *pdev)
+ 	if (info->tegra_rtc_irq <= 0)
+ 		return -EBUSY;
+ 
++	info->clk = devm_clk_get(&pdev->dev, NULL);
++	if (IS_ERR(info->clk))
++		return PTR_ERR(info->clk);
++
++	ret = clk_prepare_enable(info->clk);
++	if (ret < 0)
++		return ret;
++
+ 	/* set context info. */
+ 	info->pdev = pdev;
+ 	spin_lock_init(&info->tegra_rtc_lock);
+@@ -352,7 +362,7 @@ static int __init tegra_rtc_probe(struct platform_device *pdev)
+ 		ret = PTR_ERR(info->rtc_dev);
+ 		dev_err(&pdev->dev, "Unable to register device (err=%d).\n",
+ 			ret);
+-		return ret;
++		goto disable_clk;
+ 	}
+ 
+ 	ret = devm_request_irq(&pdev->dev, info->tegra_rtc_irq,
+@@ -362,11 +372,24 @@ static int __init tegra_rtc_probe(struct platform_device *pdev)
+ 		dev_err(&pdev->dev,
+ 			"Unable to request interrupt for device (err=%d).\n",
+ 			ret);
+-		return ret;
++		goto disable_clk;
+ 	}
+ 
+ 	dev_notice(&pdev->dev, "Tegra internal Real Time Clock\n");
+ 
++	return 0;
++
++disable_clk:
++	clk_disable_unprepare(info->clk);
++	return ret;
++}
++
++static int tegra_rtc_remove(struct platform_device *pdev)
++{
++	struct tegra_rtc_info *info = platform_get_drvdata(pdev);
++
++	clk_disable_unprepare(info->clk);
++
+ 	return 0;
+ }
+ 
+@@ -419,6 +442,7 @@ static void tegra_rtc_shutdown(struct platform_device *pdev)
+ 
+ MODULE_ALIAS("platform:tegra_rtc");
+ static struct platform_driver tegra_rtc_driver = {
++	.remove		= tegra_rtc_remove,
+ 	.shutdown	= tegra_rtc_shutdown,
+ 	.driver		= {
+ 		.name	= "tegra_rtc",
+-- 
+2.28.0
+
+
+From 6739cc12f3dbd7e4b3795f6e809d44ea6b490bb6 Mon Sep 17 00:00:00 2001
+From: Kees Cook <keescook@chromium.org>
+Date: Wed, 5 Apr 2017 09:39:08 -0700
+Subject: [PATCH 32/46] mm: Tighten x86 /dev/mem with zeroing reads
+
+commit a4866aa812518ed1a37d8ea0c881dc946409de94 upstream.
+
+Under CONFIG_STRICT_DEVMEM, reading System RAM through /dev/mem is
+disallowed. However, on x86, the first 1MB was always allowed for BIOS
+and similar things, regardless of it actually being System RAM. It was
+possible for heap to end up getting allocated in low 1MB RAM, and then
+read by things like x86info or dd, which would trip hardened usercopy:
+
+usercopy: kernel memory exposure attempt detected from ffff880000090000 (dma-kmalloc-256) (4096 bytes)
+
+This changes the x86 exception for the low 1MB by reading back zeros for
+System RAM areas instead of blindly allowing them. More work is needed to
+extend this to mmap, but currently mmap doesn't go through usercopy, so
+hardened usercopy won't Oops the kernel.
+
+Reported-by: Tommi Rantala <tommi.t.rantala@nokia.com>
+Tested-by: Tommi Rantala <tommi.t.rantala@nokia.com>
+Signed-off-by: Kees Cook <keescook@chromium.org>
+Cc: Brad Spengler <spender@grsecurity.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/mm/init.c | 41 ++++++++++++++++-------
+ drivers/char/mem.c | 82 +++++++++++++++++++++++++++++-----------------
+ 2 files changed, 82 insertions(+), 41 deletions(-)
+
+diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
+index 493f54172b4a..3aebbd6c6f5f 100644
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@ -628,21 +628,40 @@ void __init init_mem_mapping(void)
+  * devmem_is_allowed() checks to see if /dev/mem access to a certain address
+  * is valid. The argument is a physical page number.
+  *
+- *
+- * On x86, access has to be given to the first megabyte of ram because that area
+- * contains BIOS code and data regions used by X and dosemu and similar apps.
+- * Access has to be given to non-kernel-ram areas as well, these contain the PCI
+- * mmio resources as well as potential bios/acpi data regions.
++ * On x86, access has to be given to the first megabyte of RAM because that
++ * area traditionally contains BIOS code and data regions used by X, dosemu,
++ * and similar apps. Since they map the entire memory range, the whole range
++ * must be allowed (for mapping), but any areas that would otherwise be
++ * disallowed are flagged as being "zero filled" instead of rejected.
++ * Access has to be given to non-kernel-ram areas as well, these contain the
++ * PCI mmio resources as well as potential bios/acpi data regions.
+  */
+ int devmem_is_allowed(unsigned long pagenr)
+ {
+-	if (pagenr < 256)
+-		return 1;
+-	if (iomem_is_exclusive(pagenr << PAGE_SHIFT))
++	if (page_is_ram(pagenr)) {
++		/*
++		 * For disallowed memory regions in the low 1MB range,
++		 * request that the page be shown as all zeros.
++		 */
++		if (pagenr < 256)
++			return 2;
++
++		return 0;
++	}
++
++	/*
++	 * This must follow RAM test, since System RAM is considered a
++	 * restricted resource under CONFIG_STRICT_IOMEM.
++	 */
++	if (iomem_is_exclusive(pagenr << PAGE_SHIFT)) {
++		/* Low 1MB bypasses iomem restrictions. */
++		if (pagenr < 256)
++			return 1;
++
+ 		return 0;
+-	if (!page_is_ram(pagenr))
+-		return 1;
+-	return 0;
++	}
++
++	return 1;
+ }
+ 
+ void free_init_pages(char *what, unsigned long begin, unsigned long end)
 diff --git a/drivers/char/mem.c b/drivers/char/mem.c
 index 6b1721f978c2..e901463d4972 100644
 --- a/drivers/char/mem.c
@@ -636,6 +2553,254 @@ index 6b1721f978c2..e901463d4972 100644
  		}
  
  		buf += sz;
+-- 
+2.28.0
+
+
+From 502157457f52654595d28a555327e84b3e35c268 Mon Sep 17 00:00:00 2001
+From: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+Date: Tue, 24 Jan 2017 08:13:11 -0200
+Subject: [PATCH 33/46] dvb-usb: don't use stack for firmware load
+
+commit 43fab9793c1f44e665b4f98035a14942edf03ddc upstream.
+
+As reported by Marc Duponcheel <marc@offline.be>, firmware load on
+dvb-usb is using the stack, with is not allowed anymore on default
+Kernel configurations:
+
+[ 1025.958836] dvb-usb: found a 'WideView WT-220U PenType Receiver (based on ZL353)' in cold state, will try to load a firmware
+[ 1025.958853] dvb-usb: downloading firmware from file 'dvb-usb-wt220u-zl0353-01.fw'
+[ 1025.958855] dvb-usb: could not stop the USB controller CPU.
+[ 1025.958856] dvb-usb: error while transferring firmware (transferred size: -11, block size: 3)
+[ 1025.958856] dvb-usb: firmware download failed at 8 with -22
+[ 1025.958867] usbcore: registered new interface driver dvb_usb_dtt200u
+
+[    2.789902] dvb-usb: downloading firmware from file 'dvb-usb-wt220u-zl0353-01.fw'
+[    2.789905] ------------[ cut here ]------------
+[    2.789911] WARNING: CPU: 3 PID: 2196 at drivers/usb/core/hcd.c:1584 usb_hcd_map_urb_for_dma+0x430/0x560 [usbcore]
+[    2.789912] transfer buffer not dma capable
+[    2.789912] Modules linked in: btusb dvb_usb_dtt200u(+) dvb_usb_af9035(+) btrtl btbcm dvb_usb dvb_usb_v2 btintel dvb_core bluetooth rc_core rfkill x86_pkg_temp_thermal intel_powerclamp coretemp crc32_pclmul aesni_intel aes_x86_64 glue_helper lrw gf128mul ablk_helper cryptd drm_kms_helper syscopyarea sysfillrect pcspkr i2c_i801 sysimgblt fb_sys_fops drm i2c_smbus i2c_core r8169 lpc_ich mfd_core mii thermal fan rtc_cmos video button acpi_cpufreq processor snd_hda_codec_realtek snd_hda_codec_generic snd_hda_intel snd_hda_codec snd_hwdep snd_hda_core snd_pcm snd_timer snd crc32c_intel ahci libahci libata xhci_pci ehci_pci xhci_hcd ehci_hcd usbcore usb_common dm_mirror dm_region_hash dm_log dm_mod
+[    2.789936] CPU: 3 PID: 2196 Comm: systemd-udevd Not tainted 4.9.0-gentoo #1
+[    2.789937] Hardware name: ASUS All Series/H81I-PLUS, BIOS 0401 07/23/2013
+[    2.789938]  ffffc9000339b690 ffffffff812bd397 ffffc9000339b6e0 0000000000000000
+[    2.789939]  ffffc9000339b6d0 ffffffff81055c86 000006300339b6a0 ffff880116c0c000
+[    2.789941]  0000000000000000 0000000000000000 0000000000000001 ffff880116c08000
+[    2.789942] Call Trace:
+[    2.789945]  [<ffffffff812bd397>] dump_stack+0x4d/0x66
+[    2.789947]  [<ffffffff81055c86>] __warn+0xc6/0xe0
+[    2.789948]  [<ffffffff81055cea>] warn_slowpath_fmt+0x4a/0x50
+[    2.789952]  [<ffffffffa006d460>] usb_hcd_map_urb_for_dma+0x430/0x560 [usbcore]
+[    2.789954]  [<ffffffff814ed5a8>] ? io_schedule_timeout+0xd8/0x110
+[    2.789956]  [<ffffffffa006e09c>] usb_hcd_submit_urb+0x9c/0x980 [usbcore]
+[    2.789958]  [<ffffffff812d0ebf>] ? copy_page_to_iter+0x14f/0x2b0
+[    2.789960]  [<ffffffff81126818>] ? pagecache_get_page+0x28/0x240
+[    2.789962]  [<ffffffff8118c2a0>] ? touch_atime+0x20/0xa0
+[    2.789964]  [<ffffffffa006f7c4>] usb_submit_urb+0x2c4/0x520 [usbcore]
+[    2.789967]  [<ffffffffa006feca>] usb_start_wait_urb+0x5a/0xe0 [usbcore]
+[    2.789969]  [<ffffffffa007000c>] usb_control_msg+0xbc/0xf0 [usbcore]
+[    2.789970]  [<ffffffffa067903d>] usb_cypress_writemem+0x3d/0x40 [dvb_usb]
+[    2.789972]  [<ffffffffa06791cf>] usb_cypress_load_firmware+0x4f/0x130 [dvb_usb]
+[    2.789973]  [<ffffffff8109dbbe>] ? console_unlock+0x2fe/0x5d0
+[    2.789974]  [<ffffffff8109e10c>] ? vprintk_emit+0x27c/0x410
+[    2.789975]  [<ffffffff8109e40a>] ? vprintk_default+0x1a/0x20
+[    2.789976]  [<ffffffff81124d76>] ? printk+0x43/0x4b
+[    2.789977]  [<ffffffffa0679310>] dvb_usb_download_firmware+0x60/0xd0 [dvb_usb]
+[    2.789979]  [<ffffffffa0679898>] dvb_usb_device_init+0x3d8/0x610 [dvb_usb]
+[    2.789981]  [<ffffffffa069e302>] dtt200u_usb_probe+0x92/0xd0 [dvb_usb_dtt200u]
+[    2.789984]  [<ffffffffa007420c>] usb_probe_interface+0xfc/0x270 [usbcore]
+[    2.789985]  [<ffffffff8138bf95>] driver_probe_device+0x215/0x2d0
+[    2.789986]  [<ffffffff8138c0e6>] __driver_attach+0x96/0xa0
+[    2.789987]  [<ffffffff8138c050>] ? driver_probe_device+0x2d0/0x2d0
+[    2.789988]  [<ffffffff81389ffb>] bus_for_each_dev+0x5b/0x90
+[    2.789989]  [<ffffffff8138b7b9>] driver_attach+0x19/0x20
+[    2.789990]  [<ffffffff8138b33c>] bus_add_driver+0x11c/0x220
+[    2.789991]  [<ffffffff8138c91b>] driver_register+0x5b/0xd0
+[    2.789994]  [<ffffffffa0072f6c>] usb_register_driver+0x7c/0x130 [usbcore]
+[    2.789994]  [<ffffffffa06a5000>] ? 0xffffffffa06a5000
+[    2.789996]  [<ffffffffa06a501e>] dtt200u_usb_driver_init+0x1e/0x20 [dvb_usb_dtt200u]
+[    2.789997]  [<ffffffff81000408>] do_one_initcall+0x38/0x140
+[    2.789998]  [<ffffffff8116001c>] ? __vunmap+0x7c/0xc0
+[    2.789999]  [<ffffffff81124fb0>] ? do_init_module+0x22/0x1d2
+[    2.790000]  [<ffffffff81124fe8>] do_init_module+0x5a/0x1d2
+[    2.790002]  [<ffffffff810c96b1>] load_module+0x1e11/0x2580
+[    2.790003]  [<ffffffff810c68b0>] ? show_taint+0x30/0x30
+[    2.790004]  [<ffffffff81177250>] ? kernel_read_file+0x100/0x190
+[    2.790005]  [<ffffffff810c9ffa>] SyS_finit_module+0xba/0xc0
+[    2.790007]  [<ffffffff814f13e0>] entry_SYSCALL_64_fastpath+0x13/0x94
+[    2.790008] ---[ end trace c78a74e78baec6fc ]---
+
+So, allocate the structure dynamically.
+
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+[bwh: Backported to 4.9: adjust context]
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/media/usb/dvb-usb/dvb-usb-firmware.c | 19 +++++++++++++------
+ 1 file changed, 13 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/media/usb/dvb-usb/dvb-usb-firmware.c b/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
+index 733a7ff7b207..0cd9b02739c6 100644
+--- a/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
++++ b/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
+@@ -35,29 +35,34 @@ static int usb_cypress_writemem(struct usb_device *udev,u16 addr,u8 *data, u8 le
+ 
+ int usb_cypress_load_firmware(struct usb_device *udev, const struct firmware *fw, int type)
+ {
+-	struct hexline hx;
++	struct hexline *hx;
+ 	u8 reset;
+ 	int ret,pos=0;
+ 
++	hx = kmalloc(sizeof(*hx), GFP_KERNEL);
++	if (!hx)
++		return -ENOMEM;
++
+ 	/* stop the CPU */
+ 	reset = 1;
+ 	if ((ret = usb_cypress_writemem(udev,cypress[type].cpu_cs_register,&reset,1)) != 1)
+ 		err("could not stop the USB controller CPU.");
+ 
+-	while ((ret = dvb_usb_get_hexline(fw,&hx,&pos)) > 0) {
+-		deb_fw("writing to address 0x%04x (buffer: 0x%02x %02x)\n",hx.addr,hx.len,hx.chk);
+-		ret = usb_cypress_writemem(udev,hx.addr,hx.data,hx.len);
++	while ((ret = dvb_usb_get_hexline(fw, hx, &pos)) > 0) {
++		deb_fw("writing to address 0x%04x (buffer: 0x%02x %02x)\n", hx->addr, hx->len, hx->chk);
++		ret = usb_cypress_writemem(udev, hx->addr, hx->data, hx->len);
+ 
+-		if (ret != hx.len) {
++		if (ret != hx->len) {
+ 			err("error while transferring firmware "
+ 				"(transferred size: %d, block size: %d)",
+-				ret,hx.len);
++				ret, hx->len);
+ 			ret = -EINVAL;
+ 			break;
+ 		}
+ 	}
+ 	if (ret < 0) {
+ 		err("firmware download failed at %d with %d",pos,ret);
++		kfree(hx);
+ 		return ret;
+ 	}
+ 
+@@ -71,6 +76,8 @@ int usb_cypress_load_firmware(struct usb_device *udev, const struct firmware *fw
+ 	} else
+ 		ret = -EIO;
+ 
++	kfree(hx);
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL(usb_cypress_load_firmware);
+-- 
+2.28.0
+
+
+From 6be431f91632504f269b6e8ffcd552a5ca3fd84d Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Stefan=20Br=C3=BCns?= <stefan.bruens@rwth-aachen.de>
+Date: Sun, 12 Feb 2017 13:02:13 -0200
+Subject: [PATCH 34/46] dvb-usb-firmware: don't do DMA on stack
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 67b0503db9c29b04eadfeede6bebbfe5ddad94ef upstream.
+
+The buffer allocation for the firmware data was changed in
+commit 43fab9793c1f ("[media] dvb-usb: don't use stack for firmware load")
+but the same applies for the reset value.
+
+Fixes: 43fab9793c1f ("[media] dvb-usb: don't use stack for firmware load")
+Signed-off-by: Stefan Brüns <stefan.bruens@rwth-aachen.de>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Cc: Brad Spengler <spender@grsecurity.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/media/usb/dvb-usb/dvb-usb-firmware.c | 22 +++++++++++---------
+ 1 file changed, 12 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/usb/dvb-usb/dvb-usb-firmware.c b/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
+index 0cd9b02739c6..caad3b5c01ad 100644
+--- a/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
++++ b/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
+@@ -36,16 +36,18 @@ static int usb_cypress_writemem(struct usb_device *udev,u16 addr,u8 *data, u8 le
+ int usb_cypress_load_firmware(struct usb_device *udev, const struct firmware *fw, int type)
+ {
+ 	struct hexline *hx;
+-	u8 reset;
+-	int ret,pos=0;
++	u8 *buf;
++	int ret, pos = 0;
++	u16 cpu_cs_register = cypress[type].cpu_cs_register;
+ 
+-	hx = kmalloc(sizeof(*hx), GFP_KERNEL);
+-	if (!hx)
++	buf = kmalloc(sizeof(*hx), GFP_KERNEL);
++	if (!buf)
+ 		return -ENOMEM;
++	hx = (struct hexline *)buf;
+ 
+ 	/* stop the CPU */
+-	reset = 1;
+-	if ((ret = usb_cypress_writemem(udev,cypress[type].cpu_cs_register,&reset,1)) != 1)
++	buf[0] = 1;
++	if (usb_cypress_writemem(udev, cpu_cs_register, buf, 1) != 1)
+ 		err("could not stop the USB controller CPU.");
+ 
+ 	while ((ret = dvb_usb_get_hexline(fw, hx, &pos)) > 0) {
+@@ -62,21 +64,21 @@ int usb_cypress_load_firmware(struct usb_device *udev, const struct firmware *fw
+ 	}
+ 	if (ret < 0) {
+ 		err("firmware download failed at %d with %d",pos,ret);
+-		kfree(hx);
++		kfree(buf);
+ 		return ret;
+ 	}
+ 
+ 	if (ret == 0) {
+ 		/* restart the CPU */
+-		reset = 0;
+-		if (ret || usb_cypress_writemem(udev,cypress[type].cpu_cs_register,&reset,1) != 1) {
++		buf[0] = 0;
++		if (usb_cypress_writemem(udev, cpu_cs_register, buf, 1) != 1) {
+ 			err("could not restart the USB controller CPU.");
+ 			ret = -EINVAL;
+ 		}
+ 	} else
+ 		ret = -EIO;
+ 
+-	kfree(hx);
++	kfree(buf);
+ 
+ 	return ret;
+ }
+-- 
+2.28.0
+
+
+From eb5267657d85bfcbb60803dd88fa82c7dede6aab Mon Sep 17 00:00:00 2001
+From: Omar Sandoval <osandov@fb.com>
+Date: Wed, 1 Feb 2017 00:02:27 -0800
+Subject: [PATCH 35/46] virtio-console: avoid DMA from stack
+
+commit c4baad50297d84bde1a7ad45e50c73adae4a2192 upstream.
+
+put_chars() stuffs the buffer it gets into an sg, but that buffer may be
+on the stack. This breaks with CONFIG_VMAP_STACK=y (for me, it
+manifested as printks getting turned into NUL bytes).
+
+Signed-off-by: Omar Sandoval <osandov@fb.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Reviewed-by: Amit Shah <amit.shah@redhat.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Cc: Brad Spengler <spender@grsecurity.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/char/virtio_console.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
 diff --git a/drivers/char/virtio_console.c b/drivers/char/virtio_console.c
 index 090183f812be..31e8ae916ba0 100644
 --- a/drivers/char/virtio_console.c
@@ -666,309 +2831,35 @@ index 090183f812be..31e8ae916ba0 100644
  }
  
  /*
-diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
-index ece9f4102c0e..7f8acb3ebfcd 100644
---- a/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
-+++ b/drivers/gpu/drm/nouveau/nvkm/engine/device/base.c
-@@ -714,7 +714,7 @@ nv4a_chipset = {
- 	.i2c = nv04_i2c_new,
- 	.imem = nv40_instmem_new,
- 	.mc = nv44_mc_new,
--	.mmu = nv44_mmu_new,
-+	.mmu = nv04_mmu_new,
- 	.pci = nv40_pci_new,
- 	.therm = nv40_therm_new,
- 	.timer = nv41_timer_new,
-diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
-index d4d8942b1347..e55f8302d08a 100644
---- a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
-+++ b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv31.c
-@@ -198,7 +198,7 @@ nv31_mpeg_intr(struct nvkm_engine *engine)
- 		}
- 
- 		if (type == 0x00000010) {
--			if (!nv31_mpeg_mthd(mpeg, mthd, data))
-+			if (nv31_mpeg_mthd(mpeg, mthd, data))
- 				show &= ~0x01000000;
- 		}
- 	}
-diff --git a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
-index d433cfa4a8ab..36af0a8927fc 100644
---- a/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
-+++ b/drivers/gpu/drm/nouveau/nvkm/engine/mpeg/nv44.c
-@@ -172,7 +172,7 @@ nv44_mpeg_intr(struct nvkm_engine *engine)
- 		}
- 
- 		if (type == 0x00000010) {
--			if (!nv44_mpeg_mthd(subdev->device, mthd, data))
-+			if (nv44_mpeg_mthd(subdev->device, mthd, data))
- 				show &= ~0x01000000;
- 		}
- 	}
-diff --git a/drivers/input/joystick/xpad.c b/drivers/input/joystick/xpad.c
-index 16f000a76de5..3258baf3282e 100644
---- a/drivers/input/joystick/xpad.c
-+++ b/drivers/input/joystick/xpad.c
-@@ -189,6 +189,7 @@ static const struct xpad_device {
- 	{ 0x1430, 0x8888, "TX6500+ Dance Pad (first generation)", MAP_DPAD_TO_BUTTONS, XTYPE_XBOX },
- 	{ 0x146b, 0x0601, "BigBen Interactive XBOX 360 Controller", 0, XTYPE_XBOX360 },
- 	{ 0x1532, 0x0037, "Razer Sabertooth", 0, XTYPE_XBOX360 },
-+	{ 0x1532, 0x0a03, "Razer Wildcat", 0, XTYPE_XBOXONE },
- 	{ 0x15e4, 0x3f00, "Power A Mini Pro Elite", 0, XTYPE_XBOX360 },
- 	{ 0x15e4, 0x3f0a, "Xbox Airflo wired controller", 0, XTYPE_XBOX360 },
- 	{ 0x15e4, 0x3f10, "Batarang Xbox 360 controller", 0, XTYPE_XBOX360 },
-@@ -310,6 +311,7 @@ static struct usb_device_id xpad_table[] = {
- 	XPAD_XBOX360_VENDOR(0x1689),		/* Razer Onza */
- 	XPAD_XBOX360_VENDOR(0x24c6),		/* PowerA Controllers */
- 	XPAD_XBOX360_VENDOR(0x1532),		/* Razer Sabertooth */
-+	XPAD_XBOXONE_VENDOR(0x1532),		/* Razer Wildcat */
- 	XPAD_XBOX360_VENDOR(0x15e4),		/* Numark X-Box 360 controllers */
- 	XPAD_XBOX360_VENDOR(0x162e),		/* Joytech X-Box 360 controllers */
- 	{ }
-diff --git a/drivers/irqchip/irq-imx-gpcv2.c b/drivers/irqchip/irq-imx-gpcv2.c
-index 15af9a9753e5..2d203b422129 100644
---- a/drivers/irqchip/irq-imx-gpcv2.c
-+++ b/drivers/irqchip/irq-imx-gpcv2.c
-@@ -230,6 +230,8 @@ static int __init imx_gpcv2_irqchip_init(struct device_node *node,
- 		return -ENOMEM;
- 	}
- 
-+	raw_spin_lock_init(&cd->rlock);
-+
- 	cd->gpc_base = of_iomap(node, 0);
- 	if (!cd->gpc_base) {
- 		pr_err("fsl-gpcv2: unable to map gpc registers\n");
-diff --git a/drivers/media/usb/dvb-usb-v2/dvb_usb_core.c b/drivers/media/usb/dvb-usb-v2/dvb_usb_core.c
-index f5df9eaba04f..9757f35cd5f5 100644
---- a/drivers/media/usb/dvb-usb-v2/dvb_usb_core.c
-+++ b/drivers/media/usb/dvb-usb-v2/dvb_usb_core.c
-@@ -1010,8 +1010,8 @@ EXPORT_SYMBOL(dvb_usbv2_probe);
- void dvb_usbv2_disconnect(struct usb_interface *intf)
- {
- 	struct dvb_usb_device *d = usb_get_intfdata(intf);
--	const char *name = d->name;
--	struct device dev = d->udev->dev;
-+	const char *devname = kstrdup(dev_name(&d->udev->dev), GFP_KERNEL);
-+	const char *drvname = d->name;
- 
- 	dev_dbg(&d->udev->dev, "%s: bInterfaceNumber=%d\n", __func__,
- 			intf->cur_altsetting->desc.bInterfaceNumber);
-@@ -1021,8 +1021,9 @@ void dvb_usbv2_disconnect(struct usb_interface *intf)
- 
- 	dvb_usbv2_exit(d);
- 
--	dev_info(&dev, "%s: '%s' successfully deinitialized and disconnected\n",
--			KBUILD_MODNAME, name);
-+	pr_info("%s: '%s:%s' successfully deinitialized and disconnected\n",
-+		KBUILD_MODNAME, drvname, devname);
-+	kfree(devname);
- }
- EXPORT_SYMBOL(dvb_usbv2_disconnect);
- 
-diff --git a/drivers/media/usb/dvb-usb/dvb-usb-firmware.c b/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
-index 733a7ff7b207..caad3b5c01ad 100644
---- a/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
-+++ b/drivers/media/usb/dvb-usb/dvb-usb-firmware.c
-@@ -35,42 +35,51 @@ static int usb_cypress_writemem(struct usb_device *udev,u16 addr,u8 *data, u8 le
- 
- int usb_cypress_load_firmware(struct usb_device *udev, const struct firmware *fw, int type)
- {
--	struct hexline hx;
--	u8 reset;
--	int ret,pos=0;
-+	struct hexline *hx;
-+	u8 *buf;
-+	int ret, pos = 0;
-+	u16 cpu_cs_register = cypress[type].cpu_cs_register;
-+
-+	buf = kmalloc(sizeof(*hx), GFP_KERNEL);
-+	if (!buf)
-+		return -ENOMEM;
-+	hx = (struct hexline *)buf;
- 
- 	/* stop the CPU */
--	reset = 1;
--	if ((ret = usb_cypress_writemem(udev,cypress[type].cpu_cs_register,&reset,1)) != 1)
-+	buf[0] = 1;
-+	if (usb_cypress_writemem(udev, cpu_cs_register, buf, 1) != 1)
- 		err("could not stop the USB controller CPU.");
- 
--	while ((ret = dvb_usb_get_hexline(fw,&hx,&pos)) > 0) {
--		deb_fw("writing to address 0x%04x (buffer: 0x%02x %02x)\n",hx.addr,hx.len,hx.chk);
--		ret = usb_cypress_writemem(udev,hx.addr,hx.data,hx.len);
-+	while ((ret = dvb_usb_get_hexline(fw, hx, &pos)) > 0) {
-+		deb_fw("writing to address 0x%04x (buffer: 0x%02x %02x)\n", hx->addr, hx->len, hx->chk);
-+		ret = usb_cypress_writemem(udev, hx->addr, hx->data, hx->len);
- 
--		if (ret != hx.len) {
-+		if (ret != hx->len) {
- 			err("error while transferring firmware "
- 				"(transferred size: %d, block size: %d)",
--				ret,hx.len);
-+				ret, hx->len);
- 			ret = -EINVAL;
- 			break;
- 		}
- 	}
- 	if (ret < 0) {
- 		err("firmware download failed at %d with %d",pos,ret);
-+		kfree(buf);
- 		return ret;
- 	}
- 
- 	if (ret == 0) {
- 		/* restart the CPU */
--		reset = 0;
--		if (ret || usb_cypress_writemem(udev,cypress[type].cpu_cs_register,&reset,1) != 1) {
-+		buf[0] = 0;
-+		if (usb_cypress_writemem(udev, cpu_cs_register, buf, 1) != 1) {
- 			err("could not restart the USB controller CPU.");
- 			ret = -EINVAL;
- 		}
- 	} else
- 		ret = -EIO;
- 
-+	kfree(buf);
-+
- 	return ret;
- }
- EXPORT_SYMBOL(usb_cypress_load_firmware);
-diff --git a/drivers/net/ethernet/ibm/ibmveth.c b/drivers/net/ethernet/ibm/ibmveth.c
-index 855c43d8f7e0..f9e4988ea30e 100644
---- a/drivers/net/ethernet/ibm/ibmveth.c
-+++ b/drivers/net/ethernet/ibm/ibmveth.c
-@@ -1179,7 +1179,9 @@ map_failed:
- 
- static void ibmveth_rx_mss_helper(struct sk_buff *skb, u16 mss, int lrg_pkt)
- {
-+	struct tcphdr *tcph;
- 	int offset = 0;
-+	int hdr_len;
- 
- 	/* only TCP packets will be aggregated */
- 	if (skb->protocol == htons(ETH_P_IP)) {
-@@ -1206,14 +1208,20 @@ static void ibmveth_rx_mss_helper(struct sk_buff *skb, u16 mss, int lrg_pkt)
- 	/* if mss is not set through Large Packet bit/mss in rx buffer,
- 	 * expect that the mss will be written to the tcp header checksum.
- 	 */
-+	tcph = (struct tcphdr *)(skb->data + offset);
- 	if (lrg_pkt) {
- 		skb_shinfo(skb)->gso_size = mss;
- 	} else if (offset) {
--		struct tcphdr *tcph = (struct tcphdr *)(skb->data + offset);
--
- 		skb_shinfo(skb)->gso_size = ntohs(tcph->check);
- 		tcph->check = 0;
- 	}
-+
-+	if (skb_shinfo(skb)->gso_size) {
-+		hdr_len = offset + tcph->doff * 4;
-+		skb_shinfo(skb)->gso_segs =
-+				DIV_ROUND_UP(skb->len - hdr_len,
-+					     skb_shinfo(skb)->gso_size);
-+	}
- }
- 
- static int ibmveth_poll(struct napi_struct *napi, int budget)
-diff --git a/drivers/net/usb/catc.c b/drivers/net/usb/catc.c
-index 4e2b26a88b15..2aa1a1d29cb4 100644
---- a/drivers/net/usb/catc.c
-+++ b/drivers/net/usb/catc.c
-@@ -777,7 +777,7 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
- 	struct net_device *netdev;
- 	struct catc *catc;
- 	u8 broadcast[ETH_ALEN];
--	int i, pktsz;
-+	int pktsz, ret;
- 
- 	if (usb_set_interface(usbdev,
- 			intf->altsetting->desc.bInterfaceNumber, 1)) {
-@@ -812,12 +812,8 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
- 	if ((!catc->ctrl_urb) || (!catc->tx_urb) || 
- 	    (!catc->rx_urb) || (!catc->irq_urb)) {
- 		dev_err(&intf->dev, "No free urbs available.\n");
--		usb_free_urb(catc->ctrl_urb);
--		usb_free_urb(catc->tx_urb);
--		usb_free_urb(catc->rx_urb);
--		usb_free_urb(catc->irq_urb);
--		free_netdev(netdev);
--		return -ENOMEM;
-+		ret = -ENOMEM;
-+		goto fail_free;
- 	}
- 
- 	/* The F5U011 has the same vendor/product as the netmate but a device version of 0x130 */
-@@ -845,15 +841,24 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
-                 catc->irq_buf, 2, catc_irq_done, catc, 1);
- 
- 	if (!catc->is_f5u011) {
-+		u32 *buf;
-+		int i;
-+
- 		dev_dbg(dev, "Checking memory size\n");
- 
--		i = 0x12345678;
--		catc_write_mem(catc, 0x7a80, &i, 4);
--		i = 0x87654321;	
--		catc_write_mem(catc, 0xfa80, &i, 4);
--		catc_read_mem(catc, 0x7a80, &i, 4);
-+		buf = kmalloc(4, GFP_KERNEL);
-+		if (!buf) {
-+			ret = -ENOMEM;
-+			goto fail_free;
-+		}
-+
-+		*buf = 0x12345678;
-+		catc_write_mem(catc, 0x7a80, buf, 4);
-+		*buf = 0x87654321;
-+		catc_write_mem(catc, 0xfa80, buf, 4);
-+		catc_read_mem(catc, 0x7a80, buf, 4);
- 	  
--		switch (i) {
-+		switch (*buf) {
- 		case 0x12345678:
- 			catc_set_reg(catc, TxBufCount, 8);
- 			catc_set_reg(catc, RxBufCount, 32);
-@@ -868,6 +873,8 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
- 			dev_dbg(dev, "32k Memory\n");
- 			break;
- 		}
-+
-+		kfree(buf);
- 	  
- 		dev_dbg(dev, "Getting MAC from SEEROM.\n");
- 	  
-@@ -914,16 +921,21 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
- 	usb_set_intfdata(intf, catc);
- 
- 	SET_NETDEV_DEV(netdev, &intf->dev);
--	if (register_netdev(netdev) != 0) {
--		usb_set_intfdata(intf, NULL);
--		usb_free_urb(catc->ctrl_urb);
--		usb_free_urb(catc->tx_urb);
--		usb_free_urb(catc->rx_urb);
--		usb_free_urb(catc->irq_urb);
--		free_netdev(netdev);
--		return -EIO;
--	}
-+	ret = register_netdev(netdev);
-+	if (ret)
-+		goto fail_clear_intfdata;
-+
- 	return 0;
-+
-+fail_clear_intfdata:
-+	usb_set_intfdata(intf, NULL);
-+fail_free:
-+	usb_free_urb(catc->ctrl_urb);
-+	usb_free_urb(catc->tx_urb);
-+	usb_free_urb(catc->rx_urb);
-+	usb_free_urb(catc->irq_urb);
-+	free_netdev(netdev);
-+	return ret;
- }
- 
- static void catc_disconnect(struct usb_interface *intf)
+-- 
+2.28.0
+
+
+From be570e556deec7466d74a579129671185501a456 Mon Sep 17 00:00:00 2001
+From: Ben Hutchings <ben@decadent.org.uk>
+Date: Sat, 4 Feb 2017 16:56:03 +0000
+Subject: [PATCH 36/46] pegasus: Use heap buffers for all register access
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 5593523f968bc86d42a035c6df47d5e0979b5ace upstream.
+
+Allocating USB buffers on the stack is not portable, and no longer
+works on x86_64 (with VMAP_STACK enabled as per default).
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+References: https://bugs.debian.org/852556
+Reported-by: Lisandro Damián Nicanor Pérez Meyer <lisandro@debian.org>
+Tested-by: Lisandro Damián Nicanor Pérez Meyer <lisandro@debian.org>
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Brad Spengler <spender@grsecurity.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/usb/pegasus.c | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
 diff --git a/drivers/net/usb/pegasus.c b/drivers/net/usb/pegasus.c
 index f84080215915..17fac0121e56 100644
 --- a/drivers/net/usb/pegasus.c
@@ -1039,6 +2930,29 @@ index f84080215915..17fac0121e56 100644
  	return ret;
  }
  
+-- 
+2.28.0
+
+
+From a90604be51de4e63f916261a91edd4f67e8b0b2b Mon Sep 17 00:00:00 2001
+From: Ben Hutchings <ben@decadent.org.uk>
+Date: Sat, 4 Feb 2017 16:56:32 +0000
+Subject: [PATCH 37/46] rtl8150: Use heap buffers for all register access
+
+commit 7926aff5c57b577ab0f43364ff0c59d968f6a414 upstream.
+
+Allocating USB buffers on the stack is not portable, and no longer
+works on x86_64 (with VMAP_STACK enabled as per default).
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Brad Spengler <spender@grsecurity.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/usb/rtl8150.c | 34 +++++++++++++++++++++++++++-------
+ 1 file changed, 27 insertions(+), 7 deletions(-)
+
 diff --git a/drivers/net/usb/rtl8150.c b/drivers/net/usb/rtl8150.c
 index d37b7dce2d40..39672984dde1 100644
 --- a/drivers/net/usb/rtl8150.c
@@ -1087,331 +3001,351 @@ index d37b7dce2d40..39672984dde1 100644
  }
  
  static void async_set_reg_cb(struct urb *urb)
-diff --git a/drivers/net/wireless/ath/ath9k/common-spectral.c b/drivers/net/wireless/ath/ath9k/common-spectral.c
-index a8762711ad74..03945731eb65 100644
---- a/drivers/net/wireless/ath/ath9k/common-spectral.c
-+++ b/drivers/net/wireless/ath/ath9k/common-spectral.c
-@@ -528,6 +528,9 @@ int ath_cmn_process_fft(struct ath_spec_scan_priv *spec_priv, struct ieee80211_h
- 	if (!(radar_info->pulse_bw_info & SPECTRAL_SCAN_BITMASK))
- 		return 0;
+-- 
+2.28.0
+
+
+From 40531b26bade950cf9c815d8238be27b009aa197 Mon Sep 17 00:00:00 2001
+From: Ben Hutchings <ben@decadent.org.uk>
+Date: Sat, 4 Feb 2017 16:56:56 +0000
+Subject: [PATCH 38/46] catc: Combine failure cleanup code in catc_probe()
+
+commit d41149145f98fe26dcd0bfd1d6cc095e6e041418 upstream.
+
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/usb/catc.c | 33 +++++++++++++++++----------------
+ 1 file changed, 17 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/usb/catc.c b/drivers/net/usb/catc.c
+index 4e2b26a88b15..298885f81aad 100644
+--- a/drivers/net/usb/catc.c
++++ b/drivers/net/usb/catc.c
+@@ -777,7 +777,7 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
+ 	struct net_device *netdev;
+ 	struct catc *catc;
+ 	u8 broadcast[ETH_ALEN];
+-	int i, pktsz;
++	int i, pktsz, ret;
  
-+	if (!spec_priv->rfs_chan_spec_scan)
-+		return 1;
-+
- 	/* Output buffers are full, no need to process anything
- 	 * since there is no space to put the result anyway
- 	 */
-@@ -1072,7 +1075,7 @@ static struct rchan_callbacks rfs_spec_scan_cb = {
- 
- void ath9k_cmn_spectral_deinit_debug(struct ath_spec_scan_priv *spec_priv)
- {
--	if (config_enabled(CONFIG_ATH9K_DEBUGFS)) {
-+	if (config_enabled(CONFIG_ATH9K_DEBUGFS) && spec_priv->rfs_chan_spec_scan) {
- 		relay_close(spec_priv->rfs_chan_spec_scan);
- 		spec_priv->rfs_chan_spec_scan = NULL;
- 	}
-@@ -1086,6 +1089,9 @@ void ath9k_cmn_spectral_init_debug(struct ath_spec_scan_priv *spec_priv,
- 					    debugfs_phy,
- 					    1024, 256, &rfs_spec_scan_cb,
- 					    NULL);
-+	if (!spec_priv->rfs_chan_spec_scan)
-+		return;
-+
- 	debugfs_create_file("spectral_scan_ctl",
- 			    S_IRUSR | S_IWUSR,
- 			    debugfs_phy, spec_priv,
-diff --git a/drivers/nvdimm/bus.c b/drivers/nvdimm/bus.c
-index 5f47356d6942..254b0ee37039 100644
---- a/drivers/nvdimm/bus.c
-+++ b/drivers/nvdimm/bus.c
-@@ -590,8 +590,14 @@ static int __nd_ioctl(struct nvdimm_bus *nvdimm_bus, struct nvdimm *nvdimm,
- 	rc = nd_desc->ndctl(nd_desc, nvdimm, cmd, buf, buf_len);
- 	if (rc < 0)
- 		goto out_unlock;
-+	nvdimm_bus_unlock(&nvdimm_bus->dev);
-+
- 	if (copy_to_user(p, buf, buf_len))
- 		rc = -EFAULT;
-+
-+	vfree(buf);
-+	return rc;
-+
-  out_unlock:
- 	nvdimm_bus_unlock(&nvdimm_bus->dev);
-  out:
-diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
-index 1062fa42ff26..b2cdc1a1ad4f 100644
---- a/drivers/platform/x86/acer-wmi.c
-+++ b/drivers/platform/x86/acer-wmi.c
-@@ -1816,11 +1816,24 @@ static int __init acer_wmi_enable_lm(void)
- 	return status;
- }
- 
-+#define ACER_WMID_ACCEL_HID	"BST0001"
-+
- static acpi_status __init acer_wmi_get_handle_cb(acpi_handle ah, u32 level,
- 						void *ctx, void **retval)
- {
-+	struct acpi_device *dev;
-+
-+	if (!strcmp(ctx, "SENR")) {
-+		if (acpi_bus_get_device(ah, &dev))
-+			return AE_OK;
-+		if (!strcmp(ACER_WMID_ACCEL_HID, acpi_device_hid(dev)))
-+			return AE_OK;
-+	} else
-+		return AE_OK;
-+
- 	*(acpi_handle *)retval = ah;
--	return AE_OK;
-+
-+	return AE_CTRL_TERMINATE;
- }
- 
- static int __init acer_wmi_get_handle(const char *name, const char *prop,
-@@ -1847,7 +1860,7 @@ static int __init acer_wmi_accel_setup(void)
- {
- 	int err;
- 
--	err = acer_wmi_get_handle("SENR", "BST0001", &gsensor_handle);
-+	err = acer_wmi_get_handle("SENR", ACER_WMID_ACCEL_HID, &gsensor_handle);
- 	if (err)
- 		return err;
- 
-@@ -2185,10 +2198,11 @@ static int __init acer_wmi_init(void)
- 		err = acer_wmi_input_setup();
- 		if (err)
- 			return err;
-+		err = acer_wmi_accel_setup();
-+		if (err)
-+			return err;
+ 	if (usb_set_interface(usbdev,
+ 			intf->altsetting->desc.bInterfaceNumber, 1)) {
+@@ -812,12 +812,8 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
+ 	if ((!catc->ctrl_urb) || (!catc->tx_urb) || 
+ 	    (!catc->rx_urb) || (!catc->irq_urb)) {
+ 		dev_err(&intf->dev, "No free urbs available.\n");
+-		usb_free_urb(catc->ctrl_urb);
+-		usb_free_urb(catc->tx_urb);
+-		usb_free_urb(catc->rx_urb);
+-		usb_free_urb(catc->irq_urb);
+-		free_netdev(netdev);
+-		return -ENOMEM;
++		ret = -ENOMEM;
++		goto fail_free;
  	}
  
--	acer_wmi_accel_setup();
--
- 	err = platform_driver_register(&acer_platform_driver);
- 	if (err) {
- 		pr_err("Unable to register platform driver\n");
-diff --git a/drivers/rtc/rtc-tegra.c b/drivers/rtc/rtc-tegra.c
-index 60232bd366ef..71216aa68905 100644
---- a/drivers/rtc/rtc-tegra.c
-+++ b/drivers/rtc/rtc-tegra.c
-@@ -18,6 +18,7 @@
-  * 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
-  */
- #include <linux/kernel.h>
-+#include <linux/clk.h>
- #include <linux/init.h>
- #include <linux/module.h>
- #include <linux/slab.h>
-@@ -59,6 +60,7 @@ struct tegra_rtc_info {
- 	struct platform_device	*pdev;
- 	struct rtc_device	*rtc_dev;
- 	void __iomem		*rtc_base; /* NULL if not initialized. */
-+	struct clk		*clk;
- 	int			tegra_rtc_irq; /* alarm and periodic irq */
- 	spinlock_t		tegra_rtc_lock;
- };
-@@ -332,6 +334,14 @@ static int __init tegra_rtc_probe(struct platform_device *pdev)
- 	if (info->tegra_rtc_irq <= 0)
- 		return -EBUSY;
+ 	/* The F5U011 has the same vendor/product as the netmate but a device version of 0x130 */
+@@ -914,16 +910,21 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
+ 	usb_set_intfdata(intf, catc);
  
-+	info->clk = devm_clk_get(&pdev->dev, NULL);
-+	if (IS_ERR(info->clk))
-+		return PTR_ERR(info->clk);
+ 	SET_NETDEV_DEV(netdev, &intf->dev);
+-	if (register_netdev(netdev) != 0) {
+-		usb_set_intfdata(intf, NULL);
+-		usb_free_urb(catc->ctrl_urb);
+-		usb_free_urb(catc->tx_urb);
+-		usb_free_urb(catc->rx_urb);
+-		usb_free_urb(catc->irq_urb);
+-		free_netdev(netdev);
+-		return -EIO;
+-	}
++	ret = register_netdev(netdev);
++	if (ret)
++		goto fail_clear_intfdata;
 +
-+	ret = clk_prepare_enable(info->clk);
-+	if (ret < 0)
-+		return ret;
-+
- 	/* set context info. */
- 	info->pdev = pdev;
- 	spin_lock_init(&info->tegra_rtc_lock);
-@@ -352,7 +362,7 @@ static int __init tegra_rtc_probe(struct platform_device *pdev)
- 		ret = PTR_ERR(info->rtc_dev);
- 		dev_err(&pdev->dev, "Unable to register device (err=%d).\n",
- 			ret);
--		return ret;
-+		goto disable_clk;
- 	}
- 
- 	ret = devm_request_irq(&pdev->dev, info->tegra_rtc_irq,
-@@ -362,12 +372,25 @@ static int __init tegra_rtc_probe(struct platform_device *pdev)
- 		dev_err(&pdev->dev,
- 			"Unable to request interrupt for device (err=%d).\n",
- 			ret);
--		return ret;
-+		goto disable_clk;
- 	}
- 
- 	dev_notice(&pdev->dev, "Tegra internal Real Time Clock\n");
- 
  	return 0;
 +
-+disable_clk:
-+	clk_disable_unprepare(info->clk);
++fail_clear_intfdata:
++	usb_set_intfdata(intf, NULL);
++fail_free:
++	usb_free_urb(catc->ctrl_urb);
++	usb_free_urb(catc->tx_urb);
++	usb_free_urb(catc->rx_urb);
++	usb_free_urb(catc->irq_urb);
++	free_netdev(netdev);
 +	return ret;
-+}
-+
-+static int tegra_rtc_remove(struct platform_device *pdev)
-+{
-+	struct tegra_rtc_info *info = platform_get_drvdata(pdev);
-+
-+	clk_disable_unprepare(info->clk);
-+
-+	return 0;
  }
  
- #ifdef CONFIG_PM_SLEEP
-@@ -419,6 +442,7 @@ static void tegra_rtc_shutdown(struct platform_device *pdev)
+ static void catc_disconnect(struct usb_interface *intf)
+-- 
+2.28.0
+
+
+From 65596042c3af1c3578f5e478f512f595d7fa31d0 Mon Sep 17 00:00:00 2001
+From: Ben Hutchings <ben@decadent.org.uk>
+Date: Sat, 4 Feb 2017 16:57:04 +0000
+Subject: [PATCH 39/46] catc: Use heap buffer for memory size test
+
+commit 2d6a0e9de03ee658a9adc3bfb2f0ca55dff1e478 upstream.
+
+Allocating USB buffers on the stack is not portable, and no longer
+works on x86_64 (with VMAP_STACK enabled as per default).
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Brad Spengler <spender@grsecurity.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/usb/catc.c | 25 ++++++++++++++++++-------
+ 1 file changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/usb/catc.c b/drivers/net/usb/catc.c
+index 298885f81aad..2aa1a1d29cb4 100644
+--- a/drivers/net/usb/catc.c
++++ b/drivers/net/usb/catc.c
+@@ -777,7 +777,7 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
+ 	struct net_device *netdev;
+ 	struct catc *catc;
+ 	u8 broadcast[ETH_ALEN];
+-	int i, pktsz, ret;
++	int pktsz, ret;
  
- MODULE_ALIAS("platform:tegra_rtc");
- static struct platform_driver tegra_rtc_driver = {
-+	.remove		= tegra_rtc_remove,
- 	.shutdown	= tegra_rtc_shutdown,
- 	.driver		= {
- 		.name	= "tegra_rtc",
-diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
-index 78430ef28ea4..4d5207dff960 100644
---- a/drivers/scsi/sd.c
-+++ b/drivers/scsi/sd.c
-@@ -2051,6 +2051,22 @@ static void read_capacity_error(struct scsi_disk *sdkp, struct scsi_device *sdp,
+ 	if (usb_set_interface(usbdev,
+ 			intf->altsetting->desc.bInterfaceNumber, 1)) {
+@@ -841,15 +841,24 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
+                 catc->irq_buf, 2, catc_irq_done, catc, 1);
  
- #define READ_CAPACITY_RETRIES_ON_RESET	10
- 
-+/*
-+ * Ensure that we don't overflow sector_t when CONFIG_LBDAF is not set
-+ * and the reported logical block size is bigger than 512 bytes. Note
-+ * that last_sector is a u64 and therefore logical_to_sectors() is not
-+ * applicable.
-+ */
-+static bool sd_addressable_capacity(u64 lba, unsigned int sector_size)
-+{
-+	u64 last_sector = (lba + 1ULL) << (ilog2(sector_size) - 9);
+ 	if (!catc->is_f5u011) {
++		u32 *buf;
++		int i;
 +
-+	if (sizeof(sector_t) == 4 && last_sector > U32_MAX)
-+		return false;
+ 		dev_dbg(dev, "Checking memory size\n");
+ 
+-		i = 0x12345678;
+-		catc_write_mem(catc, 0x7a80, &i, 4);
+-		i = 0x87654321;	
+-		catc_write_mem(catc, 0xfa80, &i, 4);
+-		catc_read_mem(catc, 0x7a80, &i, 4);
++		buf = kmalloc(4, GFP_KERNEL);
++		if (!buf) {
++			ret = -ENOMEM;
++			goto fail_free;
++		}
 +
-+	return true;
-+}
-+
- static int read_capacity_16(struct scsi_disk *sdkp, struct scsi_device *sdp,
- 						unsigned char *buffer)
- {
-@@ -2116,7 +2132,7 @@ static int read_capacity_16(struct scsi_disk *sdkp, struct scsi_device *sdp,
- 		return -ENODEV;
- 	}
- 
--	if ((sizeof(sdkp->capacity) == 4) && (lba >= 0xffffffffULL)) {
-+	if (!sd_addressable_capacity(lba, sector_size)) {
- 		sd_printk(KERN_ERR, sdkp, "Too big for this kernel. Use a "
- 			"kernel compiled with support for large block "
- 			"devices.\n");
-@@ -2202,7 +2218,7 @@ static int read_capacity_10(struct scsi_disk *sdkp, struct scsi_device *sdp,
- 		return sector_size;
- 	}
- 
--	if ((sizeof(sdkp->capacity) == 4) && (lba == 0xffffffff)) {
-+	if (!sd_addressable_capacity(lba, sector_size)) {
- 		sd_printk(KERN_ERR, sdkp, "Too big for this kernel. Use a "
- 			"kernel compiled with support for large block "
- 			"devices.\n");
-@@ -2888,7 +2904,8 @@ static int sd_revalidate_disk(struct gendisk *disk)
- 		q->limits.io_opt = logical_to_bytes(sdp, sdkp->opt_xfer_blocks);
- 		rw_max = logical_to_sectors(sdp, sdkp->opt_xfer_blocks);
- 	} else
--		rw_max = BLK_DEF_MAX_SECTORS;
-+		rw_max = min_not_zero(logical_to_sectors(sdp, dev_max),
-+				      (sector_t)BLK_DEF_MAX_SECTORS);
- 
- 	/* Combine with controller limits */
- 	q->limits.max_sectors = min(rw_max, queue_max_hw_sectors(q));
-diff --git a/drivers/scsi/sr.c b/drivers/scsi/sr.c
-index 64c867405ad4..804586aeaffe 100644
---- a/drivers/scsi/sr.c
-+++ b/drivers/scsi/sr.c
-@@ -834,6 +834,7 @@ static void get_capabilities(struct scsi_cd *cd)
- 	unsigned char *buffer;
- 	struct scsi_mode_data data;
- 	struct scsi_sense_hdr sshdr;
-+	unsigned int ms_len = 128;
- 	int rc, n;
- 
- 	static const char *loadmech[] =
-@@ -860,10 +861,11 @@ static void get_capabilities(struct scsi_cd *cd)
- 	scsi_test_unit_ready(cd->device, SR_TIMEOUT, MAX_RETRIES, &sshdr);
- 
- 	/* ask for mode page 0x2a */
--	rc = scsi_mode_sense(cd->device, 0, 0x2a, buffer, 128,
-+	rc = scsi_mode_sense(cd->device, 0, 0x2a, buffer, ms_len,
- 			     SR_TIMEOUT, 3, &data, NULL);
- 
--	if (!scsi_status_is_good(rc)) {
-+	if (!scsi_status_is_good(rc) || data.length > ms_len ||
-+	    data.header_length + data.block_descriptor_length > data.length) {
- 		/* failed, drive doesn't have capabilities mode page */
- 		cd->cdi.speed = 1;
- 		cd->cdi.mask |= (CDC_CD_R | CDC_CD_RW | CDC_DVD_R |
-diff --git a/drivers/target/iscsi/iscsi_target_parameters.c b/drivers/target/iscsi/iscsi_target_parameters.c
-index 2cbea2af7cd0..6d1b0acbc5b3 100644
---- a/drivers/target/iscsi/iscsi_target_parameters.c
-+++ b/drivers/target/iscsi/iscsi_target_parameters.c
-@@ -781,22 +781,6 @@ static void iscsi_check_proposer_for_optional_reply(struct iscsi_param *param)
- 		if (!strcmp(param->name, MAXRECVDATASEGMENTLENGTH))
- 			SET_PSTATE_REPLY_OPTIONAL(param);
- 		/*
--		 * The GlobalSAN iSCSI Initiator for MacOSX does
--		 * not respond to MaxBurstLength, FirstBurstLength,
--		 * DefaultTime2Wait or DefaultTime2Retain parameter keys.
--		 * So, we set them to 'reply optional' here, and assume the
--		 * the defaults from iscsi_parameters.h if the initiator
--		 * is not RFC compliant and the keys are not negotiated.
--		 */
--		if (!strcmp(param->name, MAXBURSTLENGTH))
--			SET_PSTATE_REPLY_OPTIONAL(param);
--		if (!strcmp(param->name, FIRSTBURSTLENGTH))
--			SET_PSTATE_REPLY_OPTIONAL(param);
--		if (!strcmp(param->name, DEFAULTTIME2WAIT))
--			SET_PSTATE_REPLY_OPTIONAL(param);
--		if (!strcmp(param->name, DEFAULTTIME2RETAIN))
--			SET_PSTATE_REPLY_OPTIONAL(param);
--		/*
- 		 * Required for gPXE iSCSI boot client
- 		 */
- 		if (!strcmp(param->name, MAXCONNECTIONS))
-diff --git a/drivers/target/iscsi/iscsi_target_util.c b/drivers/target/iscsi/iscsi_target_util.c
-index 428b0d9e3dba..93590521ae33 100644
---- a/drivers/target/iscsi/iscsi_target_util.c
-+++ b/drivers/target/iscsi/iscsi_target_util.c
-@@ -731,21 +731,23 @@ void iscsit_free_cmd(struct iscsi_cmd *cmd, bool shutdown)
- {
- 	struct se_cmd *se_cmd = NULL;
- 	int rc;
-+	bool op_scsi = false;
- 	/*
- 	 * Determine if a struct se_cmd is associated with
- 	 * this struct iscsi_cmd.
- 	 */
- 	switch (cmd->iscsi_opcode) {
- 	case ISCSI_OP_SCSI_CMD:
--		se_cmd = &cmd->se_cmd;
--		__iscsit_free_cmd(cmd, true, shutdown);
-+		op_scsi = true;
- 		/*
- 		 * Fallthrough
- 		 */
- 	case ISCSI_OP_SCSI_TMFUNC:
--		rc = transport_generic_free_cmd(&cmd->se_cmd, shutdown);
--		if (!rc && shutdown && se_cmd && se_cmd->se_sess) {
--			__iscsit_free_cmd(cmd, true, shutdown);
-+		se_cmd = &cmd->se_cmd;
-+		__iscsit_free_cmd(cmd, op_scsi, shutdown);
-+		rc = transport_generic_free_cmd(se_cmd, shutdown);
-+		if (!rc && shutdown && se_cmd->se_sess) {
-+			__iscsit_free_cmd(cmd, op_scsi, shutdown);
- 			target_put_sess_cmd(se_cmd);
++		*buf = 0x12345678;
++		catc_write_mem(catc, 0x7a80, buf, 4);
++		*buf = 0x87654321;
++		catc_write_mem(catc, 0xfa80, buf, 4);
++		catc_read_mem(catc, 0x7a80, buf, 4);
+ 	  
+-		switch (i) {
++		switch (*buf) {
+ 		case 0x12345678:
+ 			catc_set_reg(catc, TxBufCount, 8);
+ 			catc_set_reg(catc, RxBufCount, 32);
+@@ -864,6 +873,8 @@ static int catc_probe(struct usb_interface *intf, const struct usb_device_id *id
+ 			dev_dbg(dev, "32k Memory\n");
+ 			break;
  		}
- 		break;
++
++		kfree(buf);
+ 	  
+ 		dev_dbg(dev, "Getting MAC from SEEROM.\n");
+ 	  
+-- 
+2.28.0
+
+
+From 403a728d1a35111103669aa125dcecfbe04e6872 Mon Sep 17 00:00:00 2001
+From: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+Date: Tue, 13 Dec 2016 18:15:09 -0600
+Subject: [PATCH 40/46] ibmveth: calculate gso_segs for large packets
+
+commit 94acf164dc8f1184e8d0737be7125134c2701dbe upstream.
+
+Include calculations to compute the number of segments
+that comprise an aggregated large packet.
+
+Signed-off-by: Thomas Falcon <tlfalcon@linux.vnet.ibm.com>
+Reviewed-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Reviewed-by: Jonathan Maxwell <jmaxwell37@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/ibm/ibmveth.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/ibm/ibmveth.c b/drivers/net/ethernet/ibm/ibmveth.c
+index 855c43d8f7e0..f9e4988ea30e 100644
+--- a/drivers/net/ethernet/ibm/ibmveth.c
++++ b/drivers/net/ethernet/ibm/ibmveth.c
+@@ -1179,7 +1179,9 @@ map_failed:
+ 
+ static void ibmveth_rx_mss_helper(struct sk_buff *skb, u16 mss, int lrg_pkt)
+ {
++	struct tcphdr *tcph;
+ 	int offset = 0;
++	int hdr_len;
+ 
+ 	/* only TCP packets will be aggregated */
+ 	if (skb->protocol == htons(ETH_P_IP)) {
+@@ -1206,14 +1208,20 @@ static void ibmveth_rx_mss_helper(struct sk_buff *skb, u16 mss, int lrg_pkt)
+ 	/* if mss is not set through Large Packet bit/mss in rx buffer,
+ 	 * expect that the mss will be written to the tcp header checksum.
+ 	 */
++	tcph = (struct tcphdr *)(skb->data + offset);
+ 	if (lrg_pkt) {
+ 		skb_shinfo(skb)->gso_size = mss;
+ 	} else if (offset) {
+-		struct tcphdr *tcph = (struct tcphdr *)(skb->data + offset);
+-
+ 		skb_shinfo(skb)->gso_size = ntohs(tcph->check);
+ 		tcph->check = 0;
+ 	}
++
++	if (skb_shinfo(skb)->gso_size) {
++		hdr_len = offset + tcph->doff * 4;
++		skb_shinfo(skb)->gso_segs =
++				DIV_ROUND_UP(skb->len - hdr_len,
++					     skb_shinfo(skb)->gso_size);
++	}
+ }
+ 
+ static int ibmveth_poll(struct napi_struct *napi, int budget)
+-- 
+2.28.0
+
+
+From 8dc821b9f67d9abf2d5baca3eb92a70d91c0dbe0 Mon Sep 17 00:00:00 2001
+From: NeilBrown <neilb@suse.com>
+Date: Mon, 5 Dec 2016 15:10:11 +1100
+Subject: [PATCH 41/46] SUNRPC: fix refcounting problems with auth_gss
+ messages.
+
+commit 1cded9d2974fe4fe339fc0ccd6638b80d465ab2c upstream.
+
+There are two problems with refcounting of auth_gss messages.
+
+First, the reference on the pipe->pipe list (taken by a call
+to rpc_queue_upcall()) is not counted.  It seems to be
+assumed that a message in pipe->pipe will always also be in
+pipe->in_downcall, where it is correctly reference counted.
+
+However there is no guaranty of this.  I have a report of a
+NULL dereferences in rpc_pipe_read() which suggests a msg
+that has been freed is still on the pipe->pipe list.
+
+One way I imagine this might happen is:
+- message is queued for uid=U and auth->service=S1
+- rpc.gssd reads this message and starts processing.
+  This removes the message from pipe->pipe
+- message is queued for uid=U and auth->service=S2
+- rpc.gssd replies to the first message. gss_pipe_downcall()
+  calls __gss_find_upcall(pipe, U, NULL) and it finds the
+  *second* message, as new messages are placed at the head
+  of ->in_downcall, and the service type is not checked.
+- This second message is removed from ->in_downcall and freed
+  by gss_release_msg() (even though it is still on pipe->pipe)
+- rpc.gssd tries to read another message, and dereferences a pointer
+  to this message that has just been freed.
+
+I fix this by incrementing the reference count before calling
+rpc_queue_upcall(), and decrementing it if that fails, or normally in
+gss_pipe_destroy_msg().
+
+It seems strange that the reply doesn't target the message more
+precisely, but I don't know all the details.  In any case, I think the
+reference counting irregularity became a measureable bug when the
+extra arg was added to __gss_find_upcall(), hence the Fixes: line
+below.
+
+The second problem is that if rpc_queue_upcall() fails, the new
+message is not freed. gss_alloc_msg() set the ->count to 1,
+gss_add_msg() increments this to 2, gss_unhash_msg() decrements to 1,
+then the pointer is discarded so the memory never gets freed.
+
+Fixes: 9130b8dbc6ac ("SUNRPC: allow for upcalls for same uid but different gss service")
+Link: https://bugzilla.opensuse.org/show_bug.cgi?id=1011250
+Signed-off-by: NeilBrown <neilb@suse.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sunrpc/auth_gss/auth_gss.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/net/sunrpc/auth_gss/auth_gss.c b/net/sunrpc/auth_gss/auth_gss.c
+index 06095cc8815e..1f0687d8e3d7 100644
+--- a/net/sunrpc/auth_gss/auth_gss.c
++++ b/net/sunrpc/auth_gss/auth_gss.c
+@@ -541,9 +541,13 @@ gss_setup_upcall(struct gss_auth *gss_auth, struct rpc_cred *cred)
+ 		return gss_new;
+ 	gss_msg = gss_add_msg(gss_new);
+ 	if (gss_msg == gss_new) {
+-		int res = rpc_queue_upcall(gss_new->pipe, &gss_new->msg);
++		int res;
++		atomic_inc(&gss_msg->count);
++		res = rpc_queue_upcall(gss_new->pipe, &gss_new->msg);
+ 		if (res) {
+ 			gss_unhash_msg(gss_new);
++			atomic_dec(&gss_msg->count);
++			gss_release_msg(gss_new);
+ 			gss_msg = ERR_PTR(res);
+ 		}
+ 	} else
+@@ -836,6 +840,7 @@ gss_pipe_destroy_msg(struct rpc_pipe_msg *msg)
+ 			warn_gssd();
+ 		gss_release_msg(gss_msg);
+ 	}
++	gss_release_msg(gss_msg);
+ }
+ 
+ static void gss_pipe_dentry_destroy(struct dentry *dir,
+-- 
+2.28.0
+
+
+From 990a142ee0d3b504a0a3c23a16e2cda41c5d45cf Mon Sep 17 00:00:00 2001
+From: Richard Genoud <richard.genoud@gmail.com>
+Date: Tue, 6 Dec 2016 13:05:33 +0100
+Subject: [PATCH 42/46] tty/serial: atmel: RS485 half duplex w/DMA: enable RX
+ after TX is done
+
+commit b389f173aaa1204d6dc1f299082a162eb0491545 upstream.
+
+When using RS485 in half duplex, RX should be enabled when TX is
+finished, and stopped when TX starts.
+
+Before commit 0058f0871efe7b01c6 ("tty/serial: atmel: fix RS485 half
+duplex with DMA"), RX was not disabled in atmel_start_tx() if the DMA
+was used. So, collisions could happened.
+
+But disabling RX in atmel_start_tx() uncovered another bug:
+RX was enabled again in the wrong place (in atmel_tx_dma) instead of
+being enabled when TX is finished (in atmel_complete_tx_dma), so the
+transmission simply stopped.
+
+This bug was not triggered before commit 0058f0871efe7b01c6
+("tty/serial: atmel: fix RS485 half duplex with DMA") because RX was
+never disabled before.
+
+Moving atmel_start_rx() in atmel_complete_tx_dma() corrects the problem.
+
+Reported-by: Gil Weber <webergil@gmail.com>
+Fixes: 0058f0871efe7b01c6
+Tested-by: Gil Weber <webergil@gmail.com>
+Signed-off-by: Richard Genoud <richard.genoud@gmail.com>
+Acked-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+Signed-off-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
+Tested-by: Bryan Evenson <bevenson@melinkcorp.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/tty/serial/atmel_serial.c | 11 +++++------
+ 1 file changed, 5 insertions(+), 6 deletions(-)
+
 diff --git a/drivers/tty/serial/atmel_serial.c b/drivers/tty/serial/atmel_serial.c
 index a15070a7fcd6..53e4d5056db7 100644
 --- a/drivers/tty/serial/atmel_serial.c
@@ -1441,298 +3375,34 @@ index a15070a7fcd6..53e4d5056db7 100644
  	}
  
  	if (uart_circ_chars_pending(xmit) < WAKEUP_CHARS)
-diff --git a/drivers/video/fbdev/xen-fbfront.c b/drivers/video/fbdev/xen-fbfront.c
-index 0567d517eed3..ea2f19f5fbde 100644
---- a/drivers/video/fbdev/xen-fbfront.c
-+++ b/drivers/video/fbdev/xen-fbfront.c
-@@ -644,7 +644,6 @@ static void xenfb_backend_changed(struct xenbus_device *dev,
- 		break;
- 
- 	case XenbusStateInitWait:
--InitWait:
- 		xenbus_switch_state(dev, XenbusStateConnected);
- 		break;
- 
-@@ -655,7 +654,8 @@ InitWait:
- 		 * get Connected twice here.
- 		 */
- 		if (dev->state != XenbusStateConnected)
--			goto InitWait; /* no InitWait seen yet, fudge it */
-+			/* no InitWait seen yet, fudge it */
-+			xenbus_switch_state(dev, XenbusStateConnected);
- 
- 		if (xenbus_scanf(XBT_NIL, info->xbdev->otherend,
- 				 "request-update", "%d", &val) < 0)
-diff --git a/fs/cifs/file.c b/fs/cifs/file.c
-index 72f270d4bd17..a0c0a49b6620 100644
---- a/fs/cifs/file.c
-+++ b/fs/cifs/file.c
-@@ -2545,7 +2545,7 @@ cifs_write_from_iter(loff_t offset, size_t len, struct iov_iter *from,
- 		wdata->credits = credits;
- 
- 		if (!wdata->cfile->invalidHandle ||
--		    !cifs_reopen_file(wdata->cfile, false))
-+		    !(rc = cifs_reopen_file(wdata->cfile, false)))
- 			rc = server->ops->async_writev(wdata,
- 					cifs_uncached_writedata_release);
- 		if (rc) {
-@@ -2958,7 +2958,7 @@ cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
- 		rdata->credits = credits;
- 
- 		if (!rdata->cfile->invalidHandle ||
--		    !cifs_reopen_file(rdata->cfile, true))
-+		    !(rc = cifs_reopen_file(rdata->cfile, true)))
- 			rc = server->ops->async_readv(rdata);
- error:
- 		if (rc) {
-@@ -3544,7 +3544,7 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
- 		}
- 
- 		if (!rdata->cfile->invalidHandle ||
--		    !cifs_reopen_file(rdata->cfile, true))
-+		    !(rc = cifs_reopen_file(rdata->cfile, true)))
- 			rc = server->ops->async_readv(rdata);
- 		if (rc) {
- 			add_credits_and_wake_if(server, rdata->credits, 0);
-diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
-index 7dcc97eadb12..817a937de733 100644
---- a/fs/ext4/inode.c
-+++ b/fs/ext4/inode.c
-@@ -71,10 +71,9 @@ static __u32 ext4_inode_csum(struct inode *inode, struct ext4_inode *raw,
- 			csum = ext4_chksum(sbi, csum, (__u8 *)&dummy_csum,
- 					   csum_size);
- 			offset += csum_size;
--			csum = ext4_chksum(sbi, csum, (__u8 *)raw + offset,
--					   EXT4_INODE_SIZE(inode->i_sb) -
--					   offset);
- 		}
-+		csum = ext4_chksum(sbi, csum, (__u8 *)raw + offset,
-+				   EXT4_INODE_SIZE(inode->i_sb) - offset);
- 	}
- 
- 	return csum;
-diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
-index d598b9c809c1..db1a1427c27a 100644
---- a/fs/proc/task_mmu.c
-+++ b/fs/proc/task_mmu.c
-@@ -803,7 +803,14 @@ static inline void clear_soft_dirty(struct vm_area_struct *vma,
- static inline void clear_soft_dirty_pmd(struct vm_area_struct *vma,
- 		unsigned long addr, pmd_t *pmdp)
- {
--	pmd_t pmd = pmdp_huge_get_and_clear(vma->vm_mm, addr, pmdp);
-+	pmd_t pmd = *pmdp;
-+
-+	/* See comment in change_huge_pmd() */
-+	pmdp_invalidate(vma, addr, pmdp);
-+	if (pmd_dirty(*pmdp))
-+		pmd = pmd_mkdirty(pmd);
-+	if (pmd_young(*pmdp))
-+		pmd = pmd_mkyoung(pmd);
- 
- 	pmd = pmd_wrprotect(pmd);
- 	pmd = pmd_clear_soft_dirty(pmd);
-diff --git a/include/crypto/internal/hash.h b/include/crypto/internal/hash.h
-index 3b4af1d7c7e9..a25414ce2898 100644
---- a/include/crypto/internal/hash.h
-+++ b/include/crypto/internal/hash.h
-@@ -173,6 +173,16 @@ static inline struct ahash_instance *ahash_alloc_instance(
- 	return crypto_alloc_instance2(name, alg, ahash_instance_headroom());
- }
- 
-+static inline void ahash_request_complete(struct ahash_request *req, int err)
-+{
-+	req->base.complete(&req->base, err);
-+}
-+
-+static inline u32 ahash_request_flags(struct ahash_request *req)
-+{
-+	return req->base.flags;
-+}
-+
- static inline struct crypto_ahash *crypto_spawn_ahash(
- 	struct crypto_ahash_spawn *spawn)
- {
-diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
-index cb91b44f5f78..ad2bcf647b9a 100644
---- a/include/linux/cgroup.h
-+++ b/include/linux/cgroup.h
-@@ -528,6 +528,25 @@ static inline void pr_cont_cgroup_path(struct cgroup *cgrp)
- 	pr_cont_kernfs_path(cgrp->kn);
- }
- 
-+static inline void cgroup_init_kthreadd(void)
-+{
-+	/*
-+	 * kthreadd is inherited by all kthreads, keep it in the root so
-+	 * that the new kthreads are guaranteed to stay in the root until
-+	 * initialization is finished.
-+	 */
-+	current->no_cgroup_migration = 1;
-+}
-+
-+static inline void cgroup_kthread_ready(void)
-+{
-+	/*
-+	 * This kthread finished initialization.  The creator should have
-+	 * set PF_NO_SETAFFINITY if this kthread should stay in the root.
-+	 */
-+	current->no_cgroup_migration = 0;
-+}
-+
- #else /* !CONFIG_CGROUPS */
- 
- struct cgroup_subsys_state;
-@@ -551,6 +570,8 @@ static inline void cgroup_free(struct task_struct *p) {}
- 
- static inline int cgroup_init_early(void) { return 0; }
- static inline int cgroup_init(void) { return 0; }
-+static inline void cgroup_init_kthreadd(void) {}
-+static inline void cgroup_kthread_ready(void) {}
- 
- #endif /* !CONFIG_CGROUPS */
- 
-diff --git a/include/linux/sched.h b/include/linux/sched.h
-index ce0f61dcd887..352213b360d7 100644
---- a/include/linux/sched.h
-+++ b/include/linux/sched.h
-@@ -1475,6 +1475,10 @@ struct task_struct {
- #ifdef CONFIG_COMPAT_BRK
- 	unsigned brk_randomized:1;
- #endif
-+#ifdef CONFIG_CGROUPS
-+	/* disallow userland-initiated cgroup migration */
-+	unsigned no_cgroup_migration:1;
-+#endif
- 
- 	unsigned long atomic_flags; /* Flags needing atomic access. */
- 
-diff --git a/kernel/cgroup.c b/kernel/cgroup.c
-index 127c63e02d52..4cb94b678e9f 100644
---- a/kernel/cgroup.c
-+++ b/kernel/cgroup.c
-@@ -2752,11 +2752,12 @@ static ssize_t __cgroup_procs_write(struct kernfs_open_file *of, char *buf,
- 		tsk = tsk->group_leader;
- 
- 	/*
--	 * Workqueue threads may acquire PF_NO_SETAFFINITY and become
--	 * trapped in a cpuset, or RT worker may be born in a cgroup
--	 * with no rt_runtime allocated.  Just say no.
-+	 * kthreads may acquire PF_NO_SETAFFINITY during initialization.
-+	 * If userland migrates such a kthread to a non-root cgroup, it can
-+	 * become trapped in a cpuset, or RT kthread may be born in a
-+	 * cgroup with no rt_runtime allocated.  Just say no.
- 	 */
--	if (tsk == kthreadd_task || (tsk->flags & PF_NO_SETAFFINITY)) {
-+	if (tsk->no_cgroup_migration || (tsk->flags & PF_NO_SETAFFINITY)) {
- 		ret = -EINVAL;
- 		goto out_unlock_rcu;
- 	}
-diff --git a/kernel/kthread.c b/kernel/kthread.c
-index 9ff173dca1ae..850b255649a2 100644
---- a/kernel/kthread.c
-+++ b/kernel/kthread.c
-@@ -18,6 +18,7 @@
- #include <linux/freezer.h>
- #include <linux/ptrace.h>
- #include <linux/uaccess.h>
-+#include <linux/cgroup.h>
- #include <trace/events/sched.h>
- 
- static DEFINE_SPINLOCK(kthread_create_lock);
-@@ -205,6 +206,7 @@ static int kthread(void *_create)
- 	ret = -EINTR;
- 
- 	if (!test_bit(KTHREAD_SHOULD_STOP, &self.flags)) {
-+		cgroup_kthread_ready();
- 		__kthread_parkme(&self);
- 		ret = threadfn(data);
- 	}
-@@ -510,6 +512,7 @@ int kthreadd(void *unused)
- 	set_mems_allowed(node_states[N_MEMORY]);
- 
- 	current->flags |= PF_NOFREEZE;
-+	cgroup_init_kthreadd();
- 
- 	for (;;) {
- 		set_current_state(TASK_INTERRUPTIBLE);
-diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
-index 3f743b147247..34b2a0d5cf1a 100644
---- a/kernel/trace/ftrace.c
-+++ b/kernel/trace/ftrace.c
-@@ -3677,23 +3677,24 @@ static void __enable_ftrace_function_probe(struct ftrace_ops_hash *old_hash)
- 	ftrace_probe_registered = 1;
- }
- 
--static void __disable_ftrace_function_probe(void)
-+static bool __disable_ftrace_function_probe(void)
- {
- 	int i;
- 
- 	if (!ftrace_probe_registered)
--		return;
-+		return false;
- 
- 	for (i = 0; i < FTRACE_FUNC_HASHSIZE; i++) {
- 		struct hlist_head *hhd = &ftrace_func_hash[i];
- 		if (hhd->first)
--			return;
-+			return false;
- 	}
- 
- 	/* no more funcs left */
- 	ftrace_shutdown(&trace_probe_ops, 0);
- 
- 	ftrace_probe_registered = 0;
-+	return true;
- }
- 
- 
-@@ -3820,6 +3821,7 @@ static void
- __unregister_ftrace_function_probe(char *glob, struct ftrace_probe_ops *ops,
- 				  void *data, int flags)
- {
-+	struct ftrace_ops_hash old_hash_ops;
- 	struct ftrace_func_entry *rec_entry;
- 	struct ftrace_func_probe *entry;
- 	struct ftrace_func_probe *p;
-@@ -3831,6 +3833,7 @@ __unregister_ftrace_function_probe(char *glob, struct ftrace_probe_ops *ops,
- 	struct hlist_node *tmp;
- 	char str[KSYM_SYMBOL_LEN];
- 	int i, ret;
-+	bool disabled;
- 
- 	if (glob && (strcmp(glob, "*") == 0 || !strlen(glob)))
- 		func_g.search = NULL;
-@@ -3849,6 +3852,10 @@ __unregister_ftrace_function_probe(char *glob, struct ftrace_probe_ops *ops,
- 
- 	mutex_lock(&trace_probe_ops.func_hash->regex_lock);
- 
-+	old_hash_ops.filter_hash = old_hash;
-+	/* Probes only have filters */
-+	old_hash_ops.notrace_hash = NULL;
-+
- 	hash = alloc_and_copy_ftrace_hash(FTRACE_HASH_DEFAULT_BITS, *orig_hash);
- 	if (!hash)
- 		/* Hmm, should report this somehow */
-@@ -3886,12 +3893,17 @@ __unregister_ftrace_function_probe(char *glob, struct ftrace_probe_ops *ops,
- 		}
- 	}
- 	mutex_lock(&ftrace_lock);
--	__disable_ftrace_function_probe();
-+	disabled = __disable_ftrace_function_probe();
- 	/*
- 	 * Remove after the disable is called. Otherwise, if the last
- 	 * probe is removed, a null hash means *all enabled*.
- 	 */
- 	ret = ftrace_hash_move(&trace_probe_ops, 1, orig_hash, hash);
-+
-+	/* still need to update the function call sites */
-+	if (ftrace_enabled && !disabled)
-+		ftrace_run_modify_code(&trace_probe_ops, FTRACE_UPDATE_CALLS,
-+				       &old_hash_ops);
- 	synchronize_sched();
- 	if (!ret)
- 		free_ftrace_hash_rcu(old_hash);
+-- 
+2.28.0
+
+
+From f00f18ebb3b23134012a020faad85f33cd5d2e8f Mon Sep 17 00:00:00 2001
+From: Mantas M <grawity@gmail.com>
+Date: Fri, 16 Dec 2016 10:30:59 +0200
+Subject: [PATCH 43/46] net: ipv6: check route protocol when deleting routes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit c2ed1880fd61a998e3ce40254a99a2ad000f1a7d upstream.
+
+The protocol field is checked when deleting IPv4 routes, but ignored for
+IPv6, which causes problems with routing daemons accidentally deleting
+externally set routes (observed by multiple bird6 users).
+
+This can be verified using `ip -6 route del <prefix> proto something`.
+
+Signed-off-by: Mantas Mikulėnas <grawity@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv6/route.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
 diff --git a/net/ipv6/route.c b/net/ipv6/route.c
 index 36bf4c3fe4f5..9f0aa255e288 100644
 --- a/net/ipv6/route.c
@@ -1746,6 +3416,50 @@ index 36bf4c3fe4f5..9f0aa255e288 100644
  			dst_hold(&rt->dst);
  			read_unlock_bh(&table->tb6_lock);
  
+-- 
+2.28.0
+
+
+From e2f5fb9207a6bd7101ad94e73264ac8bb9e3b87a Mon Sep 17 00:00:00 2001
+From: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Date: Thu, 23 Feb 2017 09:31:18 -0300
+Subject: [PATCH 44/46] sctp: deny peeloff operation on asocs with threads
+ sleeping on it
+
+commit dfcb9f4f99f1e9a49e43398a7bfbf56927544af1 upstream.
+
+commit 2dcab5984841 ("sctp: avoid BUG_ON on sctp_wait_for_sndbuf")
+attempted to avoid a BUG_ON call when the association being used for a
+sendmsg() is blocked waiting for more sndbuf and another thread did a
+peeloff operation on such asoc, moving it to another socket.
+
+As Ben Hutchings noticed, then in such case it would return without
+locking back the socket and would cause two unlocks in a row.
+
+Further analysis also revealed that it could allow a double free if the
+application managed to peeloff the asoc that is created during the
+sendmsg call, because then sctp_sendmsg() would try to free the asoc
+that was created only for that call.
+
+This patch takes another approach. It will deny the peeloff operation
+if there is a thread sleeping on the asoc, so this situation doesn't
+exist anymore. This avoids the issues described above and also honors
+the syscalls that are already being handled (it can be multiple sendmsg
+calls).
+
+Joint work with Xin Long.
+
+Fixes: 2dcab5984841 ("sctp: avoid BUG_ON on sctp_wait_for_sndbuf")
+Cc: Alexander Popov <alex.popov@linux.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Signed-off-by: Xin Long <lucien.xin@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sctp/socket.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
 diff --git a/net/sctp/socket.c b/net/sctp/socket.c
 index 138f2d667212..5758818435f3 100644
 --- a/net/sctp/socket.c
@@ -1772,30 +3486,79 @@ index 138f2d667212..5758818435f3 100644
  		lock_sock(sk);
  
  		*timeo_p = current_timeo;
-diff --git a/net/sunrpc/auth_gss/auth_gss.c b/net/sunrpc/auth_gss/auth_gss.c
-index 06095cc8815e..1f0687d8e3d7 100644
---- a/net/sunrpc/auth_gss/auth_gss.c
-+++ b/net/sunrpc/auth_gss/auth_gss.c
-@@ -541,9 +541,13 @@ gss_setup_upcall(struct gss_auth *gss_auth, struct rpc_cred *cred)
- 		return gss_new;
- 	gss_msg = gss_add_msg(gss_new);
- 	if (gss_msg == gss_new) {
--		int res = rpc_queue_upcall(gss_new->pipe, &gss_new->msg);
-+		int res;
-+		atomic_inc(&gss_msg->count);
-+		res = rpc_queue_upcall(gss_new->pipe, &gss_new->msg);
- 		if (res) {
- 			gss_unhash_msg(gss_new);
-+			atomic_dec(&gss_msg->count);
-+			gss_release_msg(gss_new);
- 			gss_msg = ERR_PTR(res);
- 		}
- 	} else
-@@ -836,6 +840,7 @@ gss_pipe_destroy_msg(struct rpc_pipe_msg *msg)
- 			warn_gssd();
- 		gss_release_msg(gss_msg);
- 	}
-+	gss_release_msg(gss_msg);
- }
+-- 
+2.28.0
+
+
+From d005579766761216526caa8345d1a1993eff8e24 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Wed, 19 Apr 2017 15:14:54 +0200
+Subject: [PATCH 45/46] MIPS: fix Select HAVE_IRQ_EXIT_ON_IRQ_STACK patch.
+
+Commit f017e58da4aba293e4a6ab62ca5d4801f79cc929 which was commit
+3cc3434fd6307d06b53b98ce83e76bf9807689b9 upstream, was misapplied to the
+4.4 stable kernel.
+
+This patch fixes this and moves the chunk to the proper Kconfig area.
+
+Reported-by: "Maciej W. Rozycki" <macro@linux-mips.org>
+Cc: Matt Redfearn <matt.redfearn@imgtec.com>
+Cc: Jason A. Donenfeld <jason@zx2c4.com>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Cc: Ralf Baechle <ralf@linux-mips.org>
+Cc: Amit Pundir <amit.pundir@linaro.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/mips/Kconfig | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/arch/mips/Kconfig b/arch/mips/Kconfig
+index d5cfa937d622..8b0424abc84c 100644
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -1413,7 +1413,7 @@ config CPU_MIPS32_R6
+ 	select CPU_SUPPORTS_MSA
+ 	select GENERIC_CSUM
+ 	select HAVE_KVM
+-	select MIPS_O32_FP64_SUPPORT if 32BIT
++	select MIPS_O32_FP64_SUPPORT
+ 	help
+ 	  Choose this option to build a kernel for release 6 or later of the
+ 	  MIPS32 architecture.  New MIPS processors, starting with the Warrior
+@@ -1464,7 +1464,7 @@ config CPU_MIPS64_R6
+ 	select CPU_SUPPORTS_HIGHMEM
+ 	select CPU_SUPPORTS_MSA
+ 	select GENERIC_CSUM
+-	select MIPS_O32_FP64_SUPPORT if MIPS32_O32
++	select MIPS_O32_FP64_SUPPORT if 32BIT || MIPS32_O32
+ 	help
+ 	  Choose this option to build a kernel for release 6 or later of the
+ 	  MIPS64 architecture.  New MIPS processors, starting with the Warrior
+-- 
+2.28.0
+
+
+From 81af21fe95ba45261c7894b471e5d7698c4db8f1 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Fri, 21 Apr 2017 09:30:24 +0200
+Subject: [PATCH 46/46] Linux 4.4.63
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 0309acc34472..ec52973043f6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+-SUBLEVEL = 62
++SUBLEVEL = 63
+ EXTRAVERSION =
+ NAME = Blurry Fish Butt
  
- static void gss_pipe_dentry_destroy(struct dentry *dir,
+-- 
+2.28.0
+

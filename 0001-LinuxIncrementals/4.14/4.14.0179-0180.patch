@@ -1,16 +1,110 @@
-diff --git a/Makefile b/Makefile
-index d2baacc1b0f6..525565f44b17 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- # SPDX-License-Identifier: GPL-2.0
- VERSION = 4
- PATCHLEVEL = 14
--SUBLEVEL = 179
-+SUBLEVEL = 180
- EXTRAVERSION =
- NAME = Petit Gorille
+From ad70bc0e012831920f2ddf37f7bd1f07970de9a7 Mon Sep 17 00:00:00 2001
+From: Jia He <justin.he@arm.com>
+Date: Fri, 1 May 2020 12:38:40 +0800
+Subject: [PATCH 01/23] vhost: vsock: kick send_pkt worker once device is
+ started
+
+commit 0b841030625cde5f784dd62aec72d6a766faae70 upstream.
+
+Ning Bo reported an abnormal 2-second gap when booting Kata container [1].
+The unconditional timeout was caused by VSOCK_DEFAULT_CONNECT_TIMEOUT of
+connecting from the client side. The vhost vsock client tries to connect
+an initializing virtio vsock server.
+
+The abnormal flow looks like:
+host-userspace           vhost vsock                       guest vsock
+==============           ===========                       ============
+connect()     -------->  vhost_transport_send_pkt_work()   initializing
+   |                     vq->private_data==NULL
+   |                     will not be queued
+   V
+schedule_timeout(2s)
+                         vhost_vsock_start()  <---------   device ready
+                         set vq->private_data
+
+wait for 2s and failed
+connect() again          vq->private_data!=NULL         recv connecting pkt
+
+Details:
+1. Host userspace sends a connect pkt, at that time, guest vsock is under
+   initializing, hence the vhost_vsock_start has not been called. So
+   vq->private_data==NULL, and the pkt is not been queued to send to guest
+2. Then it sleeps for 2s
+3. After guest vsock finishes initializing, vq->private_data is set
+4. When host userspace wakes up after 2s, send connecting pkt again,
+   everything is fine.
+
+As suggested by Stefano Garzarella, this fixes it by additional kicking the
+send_pkt worker in vhost_vsock_start once the virtio device is started. This
+makes the pending pkt sent again.
+
+After this patch, kata-runtime (with vsock enabled) boot time is reduced
+from 3s to 1s on a ThunderX2 arm64 server.
+
+[1] https://github.com/kata-containers/runtime/issues/1917
+
+Reported-by: Ning Bo <n.b@live.com>
+Suggested-by: Stefano Garzarella <sgarzare@redhat.com>
+Signed-off-by: Jia He <justin.he@arm.com>
+Link: https://lore.kernel.org/r/20200501043840.186557-1-justin.he@arm.com
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Reviewed-by: Stefano Garzarella <sgarzare@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/vhost/vsock.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/vhost/vsock.c b/drivers/vhost/vsock.c
+index 6391dc5b0ebe..834e88e20550 100644
+--- a/drivers/vhost/vsock.c
++++ b/drivers/vhost/vsock.c
+@@ -499,6 +499,11 @@ static int vhost_vsock_start(struct vhost_vsock *vsock)
+ 		mutex_unlock(&vq->mutex);
+ 	}
  
++	/* Some packets may have been queued before the device was started,
++	 * let's kick the send worker to send them.
++	 */
++	vhost_work_queue(&vsock->dev, &vsock->send_pkt_work);
++
+ 	mutex_unlock(&vsock->dev.mutex);
+ 	return 0;
+ 
+-- 
+2.28.0
+
+
+From 929599defc7aef8cee2c0ba836f1b281629e37e2 Mon Sep 17 00:00:00 2001
+From: Alexey Kardashevskiy <aik@ozlabs.ru>
+Date: Wed, 26 Jun 2019 12:37:46 +1000
+Subject: [PATCH 02/23] powerpc/pci/of: Parse unassigned resources
+
+commit dead1c845dbe97e0061dae2017eaf3bd8f8f06ee upstream.
+
+The pseries platform uses the PCI_PROBE_DEVTREE method of PCI probing
+which reads "assigned-addresses" of every PCI device and initializes
+the device resources. However if the property is missing or zero sized,
+then there is no fallback of any kind and the PCI resources remain
+undiscovered, i.e. pdev->resource[] array remains empty.
+
+This adds a fallback which parses the "reg" property in pretty much same
+way except it marks resources as "unset" which later make Linux assign
+those resources proper addresses.
+
+This has an effect when:
+1. a hypervisor failed to assign any resource for a device;
+2. /chosen/linux,pci-probe-only=0 is in the DT so the system may try
+assigning a resource.
+Neither is likely to happen under PowerVM.
+
+Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Cc: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/powerpc/kernel/pci_of_scan.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
 diff --git a/arch/powerpc/kernel/pci_of_scan.c b/arch/powerpc/kernel/pci_of_scan.c
 index 6ca1b3a1e196..54e949d5452d 100644
 --- a/arch/powerpc/kernel/pci_of_scan.c
@@ -43,6 +137,542 @@ index 6ca1b3a1e196..54e949d5452d 100644
  		res->name = pci_name(dev);
  		region.start = base;
  		region.end = base + size - 1;
+-- 
+2.28.0
+
+
+From f111c1d80638aaa6de3b62b4a77e64c0b4f20725 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Amadeusz=20S=C5=82awi=C5=84ski?=
+ <amadeuszx.slawinski@linux.intel.com>
+Date: Fri, 27 Mar 2020 16:47:28 -0400
+Subject: [PATCH 03/23] ASoC: topology: Check return value of pcm_new_ver
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit b3677fc3d68dd942c92de52f0bd9dd8b472a40e6 ]
+
+Function pcm_new_ver can fail, so we should check it's return value and
+handle possible error.
+
+Signed-off-by: Amadeusz Sławiński <amadeuszx.slawinski@linux.intel.com>
+Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+Link: https://lore.kernel.org/r/20200327204729.397-6-amadeuszx.slawinski@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ sound/soc/soc-topology.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/sound/soc/soc-topology.c b/sound/soc/soc-topology.c
+index a215b9ad148c..50aa45525be5 100644
+--- a/sound/soc/soc-topology.c
++++ b/sound/soc/soc-topology.c
+@@ -1954,7 +1954,9 @@ static int soc_tplg_pcm_elems_load(struct soc_tplg *tplg,
+ 			_pcm = pcm;
+ 		} else {
+ 			abi_match = false;
+-			pcm_new_ver(tplg, pcm, &_pcm);
++			ret = pcm_new_ver(tplg, pcm, &_pcm);
++			if (ret < 0)
++				return ret;
+ 		}
+ 
+ 		/* create the FE DAIs and DAI links */
+-- 
+2.28.0
+
+
+From a88e01df10fec0c3c4170a9be3af4ec147287f29 Mon Sep 17 00:00:00 2001
+From: Tyler Hicks <tyhicks@linux.microsoft.com>
+Date: Mon, 13 Apr 2020 15:21:45 -0500
+Subject: [PATCH 04/23] selftests/ipc: Fix test failure seen after initial test
+ run
+
+[ Upstream commit b87080eab4c1377706c113fc9c0157f19ea8fed1 ]
+
+After successfully running the IPC msgque test once, subsequent runs
+result in a test failure:
+
+  $ sudo ./run_kselftest.sh
+  TAP version 13
+  1..1
+  # selftests: ipc: msgque
+  # Failed to get stats for IPC queue with id 0
+  # Failed to dump queue: -22
+  # Bail out!
+  # # Pass 0 Fail 0 Xfail 0 Xpass 0 Skip 0 Error 0
+  not ok 1 selftests: ipc: msgque # exit=1
+
+The dump_queue() function loops through the possible message queue index
+values using calls to msgctl(kern_id, MSG_STAT, ...) where kern_id
+represents the index value. The first time the test is ran, the initial
+index value of 0 is valid and the test is able to complete. The index
+value of 0 is not valid in subsequent test runs and the loop attempts to
+try index values of 1, 2, 3, and so on until a valid index value is
+found that corresponds to the message queue created earlier in the test.
+
+The msgctl() syscall returns -1 and sets errno to EINVAL when invalid
+index values are used. The test failure is caused by incorrectly
+comparing errno to -EINVAL when cycling through possible index values.
+
+Fix invalid test failures on subsequent runs of the msgque test by
+correctly comparing errno values to a non-negated EINVAL.
+
+Fixes: 3a665531a3b7 ("selftests: IPC message queue copy feature test")
+Signed-off-by: Tyler Hicks <tyhicks@linux.microsoft.com>
+Signed-off-by: Shuah Khan <skhan@linuxfoundation.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ tools/testing/selftests/ipc/msgque.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/testing/selftests/ipc/msgque.c b/tools/testing/selftests/ipc/msgque.c
+index c5587844fbb8..ad723a5d0f83 100644
+--- a/tools/testing/selftests/ipc/msgque.c
++++ b/tools/testing/selftests/ipc/msgque.c
+@@ -137,7 +137,7 @@ int dump_queue(struct msgque_data *msgque)
+ 	for (kern_id = 0; kern_id < 256; kern_id++) {
+ 		ret = msgctl(kern_id, MSG_STAT, &ds);
+ 		if (ret < 0) {
+-			if (errno == -EINVAL)
++			if (errno == EINVAL)
+ 				continue;
+ 			printf("Failed to get stats for IPC queue with id %d\n",
+ 					kern_id);
+-- 
+2.28.0
+
+
+From a500f557e4db9bd1415a061695fe72fb52d51bea Mon Sep 17 00:00:00 2001
+From: Sebastian Reichel <sebastian.reichel@collabora.com>
+Date: Tue, 14 Apr 2020 20:11:40 +0200
+Subject: [PATCH 05/23] ASoC: sgtl5000: Fix VAG power-on handling
+
+[ Upstream commit aa7812737f2877e192d57626cbe8825cc7cf6de9 ]
+
+As mentioned slightly out of patch context in the code, there
+is no reset routine for the chip. On boards where the chip is
+supplied by a fixed regulator, it might not even be resetted
+during (e.g. watchdog) reboot and can be in any state.
+
+If the device is probed with VAG enabled, the driver's probe
+routine will generate a loud pop sound when ANA_POWER is
+being programmed. Avoid this by properly disabling just the
+VAG bit and waiting the required power down time.
+
+Signed-off-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Reviewed-by: Fabio Estevam <festivem@gmail.com>
+Link: https://lore.kernel.org/r/20200414181140.145825-1-sebastian.reichel@collabora.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ sound/soc/codecs/sgtl5000.c | 34 ++++++++++++++++++++++++++++++++++
+ sound/soc/codecs/sgtl5000.h |  1 +
+ 2 files changed, 35 insertions(+)
+
+diff --git a/sound/soc/codecs/sgtl5000.c b/sound/soc/codecs/sgtl5000.c
+index ca8a70ab22a8..d64cb28e8dc5 100644
+--- a/sound/soc/codecs/sgtl5000.c
++++ b/sound/soc/codecs/sgtl5000.c
+@@ -1563,6 +1563,40 @@ static int sgtl5000_i2c_probe(struct i2c_client *client,
+ 		dev_err(&client->dev,
+ 			"Error %d initializing CHIP_CLK_CTRL\n", ret);
+ 
++	/* Mute everything to avoid pop from the following power-up */
++	ret = regmap_write(sgtl5000->regmap, SGTL5000_CHIP_ANA_CTRL,
++			   SGTL5000_CHIP_ANA_CTRL_DEFAULT);
++	if (ret) {
++		dev_err(&client->dev,
++			"Error %d muting outputs via CHIP_ANA_CTRL\n", ret);
++		goto disable_clk;
++	}
++
++	/*
++	 * If VAG is powered-on (e.g. from previous boot), it would be disabled
++	 * by the write to ANA_POWER in later steps of the probe code. This
++	 * may create a loud pop even with all outputs muted. The proper way
++	 * to circumvent this is disabling the bit first and waiting the proper
++	 * cool-down time.
++	 */
++	ret = regmap_read(sgtl5000->regmap, SGTL5000_CHIP_ANA_POWER, &value);
++	if (ret) {
++		dev_err(&client->dev, "Failed to read ANA_POWER: %d\n", ret);
++		goto disable_clk;
++	}
++	if (value & SGTL5000_VAG_POWERUP) {
++		ret = regmap_update_bits(sgtl5000->regmap,
++					 SGTL5000_CHIP_ANA_POWER,
++					 SGTL5000_VAG_POWERUP,
++					 0);
++		if (ret) {
++			dev_err(&client->dev, "Error %d disabling VAG\n", ret);
++			goto disable_clk;
++		}
++
++		msleep(SGTL5000_VAG_POWERDOWN_DELAY);
++	}
++
+ 	/* Follow section 2.2.1.1 of AN3663 */
+ 	ana_pwr = SGTL5000_ANA_POWER_DEFAULT;
+ 	if (sgtl5000->num_supplies <= VDDD) {
+diff --git a/sound/soc/codecs/sgtl5000.h b/sound/soc/codecs/sgtl5000.h
+index 22f3442af982..9ea41749d037 100644
+--- a/sound/soc/codecs/sgtl5000.h
++++ b/sound/soc/codecs/sgtl5000.h
+@@ -236,6 +236,7 @@
+ /*
+  * SGTL5000_CHIP_ANA_CTRL
+  */
++#define SGTL5000_CHIP_ANA_CTRL_DEFAULT		0x0133
+ #define SGTL5000_LINE_OUT_MUTE			0x0100
+ #define SGTL5000_HP_SEL_MASK			0x0040
+ #define SGTL5000_HP_SEL_SHIFT			6
+-- 
+2.28.0
+
+
+From 2e8f2acaf32d5e6f31a734d3e19f9cf8c154fc7e Mon Sep 17 00:00:00 2001
+From: Matthias Blankertz <matthias.blankertz@cetitec.com>
+Date: Wed, 15 Apr 2020 16:10:17 +0200
+Subject: [PATCH 06/23] ASoC: rsnd: Fix HDMI channel mapping for multi-SSI mode
+
+[ Upstream commit b94e164759b82d0c1c80d4b1c8f12c9bee83f11d ]
+
+The HDMI?_SEL register maps up to four stereo SSI data lanes onto the
+sdata[0..3] inputs of the HDMI output block. The upper half of the
+register contains four blocks of 4 bits, with the most significant
+controlling the sdata3 line and the least significant the sdata0 line.
+
+The shift calculation has an off-by-one error, causing the parent SSI to
+be mapped to sdata3, the first multi-SSI child to sdata0 and so forth.
+As the parent SSI transmits the stereo L/R channels, and the HDMI core
+expects it on the sdata0 line, this causes no audio to be output when
+playing stereo audio on a multichannel capable HDMI out, and
+multichannel audio has permutated channels.
+
+Fix the shift calculation to map the parent SSI to sdata0, the first
+child to sdata1 etc.
+
+Signed-off-by: Matthias Blankertz <matthias.blankertz@cetitec.com>
+Acked-by: Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+Link: https://lore.kernel.org/r/20200415141017.384017-3-matthias.blankertz@cetitec.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ sound/soc/sh/rcar/ssiu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sound/soc/sh/rcar/ssiu.c b/sound/soc/sh/rcar/ssiu.c
+index 4d948757d300..5e5ed5475473 100644
+--- a/sound/soc/sh/rcar/ssiu.c
++++ b/sound/soc/sh/rcar/ssiu.c
+@@ -172,7 +172,7 @@ static int rsnd_ssiu_init_gen2(struct rsnd_mod *mod,
+ 			i;
+ 
+ 		for_each_rsnd_mod_array(i, pos, io, rsnd_ssi_array) {
+-			shift	= (i * 4) + 16;
++			shift	= (i * 4) + 20;
+ 			val	= (val & ~(0xF << shift)) |
+ 				rsnd_mod_id(pos) << shift;
+ 		}
+-- 
+2.28.0
+
+
+From 95b62395de419da09875db4aa10b4928e9c30024 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Amadeusz=20S=C5=82awi=C5=84ski?=
+ <amadeuszx.slawinski@linux.intel.com>
+Date: Wed, 15 Apr 2020 12:28:49 -0400
+Subject: [PATCH 07/23] ASoC: codecs: hdac_hdmi: Fix incorrect use of
+ list_for_each_entry
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 326b509238171d37402dbe308e154cc234ed1960 ]
+
+If we don't find any pcm, pcm will point at address at an offset from
+the the list head and not a meaningful structure. Fix this by returning
+correct pcm if found and NULL if not. Found with coccinelle.
+
+Signed-off-by: Amadeusz Sławiński <amadeuszx.slawinski@linux.intel.com>
+Link: https://lore.kernel.org/r/20200415162849.308-1-amadeuszx.slawinski@linux.intel.com
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ sound/soc/codecs/hdac_hdmi.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/sound/soc/codecs/hdac_hdmi.c b/sound/soc/codecs/hdac_hdmi.c
+index 1c3626347e12..aeeec1144558 100644
+--- a/sound/soc/codecs/hdac_hdmi.c
++++ b/sound/soc/codecs/hdac_hdmi.c
+@@ -142,14 +142,14 @@ static struct hdac_hdmi_pcm *
+ hdac_hdmi_get_pcm_from_cvt(struct hdac_hdmi_priv *hdmi,
+ 			   struct hdac_hdmi_cvt *cvt)
+ {
+-	struct hdac_hdmi_pcm *pcm = NULL;
++	struct hdac_hdmi_pcm *pcm;
+ 
+ 	list_for_each_entry(pcm, &hdmi->pcm_list, head) {
+ 		if (pcm->cvt == cvt)
+-			break;
++			return pcm;
+ 	}
+ 
+-	return pcm;
++	return NULL;
+ }
+ 
+ static void hdac_hdmi_jack_report(struct hdac_hdmi_pcm *pcm,
+-- 
+2.28.0
+
+
+From 67fd6fa9f1dd770f410d555f9a1d5ef2beee45f2 Mon Sep 17 00:00:00 2001
+From: Xiyu Yang <xiyuyang19@fudan.edu.cn>
+Date: Wed, 15 Apr 2020 16:41:20 +0800
+Subject: [PATCH 08/23] wimax/i2400m: Fix potential urb refcnt leak
+
+[ Upstream commit 7717cbec172c3554d470023b4020d5781961187e ]
+
+i2400mu_bus_bm_wait_for_ack() invokes usb_get_urb(), which increases the
+refcount of the "notif_urb".
+
+When i2400mu_bus_bm_wait_for_ack() returns, local variable "notif_urb"
+becomes invalid, so the refcount should be decreased to keep refcount
+balanced.
+
+The issue happens in all paths of i2400mu_bus_bm_wait_for_ack(), which
+forget to decrease the refcnt increased by usb_get_urb(), causing a
+refcnt leak.
+
+Fix this issue by calling usb_put_urb() before the
+i2400mu_bus_bm_wait_for_ack() returns.
+
+Signed-off-by: Xiyu Yang <xiyuyang19@fudan.edu.cn>
+Signed-off-by: Xin Tan <tanxin.ctf@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/wimax/i2400m/usb-fw.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/net/wimax/i2400m/usb-fw.c b/drivers/net/wimax/i2400m/usb-fw.c
+index 502c346aa790..7d396c81ec3e 100644
+--- a/drivers/net/wimax/i2400m/usb-fw.c
++++ b/drivers/net/wimax/i2400m/usb-fw.c
+@@ -354,6 +354,7 @@ ssize_t i2400mu_bus_bm_wait_for_ack(struct i2400m *i2400m,
+ 		usb_autopm_put_interface(i2400mu->usb_iface);
+ 	d_fnend(8, dev, "(i2400m %p ack %p size %zu) = %ld\n",
+ 		i2400m, ack, ack_size, (long) result);
++	usb_put_urb(&notif_urb);
+ 	return result;
+ 
+ error_exceeded:
+-- 
+2.28.0
+
+
+From 2eb4ce777854e50606d379d8185baefe4c6c4c92 Mon Sep 17 00:00:00 2001
+From: Julien Beraud <julien.beraud@orolia.com>
+Date: Wed, 15 Apr 2020 14:24:31 +0200
+Subject: [PATCH 09/23] net: stmmac: fix enabling socfpga's ptp_ref_clock
+
+[ Upstream commit 15ce30609d1e88d42fb1cd948f453e6d5f188249 ]
+
+There are 2 registers to write to enable a ptp ref clock coming from the
+fpga.
+One that enables the usage of the clock from the fpga for emac0 and emac1
+as a ptp ref clock, and the other to allow signals from the fpga to reach
+emac0 and emac1.
+Currently, if the dwmac-socfpga has phymode set to PHY_INTERFACE_MODE_MII,
+PHY_INTERFACE_MODE_GMII, or PHY_INTERFACE_MODE_SGMII, both registers will
+be written and the ptp ref clock will be set as coming from the fpga.
+Separate the 2 register writes to only enable signals from the fpga to
+reach emac0 or emac1 when ptp ref clock is not coming from the fpga.
+
+Signed-off-by: Julien Beraud <julien.beraud@orolia.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c
+index 5b3b06a0a3bf..33407df6bea6 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c
+@@ -274,16 +274,19 @@ static int socfpga_dwmac_set_phy_mode(struct socfpga_dwmac *dwmac)
+ 	    phymode == PHY_INTERFACE_MODE_MII ||
+ 	    phymode == PHY_INTERFACE_MODE_GMII ||
+ 	    phymode == PHY_INTERFACE_MODE_SGMII) {
+-		ctrl |= SYSMGR_EMACGRP_CTRL_PTP_REF_CLK_MASK << (reg_shift / 2);
+ 		regmap_read(sys_mgr_base_addr, SYSMGR_FPGAGRP_MODULE_REG,
+ 			    &module);
+ 		module |= (SYSMGR_FPGAGRP_MODULE_EMAC << (reg_shift / 2));
+ 		regmap_write(sys_mgr_base_addr, SYSMGR_FPGAGRP_MODULE_REG,
+ 			     module);
+-	} else {
+-		ctrl &= ~(SYSMGR_EMACGRP_CTRL_PTP_REF_CLK_MASK << (reg_shift / 2));
+ 	}
+ 
++	if (dwmac->f2h_ptp_ref_clk)
++		ctrl |= SYSMGR_EMACGRP_CTRL_PTP_REF_CLK_MASK << (reg_shift / 2);
++	else
++		ctrl &= ~(SYSMGR_EMACGRP_CTRL_PTP_REF_CLK_MASK <<
++			  (reg_shift / 2));
++
+ 	regmap_write(sys_mgr_base_addr, reg_offset, ctrl);
+ 
+ 	/* Deassert reset for the phy configuration to be sampled by
+-- 
+2.28.0
+
+
+From 88d82debb1f094ba34382e2f5a9b0c8a1facb671 Mon Sep 17 00:00:00 2001
+From: Julien Beraud <julien.beraud@orolia.com>
+Date: Wed, 15 Apr 2020 14:24:32 +0200
+Subject: [PATCH 10/23] net: stmmac: Fix sub-second increment
+
+[ Upstream commit 91a2559c1dc5b0f7e1256d42b1508935e8eabfbf ]
+
+In fine adjustement mode, which is the current default, the sub-second
+    increment register is the number of nanoseconds that will be added to
+    the clock when the accumulator overflows. At each clock cycle, the
+    value of the addend register is added to the accumulator.
+    Currently, we use 20ns = 1e09ns / 50MHz as this value whatever the
+    frequency of the ptp clock actually is.
+    The adjustment is then done on the addend register, only incrementing
+    every X clock cycles X being the ratio between 50MHz and ptp_clock_rate
+    (addend = 2^32 * 50MHz/ptp_clock_rate).
+    This causes the following issues :
+    - In case the frequency of the ptp clock is inferior or equal to 50MHz,
+      the addend value calculation will overflow and the default
+      addend value will be set to 0, causing the clock to not work at
+      all. (For instance, for ptp_clock_rate = 50MHz, addend = 2^32).
+    - The resolution of the timestamping clock is limited to 20ns while it
+      is not needed, thus limiting the accuracy of the timestamping to
+      20ns.
+
+    Fix this by setting sub-second increment to 2e09ns / ptp_clock_rate.
+    It will allow to reach the minimum possible frequency for
+    ptp_clk_ref, which is 5MHz for GMII 1000Mps Full-Duplex by setting the
+    sub-second-increment to a higher value. For instance, for 25MHz, it
+    gives ssinc = 80ns and default_addend = 2^31.
+    It will also allow to use a lower value for sub-second-increment, thus
+    improving the timestamping accuracy with frequencies higher than
+    100MHz, for instance, for 200MHz, ssinc = 10ns and default_addend =
+    2^31.
+
+v1->v2:
+ - Remove modifications to the calculation of default addend, which broke
+ compatibility with clock frequencies for which 2000000000 / ptp_clk_freq
+ is not an integer.
+ - Modify description according to discussions.
+
+Signed-off-by: Julien Beraud <julien.beraud@orolia.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c    | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
+index 41d528fbebb4..ccf7381c8bae 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
+@@ -36,12 +36,16 @@ static u32 stmmac_config_sub_second_increment(void __iomem *ioaddr,
+ 	unsigned long data;
+ 	u32 reg_value;
+ 
+-	/* For GMAC3.x, 4.x versions, convert the ptp_clock to nano second
+-	 *	formula = (1/ptp_clock) * 1000000000
+-	 * where ptp_clock is 50MHz if fine method is used to update system
++	/* For GMAC3.x, 4.x versions, in "fine adjustement mode" set sub-second
++	 * increment to twice the number of nanoseconds of a clock cycle.
++	 * The calculation of the default_addend value by the caller will set it
++	 * to mid-range = 2^31 when the remainder of this division is zero,
++	 * which will make the accumulator overflow once every 2 ptp_clock
++	 * cycles, adding twice the number of nanoseconds of a clock cycle :
++	 * 2000000000ULL / ptp_clock.
+ 	 */
+ 	if (value & PTP_TCR_TSCFUPDT)
+-		data = (1000000000ULL / 50000000);
++		data = (2000000000ULL / ptp_clock);
+ 	else
+ 		data = (1000000000ULL / ptp_clock);
+ 
+-- 
+2.28.0
+
+
+From 4c49cf3581b920745afc0650613a676dbb81ef60 Mon Sep 17 00:00:00 2001
+From: Ronnie Sahlberg <lsahlber@redhat.com>
+Date: Tue, 21 Apr 2020 12:37:39 +1000
+Subject: [PATCH 11/23] cifs: protect updating server->dstaddr with a spinlock
+
+[ Upstream commit fada37f6f62995cc449b36ebba1220594bfe55fe ]
+
+We use a spinlock while we are reading and accessing the destination address for a server.
+We need to also use this spinlock to protect when we are modifying this address from
+reconn_set_ipaddr().
+
+Signed-off-by: Ronnie Sahlberg <lsahlber@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@kernel.org>
+Signed-off-by: Steve French <stfrench@microsoft.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ fs/cifs/connect.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
+index 697edc92dff2..58e7288e5151 100644
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@ -348,8 +348,10 @@ static int reconn_set_ipaddr(struct TCP_Server_Info *server)
+ 		return rc;
+ 	}
+ 
++	spin_lock(&cifs_tcp_ses_lock);
+ 	rc = cifs_convert_address((struct sockaddr *)&server->dstaddr, ipaddr,
+ 				  strlen(ipaddr));
++	spin_unlock(&cifs_tcp_ses_lock);
+ 	kfree(ipaddr);
+ 
+ 	return !rc ? -1 : 0;
+-- 
+2.28.0
+
+
+From 3ca221d120ab13df15d39c8b854692924b8bfff6 Mon Sep 17 00:00:00 2001
+From: Philipp Rudo <prudo@linux.ibm.com>
+Date: Mon, 6 Apr 2020 14:47:48 +0200
+Subject: [PATCH 12/23] s390/ftrace: fix potential crashes when switching
+ tracers
+
+[ Upstream commit 8ebf6da9db1b2a20bb86cc1bee2552e894d03308 ]
+
+Switching tracers include instruction patching. To prevent that a
+instruction is patched while it's read the instruction patching is done
+in stop_machine 'context'. This also means that any function called
+during stop_machine must not be traced. Thus add 'notrace' to all
+functions called within stop_machine.
+
+Fixes: 1ec2772e0c3c ("s390/diag: add a statistic for diagnose calls")
+Fixes: 38f2c691a4b3 ("s390: improve wait logic of stop_machine")
+Fixes: 4ecf0a43e729 ("processor: get rid of cpu_relax_yield")
+Signed-off-by: Philipp Rudo <prudo@linux.ibm.com>
+Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ arch/s390/kernel/diag.c  | 2 +-
+ arch/s390/kernel/smp.c   | 4 ++--
+ arch/s390/kernel/trace.c | 2 +-
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
 diff --git a/arch/s390/kernel/diag.c b/arch/s390/kernel/diag.c
 index 35c842aa8705..4c7cf8787a84 100644
 --- a/arch/s390/kernel/diag.c
@@ -91,6 +721,88 @@ index 490b52e85014..11a669f3cc93 100644
  {
  	unsigned long flags;
  	unsigned int *depth;
+-- 
+2.28.0
+
+
+From e6b43bda86caffea0453c6d3abb0fe55a7860b31 Mon Sep 17 00:00:00 2001
+From: "Jeremie Francois (on alpha)" <jeremie.francois@gmail.com>
+Date: Fri, 10 Apr 2020 18:57:40 +0200
+Subject: [PATCH 13/23] scripts/config: allow colons in option strings for sed
+
+[ Upstream commit e461bc9f9ab105637b86065d24b0b83f182d477c ]
+
+Sed broke on some strings as it used colon as a separator.
+I made it more robust by using \001, which is legit POSIX AFAIK.
+
+E.g. ./config --set-str CONFIG_USBNET_DEVADDR "de:ad:be:ef:00:01"
+failed with: sed: -e expression #1, char 55: unknown option to `s'
+
+Signed-off-by: Jeremie Francois (on alpha) <jeremie.francois@gmail.com>
+Signed-off-by: Masahiro Yamada <masahiroy@kernel.org>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ scripts/config | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/config b/scripts/config
+index e0e39826dae9..eee5b7f3a092 100755
+--- a/scripts/config
++++ b/scripts/config
+@@ -7,6 +7,9 @@ myname=${0##*/}
+ # If no prefix forced, use the default CONFIG_
+ CONFIG_="${CONFIG_-CONFIG_}"
+ 
++# We use an uncommon delimiter for sed substitutions
++SED_DELIM=$(echo -en "\001")
++
+ usage() {
+ 	cat >&2 <<EOL
+ Manipulate options in a .config file from the command line.
+@@ -83,7 +86,7 @@ txt_subst() {
+ 	local infile="$3"
+ 	local tmpfile="$infile.swp"
+ 
+-	sed -e "s:$before:$after:" "$infile" >"$tmpfile"
++	sed -e "s$SED_DELIM$before$SED_DELIM$after$SED_DELIM" "$infile" >"$tmpfile"
+ 	# replace original file with the edited one
+ 	mv "$tmpfile" "$infile"
+ }
+-- 
+2.28.0
+
+
+From 20d782f80db489769e8f689e2dd8b949b796634d Mon Sep 17 00:00:00 2001
+From: Florian Fainelli <f.fainelli@gmail.com>
+Date: Mon, 20 Apr 2020 20:26:54 -0700
+Subject: [PATCH 14/23] net: dsa: b53: Rework ARL bin logic
+
+[ Upstream commit 6344dbde6a27d10d16246d734b968f84887841e2 ]
+
+When asking the ARL to read a MAC address, we will get a number of bins
+returned in a single read. Out of those bins, there can essentially be 3
+states:
+
+- all bins are full, we have no space left, and we can either replace an
+  existing address or return that full condition
+
+- the MAC address was found, then we need to return its bin index and
+  modify that one, and only that one
+
+- the MAC address was not found and we have a least one bin free, we use
+  that bin index location then
+
+The code would unfortunately fail on all counts.
+
+Fixes: 1da6df85c6fb ("net: dsa: b53: Implement ARL add/del/dump operations")
+Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/dsa/b53/b53_common.c | 30 ++++++++++++++++++++++++++----
+ drivers/net/dsa/b53/b53_regs.h   |  3 +++
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
 diff --git a/drivers/net/dsa/b53/b53_common.c b/drivers/net/dsa/b53/b53_common.c
 index 434e6dced6b7..274d36915110 100644
 --- a/drivers/net/dsa/b53/b53_common.c
@@ -174,20 +886,161 @@ index 1b2a337d673d..247aef92b759 100644
  /* ARL Search Control Register (8 bit) */
  #define B53_ARL_SRCH_CTL		0x50
  #define B53_ARL_SRCH_CTL_25		0x20
-diff --git a/drivers/net/ethernet/broadcom/bcmsysport.c b/drivers/net/ethernet/broadcom/bcmsysport.c
-index f48f7d104af2..123ee5c11bc0 100644
---- a/drivers/net/ethernet/broadcom/bcmsysport.c
-+++ b/drivers/net/ethernet/broadcom/bcmsysport.c
-@@ -645,7 +645,8 @@ static struct sk_buff *bcm_sysport_rx_refill(struct bcm_sysport_priv *priv,
- 	dma_addr_t mapping;
- 
- 	/* Allocate a new SKB for a new packet */
--	skb = netdev_alloc_skb(priv->netdev, RX_BUF_LENGTH);
-+	skb = __netdev_alloc_skb(priv->netdev, RX_BUF_LENGTH,
-+				 GFP_ATOMIC | __GFP_NOWARN);
- 	if (!skb) {
- 		priv->mib.alloc_rx_buff_failed++;
- 		netif_err(priv, rx_err, ndev, "SKB alloc failed\n");
+-- 
+2.28.0
+
+
+From f7cfbf422d3963207c16a3ed548db8b0ee4cd042 Mon Sep 17 00:00:00 2001
+From: Nathan Chancellor <natechancellor@gmail.com>
+Date: Mon, 13 Apr 2020 12:50:42 -0700
+Subject: [PATCH 15/23] lib/mpi: Fix building for powerpc with clang
+
+[ Upstream commit 5990cdee689c6885b27c6d969a3d58b09002b0bc ]
+
+0day reports over and over on an powerpc randconfig with clang:
+
+lib/mpi/generic_mpih-mul1.c:37:13: error: invalid use of a cast in a
+inline asm context requiring an l-value: remove the cast or build with
+-fheinous-gnu-extensions
+
+Remove the superfluous casts, which have been done previously for x86
+and arm32 in commit dea632cadd12 ("lib/mpi: fix build with clang") and
+commit 7b7c1df2883d ("lib/mpi/longlong.h: fix building with 32-bit
+x86").
+
+Reported-by: kbuild test robot <lkp@intel.com>
+Signed-off-by: Nathan Chancellor <natechancellor@gmail.com>
+Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
+Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://github.com/ClangBuiltLinux/linux/issues/991
+Link: https://lore.kernel.org/r/20200413195041.24064-1-natechancellor@gmail.com
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ lib/mpi/longlong.h | 34 +++++++++++++++++-----------------
+ 1 file changed, 17 insertions(+), 17 deletions(-)
+
+diff --git a/lib/mpi/longlong.h b/lib/mpi/longlong.h
+index 08c60d10747f..e01b705556aa 100644
+--- a/lib/mpi/longlong.h
++++ b/lib/mpi/longlong.h
+@@ -756,22 +756,22 @@ do {									\
+ do { \
+ 	if (__builtin_constant_p(bh) && (bh) == 0) \
+ 		__asm__ ("{a%I4|add%I4c} %1,%3,%4\n\t{aze|addze} %0,%2" \
+-		: "=r" ((USItype)(sh)), \
+-		"=&r" ((USItype)(sl)) \
++		: "=r" (sh), \
++		"=&r" (sl) \
+ 		: "%r" ((USItype)(ah)), \
+ 		"%r" ((USItype)(al)), \
+ 		"rI" ((USItype)(bl))); \
+ 	else if (__builtin_constant_p(bh) && (bh) == ~(USItype) 0) \
+ 		__asm__ ("{a%I4|add%I4c} %1,%3,%4\n\t{ame|addme} %0,%2" \
+-		: "=r" ((USItype)(sh)), \
+-		"=&r" ((USItype)(sl)) \
++		: "=r" (sh), \
++		"=&r" (sl) \
+ 		: "%r" ((USItype)(ah)), \
+ 		"%r" ((USItype)(al)), \
+ 		"rI" ((USItype)(bl))); \
+ 	else \
+ 		__asm__ ("{a%I5|add%I5c} %1,%4,%5\n\t{ae|adde} %0,%2,%3" \
+-		: "=r" ((USItype)(sh)), \
+-		"=&r" ((USItype)(sl)) \
++		: "=r" (sh), \
++		"=&r" (sl) \
+ 		: "%r" ((USItype)(ah)), \
+ 		"r" ((USItype)(bh)), \
+ 		"%r" ((USItype)(al)), \
+@@ -781,36 +781,36 @@ do { \
+ do { \
+ 	if (__builtin_constant_p(ah) && (ah) == 0) \
+ 		__asm__ ("{sf%I3|subf%I3c} %1,%4,%3\n\t{sfze|subfze} %0,%2" \
+-		: "=r" ((USItype)(sh)), \
+-		"=&r" ((USItype)(sl)) \
++		: "=r" (sh), \
++		"=&r" (sl) \
+ 		: "r" ((USItype)(bh)), \
+ 		"rI" ((USItype)(al)), \
+ 		"r" ((USItype)(bl))); \
+ 	else if (__builtin_constant_p(ah) && (ah) == ~(USItype) 0) \
+ 		__asm__ ("{sf%I3|subf%I3c} %1,%4,%3\n\t{sfme|subfme} %0,%2" \
+-		: "=r" ((USItype)(sh)), \
+-		"=&r" ((USItype)(sl)) \
++		: "=r" (sh), \
++		"=&r" (sl) \
+ 		: "r" ((USItype)(bh)), \
+ 		"rI" ((USItype)(al)), \
+ 		"r" ((USItype)(bl))); \
+ 	else if (__builtin_constant_p(bh) && (bh) == 0) \
+ 		__asm__ ("{sf%I3|subf%I3c} %1,%4,%3\n\t{ame|addme} %0,%2" \
+-		: "=r" ((USItype)(sh)), \
+-		"=&r" ((USItype)(sl)) \
++		: "=r" (sh), \
++		"=&r" (sl) \
+ 		: "r" ((USItype)(ah)), \
+ 		"rI" ((USItype)(al)), \
+ 		"r" ((USItype)(bl))); \
+ 	else if (__builtin_constant_p(bh) && (bh) == ~(USItype) 0) \
+ 		__asm__ ("{sf%I3|subf%I3c} %1,%4,%3\n\t{aze|addze} %0,%2" \
+-		: "=r" ((USItype)(sh)), \
+-		"=&r" ((USItype)(sl)) \
++		: "=r" (sh), \
++		"=&r" (sl) \
+ 		: "r" ((USItype)(ah)), \
+ 		"rI" ((USItype)(al)), \
+ 		"r" ((USItype)(bl))); \
+ 	else \
+ 		__asm__ ("{sf%I4|subf%I4c} %1,%5,%4\n\t{sfe|subfe} %0,%3,%2" \
+-		: "=r" ((USItype)(sh)), \
+-		"=&r" ((USItype)(sl)) \
++		: "=r" (sh), \
++		"=&r" (sl) \
+ 		: "r" ((USItype)(ah)), \
+ 		"r" ((USItype)(bh)), \
+ 		"rI" ((USItype)(al)), \
+@@ -821,7 +821,7 @@ do { \
+ do { \
+ 	USItype __m0 = (m0), __m1 = (m1); \
+ 	__asm__ ("mulhwu %0,%1,%2" \
+-	: "=r" ((USItype) ph) \
++	: "=r" (ph) \
+ 	: "%r" (__m0), \
+ 	"r" (__m1)); \
+ 	(pl) = __m0 * __m1; \
+-- 
+2.28.0
+
+
+From 27bdb2bdf2d5e3db8e4aec4b32ce6b79359efcc3 Mon Sep 17 00:00:00 2001
+From: Doug Berger <opendmb@gmail.com>
+Date: Thu, 23 Apr 2020 16:02:11 -0700
+Subject: [PATCH 16/23] net: bcmgenet: suppress warnings on failed Rx SKB
+ allocations
+
+[ Upstream commit ecaeceb8a8a145d93c7e136f170238229165348f ]
+
+The driver is designed to drop Rx packets and reclaim the buffers
+when an allocation fails, and the network interface needs to safely
+handle this packet loss. Therefore, an allocation failure of Rx
+SKBs is relatively benign.
+
+However, the output of the warning message occurs with a high
+scheduling priority that can cause excessive jitter/latency for
+other high priority processing.
+
+This commit suppresses the warning messages to prevent scheduling
+problems while retaining the failure count in the statistics of
+the network interface.
+
+Signed-off-by: Doug Berger <opendmb@gmail.com>
+Acked-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/broadcom/genet/bcmgenet.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
 diff --git a/drivers/net/ethernet/broadcom/genet/bcmgenet.c b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
 index 4b3660c63b86..38391230ca86 100644
 --- a/drivers/net/ethernet/broadcom/genet/bcmgenet.c
@@ -202,121 +1055,133 @@ index 4b3660c63b86..38391230ca86 100644
  	if (!skb) {
  		priv->mib.alloc_rx_buff_failed++;
  		netif_err(priv, rx_err, priv->dev,
-diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c
-index 5b3b06a0a3bf..33407df6bea6 100644
---- a/drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c
-+++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-socfpga.c
-@@ -274,16 +274,19 @@ static int socfpga_dwmac_set_phy_mode(struct socfpga_dwmac *dwmac)
- 	    phymode == PHY_INTERFACE_MODE_MII ||
- 	    phymode == PHY_INTERFACE_MODE_GMII ||
- 	    phymode == PHY_INTERFACE_MODE_SGMII) {
--		ctrl |= SYSMGR_EMACGRP_CTRL_PTP_REF_CLK_MASK << (reg_shift / 2);
- 		regmap_read(sys_mgr_base_addr, SYSMGR_FPGAGRP_MODULE_REG,
- 			    &module);
- 		module |= (SYSMGR_FPGAGRP_MODULE_EMAC << (reg_shift / 2));
- 		regmap_write(sys_mgr_base_addr, SYSMGR_FPGAGRP_MODULE_REG,
- 			     module);
--	} else {
--		ctrl &= ~(SYSMGR_EMACGRP_CTRL_PTP_REF_CLK_MASK << (reg_shift / 2));
- 	}
+-- 
+2.28.0
+
+
+From b39a1578fbcaa0c0acc930e31c5eef46814b2f16 Mon Sep 17 00:00:00 2001
+From: Doug Berger <opendmb@gmail.com>
+Date: Thu, 23 Apr 2020 16:13:30 -0700
+Subject: [PATCH 17/23] net: systemport: suppress warnings on failed Rx SKB
+ allocations
+
+[ Upstream commit 3554e54a46125030c534820c297ed7f6c3907e24 ]
+
+The driver is designed to drop Rx packets and reclaim the buffers
+when an allocation fails, and the network interface needs to safely
+handle this packet loss. Therefore, an allocation failure of Rx
+SKBs is relatively benign.
+
+However, the output of the warning message occurs with a high
+scheduling priority that can cause excessive jitter/latency for
+other high priority processing.
+
+This commit suppresses the warning messages to prevent scheduling
+problems while retaining the failure count in the statistics of
+the network interface.
+
+Signed-off-by: Doug Berger <opendmb@gmail.com>
+Acked-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <sashal@kernel.org>
+---
+ drivers/net/ethernet/broadcom/bcmsysport.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bcmsysport.c b/drivers/net/ethernet/broadcom/bcmsysport.c
+index f48f7d104af2..123ee5c11bc0 100644
+--- a/drivers/net/ethernet/broadcom/bcmsysport.c
++++ b/drivers/net/ethernet/broadcom/bcmsysport.c
+@@ -645,7 +645,8 @@ static struct sk_buff *bcm_sysport_rx_refill(struct bcm_sysport_priv *priv,
+ 	dma_addr_t mapping;
  
-+	if (dwmac->f2h_ptp_ref_clk)
-+		ctrl |= SYSMGR_EMACGRP_CTRL_PTP_REF_CLK_MASK << (reg_shift / 2);
+ 	/* Allocate a new SKB for a new packet */
+-	skb = netdev_alloc_skb(priv->netdev, RX_BUF_LENGTH);
++	skb = __netdev_alloc_skb(priv->netdev, RX_BUF_LENGTH,
++				 GFP_ATOMIC | __GFP_NOWARN);
+ 	if (!skb) {
+ 		priv->mib.alloc_rx_buff_failed++;
+ 		netif_err(priv, rx_err, ndev, "SKB alloc failed\n");
+-- 
+2.28.0
+
+
+From 3aa030ab4a2db5deac9ae574e25b972b39d6c0d7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jere=20Lepp=C3=A4nen?= <jere.leppanen@nokia.com>
+Date: Tue, 21 Apr 2020 22:03:42 +0300
+Subject: [PATCH 18/23] sctp: Fix SHUTDOWN CTSN Ack in the peer restart case
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 12dfd78e3a74825e6f0bc8df7ef9f938fbc6bfe3 upstream.
+
+When starting shutdown in sctp_sf_do_dupcook_a(), get the value for
+SHUTDOWN Cumulative TSN Ack from the new association, which is
+reconstructed from the cookie, instead of the old association, which
+the peer doesn't have anymore.
+
+Otherwise the SHUTDOWN is either ignored or replied to with an ABORT
+by the peer because CTSN Ack doesn't match the peer's Initial TSN.
+
+Fixes: bdf6fa52f01b ("sctp: handle association restarts when the socket is closed.")
+Signed-off-by: Jere Leppänen <jere.leppanen@nokia.com>
+Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sctp/sm_make_chunk.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
+index f67df16bd340..e698edd56bd5 100644
+--- a/net/sctp/sm_make_chunk.c
++++ b/net/sctp/sm_make_chunk.c
+@@ -858,7 +858,11 @@ struct sctp_chunk *sctp_make_shutdown(const struct sctp_association *asoc,
+ 	struct sctp_chunk *retval;
+ 	__u32 ctsn;
+ 
+-	ctsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
++	if (chunk && chunk->asoc)
++		ctsn = sctp_tsnmap_get_ctsn(&chunk->asoc->peer.tsn_map);
 +	else
-+		ctrl &= ~(SYSMGR_EMACGRP_CTRL_PTP_REF_CLK_MASK <<
-+			  (reg_shift / 2));
++		ctsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
 +
- 	regmap_write(sys_mgr_base_addr, reg_offset, ctrl);
+ 	shut.cum_tsn_ack = htonl(ctsn);
  
- 	/* Deassert reset for the phy configuration to be sampled by
-diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
-index 41d528fbebb4..ccf7381c8bae 100644
---- a/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
-+++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_hwtstamp.c
-@@ -36,12 +36,16 @@ static u32 stmmac_config_sub_second_increment(void __iomem *ioaddr,
- 	unsigned long data;
- 	u32 reg_value;
- 
--	/* For GMAC3.x, 4.x versions, convert the ptp_clock to nano second
--	 *	formula = (1/ptp_clock) * 1000000000
--	 * where ptp_clock is 50MHz if fine method is used to update system
-+	/* For GMAC3.x, 4.x versions, in "fine adjustement mode" set sub-second
-+	 * increment to twice the number of nanoseconds of a clock cycle.
-+	 * The calculation of the default_addend value by the caller will set it
-+	 * to mid-range = 2^31 when the remainder of this division is zero,
-+	 * which will make the accumulator overflow once every 2 ptp_clock
-+	 * cycles, adding twice the number of nanoseconds of a clock cycle :
-+	 * 2000000000ULL / ptp_clock.
- 	 */
- 	if (value & PTP_TCR_TSCFUPDT)
--		data = (1000000000ULL / 50000000);
-+		data = (2000000000ULL / ptp_clock);
- 	else
- 		data = (1000000000ULL / ptp_clock);
- 
-diff --git a/drivers/net/wimax/i2400m/usb-fw.c b/drivers/net/wimax/i2400m/usb-fw.c
-index 502c346aa790..7d396c81ec3e 100644
---- a/drivers/net/wimax/i2400m/usb-fw.c
-+++ b/drivers/net/wimax/i2400m/usb-fw.c
-@@ -354,6 +354,7 @@ out:
- 		usb_autopm_put_interface(i2400mu->usb_iface);
- 	d_fnend(8, dev, "(i2400m %p ack %p size %zu) = %ld\n",
- 		i2400m, ack, ack_size, (long) result);
-+	usb_put_urb(&notif_urb);
- 	return result;
- 
- error_exceeded:
-diff --git a/drivers/vhost/vsock.c b/drivers/vhost/vsock.c
-index 6391dc5b0ebe..834e88e20550 100644
---- a/drivers/vhost/vsock.c
-+++ b/drivers/vhost/vsock.c
-@@ -499,6 +499,11 @@ static int vhost_vsock_start(struct vhost_vsock *vsock)
- 		mutex_unlock(&vq->mutex);
- 	}
- 
-+	/* Some packets may have been queued before the device was started,
-+	 * let's kick the send worker to send them.
-+	 */
-+	vhost_work_queue(&vsock->dev, &vsock->send_pkt_work);
-+
- 	mutex_unlock(&vsock->dev.mutex);
- 	return 0;
- 
-diff --git a/fs/cifs/connect.c b/fs/cifs/connect.c
-index 697edc92dff2..58e7288e5151 100644
---- a/fs/cifs/connect.c
-+++ b/fs/cifs/connect.c
-@@ -348,8 +348,10 @@ static int reconn_set_ipaddr(struct TCP_Server_Info *server)
- 		return rc;
- 	}
- 
-+	spin_lock(&cifs_tcp_ses_lock);
- 	rc = cifs_convert_address((struct sockaddr *)&server->dstaddr, ipaddr,
- 				  strlen(ipaddr));
-+	spin_unlock(&cifs_tcp_ses_lock);
- 	kfree(ipaddr);
- 
- 	return !rc ? -1 : 0;
-diff --git a/include/linux/ieee80211.h b/include/linux/ieee80211.h
-index 2e179778576c..c316ff030b1d 100644
---- a/include/linux/ieee80211.h
-+++ b/include/linux/ieee80211.h
-@@ -621,6 +621,15 @@ static inline bool ieee80211_is_qos_nullfunc(__le16 fc)
- 	       cpu_to_le16(IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_NULLFUNC);
- }
- 
-+/**
-+ * ieee80211_is_any_nullfunc - check if frame is regular or QoS nullfunc frame
-+ * @fc: frame control bytes in little-endian byteorder
-+ */
-+static inline bool ieee80211_is_any_nullfunc(__le16 fc)
-+{
-+	return (ieee80211_is_nullfunc(fc) || ieee80211_is_qos_nullfunc(fc));
-+}
-+
- /**
-  * ieee80211_is_bufferable_mmpdu - check if frame is bufferable MMPDU
-  * @fc: frame control field in little-endian byteorder
+ 	retval = sctp_make_control(asoc, SCTP_CID_SHUTDOWN, 0,
+-- 
+2.28.0
+
+
+From dc13f456ff64d205a62e339c3a60b3d1951bcbe1 Mon Sep 17 00:00:00 2001
+From: "Steven Rostedt (VMware)" <rostedt@goodmis.org>
+Date: Thu, 21 Sep 2017 16:22:49 -0400
+Subject: [PATCH 19/23] tracing: Reverse the order of trace_types_lock and
+ event_mutex
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+commit 12ecef0cb12102d8c034770173d2d1363cb97d52 upstream.
+
+In order to make future changes where we need to call
+tracing_set_clock() from within an event command, the order of
+trace_types_lock and event_mutex must be reversed, as the event command
+will hold event_mutex and the trace_types_lock is taken from within
+tracing_set_clock().
+
+Link: http://lkml.kernel.org/r/20170921162249.0dde3dca@gandalf.local.home
+
+Requested-by: Tom Zanussi <tom.zanussi@linux.intel.com>
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Cc: Andress Kuo (郭孟修) <Andress.Kuo@mediatek.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ kernel/trace/trace.c        |  5 +++++
+ kernel/trace/trace_events.c | 31 +++++++++++++++----------------
+ 2 files changed, 20 insertions(+), 16 deletions(-)
+
 diff --git a/kernel/trace/trace.c b/kernel/trace/trace.c
 index 207d7c35214f..62c390a1cea8 100644
 --- a/kernel/trace/trace.c
@@ -490,111 +1355,121 @@ index 2b0a01b2be2d..421166a39253 100644
  	return 0;
  }
  
-diff --git a/lib/mpi/longlong.h b/lib/mpi/longlong.h
-index 08c60d10747f..e01b705556aa 100644
---- a/lib/mpi/longlong.h
-+++ b/lib/mpi/longlong.h
-@@ -756,22 +756,22 @@ do {									\
- do { \
- 	if (__builtin_constant_p(bh) && (bh) == 0) \
- 		__asm__ ("{a%I4|add%I4c} %1,%3,%4\n\t{aze|addze} %0,%2" \
--		: "=r" ((USItype)(sh)), \
--		"=&r" ((USItype)(sl)) \
-+		: "=r" (sh), \
-+		"=&r" (sl) \
- 		: "%r" ((USItype)(ah)), \
- 		"%r" ((USItype)(al)), \
- 		"rI" ((USItype)(bl))); \
- 	else if (__builtin_constant_p(bh) && (bh) == ~(USItype) 0) \
- 		__asm__ ("{a%I4|add%I4c} %1,%3,%4\n\t{ame|addme} %0,%2" \
--		: "=r" ((USItype)(sh)), \
--		"=&r" ((USItype)(sl)) \
-+		: "=r" (sh), \
-+		"=&r" (sl) \
- 		: "%r" ((USItype)(ah)), \
- 		"%r" ((USItype)(al)), \
- 		"rI" ((USItype)(bl))); \
- 	else \
- 		__asm__ ("{a%I5|add%I5c} %1,%4,%5\n\t{ae|adde} %0,%2,%3" \
--		: "=r" ((USItype)(sh)), \
--		"=&r" ((USItype)(sl)) \
-+		: "=r" (sh), \
-+		"=&r" (sl) \
- 		: "%r" ((USItype)(ah)), \
- 		"r" ((USItype)(bh)), \
- 		"%r" ((USItype)(al)), \
-@@ -781,36 +781,36 @@ do { \
- do { \
- 	if (__builtin_constant_p(ah) && (ah) == 0) \
- 		__asm__ ("{sf%I3|subf%I3c} %1,%4,%3\n\t{sfze|subfze} %0,%2" \
--		: "=r" ((USItype)(sh)), \
--		"=&r" ((USItype)(sl)) \
-+		: "=r" (sh), \
-+		"=&r" (sl) \
- 		: "r" ((USItype)(bh)), \
- 		"rI" ((USItype)(al)), \
- 		"r" ((USItype)(bl))); \
- 	else if (__builtin_constant_p(ah) && (ah) == ~(USItype) 0) \
- 		__asm__ ("{sf%I3|subf%I3c} %1,%4,%3\n\t{sfme|subfme} %0,%2" \
--		: "=r" ((USItype)(sh)), \
--		"=&r" ((USItype)(sl)) \
-+		: "=r" (sh), \
-+		"=&r" (sl) \
- 		: "r" ((USItype)(bh)), \
- 		"rI" ((USItype)(al)), \
- 		"r" ((USItype)(bl))); \
- 	else if (__builtin_constant_p(bh) && (bh) == 0) \
- 		__asm__ ("{sf%I3|subf%I3c} %1,%4,%3\n\t{ame|addme} %0,%2" \
--		: "=r" ((USItype)(sh)), \
--		"=&r" ((USItype)(sl)) \
-+		: "=r" (sh), \
-+		"=&r" (sl) \
- 		: "r" ((USItype)(ah)), \
- 		"rI" ((USItype)(al)), \
- 		"r" ((USItype)(bl))); \
- 	else if (__builtin_constant_p(bh) && (bh) == ~(USItype) 0) \
- 		__asm__ ("{sf%I3|subf%I3c} %1,%4,%3\n\t{aze|addze} %0,%2" \
--		: "=r" ((USItype)(sh)), \
--		"=&r" ((USItype)(sl)) \
-+		: "=r" (sh), \
-+		"=&r" (sl) \
- 		: "r" ((USItype)(ah)), \
- 		"rI" ((USItype)(al)), \
- 		"r" ((USItype)(bl))); \
- 	else \
- 		__asm__ ("{sf%I4|subf%I4c} %1,%5,%4\n\t{sfe|subfe} %0,%3,%2" \
--		: "=r" ((USItype)(sh)), \
--		"=&r" ((USItype)(sl)) \
-+		: "=r" (sh), \
-+		"=&r" (sl) \
- 		: "r" ((USItype)(ah)), \
- 		"r" ((USItype)(bh)), \
- 		"rI" ((USItype)(al)), \
-@@ -821,7 +821,7 @@ do { \
- do { \
- 	USItype __m0 = (m0), __m1 = (m1); \
- 	__asm__ ("mulhwu %0,%1,%2" \
--	: "=r" ((USItype) ph) \
-+	: "=r" (ph) \
- 	: "%r" (__m0), \
- 	"r" (__m1)); \
- 	(pl) = __m0 * __m1; \
-diff --git a/net/core/netclassid_cgroup.c b/net/core/netclassid_cgroup.c
-index 67feeb207dad..668330ace961 100644
---- a/net/core/netclassid_cgroup.c
-+++ b/net/core/netclassid_cgroup.c
-@@ -131,10 +131,8 @@ static int write_classid(struct cgroup_subsys_state *css, struct cftype *cft,
- 	cs->classid = (u32)value;
+-- 
+2.28.0
+
+
+From 092d8c20f03eb33920de5205d5d545fb4a6b7aeb Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Fri, 24 Apr 2020 08:12:22 +0200
+Subject: [PATCH 20/23] ALSA: hda: Match both PCI ID and SSID for driver
+ blacklist
+
+commit 977dfef40c8996b69afe23a9094d184049efb7bb upstream.
+
+The commit 3c6fd1f07ed0 ("ALSA: hda: Add driver blacklist") added a
+new blacklist for the devices that are known to have empty codecs, and
+one of the entries was ASUS ROG Zenith II (PCI SSID 1043:874f).
+However, it turned out that the very same PCI SSID is used for the
+previous model that does have the valid HD-audio codecs and the change
+broke the sound on it.
+
+Since the empty codec problem appear on the certain AMD platform (PCI
+ID 1022:1487), this patch changes the blacklist matching to both PCI
+ID and SSID using pci_match_id().  Also, the entry that was removed by
+the previous fix for ASUS ROG Zenigh II is re-added.
+
+Link: https://lore.kernel.org/r/20200424061222.19792-1-tiwai@suse.de
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ sound/pci/hda/hda_intel.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/sound/pci/hda/hda_intel.c b/sound/pci/hda/hda_intel.c
+index 46670da04707..7779f5460715 100644
+--- a/sound/pci/hda/hda_intel.c
++++ b/sound/pci/hda/hda_intel.c
+@@ -2172,9 +2172,10 @@ static const struct hdac_io_ops pci_hda_io_ops = {
+  * some HD-audio PCI entries are exposed without any codecs, and such devices
+  * should be ignored from the beginning.
+  */
+-static const struct snd_pci_quirk driver_blacklist[] = {
+-	SND_PCI_QUIRK(0x1462, 0xcb59, "MSI TRX40 Creator", 0),
+-	SND_PCI_QUIRK(0x1462, 0xcb60, "MSI TRX40", 0),
++static const struct pci_device_id driver_blacklist[] = {
++	{ PCI_DEVICE_SUB(0x1022, 0x1487, 0x1043, 0x874f) }, /* ASUS ROG Zenith II / Strix */
++	{ PCI_DEVICE_SUB(0x1022, 0x1487, 0x1462, 0xcb59) }, /* MSI TRX40 Creator */
++	{ PCI_DEVICE_SUB(0x1022, 0x1487, 0x1462, 0xcb60) }, /* MSI TRX40 */
+ 	{}
+ };
  
- 	css_task_iter_start(css, 0, &it);
--	while ((p = css_task_iter_next(&it))) {
-+	while ((p = css_task_iter_next(&it)))
- 		update_classid_task(p, cs->classid);
--		cond_resched();
--	}
- 	css_task_iter_end(&it);
+@@ -2197,7 +2198,7 @@ static int azx_probe(struct pci_dev *pci,
+ 	bool schedule_probe;
+ 	int err;
  
- 	return 0;
+-	if (snd_pci_quirk_lookup(pci, driver_blacklist)) {
++	if (pci_match_id(driver_blacklist, pci)) {
+ 		dev_info(&pci->dev, "Skipping the blacklisted device\n");
+ 		return -ENODEV;
+ 	}
+-- 
+2.28.0
+
+
+From 1bfd4bed884d075f90793f297bc4ac09df3bd844 Mon Sep 17 00:00:00 2001
+From: Thomas Pedersen <thomas@adapt-ip.com>
+Date: Mon, 13 Jan 2020 21:59:40 -0800
+Subject: [PATCH 21/23] mac80211: add ieee80211_is_any_nullfunc()
+
+commit 30b2f0be23fb40e58d0ad2caf8702c2a44cda2e1 upstream.
+
+commit 08a5bdde3812 ("mac80211: consider QoS Null frames for STA_NULLFUNC_ACKED")
+Fixed a bug where we failed to take into account a
+nullfunc frame can be either non-QoS or QoS. It turns out
+there is at least one more bug in
+ieee80211_sta_tx_notify(), introduced in
+commit 7b6ddeaf27ec ("mac80211: use QoS NDP for AP probing"),
+where we forgot to check for the QoS variant and so
+assumed the QoS nullfunc frame never went out
+
+Fix this by adding a helper ieee80211_is_any_nullfunc()
+which consolidates the check for non-QoS and QoS nullfunc
+frames. Replace existing compound conditionals and add a
+couple more missing checks for QoS variant.
+
+Signed-off-by: Thomas Pedersen <thomas@adapt-ip.com>
+Link: https://lore.kernel.org/r/20200114055940.18502-3-thomas@adapt-ip.com
+Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/ieee80211.h | 9 +++++++++
+ net/mac80211/mlme.c       | 2 +-
+ net/mac80211/rx.c         | 8 +++-----
+ net/mac80211/status.c     | 5 ++---
+ net/mac80211/tx.c         | 2 +-
+ 5 files changed, 16 insertions(+), 10 deletions(-)
+
+diff --git a/include/linux/ieee80211.h b/include/linux/ieee80211.h
+index 2e179778576c..c316ff030b1d 100644
+--- a/include/linux/ieee80211.h
++++ b/include/linux/ieee80211.h
+@@ -621,6 +621,15 @@ static inline bool ieee80211_is_qos_nullfunc(__le16 fc)
+ 	       cpu_to_le16(IEEE80211_FTYPE_DATA | IEEE80211_STYPE_QOS_NULLFUNC);
+ }
+ 
++/**
++ * ieee80211_is_any_nullfunc - check if frame is regular or QoS nullfunc frame
++ * @fc: frame control bytes in little-endian byteorder
++ */
++static inline bool ieee80211_is_any_nullfunc(__le16 fc)
++{
++	return (ieee80211_is_nullfunc(fc) || ieee80211_is_qos_nullfunc(fc));
++}
++
+ /**
+  * ieee80211_is_bufferable_mmpdu - check if frame is bufferable MMPDU
+  * @fc: frame control field in little-endian byteorder
 diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
 index 36bd59ff49c4..ab26b8b95471 100644
 --- a/net/mac80211/mlme.c
@@ -677,190 +1552,73 @@ index 513d071ccac7..1b1f2d6cb3f4 100644
  		/*
  		 * When software scanning only nullfunc frames (to notify
  		 * the sleep state to the AP) and probe requests (for the
-diff --git a/net/sctp/sm_make_chunk.c b/net/sctp/sm_make_chunk.c
-index f67df16bd340..e698edd56bd5 100644
---- a/net/sctp/sm_make_chunk.c
-+++ b/net/sctp/sm_make_chunk.c
-@@ -858,7 +858,11 @@ struct sctp_chunk *sctp_make_shutdown(const struct sctp_association *asoc,
- 	struct sctp_chunk *retval;
- 	__u32 ctsn;
+-- 
+2.28.0
+
+
+From dbc839a90fb50f9ab52bbb64ab31991a0eb01d9f Mon Sep 17 00:00:00 2001
+From: Jiri Slaby <jslaby@suse.cz>
+Date: Mon, 20 Apr 2020 09:04:24 +0200
+Subject: [PATCH 22/23] cgroup, netclassid: remove double cond_resched
+
+commit 526f3d96b8f83b1b13d73bd0b5c79cc2c487ec8e upstream.
+
+Commit 018d26fcd12a ("cgroup, netclassid: periodically release file_lock
+on classid") added a second cond_resched to write_classid indirectly by
+update_classid_task. Remove the one in write_classid.
+
+Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+Cc: Dmitry Yakunin <zeil@yandex-team.ru>
+Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+Cc: David S. Miller <davem@davemloft.net>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/netclassid_cgroup.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/net/core/netclassid_cgroup.c b/net/core/netclassid_cgroup.c
+index 67feeb207dad..668330ace961 100644
+--- a/net/core/netclassid_cgroup.c
++++ b/net/core/netclassid_cgroup.c
+@@ -131,10 +131,8 @@ static int write_classid(struct cgroup_subsys_state *css, struct cftype *cft,
+ 	cs->classid = (u32)value;
  
--	ctsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
-+	if (chunk && chunk->asoc)
-+		ctsn = sctp_tsnmap_get_ctsn(&chunk->asoc->peer.tsn_map);
-+	else
-+		ctsn = sctp_tsnmap_get_ctsn(&asoc->peer.tsn_map);
-+
- 	shut.cum_tsn_ack = htonl(ctsn);
+ 	css_task_iter_start(css, 0, &it);
+-	while ((p = css_task_iter_next(&it))) {
++	while ((p = css_task_iter_next(&it)))
+ 		update_classid_task(p, cs->classid);
+-		cond_resched();
+-	}
+ 	css_task_iter_end(&it);
  
- 	retval = sctp_make_control(asoc, SCTP_CID_SHUTDOWN, 0,
-diff --git a/scripts/config b/scripts/config
-index e0e39826dae9..eee5b7f3a092 100755
---- a/scripts/config
-+++ b/scripts/config
-@@ -7,6 +7,9 @@ myname=${0##*/}
- # If no prefix forced, use the default CONFIG_
- CONFIG_="${CONFIG_-CONFIG_}"
+ 	return 0;
+-- 
+2.28.0
+
+
+From ab9dfda232481dcfaf549ce774004d116fc80c13 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Sun, 10 May 2020 10:29:03 +0200
+Subject: [PATCH 23/23] Linux 4.14.180
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index d2baacc1b0f6..525565f44b17 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 14
+-SUBLEVEL = 179
++SUBLEVEL = 180
+ EXTRAVERSION =
+ NAME = Petit Gorille
  
-+# We use an uncommon delimiter for sed substitutions
-+SED_DELIM=$(echo -en "\001")
-+
- usage() {
- 	cat >&2 <<EOL
- Manipulate options in a .config file from the command line.
-@@ -83,7 +86,7 @@ txt_subst() {
- 	local infile="$3"
- 	local tmpfile="$infile.swp"
- 
--	sed -e "s:$before:$after:" "$infile" >"$tmpfile"
-+	sed -e "s$SED_DELIM$before$SED_DELIM$after$SED_DELIM" "$infile" >"$tmpfile"
- 	# replace original file with the edited one
- 	mv "$tmpfile" "$infile"
- }
-diff --git a/sound/pci/hda/hda_intel.c b/sound/pci/hda/hda_intel.c
-index 46670da04707..7779f5460715 100644
---- a/sound/pci/hda/hda_intel.c
-+++ b/sound/pci/hda/hda_intel.c
-@@ -2172,9 +2172,10 @@ static const struct hdac_io_ops pci_hda_io_ops = {
-  * some HD-audio PCI entries are exposed without any codecs, and such devices
-  * should be ignored from the beginning.
-  */
--static const struct snd_pci_quirk driver_blacklist[] = {
--	SND_PCI_QUIRK(0x1462, 0xcb59, "MSI TRX40 Creator", 0),
--	SND_PCI_QUIRK(0x1462, 0xcb60, "MSI TRX40", 0),
-+static const struct pci_device_id driver_blacklist[] = {
-+	{ PCI_DEVICE_SUB(0x1022, 0x1487, 0x1043, 0x874f) }, /* ASUS ROG Zenith II / Strix */
-+	{ PCI_DEVICE_SUB(0x1022, 0x1487, 0x1462, 0xcb59) }, /* MSI TRX40 Creator */
-+	{ PCI_DEVICE_SUB(0x1022, 0x1487, 0x1462, 0xcb60) }, /* MSI TRX40 */
- 	{}
- };
- 
-@@ -2197,7 +2198,7 @@ static int azx_probe(struct pci_dev *pci,
- 	bool schedule_probe;
- 	int err;
- 
--	if (snd_pci_quirk_lookup(pci, driver_blacklist)) {
-+	if (pci_match_id(driver_blacklist, pci)) {
- 		dev_info(&pci->dev, "Skipping the blacklisted device\n");
- 		return -ENODEV;
- 	}
-diff --git a/sound/soc/codecs/hdac_hdmi.c b/sound/soc/codecs/hdac_hdmi.c
-index 1c3626347e12..aeeec1144558 100644
---- a/sound/soc/codecs/hdac_hdmi.c
-+++ b/sound/soc/codecs/hdac_hdmi.c
-@@ -142,14 +142,14 @@ static struct hdac_hdmi_pcm *
- hdac_hdmi_get_pcm_from_cvt(struct hdac_hdmi_priv *hdmi,
- 			   struct hdac_hdmi_cvt *cvt)
- {
--	struct hdac_hdmi_pcm *pcm = NULL;
-+	struct hdac_hdmi_pcm *pcm;
- 
- 	list_for_each_entry(pcm, &hdmi->pcm_list, head) {
- 		if (pcm->cvt == cvt)
--			break;
-+			return pcm;
- 	}
- 
--	return pcm;
-+	return NULL;
- }
- 
- static void hdac_hdmi_jack_report(struct hdac_hdmi_pcm *pcm,
-diff --git a/sound/soc/codecs/sgtl5000.c b/sound/soc/codecs/sgtl5000.c
-index ca8a70ab22a8..d64cb28e8dc5 100644
---- a/sound/soc/codecs/sgtl5000.c
-+++ b/sound/soc/codecs/sgtl5000.c
-@@ -1563,6 +1563,40 @@ static int sgtl5000_i2c_probe(struct i2c_client *client,
- 		dev_err(&client->dev,
- 			"Error %d initializing CHIP_CLK_CTRL\n", ret);
- 
-+	/* Mute everything to avoid pop from the following power-up */
-+	ret = regmap_write(sgtl5000->regmap, SGTL5000_CHIP_ANA_CTRL,
-+			   SGTL5000_CHIP_ANA_CTRL_DEFAULT);
-+	if (ret) {
-+		dev_err(&client->dev,
-+			"Error %d muting outputs via CHIP_ANA_CTRL\n", ret);
-+		goto disable_clk;
-+	}
-+
-+	/*
-+	 * If VAG is powered-on (e.g. from previous boot), it would be disabled
-+	 * by the write to ANA_POWER in later steps of the probe code. This
-+	 * may create a loud pop even with all outputs muted. The proper way
-+	 * to circumvent this is disabling the bit first and waiting the proper
-+	 * cool-down time.
-+	 */
-+	ret = regmap_read(sgtl5000->regmap, SGTL5000_CHIP_ANA_POWER, &value);
-+	if (ret) {
-+		dev_err(&client->dev, "Failed to read ANA_POWER: %d\n", ret);
-+		goto disable_clk;
-+	}
-+	if (value & SGTL5000_VAG_POWERUP) {
-+		ret = regmap_update_bits(sgtl5000->regmap,
-+					 SGTL5000_CHIP_ANA_POWER,
-+					 SGTL5000_VAG_POWERUP,
-+					 0);
-+		if (ret) {
-+			dev_err(&client->dev, "Error %d disabling VAG\n", ret);
-+			goto disable_clk;
-+		}
-+
-+		msleep(SGTL5000_VAG_POWERDOWN_DELAY);
-+	}
-+
- 	/* Follow section 2.2.1.1 of AN3663 */
- 	ana_pwr = SGTL5000_ANA_POWER_DEFAULT;
- 	if (sgtl5000->num_supplies <= VDDD) {
-diff --git a/sound/soc/codecs/sgtl5000.h b/sound/soc/codecs/sgtl5000.h
-index 22f3442af982..9ea41749d037 100644
---- a/sound/soc/codecs/sgtl5000.h
-+++ b/sound/soc/codecs/sgtl5000.h
-@@ -236,6 +236,7 @@
- /*
-  * SGTL5000_CHIP_ANA_CTRL
-  */
-+#define SGTL5000_CHIP_ANA_CTRL_DEFAULT		0x0133
- #define SGTL5000_LINE_OUT_MUTE			0x0100
- #define SGTL5000_HP_SEL_MASK			0x0040
- #define SGTL5000_HP_SEL_SHIFT			6
-diff --git a/sound/soc/sh/rcar/ssiu.c b/sound/soc/sh/rcar/ssiu.c
-index 4d948757d300..5e5ed5475473 100644
---- a/sound/soc/sh/rcar/ssiu.c
-+++ b/sound/soc/sh/rcar/ssiu.c
-@@ -172,7 +172,7 @@ static int rsnd_ssiu_init_gen2(struct rsnd_mod *mod,
- 			i;
- 
- 		for_each_rsnd_mod_array(i, pos, io, rsnd_ssi_array) {
--			shift	= (i * 4) + 16;
-+			shift	= (i * 4) + 20;
- 			val	= (val & ~(0xF << shift)) |
- 				rsnd_mod_id(pos) << shift;
- 		}
-diff --git a/sound/soc/soc-topology.c b/sound/soc/soc-topology.c
-index a215b9ad148c..50aa45525be5 100644
---- a/sound/soc/soc-topology.c
-+++ b/sound/soc/soc-topology.c
-@@ -1954,7 +1954,9 @@ static int soc_tplg_pcm_elems_load(struct soc_tplg *tplg,
- 			_pcm = pcm;
- 		} else {
- 			abi_match = false;
--			pcm_new_ver(tplg, pcm, &_pcm);
-+			ret = pcm_new_ver(tplg, pcm, &_pcm);
-+			if (ret < 0)
-+				return ret;
- 		}
- 
- 		/* create the FE DAIs and DAI links */
-diff --git a/tools/testing/selftests/ipc/msgque.c b/tools/testing/selftests/ipc/msgque.c
-index c5587844fbb8..ad723a5d0f83 100644
---- a/tools/testing/selftests/ipc/msgque.c
-+++ b/tools/testing/selftests/ipc/msgque.c
-@@ -137,7 +137,7 @@ int dump_queue(struct msgque_data *msgque)
- 	for (kern_id = 0; kern_id < 256; kern_id++) {
- 		ret = msgctl(kern_id, MSG_STAT, &ds);
- 		if (ret < 0) {
--			if (errno == -EINVAL)
-+			if (errno == EINVAL)
- 				continue;
- 			printf("Failed to get stats for IPC queue with id %d\n",
- 					kern_id);
+-- 
+2.28.0
+

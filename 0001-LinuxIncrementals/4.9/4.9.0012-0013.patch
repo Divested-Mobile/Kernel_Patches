@@ -1,3 +1,1664 @@
+From 1409935400aa1faffd9fe1830adb8ea08ea424d2 Mon Sep 17 00:00:00 2001
+From: WANG Cong <xiyou.wangcong@gmail.com>
+Date: Tue, 7 Feb 2017 12:59:47 -0800
+Subject: [PATCH 01/32] kcm: fix 0-length case for kcm_sendmsg()
+
+[ Upstream commit 98e3862ca2b1ae595a13805dcab4c3a6d7718f4d ]
+
+Dmitry reported a kernel warning:
+
+ WARNING: CPU: 3 PID: 2936 at net/kcm/kcmsock.c:627
+ kcm_write_msgs+0x12e3/0x1b90 net/kcm/kcmsock.c:627
+ CPU: 3 PID: 2936 Comm: a.out Not tainted 4.10.0-rc6+ #209
+ Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+ Call Trace:
+  __dump_stack lib/dump_stack.c:15 [inline]
+  dump_stack+0x2ee/0x3ef lib/dump_stack.c:51
+  panic+0x1fb/0x412 kernel/panic.c:179
+  __warn+0x1c4/0x1e0 kernel/panic.c:539
+  warn_slowpath_null+0x2c/0x40 kernel/panic.c:582
+  kcm_write_msgs+0x12e3/0x1b90 net/kcm/kcmsock.c:627
+  kcm_sendmsg+0x163a/0x2200 net/kcm/kcmsock.c:1029
+  sock_sendmsg_nosec net/socket.c:635 [inline]
+  sock_sendmsg+0xca/0x110 net/socket.c:645
+  sock_write_iter+0x326/0x600 net/socket.c:848
+  new_sync_write fs/read_write.c:499 [inline]
+  __vfs_write+0x483/0x740 fs/read_write.c:512
+  vfs_write+0x187/0x530 fs/read_write.c:560
+  SYSC_write fs/read_write.c:607 [inline]
+  SyS_write+0xfb/0x230 fs/read_write.c:599
+  entry_SYSCALL_64_fastpath+0x1f/0xc2
+
+when calling syscall(__NR_write, sock2, 0x208aaf27ul, 0x0ul) on a KCM
+seqpacket socket. It appears that kcm_sendmsg() does not handle len==0
+case correctly, which causes an empty skb is allocated and queued.
+Fix this by skipping the skb allocation for len==0 case.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Cc: Tom Herbert <tom@herbertland.com>
+Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/kcm/kcmsock.c | 40 ++++++++++++++++++++++------------------
+ 1 file changed, 22 insertions(+), 18 deletions(-)
+
+diff --git a/net/kcm/kcmsock.c b/net/kcm/kcmsock.c
+index 7e08a4d3d77d..64f0e8531af0 100644
+--- a/net/kcm/kcmsock.c
++++ b/net/kcm/kcmsock.c
+@@ -929,23 +929,25 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 			goto out_error;
+ 	}
+ 
+-	/* New message, alloc head skb */
+-	head = alloc_skb(0, sk->sk_allocation);
+-	while (!head) {
+-		kcm_push(kcm);
+-		err = sk_stream_wait_memory(sk, &timeo);
+-		if (err)
+-			goto out_error;
+-
++	if (msg_data_left(msg)) {
++		/* New message, alloc head skb */
+ 		head = alloc_skb(0, sk->sk_allocation);
+-	}
++		while (!head) {
++			kcm_push(kcm);
++			err = sk_stream_wait_memory(sk, &timeo);
++			if (err)
++				goto out_error;
+ 
+-	skb = head;
++			head = alloc_skb(0, sk->sk_allocation);
++		}
+ 
+-	/* Set ip_summed to CHECKSUM_UNNECESSARY to avoid calling
+-	 * csum_and_copy_from_iter from skb_do_copy_data_nocache.
+-	 */
+-	skb->ip_summed = CHECKSUM_UNNECESSARY;
++		skb = head;
++
++		/* Set ip_summed to CHECKSUM_UNNECESSARY to avoid calling
++		 * csum_and_copy_from_iter from skb_do_copy_data_nocache.
++		 */
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++	}
+ 
+ start:
+ 	while (msg_data_left(msg)) {
+@@ -1018,10 +1020,12 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 	if (eor) {
+ 		bool not_busy = skb_queue_empty(&sk->sk_write_queue);
+ 
+-		/* Message complete, queue it on send buffer */
+-		__skb_queue_tail(&sk->sk_write_queue, head);
+-		kcm->seq_skb = NULL;
+-		KCM_STATS_INCR(kcm->stats.tx_msgs);
++		if (head) {
++			/* Message complete, queue it on send buffer */
++			__skb_queue_tail(&sk->sk_write_queue, head);
++			kcm->seq_skb = NULL;
++			KCM_STATS_INCR(kcm->stats.tx_msgs);
++		}
+ 
+ 		if (msg->msg_flags & MSG_BATCH) {
+ 			kcm->tx_wait_more = true;
+-- 
+2.28.0
+
+
+From 90aa7993d5c7fdc476009189a9b2a65d97fe9350 Mon Sep 17 00:00:00 2001
+From: WANG Cong <xiyou.wangcong@gmail.com>
+Date: Mon, 13 Feb 2017 11:13:16 -0800
+Subject: [PATCH 02/32] kcm: fix a null pointer dereference in kcm_sendmsg()
+
+[ Upstream commit cd27b96bc13841ee7af25837a6ae86fee87273d6 ]
+
+In commit 98e3862ca2b1 ("kcm: fix 0-length case for kcm_sendmsg()")
+I tried to avoid skb allocation for 0-length case, but missed
+a check for NULL pointer in the non EOR case.
+
+Fixes: 98e3862ca2b1 ("kcm: fix 0-length case for kcm_sendmsg()")
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Cc: Tom Herbert <tom@herbertland.com>
+Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+Acked-by: Tom Herbert <tom@herbertland.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/kcm/kcmsock.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/net/kcm/kcmsock.c b/net/kcm/kcmsock.c
+index 64f0e8531af0..a646f3481240 100644
+--- a/net/kcm/kcmsock.c
++++ b/net/kcm/kcmsock.c
+@@ -1044,8 +1044,10 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
+ 	} else {
+ 		/* Message not complete, save state */
+ partial_message:
+-		kcm->seq_skb = head;
+-		kcm_tx_msg(head)->last_skb = skb;
++		if (head) {
++			kcm->seq_skb = head;
++			kcm_tx_msg(head)->last_skb = skb;
++		}
+ 	}
+ 
+ 	KCM_STATS_ADD(kcm->stats.tx_bytes, copied);
+-- 
+2.28.0
+
+
+From 859900c24bff90768e1789bd93e1b51fa726a659 Mon Sep 17 00:00:00 2001
+From: Or Gerlitz <ogerlitz@mellanox.com>
+Date: Sun, 12 Feb 2017 11:21:31 +0200
+Subject: [PATCH 03/32] net/mlx5e: Disable preemption when doing TC statistics
+ upcall
+
+[ Upstream commit fed06ee89b78d3af32e235e0e89ad0d946fcb95d ]
+
+When called by HW offloading drivers, the TC action (e.g
+net/sched/act_mirred.c) code uses this_cpu logic, e.g
+
+ _bstats_cpu_update(this_cpu_ptr(a->cpu_bstats), bytes, packets)
+
+per the kernel documention, preemption should be disabled, add that.
+
+Before the fix, when running with CONFIG_PREEMPT set, we get a
+
+BUG: using smp_processor_id() in preemptible [00000000] code: tc/3793
+
+asserion from the TC action (mirred) stats_update callback.
+
+Fixes: aad7e08d39bd ('net/mlx5e: Hardware offloaded flower filter statistics support')
+Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_tc.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 6bb21b31cfeb..a543ea676de3 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -567,10 +567,14 @@ int mlx5e_stats_flower(struct mlx5e_priv *priv,
+ 
+ 	mlx5_fc_query_cached(counter, &bytes, &packets, &lastuse);
+ 
++	preempt_disable();
++
+ 	tcf_exts_to_list(f->exts, &actions);
+ 	list_for_each_entry(a, &actions, list)
+ 		tcf_action_stats_update(a, bytes, packets, lastuse);
+ 
++	preempt_enable();
++
+ 	return 0;
+ }
+ 
+-- 
+2.28.0
+
+
+From 42b52783a59cc706c71cdc7096edce4a6f086fd3 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Sun, 12 Feb 2017 14:03:52 -0800
+Subject: [PATCH 04/32] net/llc: avoid BUG_ON() in skb_orphan()
+
+[ Upstream commit 8b74d439e1697110c5e5c600643e823eb1dd0762 ]
+
+It seems nobody used LLC since linux-3.12.
+
+Fortunately fuzzers like syzkaller still know how to run this code,
+otherwise it would be no fun.
+
+Setting skb->sk without skb->destructor leads to all kinds of
+bugs, we now prefer to be very strict about it.
+
+Ideally here we would use skb_set_owner() but this helper does not exist yet,
+only CAN seems to have a private helper for that.
+
+Fixes: 376c7311bdb6 ("net: add a temporary sanity check in skb_orphan()")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Andrey Konovalov <andreyknvl@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/llc/llc_conn.c | 3 +++
+ net/llc/llc_sap.c  | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/net/llc/llc_conn.c b/net/llc/llc_conn.c
+index 3e821daf9dd4..8bc5a1bd2d45 100644
+--- a/net/llc/llc_conn.c
++++ b/net/llc/llc_conn.c
+@@ -821,7 +821,10 @@ void llc_conn_handler(struct llc_sap *sap, struct sk_buff *skb)
+ 		 * another trick required to cope with how the PROCOM state
+ 		 * machine works. -acme
+ 		 */
++		skb_orphan(skb);
++		sock_hold(sk);
+ 		skb->sk = sk;
++		skb->destructor = sock_efree;
+ 	}
+ 	if (!sock_owned_by_user(sk))
+ 		llc_conn_rcv(sk, skb);
+diff --git a/net/llc/llc_sap.c b/net/llc/llc_sap.c
+index d0e1e804ebd7..5404d0d195cc 100644
+--- a/net/llc/llc_sap.c
++++ b/net/llc/llc_sap.c
+@@ -290,7 +290,10 @@ static void llc_sap_rcv(struct llc_sap *sap, struct sk_buff *skb,
+ 
+ 	ev->type   = LLC_SAP_EV_TYPE_PDU;
+ 	ev->reason = 0;
++	skb_orphan(skb);
++	sock_hold(sk);
+ 	skb->sk = sk;
++	skb->destructor = sock_efree;
+ 	llc_sap_state_process(sap, skb);
+ }
+ 
+-- 
+2.28.0
+
+
+From e0cb28247882a90f60b219f335c00d8d578cbe66 Mon Sep 17 00:00:00 2001
+From: Ivan Khoronzhuk <ivan.khoronzhuk@linaro.org>
+Date: Tue, 14 Feb 2017 14:42:15 +0200
+Subject: [PATCH 05/32] net: ethernet: ti: cpsw: fix cpsw assignment in resume
+
+[ Upstream commit a60ced990e309666915d21445e95347d12406694 ]
+
+There is a copy-paste error, which hides breaking of resume
+for CPSW driver: there was replaced netdev_priv() to ndev_to_cpsw(ndev)
+in suspend, but left it unchanged in resume.
+
+Fixes: 606f39939595a4d4540406bfc11f265b2036af6d
+(ti: cpsw: move platform data and slaves info to cpsw_common)
+
+Reported-by: Alexey Starikovskiy <AStarikovskiy@topcon.com>
+Signed-off-by: Ivan Khoronzhuk <ivan.khoronzhuk@linaro.org>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/ti/cpsw.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/ti/cpsw.c b/drivers/net/ethernet/ti/cpsw.c
+index b9087b828eff..3f1971d485f3 100644
+--- a/drivers/net/ethernet/ti/cpsw.c
++++ b/drivers/net/ethernet/ti/cpsw.c
+@@ -2925,7 +2925,7 @@ static int cpsw_resume(struct device *dev)
+ {
+ 	struct platform_device	*pdev = to_platform_device(dev);
+ 	struct net_device	*ndev = platform_get_drvdata(pdev);
+-	struct cpsw_common	*cpsw = netdev_priv(ndev);
++	struct cpsw_common	*cpsw = ndev_to_cpsw(ndev);
+ 
+ 	/* Select default pin state */
+ 	pinctrl_pm_select_default_state(dev);
+-- 
+2.28.0
+
+
+From 722737f27774b14be5a1d2d3b9281dcded7c48b2 Mon Sep 17 00:00:00 2001
+From: Eric Dumazet <edumazet@google.com>
+Date: Tue, 14 Feb 2017 09:03:51 -0800
+Subject: [PATCH 06/32] packet: fix races in fanout_add()
+
+[ Upstream commit d199fab63c11998a602205f7ee7ff7c05c97164b ]
+
+Multiple threads can call fanout_add() at the same time.
+
+We need to grab fanout_mutex earlier to avoid races that could
+lead to one thread freeing po->rollover that was set by another thread.
+
+Do the same in fanout_release(), for peace of mind, and to help us
+finding lockdep issues earlier.
+
+Fixes: dc99f600698d ("packet: Add fanout support.")
+Fixes: 0648ab70afe6 ("packet: rollover prepare: per-socket state")
+Signed-off-by: Eric Dumazet <edumazet@google.com>
+Cc: Willem de Bruijn <willemb@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/packet/af_packet.c | 55 +++++++++++++++++++++++-------------------
+ 1 file changed, 30 insertions(+), 25 deletions(-)
+
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 458722b938c7..87113e86b328 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -1619,6 +1619,7 @@ static void fanout_release_data(struct packet_fanout *f)
+ 
+ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
+ {
++	struct packet_rollover *rollover = NULL;
+ 	struct packet_sock *po = pkt_sk(sk);
+ 	struct packet_fanout *f, *match;
+ 	u8 type = type_flags & 0xff;
+@@ -1641,23 +1642,28 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&fanout_mutex);
++
++	err = -EINVAL;
+ 	if (!po->running)
+-		return -EINVAL;
++		goto out;
+ 
++	err = -EALREADY;
+ 	if (po->fanout)
+-		return -EALREADY;
++		goto out;
+ 
+ 	if (type == PACKET_FANOUT_ROLLOVER ||
+ 	    (type_flags & PACKET_FANOUT_FLAG_ROLLOVER)) {
+-		po->rollover = kzalloc(sizeof(*po->rollover), GFP_KERNEL);
+-		if (!po->rollover)
+-			return -ENOMEM;
+-		atomic_long_set(&po->rollover->num, 0);
+-		atomic_long_set(&po->rollover->num_huge, 0);
+-		atomic_long_set(&po->rollover->num_failed, 0);
++		err = -ENOMEM;
++		rollover = kzalloc(sizeof(*rollover), GFP_KERNEL);
++		if (!rollover)
++			goto out;
++		atomic_long_set(&rollover->num, 0);
++		atomic_long_set(&rollover->num_huge, 0);
++		atomic_long_set(&rollover->num_failed, 0);
++		po->rollover = rollover;
+ 	}
+ 
+-	mutex_lock(&fanout_mutex);
+ 	match = NULL;
+ 	list_for_each_entry(f, &fanout_list, list) {
+ 		if (f->id == id &&
+@@ -1704,11 +1710,11 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
+ 		}
+ 	}
+ out:
+-	mutex_unlock(&fanout_mutex);
+-	if (err) {
+-		kfree(po->rollover);
++	if (err && rollover) {
++		kfree(rollover);
+ 		po->rollover = NULL;
+ 	}
++	mutex_unlock(&fanout_mutex);
+ 	return err;
+ }
+ 
+@@ -1717,23 +1723,22 @@ static void fanout_release(struct sock *sk)
+ 	struct packet_sock *po = pkt_sk(sk);
+ 	struct packet_fanout *f;
+ 
+-	f = po->fanout;
+-	if (!f)
+-		return;
+-
+ 	mutex_lock(&fanout_mutex);
+-	po->fanout = NULL;
++	f = po->fanout;
++	if (f) {
++		po->fanout = NULL;
++
++		if (atomic_dec_and_test(&f->sk_ref)) {
++			list_del(&f->list);
++			dev_remove_pack(&f->prot_hook);
++			fanout_release_data(f);
++			kfree(f);
++		}
+ 
+-	if (atomic_dec_and_test(&f->sk_ref)) {
+-		list_del(&f->list);
+-		dev_remove_pack(&f->prot_hook);
+-		fanout_release_data(f);
+-		kfree(f);
++		if (po->rollover)
++			kfree_rcu(po->rollover, rcu);
+ 	}
+ 	mutex_unlock(&fanout_mutex);
+-
+-	if (po->rollover)
+-		kfree_rcu(po->rollover, rcu);
+ }
+ 
+ static bool packet_extra_vlan_len_allowed(const struct net_device *dev,
+-- 
+2.28.0
+
+
+From 9206efc8a1f74e558e3165218fab136b51be848a Mon Sep 17 00:00:00 2001
+From: Anoob Soman <anoob.soman@citrix.com>
+Date: Wed, 15 Feb 2017 20:25:39 +0000
+Subject: [PATCH 07/32] packet: Do not call fanout_release from atomic contexts
+
+[ Upstream commit 2bd624b4611ffee36422782d16e1c944d1351e98 ]
+
+Commit 6664498280cf ("packet: call fanout_release, while UNREGISTERING a
+netdev"), unfortunately, introduced the following issues.
+
+1. calling mutex_lock(&fanout_mutex) (fanout_release()) from inside
+rcu_read-side critical section. rcu_read_lock disables preemption, most often,
+which prohibits calling sleeping functions.
+
+[  ] include/linux/rcupdate.h:560 Illegal context switch in RCU read-side critical section!
+[  ]
+[  ] rcu_scheduler_active = 1, debug_locks = 0
+[  ] 4 locks held by ovs-vswitchd/1969:
+[  ]  #0:  (cb_lock){++++++}, at: [<ffffffff8158a6c9>] genl_rcv+0x19/0x40
+[  ]  #1:  (ovs_mutex){+.+.+.}, at: [<ffffffffa04878ca>] ovs_vport_cmd_del+0x4a/0x100 [openvswitch]
+[  ]  #2:  (rtnl_mutex){+.+.+.}, at: [<ffffffff81564157>] rtnl_lock+0x17/0x20
+[  ]  #3:  (rcu_read_lock){......}, at: [<ffffffff81614165>] packet_notifier+0x5/0x3f0
+[  ]
+[  ] Call Trace:
+[  ]  [<ffffffff813770c1>] dump_stack+0x85/0xc4
+[  ]  [<ffffffff810c9077>] lockdep_rcu_suspicious+0x107/0x110
+[  ]  [<ffffffff810a2da7>] ___might_sleep+0x57/0x210
+[  ]  [<ffffffff810a2fd0>] __might_sleep+0x70/0x90
+[  ]  [<ffffffff8162e80c>] mutex_lock_nested+0x3c/0x3a0
+[  ]  [<ffffffff810de93f>] ? vprintk_default+0x1f/0x30
+[  ]  [<ffffffff81186e88>] ? printk+0x4d/0x4f
+[  ]  [<ffffffff816106dd>] fanout_release+0x1d/0xe0
+[  ]  [<ffffffff81614459>] packet_notifier+0x2f9/0x3f0
+
+2. calling mutex_lock(&fanout_mutex) inside spin_lock(&po->bind_lock).
+"sleeping function called from invalid context"
+
+[  ] BUG: sleeping function called from invalid context at kernel/locking/mutex.c:620
+[  ] in_atomic(): 1, irqs_disabled(): 0, pid: 1969, name: ovs-vswitchd
+[  ] INFO: lockdep is turned off.
+[  ] Call Trace:
+[  ]  [<ffffffff813770c1>] dump_stack+0x85/0xc4
+[  ]  [<ffffffff810a2f52>] ___might_sleep+0x202/0x210
+[  ]  [<ffffffff810a2fd0>] __might_sleep+0x70/0x90
+[  ]  [<ffffffff8162e80c>] mutex_lock_nested+0x3c/0x3a0
+[  ]  [<ffffffff816106dd>] fanout_release+0x1d/0xe0
+[  ]  [<ffffffff81614459>] packet_notifier+0x2f9/0x3f0
+
+3. calling dev_remove_pack(&fanout->prot_hook), from inside
+spin_lock(&po->bind_lock) or rcu_read-side critical-section. dev_remove_pack()
+-> synchronize_net(), which might sleep.
+
+[  ] BUG: scheduling while atomic: ovs-vswitchd/1969/0x00000002
+[  ] INFO: lockdep is turned off.
+[  ] Call Trace:
+[  ]  [<ffffffff813770c1>] dump_stack+0x85/0xc4
+[  ]  [<ffffffff81186274>] __schedule_bug+0x64/0x73
+[  ]  [<ffffffff8162b8cb>] __schedule+0x6b/0xd10
+[  ]  [<ffffffff8162c5db>] schedule+0x6b/0x80
+[  ]  [<ffffffff81630b1d>] schedule_timeout+0x38d/0x410
+[  ]  [<ffffffff810ea3fd>] synchronize_sched_expedited+0x53d/0x810
+[  ]  [<ffffffff810ea6de>] synchronize_rcu_expedited+0xe/0x10
+[  ]  [<ffffffff8154eab5>] synchronize_net+0x35/0x50
+[  ]  [<ffffffff8154eae3>] dev_remove_pack+0x13/0x20
+[  ]  [<ffffffff8161077e>] fanout_release+0xbe/0xe0
+[  ]  [<ffffffff81614459>] packet_notifier+0x2f9/0x3f0
+
+4. fanout_release() races with calls from different CPU.
+
+To fix the above problems, remove the call to fanout_release() under
+rcu_read_lock(). Instead, call __dev_remove_pack(&fanout->prot_hook) and
+netdev_run_todo will be happy that &dev->ptype_specific list is empty. In order
+to achieve this, I moved dev_{add,remove}_pack() out of fanout_{add,release} to
+__fanout_{link,unlink}. So, call to {,__}unregister_prot_hook() will make sure
+fanout->prot_hook is removed as well.
+
+Fixes: 6664498280cf ("packet: call fanout_release, while UNREGISTERING a netdev")
+Reported-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: Anoob Soman <anoob.soman@citrix.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/packet/af_packet.c | 31 ++++++++++++++++++++++---------
+ 1 file changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 87113e86b328..34de326b4f09 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -1497,6 +1497,8 @@ static void __fanout_link(struct sock *sk, struct packet_sock *po)
+ 	f->arr[f->num_members] = sk;
+ 	smp_wmb();
+ 	f->num_members++;
++	if (f->num_members == 1)
++		dev_add_pack(&f->prot_hook);
+ 	spin_unlock(&f->lock);
+ }
+ 
+@@ -1513,6 +1515,8 @@ static void __fanout_unlink(struct sock *sk, struct packet_sock *po)
+ 	BUG_ON(i >= f->num_members);
+ 	f->arr[i] = f->arr[f->num_members - 1];
+ 	f->num_members--;
++	if (f->num_members == 0)
++		__dev_remove_pack(&f->prot_hook);
+ 	spin_unlock(&f->lock);
+ }
+ 
+@@ -1693,7 +1697,6 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
+ 		match->prot_hook.func = packet_rcv_fanout;
+ 		match->prot_hook.af_packet_priv = match;
+ 		match->prot_hook.id_match = match_fanout_group;
+-		dev_add_pack(&match->prot_hook);
+ 		list_add(&match->list, &fanout_list);
+ 	}
+ 	err = -EINVAL;
+@@ -1718,7 +1721,12 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
+ 	return err;
+ }
+ 
+-static void fanout_release(struct sock *sk)
++/* If pkt_sk(sk)->fanout->sk_ref is zero, this function removes
++ * pkt_sk(sk)->fanout from fanout_list and returns pkt_sk(sk)->fanout.
++ * It is the responsibility of the caller to call fanout_release_data() and
++ * free the returned packet_fanout (after synchronize_net())
++ */
++static struct packet_fanout *fanout_release(struct sock *sk)
+ {
+ 	struct packet_sock *po = pkt_sk(sk);
+ 	struct packet_fanout *f;
+@@ -1728,17 +1736,17 @@ static void fanout_release(struct sock *sk)
+ 	if (f) {
+ 		po->fanout = NULL;
+ 
+-		if (atomic_dec_and_test(&f->sk_ref)) {
++		if (atomic_dec_and_test(&f->sk_ref))
+ 			list_del(&f->list);
+-			dev_remove_pack(&f->prot_hook);
+-			fanout_release_data(f);
+-			kfree(f);
+-		}
++		else
++			f = NULL;
+ 
+ 		if (po->rollover)
+ 			kfree_rcu(po->rollover, rcu);
+ 	}
+ 	mutex_unlock(&fanout_mutex);
++
++	return f;
+ }
+ 
+ static bool packet_extra_vlan_len_allowed(const struct net_device *dev,
+@@ -2970,6 +2978,7 @@ static int packet_release(struct socket *sock)
+ {
+ 	struct sock *sk = sock->sk;
+ 	struct packet_sock *po;
++	struct packet_fanout *f;
+ 	struct net *net;
+ 	union tpacket_req_u req_u;
+ 
+@@ -3009,9 +3018,14 @@ static int packet_release(struct socket *sock)
+ 		packet_set_ring(sk, &req_u, 1, 1);
+ 	}
+ 
+-	fanout_release(sk);
++	f = fanout_release(sk);
+ 
+ 	synchronize_net();
++
++	if (f) {
++		fanout_release_data(f);
++		kfree(f);
++	}
+ 	/*
+ 	 *	Now the socket is dead. No more input will appear.
+ 	 */
+@@ -3963,7 +3977,6 @@ static int packet_notifier(struct notifier_block *this,
+ 				}
+ 				if (msg == NETDEV_UNREGISTER) {
+ 					packet_cached_dev_reset(po);
+-					fanout_release(sk);
+ 					po->ifindex = -1;
+ 					if (po->prot_hook.dev)
+ 						dev_put(po->prot_hook.dev);
+-- 
+2.28.0
+
+
+From 6c854afc5399dd74cf5eba04ee7ba9ffb9ad5158 Mon Sep 17 00:00:00 2001
+From: Marcus Huewe <suse-tux@gmx.de>
+Date: Wed, 15 Feb 2017 01:00:36 +0100
+Subject: [PATCH 08/32] net: neigh: Fix netevent
+ NETEVENT_DELAY_PROBE_TIME_UPDATE notification
+
+[ Upstream commit 7627ae6030f56a9a91a5b3867b21f35d79c16e64 ]
+
+When setting a neigh related sysctl parameter, we always send a
+NETEVENT_DELAY_PROBE_TIME_UPDATE netevent. For instance, when
+executing
+
+	sysctl net.ipv6.neigh.wlp3s0.retrans_time_ms=2000
+
+a NETEVENT_DELAY_PROBE_TIME_UPDATE netevent is generated.
+
+This is caused by commit 2a4501ae18b5 ("neigh: Send a
+notification when DELAY_PROBE_TIME changes"). According to the
+commit's description, it was intended to generate such an event
+when setting the "delay_first_probe_time" sysctl parameter.
+
+In order to fix this, only generate this event when actually
+setting the "delay_first_probe_time" sysctl parameter. This fix
+should not have any unintended side-effects, because all but one
+registered netevent callbacks check for other netevent event
+types (the registered callbacks were obtained by grepping for
+"register_netevent_notifier"). The only callback that uses the
+NETEVENT_DELAY_PROBE_TIME_UPDATE event is
+mlxsw_sp_router_netevent_event() (in
+drivers/net/ethernet/mellanox/mlxsw/spectrum_router.c): in case
+of this event, it only accesses the DELAY_PROBE_TIME of the
+passed neigh_parms.
+
+Fixes: 2a4501ae18b5 ("neigh: Send a notification when DELAY_PROBE_TIME changes")
+Signed-off-by: Marcus Huewe <suse-tux@gmx.de>
+Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/core/neighbour.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/net/core/neighbour.c b/net/core/neighbour.c
+index 2ae929f9bd06..9901e5b75a05 100644
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -2927,7 +2927,8 @@ static void neigh_proc_update(struct ctl_table *ctl, int write)
+ 		return;
+ 
+ 	set_bit(index, p->data_state);
+-	call_netevent_notifiers(NETEVENT_DELAY_PROBE_TIME_UPDATE, p);
++	if (index == NEIGH_VAR_DELAY_PROBE_TIME)
++		call_netevent_notifiers(NETEVENT_DELAY_PROBE_TIME_UPDATE, p);
+ 	if (!dev) /* NULL dev means this is default value */
+ 		neigh_copy_dflt_parms(net, p, index);
+ }
+-- 
+2.28.0
+
+
+From 171d92a9d915d238e05285ca67faf30f554d7df7 Mon Sep 17 00:00:00 2001
+From: Andrey Konovalov <andreyknvl@google.com>
+Date: Thu, 16 Feb 2017 17:22:46 +0100
+Subject: [PATCH 09/32] dccp: fix freeing skb too early for IPV6_RECVPKTINFO
+
+[ Upstream commit 5edabca9d4cff7f1f2b68f0bac55ef99d9798ba4 ]
+
+In the current DCCP implementation an skb for a DCCP_PKT_REQUEST packet
+is forcibly freed via __kfree_skb in dccp_rcv_state_process if
+dccp_v6_conn_request successfully returns.
+
+However, if IPV6_RECVPKTINFO is set on a socket, the address of the skb
+is saved to ireq->pktopts and the ref count for skb is incremented in
+dccp_v6_conn_request, so skb is still in use. Nevertheless, it gets freed
+in dccp_rcv_state_process.
+
+Fix by calling consume_skb instead of doing goto discard and therefore
+calling __kfree_skb.
+
+Similar fixes for TCP:
+
+fb7e2399ec17f1004c0e0ccfd17439f8759ede01 [TCP]: skb is unexpectedly freed.
+0aea76d35c9651d55bbaf746e7914e5f9ae5a25d tcp: SYN packets are now
+simply consumed
+
+Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/dccp/input.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/net/dccp/input.c b/net/dccp/input.c
+index ba347184bda9..8fedc2d49770 100644
+--- a/net/dccp/input.c
++++ b/net/dccp/input.c
+@@ -606,7 +606,8 @@ int dccp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+ 			if (inet_csk(sk)->icsk_af_ops->conn_request(sk,
+ 								    skb) < 0)
+ 				return 1;
+-			goto discard;
++			consume_skb(skb);
++			return 0;
+ 		}
+ 		if (dh->dccph_type == DCCP_PKT_RESET)
+ 			goto discard;
+-- 
+2.28.0
+
+
+From f23fd87e154f2c0fbac2e33c999e388f9baf2714 Mon Sep 17 00:00:00 2001
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Fri, 17 Feb 2017 19:14:27 +0100
+Subject: [PATCH 10/32] vxlan: fix oops in dev_fill_metadata_dst
+
+[ Upstream commit 22f0708a718daea5e79de2d29b4829de016a4ff4 ]
+
+Since the commit 0c1d70af924b ("net: use dst_cache for vxlan device")
+vxlan_fill_metadata_dst() calls vxlan_get_route() passing a NULL
+dst_cache pointer, so the latter should explicitly check for
+valid dst_cache ptr. Unfortunately the commit d71785ffc7e7 ("net: add
+dst_cache to ovs vxlan lwtunnel") removed said check.
+
+As a result is possible to trigger a null pointer access calling
+vxlan_fill_metadata_dst(), e.g. with:
+
+ovs-vsctl add-br ovs-br0
+ovs-vsctl add-port ovs-br0 vxlan0 -- set interface vxlan0 \
+	type=vxlan options:remote_ip=192.168.1.1 \
+	options:key=1234 options:dst_port=4789 ofport_request=10
+ip address add dev ovs-br0 172.16.1.2/24
+ovs-vsctl set Bridge ovs-br0 ipfix=@i -- --id=@i create IPFIX \
+	targets=\"172.16.1.1:1234\" sampling=1
+iperf -c 172.16.1.1 -u -l 1000 -b 10M -t 1 -p 1234
+
+This commit addresses the issue passing to vxlan_get_route() the
+dst_cache already available into the lwt info processed by
+vxlan_fill_metadata_dst().
+
+Fixes: d71785ffc7e7 ("net: add dst_cache to ovs vxlan lwtunnel")
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Jiri Benc <jbenc@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/vxlan.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 0fafaa9d903b..d4f495b41bd4 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -2449,7 +2449,8 @@ static int vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
+ 			return -EINVAL;
+ 		rt = vxlan_get_route(vxlan, skb, 0, info->key.tos,
+ 				     info->key.u.ipv4.dst,
+-				     &info->key.u.ipv4.src, NULL, info);
++				     &info->key.u.ipv4.src,
++				     &info->dst_cache, info);
+ 		if (IS_ERR(rt))
+ 			return PTR_ERR(rt);
+ 		ip_rt_put(rt);
+@@ -2459,7 +2460,8 @@ static int vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
+ 
+ 		ndst = vxlan6_get_route(vxlan, skb, 0, info->key.tos,
+ 					info->key.label, &info->key.u.ipv6.dst,
+-					&info->key.u.ipv6.src, NULL, info);
++					&info->key.u.ipv6.src,
++					&info->dst_cache, info);
+ 		if (IS_ERR(ndst))
+ 			return PTR_ERR(ndst);
+ 		dst_release(ndst);
+-- 
+2.28.0
+
+
+From c2219da51664451149350e47321aa0fcf72a8b8f Mon Sep 17 00:00:00 2001
+From: "David S. Miller" <davem@davemloft.net>
+Date: Fri, 17 Feb 2017 16:19:39 -0500
+Subject: [PATCH 11/32] irda: Fix lockdep annotations in hashbin_delete().
+
+[ Upstream commit 4c03b862b12f980456f9de92db6d508a4999b788 ]
+
+A nested lock depth was added to the hasbin_delete() code but it
+doesn't actually work some well and results in tons of lockdep splats.
+
+Fix the code instead to properly drop the lock around the operation
+and just keep peeking the head of the hashbin queue.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Tested-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/irda/irqueue.c | 34 ++++++++++++++++------------------
+ 1 file changed, 16 insertions(+), 18 deletions(-)
+
+diff --git a/net/irda/irqueue.c b/net/irda/irqueue.c
+index acbe61c7e683..160dc89335e2 100644
+--- a/net/irda/irqueue.c
++++ b/net/irda/irqueue.c
+@@ -383,9 +383,6 @@ EXPORT_SYMBOL(hashbin_new);
+  *    for deallocating this structure if it's complex. If not the user can
+  *    just supply kfree, which should take care of the job.
+  */
+-#ifdef CONFIG_LOCKDEP
+-static int hashbin_lock_depth = 0;
+-#endif
+ int hashbin_delete( hashbin_t* hashbin, FREE_FUNC free_func)
+ {
+ 	irda_queue_t* queue;
+@@ -396,22 +393,27 @@ int hashbin_delete( hashbin_t* hashbin, FREE_FUNC free_func)
+ 	IRDA_ASSERT(hashbin->magic == HB_MAGIC, return -1;);
+ 
+ 	/* Synchronize */
+-	if ( hashbin->hb_type & HB_LOCK ) {
+-		spin_lock_irqsave_nested(&hashbin->hb_spinlock, flags,
+-					 hashbin_lock_depth++);
+-	}
++	if (hashbin->hb_type & HB_LOCK)
++		spin_lock_irqsave(&hashbin->hb_spinlock, flags);
+ 
+ 	/*
+ 	 *  Free the entries in the hashbin, TODO: use hashbin_clear when
+ 	 *  it has been shown to work
+ 	 */
+ 	for (i = 0; i < HASHBIN_SIZE; i ++ ) {
+-		queue = dequeue_first((irda_queue_t**) &hashbin->hb_queue[i]);
+-		while (queue ) {
+-			if (free_func)
+-				(*free_func)(queue);
+-			queue = dequeue_first(
+-				(irda_queue_t**) &hashbin->hb_queue[i]);
++		while (1) {
++			queue = dequeue_first((irda_queue_t**) &hashbin->hb_queue[i]);
++
++			if (!queue)
++				break;
++
++			if (free_func) {
++				if (hashbin->hb_type & HB_LOCK)
++					spin_unlock_irqrestore(&hashbin->hb_spinlock, flags);
++				free_func(queue);
++				if (hashbin->hb_type & HB_LOCK)
++					spin_lock_irqsave(&hashbin->hb_spinlock, flags);
++			}
+ 		}
+ 	}
+ 
+@@ -420,12 +422,8 @@ int hashbin_delete( hashbin_t* hashbin, FREE_FUNC free_func)
+ 	hashbin->magic = ~HB_MAGIC;
+ 
+ 	/* Release lock */
+-	if ( hashbin->hb_type & HB_LOCK) {
++	if (hashbin->hb_type & HB_LOCK)
+ 		spin_unlock_irqrestore(&hashbin->hb_spinlock, flags);
+-#ifdef CONFIG_LOCKDEP
+-		hashbin_lock_depth--;
+-#endif
+-	}
+ 
+ 	/*
+ 	 *  Free the hashbin structure
+-- 
+2.28.0
+
+
+From 7c56012e92b51030b13c4652a9494d422562d5d5 Mon Sep 17 00:00:00 2001
+From: "Michael S. Tsirkin" <mst@redhat.com>
+Date: Sun, 19 Feb 2017 07:17:17 +0200
+Subject: [PATCH 12/32] ptr_ring: fix race conditions when resizing
+
+[ Upstream commit e71695307114335be1ed912f4a347396c2ed0e69 ]
+
+Resizing currently drops consumer lock.  This can cause entries to be
+reordered, which isn't good in itself.  More importantly, consumer can
+detect a false ring empty condition and block forever.
+
+Further, nesting of consumer within producer lock is problematic for
+tun, since it produces entries in a BH, which causes a lock order
+reversal:
+
+       CPU0                    CPU1
+       ----                    ----
+  consume:
+  lock(&(&r->consumer_lock)->rlock);
+                               resize:
+                               local_irq_disable();
+                               lock(&(&r->producer_lock)->rlock);
+                               lock(&(&r->consumer_lock)->rlock);
+  <Interrupt>
+  produce:
+  lock(&(&r->producer_lock)->rlock);
+
+To fix, nest producer lock within consumer lock during resize,
+and keep consumer lock during the whole swap operation.
+
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Cc: stable@vger.kernel.org
+Cc: "David S. Miller" <davem@davemloft.net>
+Acked-by: Jason Wang <jasowang@redhat.com>
+Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/ptr_ring.h | 36 +++++++++++++++++++++++++++++++-----
+ 1 file changed, 31 insertions(+), 5 deletions(-)
+
+diff --git a/include/linux/ptr_ring.h b/include/linux/ptr_ring.h
+index 2052011bf9fb..6c70444da3b9 100644
+--- a/include/linux/ptr_ring.h
++++ b/include/linux/ptr_ring.h
+@@ -111,6 +111,11 @@ static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
+ 	return 0;
+ }
+ 
++/*
++ * Note: resize (below) nests producer lock within consumer lock, so if you
++ * consume in interrupt or BH context, you must disable interrupts/BH when
++ * calling this.
++ */
+ static inline int ptr_ring_produce(struct ptr_ring *r, void *ptr)
+ {
+ 	int ret;
+@@ -242,6 +247,11 @@ static inline void *__ptr_ring_consume(struct ptr_ring *r)
+ 	return ptr;
+ }
+ 
++/*
++ * Note: resize (below) nests producer lock within consumer lock, so if you
++ * call this in interrupt or BH context, you must disable interrupts/BH when
++ * producing.
++ */
+ static inline void *ptr_ring_consume(struct ptr_ring *r)
+ {
+ 	void *ptr;
+@@ -357,7 +367,7 @@ static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
+ 	void **old;
+ 	void *ptr;
+ 
+-	while ((ptr = ptr_ring_consume(r)))
++	while ((ptr = __ptr_ring_consume(r)))
+ 		if (producer < size)
+ 			queue[producer++] = ptr;
+ 		else if (destroy)
+@@ -372,6 +382,12 @@ static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
+ 	return old;
+ }
+ 
++/*
++ * Note: producer lock is nested within consumer lock, so if you
++ * resize you must make sure all uses nest correctly.
++ * In particular if you consume ring in interrupt or BH context, you must
++ * disable interrupts/BH when doing so.
++ */
+ static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
+ 				  void (*destroy)(void *))
+ {
+@@ -382,17 +398,25 @@ static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
+ 	if (!queue)
+ 		return -ENOMEM;
+ 
+-	spin_lock_irqsave(&(r)->producer_lock, flags);
++	spin_lock_irqsave(&(r)->consumer_lock, flags);
++	spin_lock(&(r)->producer_lock);
+ 
+ 	old = __ptr_ring_swap_queue(r, queue, size, gfp, destroy);
+ 
+-	spin_unlock_irqrestore(&(r)->producer_lock, flags);
++	spin_unlock(&(r)->producer_lock);
++	spin_unlock_irqrestore(&(r)->consumer_lock, flags);
+ 
+ 	kfree(old);
+ 
+ 	return 0;
+ }
+ 
++/*
++ * Note: producer lock is nested within consumer lock, so if you
++ * resize you must make sure all uses nest correctly.
++ * In particular if you consume ring in interrupt or BH context, you must
++ * disable interrupts/BH when doing so.
++ */
+ static inline int ptr_ring_resize_multiple(struct ptr_ring **rings, int nrings,
+ 					   int size,
+ 					   gfp_t gfp, void (*destroy)(void *))
+@@ -412,10 +436,12 @@ static inline int ptr_ring_resize_multiple(struct ptr_ring **rings, int nrings,
+ 	}
+ 
+ 	for (i = 0; i < nrings; ++i) {
+-		spin_lock_irqsave(&(rings[i])->producer_lock, flags);
++		spin_lock_irqsave(&(rings[i])->consumer_lock, flags);
++		spin_lock(&(rings[i])->producer_lock);
+ 		queues[i] = __ptr_ring_swap_queue(rings[i], queues[i],
+ 						  size, gfp, destroy);
+-		spin_unlock_irqrestore(&(rings[i])->producer_lock, flags);
++		spin_unlock(&(rings[i])->producer_lock);
++		spin_unlock_irqrestore(&(rings[i])->consumer_lock, flags);
+ 	}
+ 
+ 	for (i = 0; i < nrings; ++i)
+-- 
+2.28.0
+
+
+From 481aedf869fbf2d4503ca0005dbd68b78422955a Mon Sep 17 00:00:00 2001
+From: Paolo Abeni <pabeni@redhat.com>
+Date: Tue, 21 Feb 2017 09:33:18 +0100
+Subject: [PATCH 13/32] ip: fix IP_CHECKSUM handling
+
+[ Upstream commit ca4ef4574f1ee5252e2cd365f8f5d5bafd048f32 ]
+
+The skbs processed by ip_cmsg_recv() are not guaranteed to
+be linear e.g. when sending UDP packets over loopback with
+MSGMORE.
+Using csum_partial() on [potentially] the whole skb len
+is dangerous; instead be on the safe side and use skb_checksum().
+
+Thanks to syzkaller team to detect the issue and provide the
+reproducer.
+
+v1 -> v2:
+ - move the variable declaration in a tighter scope
+
+Fixes: ad6f939ab193 ("ip: Add offset parameter to ip_cmsg_recv")
+Reported-by: Andrey Konovalov <andreyknvl@google.com>
+Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/ip_sockglue.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index 65336f38a5d8..9826695ddfc6 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -105,10 +105,10 @@ static void ip_cmsg_recv_checksum(struct msghdr *msg, struct sk_buff *skb,
+ 	if (skb->ip_summed != CHECKSUM_COMPLETE)
+ 		return;
+ 
+-	if (offset != 0)
+-		csum = csum_sub(csum,
+-				csum_partial(skb_transport_header(skb) + tlen,
+-					     offset, 0));
++	if (offset != 0) {
++		int tend_off = skb_transport_offset(skb) + tlen;
++		csum = csum_sub(csum, skb_checksum(skb, tend_off, offset, 0));
++	}
+ 
+ 	put_cmsg(msg, SOL_IP, IP_CHECKSUM, sizeof(__wsum), &csum);
+ }
+-- 
+2.28.0
+
+
+From 1a0e2594ef76fabe28049922c20d19c12aad4881 Mon Sep 17 00:00:00 2001
+From: Maxime Jayat <maxime.jayat@mobile-devices.fr>
+Date: Tue, 21 Feb 2017 18:35:51 +0100
+Subject: [PATCH 14/32] net: socket: fix recvmmsg not returning error from
+ sock_error
+
+[ Upstream commit e623a9e9dec29ae811d11f83d0074ba254aba374 ]
+
+Commit 34b88a68f26a ("net: Fix use after free in the recvmmsg exit path"),
+changed the exit path of recvmmsg to always return the datagrams
+variable and modified the error paths to set the variable to the error
+code returned by recvmsg if necessary.
+
+However in the case sock_error returned an error, the error code was
+then ignored, and recvmmsg returned 0.
+
+Change the error path of recvmmsg to correctly return the error code
+of sock_error.
+
+The bug was triggered by using recvmmsg on a CAN interface which was
+not up. Linux 4.6 and later return 0 in this case while earlier
+releases returned -ENETDOWN.
+
+Fixes: 34b88a68f26a ("net: Fix use after free in the recvmmsg exit path")
+Signed-off-by: Maxime Jayat <maxime.jayat@mobile-devices.fr>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/socket.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/net/socket.c b/net/socket.c
+index 73dc69f9681e..6bbccf05854f 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -2197,8 +2197,10 @@ int __sys_recvmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
+ 		return err;
+ 
+ 	err = sock_error(sock->sk);
+-	if (err)
++	if (err) {
++		datagrams = err;
+ 		goto out_put;
++	}
+ 
+ 	entry = mmsg;
+ 	compat_entry = (struct compat_mmsghdr __user *)mmsg;
+-- 
+2.28.0
+
+
+From 9ab870e7425c224328ec5807ed916d417810b2eb Mon Sep 17 00:00:00 2001
+From: Javier Martinez Canillas <javier@osg.samsung.com>
+Date: Mon, 2 Jan 2017 11:57:20 -0300
+Subject: [PATCH 15/32] tty: serial: msm: Fix module autoload
+
+commit abe81f3b8ed2996e1712d26d38ff6b73f582c616 upstream.
+
+If the driver is built as a module, autoload won't work because the module
+alias information is not filled. So user-space can't match the registered
+device with the corresponding module.
+
+Export the module alias information using the MODULE_DEVICE_TABLE() macro.
+
+Before this patch:
+
+$ modinfo drivers/tty/serial/msm_serial.ko | grep alias
+$
+
+After this patch:
+
+$ modinfo drivers/tty/serial/msm_serial.ko | grep alias
+alias:          of:N*T*Cqcom,msm-uartdmC*
+alias:          of:N*T*Cqcom,msm-uartdm
+alias:          of:N*T*Cqcom,msm-uartC*
+alias:          of:N*T*Cqcom,msm-uart
+
+Signed-off-by: Javier Martinez Canillas <javier@osg.samsung.com>
+Acked-by: Bjorn Andersson <bjorn.andersson@linaro.org>
+Cc: stable <stable@vger.kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/tty/serial/msm_serial.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/tty/serial/msm_serial.c b/drivers/tty/serial/msm_serial.c
+index 7312e7e01b7e..6788e7532dff 100644
+--- a/drivers/tty/serial/msm_serial.c
++++ b/drivers/tty/serial/msm_serial.c
+@@ -1809,6 +1809,7 @@ static const struct of_device_id msm_match_table[] = {
+ 	{ .compatible = "qcom,msm-uartdm" },
+ 	{}
+ };
++MODULE_DEVICE_TABLE(of, msm_match_table);
+ 
+ static struct platform_driver msm_platform_driver = {
+ 	.remove = msm_serial_remove,
+-- 
+2.28.0
+
+
+From 308a96c857ccba6aaebfdc4c63045cb2970de0fb Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan@kernel.org>
+Date: Thu, 9 Feb 2017 12:11:41 +0100
+Subject: [PATCH 16/32] USB: serial: mos7840: fix another NULL-deref at open
+
+commit 5182c2cf2a9bfb7f066ef0bdd2bb6330b94dd74e upstream.
+
+Fix another NULL-pointer dereference at open should a malicious device
+lack an interrupt-in endpoint.
+
+Note that the driver has a broken check for an interrupt-in endpoint
+which means that an interrupt URB has never even been submitted.
+
+Fixes: 3f5429746d91 ("USB: Moschip 7840 USB-Serial Driver")
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/mos7840.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/serial/mos7840.c b/drivers/usb/serial/mos7840.c
+index 4f9af47e6a29..5c4fc3abf6a7 100644
+--- a/drivers/usb/serial/mos7840.c
++++ b/drivers/usb/serial/mos7840.c
+@@ -1024,6 +1024,7 @@ static int mos7840_open(struct tty_struct *tty, struct usb_serial_port *port)
+ 	 * (can't set it up in mos7840_startup as the structures *
+ 	 * were not set up at that time.)                        */
+ 	if (port0->open_ports == 1) {
++		/* FIXME: Buffer never NULL, so URB is not submitted. */
+ 		if (serial->port[0]->interrupt_in_buffer == NULL) {
+ 			/* set up interrupt urb */
+ 			usb_fill_int_urb(serial->port[0]->interrupt_in_urb,
+@@ -2119,7 +2120,8 @@ static int mos7840_calc_num_ports(struct usb_serial *serial)
+ static int mos7840_attach(struct usb_serial *serial)
+ {
+ 	if (serial->num_bulk_in < serial->num_ports ||
+-			serial->num_bulk_out < serial->num_ports) {
++			serial->num_bulk_out < serial->num_ports ||
++			serial->num_interrupt_in < 1) {
+ 		dev_err(&serial->interface->dev, "missing endpoints\n");
+ 		return -ENODEV;
+ 	}
+-- 
+2.28.0
+
+
+From 4420e0f8fddfade44c399d346dc388dd925eb100 Mon Sep 17 00:00:00 2001
+From: Ken Lin <yungching0725@gmail.com>
+Date: Sat, 4 Feb 2017 04:00:24 +0800
+Subject: [PATCH 17/32] USB: serial: cp210x: add new IDs for GE Bx50v3 boards
+
+commit 9a593656def0dc2f6c227851e8e602077267a5f1 upstream.
+
+Add new USB IDs for cp2104/5 devices on Bx50v3 boards due to the design
+change.
+
+Signed-off-by: Ken Lin <yungching0725@gmail.com>
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/cp210x.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
+index 243ac5ebe46a..8bb48751028c 100644
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@ -172,6 +172,8 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x1901, 0x0190) }, /* GE B850 CP2105 Recorder interface */
+ 	{ USB_DEVICE(0x1901, 0x0193) }, /* GE B650 CP2104 PMC interface */
+ 	{ USB_DEVICE(0x1901, 0x0194) },	/* GE Healthcare Remote Alarm Box */
++	{ USB_DEVICE(0x1901, 0x0195) },	/* GE B850/B650/B450 CP2104 DP UART interface */
++	{ USB_DEVICE(0x1901, 0x0196) },	/* GE B850 CP2105 DP UART interface */
+ 	{ USB_DEVICE(0x19CF, 0x3000) }, /* Parrot NMEA GPS Flight Recorder */
+ 	{ USB_DEVICE(0x1ADB, 0x0001) }, /* Schweitzer Engineering C662 Cable */
+ 	{ USB_DEVICE(0x1B1C, 0x1C00) }, /* Corsair USB Dongle */
+-- 
+2.28.0
+
+
+From f3d56f7a586e6fdddb9cfae46787492c94add38d Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan@kernel.org>
+Date: Thu, 12 Jan 2017 14:56:11 +0100
+Subject: [PATCH 18/32] USB: serial: ftdi_sio: fix modem-status error handling
+
+commit 427c3a95e3e29e65f59d99aaf320d7506f3eed57 upstream.
+
+Make sure to detect short responses when fetching the modem status in
+order to avoid parsing uninitialised buffer data and having bits of it
+leak to user space.
+
+Note that we still allow for short 1-byte responses.
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/ftdi_sio.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
+index 6e9fc8bcc285..86cbb77be038 100644
+--- a/drivers/usb/serial/ftdi_sio.c
++++ b/drivers/usb/serial/ftdi_sio.c
+@@ -2433,8 +2433,12 @@ static int ftdi_get_modem_status(struct usb_serial_port *port,
+ 			FTDI_SIO_GET_MODEM_STATUS_REQUEST_TYPE,
+ 			0, priv->interface,
+ 			buf, len, WDR_TIMEOUT);
+-	if (ret < 0) {
++
++	/* NOTE: We allow short responses and handle that below. */
++	if (ret < 1) {
+ 		dev_err(&port->dev, "failed to get modem status: %d\n", ret);
++		if (ret >= 0)
++			ret = -EIO;
+ 		ret = usb_translate_errors(ret);
+ 		goto out;
+ 	}
+-- 
+2.28.0
+
+
+From a1510a8c0ded157158be688a54c107aac4291f77 Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan@kernel.org>
+Date: Wed, 25 Jan 2017 15:35:20 +0100
+Subject: [PATCH 19/32] USB: serial: ftdi_sio: fix extreme low-latency setting
+
+commit c6dce2626606ef16434802989466636bc28c1419 upstream.
+
+Since commit 557aaa7ffab6 ("ft232: support the ASYNC_LOW_LATENCY
+flag") the FTDI driver has been using a receive latency-timer value of
+1 ms instead of the device default of 16 ms.
+
+The latency timer is used to periodically empty a non-full receive
+buffer, but a status header is always sent when the timer expires
+including when the buffer is empty. This means that a two-byte bulk
+message is received every millisecond also for an otherwise idle port as
+long as it is open.
+
+Let's restore the pre-2009 behaviour which reduces the rate of the
+status messages to 1/16th (e.g. interrupt frequency drops from 1 kHz to
+62.5 Hz) by not setting ASYNC_LOW_LATENCY by default.
+
+Anyone willing to pay the price for the minimum-latency behaviour should
+set the flag explicitly instead using the TIOCSSERIAL ioctl or a tool
+such as setserial (e.g. setserial /dev/ttyUSB0 low_latency).
+
+Note that since commit 0cbd81a9f6ba ("USB: ftdi_sio: remove
+tty->low_latency") the ASYNC_LOW_LATENCY flag has no other effects but
+to set a minimal latency timer.
+
+Reported-by: Antoine Aubert <a.aubert@overkiz.com>
+Fixes: 557aaa7ffab6 ("ft232: support the ASYNC_LOW_LATENCY flag")
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/ftdi_sio.c | 2 --
+ 1 file changed, 2 deletions(-)
+
+diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
+index 86cbb77be038..c990af07086f 100644
+--- a/drivers/usb/serial/ftdi_sio.c
++++ b/drivers/usb/serial/ftdi_sio.c
+@@ -1807,8 +1807,6 @@ static int ftdi_sio_port_probe(struct usb_serial_port *port)
+ 
+ 	mutex_init(&priv->cfg_lock);
+ 
+-	priv->flags = ASYNC_LOW_LATENCY;
+-
+ 	if (quirk && quirk->port_probe)
+ 		quirk->port_probe(priv);
+ 
+-- 
+2.28.0
+
+
+From 26805681a45d071ac8df99933d842c1380b7e279 Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan@kernel.org>
+Date: Thu, 2 Feb 2017 17:38:35 +0100
+Subject: [PATCH 20/32] USB: serial: ftdi_sio: fix line-status over-reporting
+
+commit a6bb1e17a39818b01b55d8e6238b4b5f06d55038 upstream.
+
+FTDI devices use a receive latency timer to periodically empty the
+receive buffer and report modem and line status (also when the buffer is
+empty).
+
+When a break or error condition is detected the corresponding status
+flags will be set on a packet with nonzero data payload and the flags
+are not updated until the break is over or further characters are
+received.
+
+In order to avoid over-reporting break and error conditions, these flags
+must therefore only be processed for packets with payload.
+
+This specifically fixes the case where after an overrun, the error
+condition is continuously reported and NULL-characters inserted until
+further data is received.
+
+Reported-by: Michael Walle <michael@walle.cc>
+Fixes: 72fda3ca6fc1 ("USB: serial: ftd_sio: implement sysrq handling on
+break")
+Fixes: 166ceb690750 ("USB: ftdi_sio: clean up line-status handling")
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/ftdi_sio.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
+index c990af07086f..99a0a5f1b400 100644
+--- a/drivers/usb/serial/ftdi_sio.c
++++ b/drivers/usb/serial/ftdi_sio.c
+@@ -2070,6 +2070,20 @@ static int ftdi_process_packet(struct usb_serial_port *port,
+ 		priv->prev_status = status;
+ 	}
+ 
++	/* save if the transmitter is empty or not */
++	if (packet[1] & FTDI_RS_TEMT)
++		priv->transmit_empty = 1;
++	else
++		priv->transmit_empty = 0;
++
++	len -= 2;
++	if (!len)
++		return 0;	/* status only */
++
++	/*
++	 * Break and error status must only be processed for packets with
++	 * data payload to avoid over-reporting.
++	 */
+ 	flag = TTY_NORMAL;
+ 	if (packet[1] & FTDI_RS_ERR_MASK) {
+ 		/* Break takes precedence over parity, which takes precedence
+@@ -2092,15 +2106,6 @@ static int ftdi_process_packet(struct usb_serial_port *port,
+ 		}
+ 	}
+ 
+-	/* save if the transmitter is empty or not */
+-	if (packet[1] & FTDI_RS_TEMT)
+-		priv->transmit_empty = 1;
+-	else
+-		priv->transmit_empty = 0;
+-
+-	len -= 2;
+-	if (!len)
+-		return 0;	/* status only */
+ 	port->icount.rx += len;
+ 	ch = packet + 2;
+ 
+-- 
+2.28.0
+
+
+From a1fc6fb5f31edc1b6fb8de092f6ab6fbe967aaa7 Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan@kernel.org>
+Date: Thu, 12 Jan 2017 14:56:21 +0100
+Subject: [PATCH 21/32] USB: serial: spcp8x5: fix modem-status handling
+
+commit 5ed8d41023751bdd3546f2fe4118304357efe8d2 upstream.
+
+Make sure to detect short control transfers and return zero on success
+when retrieving the modem status.
+
+This fixes the TIOCMGET implementation which since e1ed212d8593 ("USB:
+spcp8x5: add proper modem-status support") has returned TIOCM_LE on
+successful retrieval, and avoids leaking bits from the stack on short
+transfers.
+
+This also fixes the carrier-detect implementation which since the above
+mentioned commit unconditionally has returned true.
+
+Fixes: e1ed212d8593 ("USB: spcp8x5: add proper modem-status support")
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/spcp8x5.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/serial/spcp8x5.c b/drivers/usb/serial/spcp8x5.c
+index 475e6c31b266..ddfd787c461c 100644
+--- a/drivers/usb/serial/spcp8x5.c
++++ b/drivers/usb/serial/spcp8x5.c
+@@ -232,11 +232,17 @@ static int spcp8x5_get_msr(struct usb_serial_port *port, u8 *status)
+ 	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
+ 			      GET_UART_STATUS, GET_UART_STATUS_TYPE,
+ 			      0, GET_UART_STATUS_MSR, buf, 1, 100);
+-	if (ret < 0)
++	if (ret < 1) {
+ 		dev_err(&port->dev, "failed to get modem status: %d\n", ret);
++		if (ret >= 0)
++			ret = -EIO;
++		goto out;
++	}
+ 
+ 	dev_dbg(&port->dev, "0xc0:0x22:0:6  %d - 0x02%x\n", ret, *buf);
+ 	*status = *buf;
++	ret = 0;
++out:
+ 	kfree(buf);
+ 
+ 	return ret;
+-- 
+2.28.0
+
+
+From a2ce74e35d5fd1afb5304b645c3b459c922a2c4a Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan@kernel.org>
+Date: Fri, 13 Jan 2017 13:21:08 +0100
+Subject: [PATCH 22/32] USB: serial: opticon: fix CTS retrieval at open
+
+commit 2eee05020a0e7ee7c04422cbacdb07859e45dce6 upstream.
+
+The opticon driver used a control request at open to trigger a CTS
+status notification to be sent over the bulk-in pipe. When the driver
+was converted to using the generic read implementation, an inverted test
+prevented this request from being sent, something which could lead to
+TIOCMGET reporting an incorrect CTS state.
+
+Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+Fixes: 7a6ee2b02751 ("USB: opticon: switch to generic read implementation")
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/opticon.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/usb/serial/opticon.c b/drivers/usb/serial/opticon.c
+index 4b7bfb394a32..64bf258e7e00 100644
+--- a/drivers/usb/serial/opticon.c
++++ b/drivers/usb/serial/opticon.c
+@@ -142,7 +142,7 @@ static int opticon_open(struct tty_struct *tty, struct usb_serial_port *port)
+ 	usb_clear_halt(port->serial->dev, port->read_urb->pipe);
+ 
+ 	res = usb_serial_generic_open(tty, port);
+-	if (!res)
++	if (res)
+ 		return res;
+ 
+ 	/* Request CTS line state, sometimes during opening the current
+-- 
+2.28.0
+
+
+From 960a38eae80a9e5ba9688c0eb92114f6de028904 Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan@kernel.org>
+Date: Thu, 12 Jan 2017 14:56:09 +0100
+Subject: [PATCH 23/32] USB: serial: ark3116: fix register-accessor error
+ handling
+
+commit 9fef37d7cf170522fb354d6d0ea6de09b9b16678 upstream.
+
+The current implementation failed to detect short transfers, something
+which could lead to bits of the uninitialised heap transfer buffer
+leaking to user space.
+
+Fixes: 149fc791a452 ("USB: ark3116: Setup some basic infrastructure for new ark3116 driver.")
+Fixes: f4c1e8d597d1 ("USB: ark3116: Make existing functions 16450-aware and add close and release functions.")
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/ark3116.c | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/usb/serial/ark3116.c b/drivers/usb/serial/ark3116.c
+index 1532cde8a437..7812052dc700 100644
+--- a/drivers/usb/serial/ark3116.c
++++ b/drivers/usb/serial/ark3116.c
+@@ -99,10 +99,17 @@ static int ark3116_read_reg(struct usb_serial *serial,
+ 				 usb_rcvctrlpipe(serial->dev, 0),
+ 				 0xfe, 0xc0, 0, reg,
+ 				 buf, 1, ARK_TIMEOUT);
+-	if (result < 0)
++	if (result < 1) {
++		dev_err(&serial->interface->dev,
++				"failed to read register %u: %d\n",
++				reg, result);
++		if (result >= 0)
++			result = -EIO;
++
+ 		return result;
+-	else
+-		return buf[0];
++	}
++
++	return buf[0];
+ }
+ 
+ static inline int calc_divisor(int bps)
+-- 
+2.28.0
+
+
+From fef3fdf2d83cd0ca3bc0052ab58baab010929434 Mon Sep 17 00:00:00 2001
+From: Johan Hovold <johan@kernel.org>
+Date: Wed, 8 Feb 2017 18:53:08 +0100
+Subject: [PATCH 24/32] USB: serial: console: fix uninitialised spinlock
+
+commit 14816b16fa0adac24f82492f18fa62c55acabbbe upstream.
+
+Since commit 4a510969374a ("tty: Make tty_files_lock per-tty") a new
+tty_struct spin lock is taken in the tty release path, but the
+USB-serial-console hack was never updated hence leaving the lock of its
+"fake" tty uninitialised. This was eventually detected by lockdep.
+
+Make sure to initialise the new lock also for the fake tty to address
+this regression.
+
+Yes, this code is a mess, but cleaning it up is left for another day.
+
+Fixes: 4a510969374a ("tty: Make tty_files_lock per-tty")
+Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/console.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/usb/serial/console.c b/drivers/usb/serial/console.c
+index 8967715fe6fc..b6f1adefb758 100644
+--- a/drivers/usb/serial/console.c
++++ b/drivers/usb/serial/console.c
+@@ -143,6 +143,7 @@ static int usb_console_setup(struct console *co, char *options)
+ 			tty->driver = usb_serial_tty_driver;
+ 			tty->index = co->index;
+ 			init_ldsem(&tty->ldisc_sem);
++			spin_lock_init(&tty->files_lock);
+ 			INIT_LIST_HEAD(&tty->tty_files);
+ 			kref_get(&tty->driver->kref);
+ 			__module_get(tty->driver->owner);
+-- 
+2.28.0
+
+
+From 2709c2a1b0165e7b4084077148697175ecd9d2c7 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 15 Feb 2017 11:11:50 +0100
+Subject: [PATCH 25/32] x86/platform/goldfish: Prevent unconditional loading
+
+commit 47512cfd0d7a8bd6ab71d01cd89fca19eb2093eb upstream.
+
+The goldfish platform code registers the platform device unconditionally
+which causes havoc in several ways if the goldfish_pdev_bus driver is
+enabled:
+
+ - Access to the hardcoded physical memory region, which is either not
+   available or contains stuff which is completely unrelated.
+
+ - Prevents that the interrupt of the serial port can be requested
+
+ - In case of a spurious interrupt it goes into a infinite loop in the
+   interrupt handler of the pdev_bus driver (which needs to be fixed
+   seperately).
+
+Add a 'goldfish' command line option to make the registration opt-in when
+the platform is compiled in.
+
+I'm seriously grumpy about this engineering trainwreck, which has seven
+SOBs from Intel developers for 50 lines of code. And none of them figured
+out that this is broken. Impressive fail!
+
+Fixes: ddd70cf93d78 ("goldfish: platform device for x86")
+Reported-by: Gabriel C <nix.or.die@gmail.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ Documentation/kernel-parameters.txt   |  4 ++++
+ arch/x86/platform/goldfish/goldfish.c | 14 +++++++++++++-
+ 2 files changed, 17 insertions(+), 1 deletion(-)
+
 diff --git a/Documentation/kernel-parameters.txt b/Documentation/kernel-parameters.txt
 index 922dec8fa07e..65b05ba6ef98 100644
 --- a/Documentation/kernel-parameters.txt
@@ -13,18 +1674,6 @@ index 922dec8fa07e..65b05ba6ef98 100644
  	gpt		[EFI] Forces disk with valid GPT signature but
  			invalid Protective MBR to be treated as GPT. If the
  			primary GPT is corrupted, it enables the backup/alternate
-diff --git a/Makefile b/Makefile
-index 3cd6f6fb4f20..14dc2758345b 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 9
--SUBLEVEL = 12
-+SUBLEVEL = 13
- EXTRAVERSION =
- NAME = Roaring Lionus
- 
 diff --git a/arch/x86/platform/goldfish/goldfish.c b/arch/x86/platform/goldfish/goldfish.c
 index 1693107a518e..0d17c0aafeb1 100644
 --- a/arch/x86/platform/goldfish/goldfish.c
@@ -53,97 +1702,39 @@ index 1693107a518e..0d17c0aafeb1 100644
  	return 0;
  }
  device_initcall(goldfish_init);
-diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
-index 6bb21b31cfeb..a543ea676de3 100644
---- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
-+++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
-@@ -567,10 +567,14 @@ int mlx5e_stats_flower(struct mlx5e_priv *priv,
- 
- 	mlx5_fc_query_cached(counter, &bytes, &packets, &lastuse);
- 
-+	preempt_disable();
-+
- 	tcf_exts_to_list(f->exts, &actions);
- 	list_for_each_entry(a, &actions, list)
- 		tcf_action_stats_update(a, bytes, packets, lastuse);
- 
-+	preempt_enable();
-+
- 	return 0;
- }
- 
-diff --git a/drivers/net/ethernet/ti/cpsw.c b/drivers/net/ethernet/ti/cpsw.c
-index b9087b828eff..3f1971d485f3 100644
---- a/drivers/net/ethernet/ti/cpsw.c
-+++ b/drivers/net/ethernet/ti/cpsw.c
-@@ -2925,7 +2925,7 @@ static int cpsw_resume(struct device *dev)
- {
- 	struct platform_device	*pdev = to_platform_device(dev);
- 	struct net_device	*ndev = platform_get_drvdata(pdev);
--	struct cpsw_common	*cpsw = netdev_priv(ndev);
-+	struct cpsw_common	*cpsw = ndev_to_cpsw(ndev);
- 
- 	/* Select default pin state */
- 	pinctrl_pm_select_default_state(dev);
-diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
-index 0fafaa9d903b..d4f495b41bd4 100644
---- a/drivers/net/vxlan.c
-+++ b/drivers/net/vxlan.c
-@@ -2449,7 +2449,8 @@ static int vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
- 			return -EINVAL;
- 		rt = vxlan_get_route(vxlan, skb, 0, info->key.tos,
- 				     info->key.u.ipv4.dst,
--				     &info->key.u.ipv4.src, NULL, info);
-+				     &info->key.u.ipv4.src,
-+				     &info->dst_cache, info);
- 		if (IS_ERR(rt))
- 			return PTR_ERR(rt);
- 		ip_rt_put(rt);
-@@ -2459,7 +2460,8 @@ static int vxlan_fill_metadata_dst(struct net_device *dev, struct sk_buff *skb)
- 
- 		ndst = vxlan6_get_route(vxlan, skb, 0, info->key.tos,
- 					info->key.label, &info->key.u.ipv6.dst,
--					&info->key.u.ipv6.src, NULL, info);
-+					&info->key.u.ipv6.src,
-+					&info->dst_cache, info);
- 		if (IS_ERR(ndst))
- 			return PTR_ERR(ndst);
- 		dst_release(ndst);
-diff --git a/drivers/net/wireless/realtek/rtlwifi/usb.c b/drivers/net/wireless/realtek/rtlwifi/usb.c
-index 3837bbdecf05..ae0c48f3c2bc 100644
---- a/drivers/net/wireless/realtek/rtlwifi/usb.c
-+++ b/drivers/net/wireless/realtek/rtlwifi/usb.c
-@@ -831,12 +831,30 @@ static void rtl_usb_stop(struct ieee80211_hw *hw)
- 	struct rtl_priv *rtlpriv = rtl_priv(hw);
- 	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
- 	struct rtl_usb *rtlusb = rtl_usbdev(rtl_usbpriv(hw));
-+	struct urb *urb;
- 
- 	/* should after adapter start and interrupt enable. */
- 	set_hal_stop(rtlhal);
- 	cancel_work_sync(&rtlpriv->works.fill_h2c_cmd);
- 	/* Enable software */
- 	SET_USB_STOP(rtlusb);
-+
-+	/* free pre-allocated URBs from rtl_usb_start() */
-+	usb_kill_anchored_urbs(&rtlusb->rx_submitted);
-+
-+	tasklet_kill(&rtlusb->rx_work_tasklet);
-+	cancel_work_sync(&rtlpriv->works.lps_change_work);
-+
-+	flush_workqueue(rtlpriv->works.rtl_wq);
-+
-+	skb_queue_purge(&rtlusb->rx_queue);
-+
-+	while ((urb = usb_get_from_anchor(&rtlusb->rx_cleanup_urbs))) {
-+		usb_free_coherent(urb->dev, urb->transfer_buffer_length,
-+				urb->transfer_buffer, urb->transfer_dma);
-+		usb_free_urb(urb);
-+	}
-+
- 	rtlpriv->cfg->ops->hw_disable(hw);
- }
- 
+-- 
+2.28.0
+
+
+From e6bdd8d2fffc0875eb16ec5e08e8230771539073 Mon Sep 17 00:00:00 2001
+From: Thomas Gleixner <tglx@linutronix.de>
+Date: Wed, 15 Feb 2017 11:11:51 +0100
+Subject: [PATCH 26/32] goldfish: Sanitize the broken interrupt handler
+
+commit 6cf18e6927c0b224f972e3042fb85770d63cb9f8 upstream.
+
+This interrupt handler is broken in several ways:
+
+  - It loops forever when the op code is not decodeable
+
+  - It never returns IRQ_HANDLED because the only way to exit the loop
+    returns IRQ_NONE unconditionally.
+
+The whole concept of this is broken. Creating devices in an interrupt
+handler is beyond any point of sanity.
+
+Make it at least behave halfways sane so accidental users do not have to
+deal with a hard to debug lockup.
+
+Fixes: e809c22b8fb028 ("goldfish: add the goldfish virtual bus")
+Reported-by: Gabriel C <nix.or.die@gmail.com>
+Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/platform/goldfish/pdev_bus.c | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
 diff --git a/drivers/platform/goldfish/pdev_bus.c b/drivers/platform/goldfish/pdev_bus.c
 index 1f52462f4cdd..dd9ea463c2a4 100644
 --- a/drivers/platform/goldfish/pdev_bus.c
@@ -180,221 +1771,147 @@ index 1f52462f4cdd..dd9ea463c2a4 100644
  }
  
  static int goldfish_pdev_bus_probe(struct platform_device *pdev)
-diff --git a/drivers/tty/serial/msm_serial.c b/drivers/tty/serial/msm_serial.c
-index 7312e7e01b7e..6788e7532dff 100644
---- a/drivers/tty/serial/msm_serial.c
-+++ b/drivers/tty/serial/msm_serial.c
-@@ -1809,6 +1809,7 @@ static const struct of_device_id msm_match_table[] = {
- 	{ .compatible = "qcom,msm-uartdm" },
- 	{}
- };
-+MODULE_DEVICE_TABLE(of, msm_match_table);
- 
- static struct platform_driver msm_platform_driver = {
- 	.remove = msm_serial_remove,
-diff --git a/drivers/usb/serial/ark3116.c b/drivers/usb/serial/ark3116.c
-index 1532cde8a437..7812052dc700 100644
---- a/drivers/usb/serial/ark3116.c
-+++ b/drivers/usb/serial/ark3116.c
-@@ -99,10 +99,17 @@ static int ark3116_read_reg(struct usb_serial *serial,
- 				 usb_rcvctrlpipe(serial->dev, 0),
- 				 0xfe, 0xc0, 0, reg,
- 				 buf, 1, ARK_TIMEOUT);
--	if (result < 0)
-+	if (result < 1) {
-+		dev_err(&serial->interface->dev,
-+				"failed to read register %u: %d\n",
-+				reg, result);
-+		if (result >= 0)
-+			result = -EIO;
-+
- 		return result;
--	else
--		return buf[0];
-+	}
-+
-+	return buf[0];
+-- 
+2.28.0
+
+
+From 8f9872be6db939a75a075cd893a47ce5742cee00 Mon Sep 17 00:00:00 2001
+From: Jiri Kosina <jkosina@suse.cz>
+Date: Wed, 1 Feb 2017 21:01:54 +0100
+Subject: [PATCH 27/32] netfilter: nf_ct_helper: warn when not applying default
+ helper assignment
+
+commit dfe75ff8ca74f54b0fa5a326a1aa9afa485ed802 upstream.
+
+Commit 3bb398d925 ("netfilter: nf_ct_helper: disable automatic helper
+assignment") is causing behavior regressions in firewalls, as traffic
+handled by conntrack helpers is now by default not passed through even
+though it was before due to missing CT targets (which were not necessary
+before this commit).
+
+The default had to be switched off due to security reasons [1] [2] and
+therefore should stay the way it is, but let's be friendly to firewall
+admins and issue a warning the first time we're in situation where packet
+would be likely passed through with the old default but we're likely going
+to drop it on the floor now.
+
+Rewrite the code a little bit as suggested by Linus, so that we avoid
+spaghettiing the code even more -- namely the whole decision making
+process regarding helper selection (either automatic or not) is being
+separated, so that the whole logic can be simplified and code (condition)
+duplication reduced.
+
+[1] https://cansecwest.com/csw12/conntrack-attack.pdf
+[2] https://home.regit.org/netfilter-en/secure-use-of-helpers/
+
+Signed-off-by: Jiri Kosina <jkosina@suse.cz>
+Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/netfilter/nf_conntrack_helper.c | 39 +++++++++++++++++++----------
+ 1 file changed, 26 insertions(+), 13 deletions(-)
+
+diff --git a/net/netfilter/nf_conntrack_helper.c b/net/netfilter/nf_conntrack_helper.c
+index 7341adf7059d..6dc44d9b4190 100644
+--- a/net/netfilter/nf_conntrack_helper.c
++++ b/net/netfilter/nf_conntrack_helper.c
+@@ -188,6 +188,26 @@ nf_ct_helper_ext_add(struct nf_conn *ct,
  }
+ EXPORT_SYMBOL_GPL(nf_ct_helper_ext_add);
  
- static inline int calc_divisor(int bps)
-diff --git a/drivers/usb/serial/console.c b/drivers/usb/serial/console.c
-index 8967715fe6fc..b6f1adefb758 100644
---- a/drivers/usb/serial/console.c
-+++ b/drivers/usb/serial/console.c
-@@ -143,6 +143,7 @@ static int usb_console_setup(struct console *co, char *options)
- 			tty->driver = usb_serial_tty_driver;
- 			tty->index = co->index;
- 			init_ldsem(&tty->ldisc_sem);
-+			spin_lock_init(&tty->files_lock);
- 			INIT_LIST_HEAD(&tty->tty_files);
- 			kref_get(&tty->driver->kref);
- 			__module_get(tty->driver->owner);
-diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
-index 243ac5ebe46a..8bb48751028c 100644
---- a/drivers/usb/serial/cp210x.c
-+++ b/drivers/usb/serial/cp210x.c
-@@ -172,6 +172,8 @@ static const struct usb_device_id id_table[] = {
- 	{ USB_DEVICE(0x1901, 0x0190) }, /* GE B850 CP2105 Recorder interface */
- 	{ USB_DEVICE(0x1901, 0x0193) }, /* GE B650 CP2104 PMC interface */
- 	{ USB_DEVICE(0x1901, 0x0194) },	/* GE Healthcare Remote Alarm Box */
-+	{ USB_DEVICE(0x1901, 0x0195) },	/* GE B850/B650/B450 CP2104 DP UART interface */
-+	{ USB_DEVICE(0x1901, 0x0196) },	/* GE B850 CP2105 DP UART interface */
- 	{ USB_DEVICE(0x19CF, 0x3000) }, /* Parrot NMEA GPS Flight Recorder */
- 	{ USB_DEVICE(0x1ADB, 0x0001) }, /* Schweitzer Engineering C662 Cable */
- 	{ USB_DEVICE(0x1B1C, 0x1C00) }, /* Corsair USB Dongle */
-diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
-index 6e9fc8bcc285..99a0a5f1b400 100644
---- a/drivers/usb/serial/ftdi_sio.c
-+++ b/drivers/usb/serial/ftdi_sio.c
-@@ -1807,8 +1807,6 @@ static int ftdi_sio_port_probe(struct usb_serial_port *port)
- 
- 	mutex_init(&priv->cfg_lock);
- 
--	priv->flags = ASYNC_LOW_LATENCY;
--
- 	if (quirk && quirk->port_probe)
- 		quirk->port_probe(priv);
- 
-@@ -2072,6 +2070,20 @@ static int ftdi_process_packet(struct usb_serial_port *port,
- 		priv->prev_status = status;
- 	}
- 
-+	/* save if the transmitter is empty or not */
-+	if (packet[1] & FTDI_RS_TEMT)
-+		priv->transmit_empty = 1;
-+	else
-+		priv->transmit_empty = 0;
-+
-+	len -= 2;
-+	if (!len)
-+		return 0;	/* status only */
-+
-+	/*
-+	 * Break and error status must only be processed for packets with
-+	 * data payload to avoid over-reporting.
-+	 */
- 	flag = TTY_NORMAL;
- 	if (packet[1] & FTDI_RS_ERR_MASK) {
- 		/* Break takes precedence over parity, which takes precedence
-@@ -2094,15 +2106,6 @@ static int ftdi_process_packet(struct usb_serial_port *port,
- 		}
- 	}
- 
--	/* save if the transmitter is empty or not */
--	if (packet[1] & FTDI_RS_TEMT)
--		priv->transmit_empty = 1;
--	else
--		priv->transmit_empty = 0;
--
--	len -= 2;
--	if (!len)
--		return 0;	/* status only */
- 	port->icount.rx += len;
- 	ch = packet + 2;
- 
-@@ -2433,8 +2436,12 @@ static int ftdi_get_modem_status(struct usb_serial_port *port,
- 			FTDI_SIO_GET_MODEM_STATUS_REQUEST_TYPE,
- 			0, priv->interface,
- 			buf, len, WDR_TIMEOUT);
--	if (ret < 0) {
-+
-+	/* NOTE: We allow short responses and handle that below. */
-+	if (ret < 1) {
- 		dev_err(&port->dev, "failed to get modem status: %d\n", ret);
-+		if (ret >= 0)
-+			ret = -EIO;
- 		ret = usb_translate_errors(ret);
- 		goto out;
- 	}
-diff --git a/drivers/usb/serial/mos7840.c b/drivers/usb/serial/mos7840.c
-index 4f9af47e6a29..5c4fc3abf6a7 100644
---- a/drivers/usb/serial/mos7840.c
-+++ b/drivers/usb/serial/mos7840.c
-@@ -1024,6 +1024,7 @@ static int mos7840_open(struct tty_struct *tty, struct usb_serial_port *port)
- 	 * (can't set it up in mos7840_startup as the structures *
- 	 * were not set up at that time.)                        */
- 	if (port0->open_ports == 1) {
-+		/* FIXME: Buffer never NULL, so URB is not submitted. */
- 		if (serial->port[0]->interrupt_in_buffer == NULL) {
- 			/* set up interrupt urb */
- 			usb_fill_int_urb(serial->port[0]->interrupt_in_urb,
-@@ -2119,7 +2120,8 @@ static int mos7840_calc_num_ports(struct usb_serial *serial)
- static int mos7840_attach(struct usb_serial *serial)
- {
- 	if (serial->num_bulk_in < serial->num_ports ||
--			serial->num_bulk_out < serial->num_ports) {
-+			serial->num_bulk_out < serial->num_ports ||
-+			serial->num_interrupt_in < 1) {
- 		dev_err(&serial->interface->dev, "missing endpoints\n");
- 		return -ENODEV;
- 	}
-diff --git a/drivers/usb/serial/opticon.c b/drivers/usb/serial/opticon.c
-index 4b7bfb394a32..64bf258e7e00 100644
---- a/drivers/usb/serial/opticon.c
-+++ b/drivers/usb/serial/opticon.c
-@@ -142,7 +142,7 @@ static int opticon_open(struct tty_struct *tty, struct usb_serial_port *port)
- 	usb_clear_halt(port->serial->dev, port->read_urb->pipe);
- 
- 	res = usb_serial_generic_open(tty, port);
--	if (!res)
-+	if (res)
- 		return res;
- 
- 	/* Request CTS line state, sometimes during opening the current
-diff --git a/drivers/usb/serial/spcp8x5.c b/drivers/usb/serial/spcp8x5.c
-index 475e6c31b266..ddfd787c461c 100644
---- a/drivers/usb/serial/spcp8x5.c
-+++ b/drivers/usb/serial/spcp8x5.c
-@@ -232,11 +232,17 @@ static int spcp8x5_get_msr(struct usb_serial_port *port, u8 *status)
- 	ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0),
- 			      GET_UART_STATUS, GET_UART_STATUS_TYPE,
- 			      0, GET_UART_STATUS_MSR, buf, 1, 100);
--	if (ret < 0)
-+	if (ret < 1) {
- 		dev_err(&port->dev, "failed to get modem status: %d\n", ret);
-+		if (ret >= 0)
-+			ret = -EIO;
-+		goto out;
++static struct nf_conntrack_helper *
++nf_ct_lookup_helper(struct nf_conn *ct, struct net *net)
++{
++	if (!net->ct.sysctl_auto_assign_helper) {
++		if (net->ct.auto_assign_helper_warned)
++			return NULL;
++		if (!__nf_ct_helper_find(&ct->tuplehash[IP_CT_DIR_REPLY].tuple))
++			return NULL;
++		pr_info("nf_conntrack: default automatic helper assignment "
++			"has been turned off for security reasons and CT-based "
++			" firewall rule not found. Use the iptables CT target "
++			"to attach helpers instead.\n");
++		net->ct.auto_assign_helper_warned = 1;
++		return NULL;
 +	}
- 
- 	dev_dbg(&port->dev, "0xc0:0x22:0:6  %d - 0x02%x\n", ret, *buf);
- 	*status = *buf;
-+	ret = 0;
-+out:
- 	kfree(buf);
- 
- 	return ret;
-diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
-index cdc6bdd495be..e8889614cec3 100644
---- a/fs/xfs/xfs_iomap.c
-+++ b/fs/xfs/xfs_iomap.c
-@@ -1068,7 +1068,15 @@ xfs_file_iomap_end_delalloc(
- 	xfs_fileoff_t		end_fsb;
- 	int			error = 0;
- 
--	start_fsb = XFS_B_TO_FSB(mp, offset + written);
-+	/*
-+	 * start_fsb refers to the first unused block after a short write. If
-+	 * nothing was written, round offset down to point at the first block in
-+	 * the range.
-+	 */
-+	if (unlikely(!written))
-+		start_fsb = XFS_B_TO_FSBT(mp, offset);
-+	else
-+		start_fsb = XFS_B_TO_FSB(mp, offset + written);
- 	end_fsb = XFS_B_TO_FSB(mp, offset + length);
- 
- 	/*
-@@ -1080,6 +1088,9 @@ xfs_file_iomap_end_delalloc(
- 	 * blocks in the range, they are ours.
- 	 */
- 	if (start_fsb < end_fsb) {
-+		truncate_pagecache_range(VFS_I(ip), XFS_FSB_TO_B(mp, start_fsb),
-+					 XFS_FSB_TO_B(mp, end_fsb) - 1);
 +
- 		xfs_ilock(ip, XFS_ILOCK_EXCL);
- 		error = xfs_bmap_punch_delalloc_range(ip, start_fsb,
- 					       end_fsb - start_fsb);
++	return __nf_ct_helper_find(&ct->tuplehash[IP_CT_DIR_REPLY].tuple);
++}
++
++
+ int __nf_ct_try_assign_helper(struct nf_conn *ct, struct nf_conn *tmpl,
+ 			      gfp_t flags)
+ {
+@@ -213,21 +233,14 @@ int __nf_ct_try_assign_helper(struct nf_conn *ct, struct nf_conn *tmpl,
+ 	}
+ 
+ 	help = nfct_help(ct);
+-	if (net->ct.sysctl_auto_assign_helper && helper == NULL) {
+-		helper = __nf_ct_helper_find(&ct->tuplehash[IP_CT_DIR_REPLY].tuple);
+-		if (unlikely(!net->ct.auto_assign_helper_warned && helper)) {
+-			pr_info("nf_conntrack: automatic helper "
+-				"assignment is deprecated and it will "
+-				"be removed soon. Use the iptables CT target "
+-				"to attach helpers instead.\n");
+-			net->ct.auto_assign_helper_warned = true;
+-		}
+-	}
+ 
+ 	if (helper == NULL) {
+-		if (help)
+-			RCU_INIT_POINTER(help->helper, NULL);
+-		return 0;
++		helper = nf_ct_lookup_helper(ct, net);
++		if (helper == NULL) {
++			if (help)
++				RCU_INIT_POINTER(help->helper, NULL);
++			return 0;
++		}
+ 	}
+ 
+ 	if (help == NULL) {
+-- 
+2.28.0
+
+
+From 62c153f346fe5ef8946103050548707ff294961f Mon Sep 17 00:00:00 2001
+From: Lv Zheng <lv.zheng@intel.com>
+Date: Wed, 8 Feb 2017 11:00:01 +0800
+Subject: [PATCH 28/32] ACPICA: Linuxize: Restore and fix Intel compiler build
+
+commit ffab9188e444854882dbc291500d576d6bad7b7b upstream.
+
+ACPICA commit b59347d0b8b676cb555fe8da5cad08fcd4eeb0d3
+
+The following commit cleans up compiler specific inclusions:
+
+  Commit: 9fa1cebdbfff3db8953cebca8ee327d75edefc40
+  Subject: ACPICA: OSL: Cleanup the inclusion order of the compiler-specific headers
+
+But breaks one thing due to the following old issue:
+
+ Buidling Linux kernel with Intel compiler originally depends on acgcc.h
+ not acintel.h.
+
+So after making Intel compiler build working in ACPICA upstream by
+correctly using acintel.h, it becomes unable to build Linux kernel using
+Intel compiler as there is no acintel.h in the kernel source tree.
+
+This patch releases acintel.h to Linux kernel and fixes its inclusion in
+acenv.h.
+
+Fixes: 9fa1cebdbfff (ACPICA: OSL: Cleanup the inclusion order of the compiler-specific headers)
+Link: https://github.com/acpica/acpica/commit/b59347d0
+Tested-by: Stepan M Mishura <stepan.m.mishura@intel.com>
+Signed-off-by: Lv Zheng <lv.zheng@intel.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/acpi/platform/acenv.h   |  2 +-
+ include/acpi/platform/acintel.h | 87 +++++++++++++++++++++++++++++++++
+ 2 files changed, 88 insertions(+), 1 deletion(-)
+ create mode 100644 include/acpi/platform/acintel.h
+
 diff --git a/include/acpi/platform/acenv.h b/include/acpi/platform/acenv.h
 index 34cce729109c..fca15390a42c 100644
 --- a/include/acpi/platform/acenv.h
@@ -501,99 +2018,41 @@ index 000000000000..17bd3b7b4e5a
 +#pragma warning(disable:4214)
 +
 +#endif				/* __ACINTEL_H__ */
-diff --git a/include/linux/ptr_ring.h b/include/linux/ptr_ring.h
-index 2052011bf9fb..6c70444da3b9 100644
---- a/include/linux/ptr_ring.h
-+++ b/include/linux/ptr_ring.h
-@@ -111,6 +111,11 @@ static inline int __ptr_ring_produce(struct ptr_ring *r, void *ptr)
- 	return 0;
- }
- 
-+/*
-+ * Note: resize (below) nests producer lock within consumer lock, so if you
-+ * consume in interrupt or BH context, you must disable interrupts/BH when
-+ * calling this.
-+ */
- static inline int ptr_ring_produce(struct ptr_ring *r, void *ptr)
- {
- 	int ret;
-@@ -242,6 +247,11 @@ static inline void *__ptr_ring_consume(struct ptr_ring *r)
- 	return ptr;
- }
- 
-+/*
-+ * Note: resize (below) nests producer lock within consumer lock, so if you
-+ * call this in interrupt or BH context, you must disable interrupts/BH when
-+ * producing.
-+ */
- static inline void *ptr_ring_consume(struct ptr_ring *r)
- {
- 	void *ptr;
-@@ -357,7 +367,7 @@ static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
- 	void **old;
- 	void *ptr;
- 
--	while ((ptr = ptr_ring_consume(r)))
-+	while ((ptr = __ptr_ring_consume(r)))
- 		if (producer < size)
- 			queue[producer++] = ptr;
- 		else if (destroy)
-@@ -372,6 +382,12 @@ static inline void **__ptr_ring_swap_queue(struct ptr_ring *r, void **queue,
- 	return old;
- }
- 
-+/*
-+ * Note: producer lock is nested within consumer lock, so if you
-+ * resize you must make sure all uses nest correctly.
-+ * In particular if you consume ring in interrupt or BH context, you must
-+ * disable interrupts/BH when doing so.
-+ */
- static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
- 				  void (*destroy)(void *))
- {
-@@ -382,17 +398,25 @@ static inline int ptr_ring_resize(struct ptr_ring *r, int size, gfp_t gfp,
- 	if (!queue)
- 		return -ENOMEM;
- 
--	spin_lock_irqsave(&(r)->producer_lock, flags);
-+	spin_lock_irqsave(&(r)->consumer_lock, flags);
-+	spin_lock(&(r)->producer_lock);
- 
- 	old = __ptr_ring_swap_queue(r, queue, size, gfp, destroy);
- 
--	spin_unlock_irqrestore(&(r)->producer_lock, flags);
-+	spin_unlock(&(r)->producer_lock);
-+	spin_unlock_irqrestore(&(r)->consumer_lock, flags);
- 
- 	kfree(old);
- 
- 	return 0;
- }
- 
-+/*
-+ * Note: producer lock is nested within consumer lock, so if you
-+ * resize you must make sure all uses nest correctly.
-+ * In particular if you consume ring in interrupt or BH context, you must
-+ * disable interrupts/BH when doing so.
-+ */
- static inline int ptr_ring_resize_multiple(struct ptr_ring **rings, int nrings,
- 					   int size,
- 					   gfp_t gfp, void (*destroy)(void *))
-@@ -412,10 +436,12 @@ static inline int ptr_ring_resize_multiple(struct ptr_ring **rings, int nrings,
- 	}
- 
- 	for (i = 0; i < nrings; ++i) {
--		spin_lock_irqsave(&(rings[i])->producer_lock, flags);
-+		spin_lock_irqsave(&(rings[i])->consumer_lock, flags);
-+		spin_lock(&(rings[i])->producer_lock);
- 		queues[i] = __ptr_ring_swap_queue(rings[i], queues[i],
- 						  size, gfp, destroy);
--		spin_unlock_irqrestore(&(rings[i])->producer_lock, flags);
-+		spin_unlock(&(rings[i])->producer_lock);
-+		spin_unlock_irqrestore(&(rings[i])->consumer_lock, flags);
- 	}
- 
- 	for (i = 0; i < nrings; ++i)
+-- 
+2.28.0
+
+
+From 1cb3de83ab740c17dafe9148c2a5b5ac41a736cf Mon Sep 17 00:00:00 2001
+From: Tejun Heo <tj@kernel.org>
+Date: Wed, 8 Feb 2017 15:19:07 -0500
+Subject: [PATCH 29/32] block: fix double-free in the failure path of
+ cgwb_bdi_init()
+
+commit 5f478e4ea5c5560b4e40eb136991a09f9389f331 upstream.
+
+When !CONFIG_CGROUP_WRITEBACK, bdi has single bdi_writeback_congested
+at bdi->wb_congested.  cgwb_bdi_init() allocates it with kzalloc() and
+doesn't do further initialization.  This usually works fine as the
+reference count gets bumped to 1 by wb_init() and the put from
+wb_exit() releases it.
+
+However, when wb_init() fails, it puts the wb base ref automatically
+freeing the wb and the explicit kfree() in cgwb_bdi_init() error path
+ends up trying to free the same pointer the second time causing a
+double-free.
+
+Fix it by explicitly initilizing the refcnt to 1 and putting the base
+ref from cgwb_bdi_destroy().
+
+Signed-off-by: Tejun Heo <tj@kernel.org>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Fixes: a13f35e87140 ("writeback: don't embed root bdi_writeback_congested in bdi_writeback")
+Signed-off-by: Jens Axboe <axboe@fb.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ mm/backing-dev.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
 diff --git a/mm/backing-dev.c b/mm/backing-dev.c
 index 8fde443f36d7..6ff2d7744223 100644
 --- a/mm/backing-dev.c
@@ -621,459 +2080,160 @@ index 8fde443f36d7..6ff2d7744223 100644
  
  #endif	/* CONFIG_CGROUP_WRITEBACK */
  
-diff --git a/net/core/neighbour.c b/net/core/neighbour.c
-index 2ae929f9bd06..9901e5b75a05 100644
---- a/net/core/neighbour.c
-+++ b/net/core/neighbour.c
-@@ -2927,7 +2927,8 @@ static void neigh_proc_update(struct ctl_table *ctl, int write)
- 		return;
+-- 
+2.28.0
+
+
+From 57d759622aa76591958f46707edebe20c284b7d2 Mon Sep 17 00:00:00 2001
+From: Michael Schenk <michael.schenk@albis-elcon.com>
+Date: Thu, 26 Jan 2017 11:25:04 -0600
+Subject: [PATCH 30/32] rtlwifi: rtl_usb: Fix for URB leaking when doing
+ ifconfig up/down
+
+commit 575ddce0507789bf9830d089557d2199d2f91865 upstream.
+
+In the function rtl_usb_start we pre-allocate a certain number of urbs
+for RX path but they will not be freed when calling rtl_usb_stop. This
+results in leaking urbs when doing ifconfig up and down. Eventually,
+the system has no available urbs.
+
+Signed-off-by: Michael Schenk <michael.schenk@albis-elcon.com>
+Signed-off-by: Larry Finger <Larry.Finger@lwfinger.net>
+Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/wireless/realtek/rtlwifi/usb.c | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+diff --git a/drivers/net/wireless/realtek/rtlwifi/usb.c b/drivers/net/wireless/realtek/rtlwifi/usb.c
+index 3837bbdecf05..ae0c48f3c2bc 100644
+--- a/drivers/net/wireless/realtek/rtlwifi/usb.c
++++ b/drivers/net/wireless/realtek/rtlwifi/usb.c
+@@ -831,12 +831,30 @@ static void rtl_usb_stop(struct ieee80211_hw *hw)
+ 	struct rtl_priv *rtlpriv = rtl_priv(hw);
+ 	struct rtl_hal *rtlhal = rtl_hal(rtl_priv(hw));
+ 	struct rtl_usb *rtlusb = rtl_usbdev(rtl_usbpriv(hw));
++	struct urb *urb;
  
- 	set_bit(index, p->data_state);
--	call_netevent_notifiers(NETEVENT_DELAY_PROBE_TIME_UPDATE, p);
-+	if (index == NEIGH_VAR_DELAY_PROBE_TIME)
-+		call_netevent_notifiers(NETEVENT_DELAY_PROBE_TIME_UPDATE, p);
- 	if (!dev) /* NULL dev means this is default value */
- 		neigh_copy_dflt_parms(net, p, index);
- }
-diff --git a/net/dccp/input.c b/net/dccp/input.c
-index ba347184bda9..8fedc2d49770 100644
---- a/net/dccp/input.c
-+++ b/net/dccp/input.c
-@@ -606,7 +606,8 @@ int dccp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
- 			if (inet_csk(sk)->icsk_af_ops->conn_request(sk,
- 								    skb) < 0)
- 				return 1;
--			goto discard;
-+			consume_skb(skb);
-+			return 0;
- 		}
- 		if (dh->dccph_type == DCCP_PKT_RESET)
- 			goto discard;
-diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
-index 65336f38a5d8..9826695ddfc6 100644
---- a/net/ipv4/ip_sockglue.c
-+++ b/net/ipv4/ip_sockglue.c
-@@ -105,10 +105,10 @@ static void ip_cmsg_recv_checksum(struct msghdr *msg, struct sk_buff *skb,
- 	if (skb->ip_summed != CHECKSUM_COMPLETE)
- 		return;
- 
--	if (offset != 0)
--		csum = csum_sub(csum,
--				csum_partial(skb_transport_header(skb) + tlen,
--					     offset, 0));
-+	if (offset != 0) {
-+		int tend_off = skb_transport_offset(skb) + tlen;
-+		csum = csum_sub(csum, skb_checksum(skb, tend_off, offset, 0));
+ 	/* should after adapter start and interrupt enable. */
+ 	set_hal_stop(rtlhal);
+ 	cancel_work_sync(&rtlpriv->works.fill_h2c_cmd);
+ 	/* Enable software */
+ 	SET_USB_STOP(rtlusb);
++
++	/* free pre-allocated URBs from rtl_usb_start() */
++	usb_kill_anchored_urbs(&rtlusb->rx_submitted);
++
++	tasklet_kill(&rtlusb->rx_work_tasklet);
++	cancel_work_sync(&rtlpriv->works.lps_change_work);
++
++	flush_workqueue(rtlpriv->works.rtl_wq);
++
++	skb_queue_purge(&rtlusb->rx_queue);
++
++	while ((urb = usb_get_from_anchor(&rtlusb->rx_cleanup_urbs))) {
++		usb_free_coherent(urb->dev, urb->transfer_buffer_length,
++				urb->transfer_buffer, urb->transfer_dma);
++		usb_free_urb(urb);
 +	}
- 
- 	put_cmsg(msg, SOL_IP, IP_CHECKSUM, sizeof(__wsum), &csum);
++
+ 	rtlpriv->cfg->ops->hw_disable(hw);
  }
-diff --git a/net/irda/irqueue.c b/net/irda/irqueue.c
-index acbe61c7e683..160dc89335e2 100644
---- a/net/irda/irqueue.c
-+++ b/net/irda/irqueue.c
-@@ -383,9 +383,6 @@ EXPORT_SYMBOL(hashbin_new);
-  *    for deallocating this structure if it's complex. If not the user can
-  *    just supply kfree, which should take care of the job.
-  */
--#ifdef CONFIG_LOCKDEP
--static int hashbin_lock_depth = 0;
--#endif
- int hashbin_delete( hashbin_t* hashbin, FREE_FUNC free_func)
- {
- 	irda_queue_t* queue;
-@@ -396,22 +393,27 @@ int hashbin_delete( hashbin_t* hashbin, FREE_FUNC free_func)
- 	IRDA_ASSERT(hashbin->magic == HB_MAGIC, return -1;);
  
- 	/* Synchronize */
--	if ( hashbin->hb_type & HB_LOCK ) {
--		spin_lock_irqsave_nested(&hashbin->hb_spinlock, flags,
--					 hashbin_lock_depth++);
--	}
-+	if (hashbin->hb_type & HB_LOCK)
-+		spin_lock_irqsave(&hashbin->hb_spinlock, flags);
+-- 
+2.28.0
+
+
+From d004006055974a976841c4f95e8c25ca7b5b38d5 Mon Sep 17 00:00:00 2001
+From: Brian Foster <bfoster@redhat.com>
+Date: Thu, 16 Feb 2017 17:19:12 -0800
+Subject: [PATCH 31/32] xfs: clear delalloc and cache on buffered write failure
+
+commit fa7f138ac4c70dc00519c124cf7cd4862a0a5b0e upstream.
+
+The buffered write failure handling code in
+xfs_file_iomap_end_delalloc() has a couple minor problems. First, if
+written == 0, start_fsb is not rounded down and it fails to kill off a
+delalloc block if the start offset is block unaligned. This results in a
+lingering delalloc block and broken delalloc block accounting detected
+at unmount time. Fix this by rounding down start_fsb in the unlikely
+event that written == 0.
+
+Second, it is possible for a failed overwrite of a delalloc extent to
+leave dirty pagecache around over a hole in the file. This is because is
+possible to hit ->iomap_end() on write failure before the iomap code has
+attempted to allocate pagecache, and thus has no need to clean it up. If
+the targeted delalloc extent was successfully written by a previous
+write, however, then it does still have dirty pages when ->iomap_end()
+punches out the underlying blocks. This ultimately results in writeback
+over a hole. To fix this problem, unconditionally punch out the
+pagecache from XFS before the associated delalloc range.
+
+Signed-off-by: Brian Foster <bfoster@redhat.com>
+Reviewed-by: Christoph Hellwig <hch@lst.de>
+Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/xfs/xfs_iomap.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index cdc6bdd495be..e8889614cec3 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -1068,7 +1068,15 @@ xfs_file_iomap_end_delalloc(
+ 	xfs_fileoff_t		end_fsb;
+ 	int			error = 0;
+ 
+-	start_fsb = XFS_B_TO_FSB(mp, offset + written);
++	/*
++	 * start_fsb refers to the first unused block after a short write. If
++	 * nothing was written, round offset down to point at the first block in
++	 * the range.
++	 */
++	if (unlikely(!written))
++		start_fsb = XFS_B_TO_FSBT(mp, offset);
++	else
++		start_fsb = XFS_B_TO_FSB(mp, offset + written);
+ 	end_fsb = XFS_B_TO_FSB(mp, offset + length);
  
  	/*
- 	 *  Free the entries in the hashbin, TODO: use hashbin_clear when
- 	 *  it has been shown to work
+@@ -1080,6 +1088,9 @@ xfs_file_iomap_end_delalloc(
+ 	 * blocks in the range, they are ours.
  	 */
- 	for (i = 0; i < HASHBIN_SIZE; i ++ ) {
--		queue = dequeue_first((irda_queue_t**) &hashbin->hb_queue[i]);
--		while (queue ) {
--			if (free_func)
--				(*free_func)(queue);
--			queue = dequeue_first(
--				(irda_queue_t**) &hashbin->hb_queue[i]);
-+		while (1) {
-+			queue = dequeue_first((irda_queue_t**) &hashbin->hb_queue[i]);
+ 	if (start_fsb < end_fsb) {
++		truncate_pagecache_range(VFS_I(ip), XFS_FSB_TO_B(mp, start_fsb),
++					 XFS_FSB_TO_B(mp, end_fsb) - 1);
 +
-+			if (!queue)
-+				break;
-+
-+			if (free_func) {
-+				if (hashbin->hb_type & HB_LOCK)
-+					spin_unlock_irqrestore(&hashbin->hb_spinlock, flags);
-+				free_func(queue);
-+				if (hashbin->hb_type & HB_LOCK)
-+					spin_lock_irqsave(&hashbin->hb_spinlock, flags);
-+			}
- 		}
- 	}
+ 		xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 		error = xfs_bmap_punch_delalloc_range(ip, start_fsb,
+ 					       end_fsb - start_fsb);
+-- 
+2.28.0
+
+
+From 3737a5f7223464efed3b0a9da2b045dae28d3a53 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Sun, 26 Feb 2017 11:11:18 +0100
+Subject: [PATCH 32/32] Linux 4.9.13
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 3cd6f6fb4f20..14dc2758345b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 9
+-SUBLEVEL = 12
++SUBLEVEL = 13
+ EXTRAVERSION =
+ NAME = Roaring Lionus
  
-@@ -420,12 +422,8 @@ int hashbin_delete( hashbin_t* hashbin, FREE_FUNC free_func)
- 	hashbin->magic = ~HB_MAGIC;
- 
- 	/* Release lock */
--	if ( hashbin->hb_type & HB_LOCK) {
-+	if (hashbin->hb_type & HB_LOCK)
- 		spin_unlock_irqrestore(&hashbin->hb_spinlock, flags);
--#ifdef CONFIG_LOCKDEP
--		hashbin_lock_depth--;
--#endif
--	}
- 
- 	/*
- 	 *  Free the hashbin structure
-diff --git a/net/kcm/kcmsock.c b/net/kcm/kcmsock.c
-index 7e08a4d3d77d..a646f3481240 100644
---- a/net/kcm/kcmsock.c
-+++ b/net/kcm/kcmsock.c
-@@ -929,23 +929,25 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
- 			goto out_error;
- 	}
- 
--	/* New message, alloc head skb */
--	head = alloc_skb(0, sk->sk_allocation);
--	while (!head) {
--		kcm_push(kcm);
--		err = sk_stream_wait_memory(sk, &timeo);
--		if (err)
--			goto out_error;
--
-+	if (msg_data_left(msg)) {
-+		/* New message, alloc head skb */
- 		head = alloc_skb(0, sk->sk_allocation);
--	}
-+		while (!head) {
-+			kcm_push(kcm);
-+			err = sk_stream_wait_memory(sk, &timeo);
-+			if (err)
-+				goto out_error;
- 
--	skb = head;
-+			head = alloc_skb(0, sk->sk_allocation);
-+		}
- 
--	/* Set ip_summed to CHECKSUM_UNNECESSARY to avoid calling
--	 * csum_and_copy_from_iter from skb_do_copy_data_nocache.
--	 */
--	skb->ip_summed = CHECKSUM_UNNECESSARY;
-+		skb = head;
-+
-+		/* Set ip_summed to CHECKSUM_UNNECESSARY to avoid calling
-+		 * csum_and_copy_from_iter from skb_do_copy_data_nocache.
-+		 */
-+		skb->ip_summed = CHECKSUM_UNNECESSARY;
-+	}
- 
- start:
- 	while (msg_data_left(msg)) {
-@@ -1018,10 +1020,12 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
- 	if (eor) {
- 		bool not_busy = skb_queue_empty(&sk->sk_write_queue);
- 
--		/* Message complete, queue it on send buffer */
--		__skb_queue_tail(&sk->sk_write_queue, head);
--		kcm->seq_skb = NULL;
--		KCM_STATS_INCR(kcm->stats.tx_msgs);
-+		if (head) {
-+			/* Message complete, queue it on send buffer */
-+			__skb_queue_tail(&sk->sk_write_queue, head);
-+			kcm->seq_skb = NULL;
-+			KCM_STATS_INCR(kcm->stats.tx_msgs);
-+		}
- 
- 		if (msg->msg_flags & MSG_BATCH) {
- 			kcm->tx_wait_more = true;
-@@ -1040,8 +1044,10 @@ static int kcm_sendmsg(struct socket *sock, struct msghdr *msg, size_t len)
- 	} else {
- 		/* Message not complete, save state */
- partial_message:
--		kcm->seq_skb = head;
--		kcm_tx_msg(head)->last_skb = skb;
-+		if (head) {
-+			kcm->seq_skb = head;
-+			kcm_tx_msg(head)->last_skb = skb;
-+		}
- 	}
- 
- 	KCM_STATS_ADD(kcm->stats.tx_bytes, copied);
-diff --git a/net/llc/llc_conn.c b/net/llc/llc_conn.c
-index 3e821daf9dd4..8bc5a1bd2d45 100644
---- a/net/llc/llc_conn.c
-+++ b/net/llc/llc_conn.c
-@@ -821,7 +821,10 @@ void llc_conn_handler(struct llc_sap *sap, struct sk_buff *skb)
- 		 * another trick required to cope with how the PROCOM state
- 		 * machine works. -acme
- 		 */
-+		skb_orphan(skb);
-+		sock_hold(sk);
- 		skb->sk = sk;
-+		skb->destructor = sock_efree;
- 	}
- 	if (!sock_owned_by_user(sk))
- 		llc_conn_rcv(sk, skb);
-diff --git a/net/llc/llc_sap.c b/net/llc/llc_sap.c
-index d0e1e804ebd7..5404d0d195cc 100644
---- a/net/llc/llc_sap.c
-+++ b/net/llc/llc_sap.c
-@@ -290,7 +290,10 @@ static void llc_sap_rcv(struct llc_sap *sap, struct sk_buff *skb,
- 
- 	ev->type   = LLC_SAP_EV_TYPE_PDU;
- 	ev->reason = 0;
-+	skb_orphan(skb);
-+	sock_hold(sk);
- 	skb->sk = sk;
-+	skb->destructor = sock_efree;
- 	llc_sap_state_process(sap, skb);
- }
- 
-diff --git a/net/netfilter/nf_conntrack_helper.c b/net/netfilter/nf_conntrack_helper.c
-index 7341adf7059d..6dc44d9b4190 100644
---- a/net/netfilter/nf_conntrack_helper.c
-+++ b/net/netfilter/nf_conntrack_helper.c
-@@ -188,6 +188,26 @@ nf_ct_helper_ext_add(struct nf_conn *ct,
- }
- EXPORT_SYMBOL_GPL(nf_ct_helper_ext_add);
- 
-+static struct nf_conntrack_helper *
-+nf_ct_lookup_helper(struct nf_conn *ct, struct net *net)
-+{
-+	if (!net->ct.sysctl_auto_assign_helper) {
-+		if (net->ct.auto_assign_helper_warned)
-+			return NULL;
-+		if (!__nf_ct_helper_find(&ct->tuplehash[IP_CT_DIR_REPLY].tuple))
-+			return NULL;
-+		pr_info("nf_conntrack: default automatic helper assignment "
-+			"has been turned off for security reasons and CT-based "
-+			" firewall rule not found. Use the iptables CT target "
-+			"to attach helpers instead.\n");
-+		net->ct.auto_assign_helper_warned = 1;
-+		return NULL;
-+	}
-+
-+	return __nf_ct_helper_find(&ct->tuplehash[IP_CT_DIR_REPLY].tuple);
-+}
-+
-+
- int __nf_ct_try_assign_helper(struct nf_conn *ct, struct nf_conn *tmpl,
- 			      gfp_t flags)
- {
-@@ -213,21 +233,14 @@ int __nf_ct_try_assign_helper(struct nf_conn *ct, struct nf_conn *tmpl,
- 	}
- 
- 	help = nfct_help(ct);
--	if (net->ct.sysctl_auto_assign_helper && helper == NULL) {
--		helper = __nf_ct_helper_find(&ct->tuplehash[IP_CT_DIR_REPLY].tuple);
--		if (unlikely(!net->ct.auto_assign_helper_warned && helper)) {
--			pr_info("nf_conntrack: automatic helper "
--				"assignment is deprecated and it will "
--				"be removed soon. Use the iptables CT target "
--				"to attach helpers instead.\n");
--			net->ct.auto_assign_helper_warned = true;
--		}
--	}
- 
- 	if (helper == NULL) {
--		if (help)
--			RCU_INIT_POINTER(help->helper, NULL);
--		return 0;
-+		helper = nf_ct_lookup_helper(ct, net);
-+		if (helper == NULL) {
-+			if (help)
-+				RCU_INIT_POINTER(help->helper, NULL);
-+			return 0;
-+		}
- 	}
- 
- 	if (help == NULL) {
-diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
-index 458722b938c7..34de326b4f09 100644
---- a/net/packet/af_packet.c
-+++ b/net/packet/af_packet.c
-@@ -1497,6 +1497,8 @@ static void __fanout_link(struct sock *sk, struct packet_sock *po)
- 	f->arr[f->num_members] = sk;
- 	smp_wmb();
- 	f->num_members++;
-+	if (f->num_members == 1)
-+		dev_add_pack(&f->prot_hook);
- 	spin_unlock(&f->lock);
- }
- 
-@@ -1513,6 +1515,8 @@ static void __fanout_unlink(struct sock *sk, struct packet_sock *po)
- 	BUG_ON(i >= f->num_members);
- 	f->arr[i] = f->arr[f->num_members - 1];
- 	f->num_members--;
-+	if (f->num_members == 0)
-+		__dev_remove_pack(&f->prot_hook);
- 	spin_unlock(&f->lock);
- }
- 
-@@ -1619,6 +1623,7 @@ static void fanout_release_data(struct packet_fanout *f)
- 
- static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
- {
-+	struct packet_rollover *rollover = NULL;
- 	struct packet_sock *po = pkt_sk(sk);
- 	struct packet_fanout *f, *match;
- 	u8 type = type_flags & 0xff;
-@@ -1641,23 +1646,28 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
- 		return -EINVAL;
- 	}
- 
-+	mutex_lock(&fanout_mutex);
-+
-+	err = -EINVAL;
- 	if (!po->running)
--		return -EINVAL;
-+		goto out;
- 
-+	err = -EALREADY;
- 	if (po->fanout)
--		return -EALREADY;
-+		goto out;
- 
- 	if (type == PACKET_FANOUT_ROLLOVER ||
- 	    (type_flags & PACKET_FANOUT_FLAG_ROLLOVER)) {
--		po->rollover = kzalloc(sizeof(*po->rollover), GFP_KERNEL);
--		if (!po->rollover)
--			return -ENOMEM;
--		atomic_long_set(&po->rollover->num, 0);
--		atomic_long_set(&po->rollover->num_huge, 0);
--		atomic_long_set(&po->rollover->num_failed, 0);
-+		err = -ENOMEM;
-+		rollover = kzalloc(sizeof(*rollover), GFP_KERNEL);
-+		if (!rollover)
-+			goto out;
-+		atomic_long_set(&rollover->num, 0);
-+		atomic_long_set(&rollover->num_huge, 0);
-+		atomic_long_set(&rollover->num_failed, 0);
-+		po->rollover = rollover;
- 	}
- 
--	mutex_lock(&fanout_mutex);
- 	match = NULL;
- 	list_for_each_entry(f, &fanout_list, list) {
- 		if (f->id == id &&
-@@ -1687,7 +1697,6 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
- 		match->prot_hook.func = packet_rcv_fanout;
- 		match->prot_hook.af_packet_priv = match;
- 		match->prot_hook.id_match = match_fanout_group;
--		dev_add_pack(&match->prot_hook);
- 		list_add(&match->list, &fanout_list);
- 	}
- 	err = -EINVAL;
-@@ -1704,36 +1713,40 @@ static int fanout_add(struct sock *sk, u16 id, u16 type_flags)
- 		}
- 	}
- out:
--	mutex_unlock(&fanout_mutex);
--	if (err) {
--		kfree(po->rollover);
-+	if (err && rollover) {
-+		kfree(rollover);
- 		po->rollover = NULL;
- 	}
-+	mutex_unlock(&fanout_mutex);
- 	return err;
- }
- 
--static void fanout_release(struct sock *sk)
-+/* If pkt_sk(sk)->fanout->sk_ref is zero, this function removes
-+ * pkt_sk(sk)->fanout from fanout_list and returns pkt_sk(sk)->fanout.
-+ * It is the responsibility of the caller to call fanout_release_data() and
-+ * free the returned packet_fanout (after synchronize_net())
-+ */
-+static struct packet_fanout *fanout_release(struct sock *sk)
- {
- 	struct packet_sock *po = pkt_sk(sk);
- 	struct packet_fanout *f;
- 
-+	mutex_lock(&fanout_mutex);
- 	f = po->fanout;
--	if (!f)
--		return;
-+	if (f) {
-+		po->fanout = NULL;
- 
--	mutex_lock(&fanout_mutex);
--	po->fanout = NULL;
-+		if (atomic_dec_and_test(&f->sk_ref))
-+			list_del(&f->list);
-+		else
-+			f = NULL;
- 
--	if (atomic_dec_and_test(&f->sk_ref)) {
--		list_del(&f->list);
--		dev_remove_pack(&f->prot_hook);
--		fanout_release_data(f);
--		kfree(f);
-+		if (po->rollover)
-+			kfree_rcu(po->rollover, rcu);
- 	}
- 	mutex_unlock(&fanout_mutex);
- 
--	if (po->rollover)
--		kfree_rcu(po->rollover, rcu);
-+	return f;
- }
- 
- static bool packet_extra_vlan_len_allowed(const struct net_device *dev,
-@@ -2965,6 +2978,7 @@ static int packet_release(struct socket *sock)
- {
- 	struct sock *sk = sock->sk;
- 	struct packet_sock *po;
-+	struct packet_fanout *f;
- 	struct net *net;
- 	union tpacket_req_u req_u;
- 
-@@ -3004,9 +3018,14 @@ static int packet_release(struct socket *sock)
- 		packet_set_ring(sk, &req_u, 1, 1);
- 	}
- 
--	fanout_release(sk);
-+	f = fanout_release(sk);
- 
- 	synchronize_net();
-+
-+	if (f) {
-+		fanout_release_data(f);
-+		kfree(f);
-+	}
- 	/*
- 	 *	Now the socket is dead. No more input will appear.
- 	 */
-@@ -3958,7 +3977,6 @@ static int packet_notifier(struct notifier_block *this,
- 				}
- 				if (msg == NETDEV_UNREGISTER) {
- 					packet_cached_dev_reset(po);
--					fanout_release(sk);
- 					po->ifindex = -1;
- 					if (po->prot_hook.dev)
- 						dev_put(po->prot_hook.dev);
-diff --git a/net/socket.c b/net/socket.c
-index 73dc69f9681e..6bbccf05854f 100644
---- a/net/socket.c
-+++ b/net/socket.c
-@@ -2197,8 +2197,10 @@ int __sys_recvmmsg(int fd, struct mmsghdr __user *mmsg, unsigned int vlen,
- 		return err;
- 
- 	err = sock_error(sock->sk);
--	if (err)
-+	if (err) {
-+		datagrams = err;
- 		goto out_put;
-+	}
- 
- 	entry = mmsg;
- 	compat_entry = (struct compat_mmsghdr __user *)mmsg;
+-- 
+2.28.0
+

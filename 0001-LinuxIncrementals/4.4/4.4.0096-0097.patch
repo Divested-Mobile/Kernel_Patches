@@ -1,15 +1,486 @@
-diff --git a/Makefile b/Makefile
-index 12dfe1dcbaca..fb1a40d64ba8 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 4
--SUBLEVEL = 96
-+SUBLEVEL = 97
- EXTRAVERSION =
- NAME = Blurry Fish Butt
+From 70358782743fbc2b2fa26b4e7370b359350cfba3 Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Sun, 29 Oct 2017 11:02:04 +0100
+Subject: [PATCH 01/40] ALSA: timer: Add missing mutex lock for compat ioctls
+
+commit 79fb0518fec8c8b4ea7f1729f54f293724b3dbb0 upstream.
+
+The races among ioctl and other operations were protected by the
+commit af368027a49a ("ALSA: timer: Fix race among timer ioctls") and
+later fixes, but one code path was forgotten in the scenario: the
+32bit compat ioctl.  As syzkaller recently spotted, a very similar
+use-after-free may happen with the combination of compat ioctls.
+
+The fix is simply to apply the same ioctl_lock to the compat_ioctl
+callback, too.
+
+Fixes: af368027a49a ("ALSA: timer: Fix race among timer ioctls")
+Reference: http://lkml.kernel.org/r/089e082686ac9b482e055c832617@google.com
+Reported-by: syzbot <bot+e5f3c9783e7048a74233054febbe9f1bdf54b6da@syzkaller.appspotmail.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ sound/core/timer_compat.c | 17 +++++++++++++++--
+ 1 file changed, 15 insertions(+), 2 deletions(-)
+
+diff --git a/sound/core/timer_compat.c b/sound/core/timer_compat.c
+index 2e908225d754..0b4b028e8e98 100644
+--- a/sound/core/timer_compat.c
++++ b/sound/core/timer_compat.c
+@@ -106,7 +106,8 @@ enum {
+ #endif /* CONFIG_X86_X32 */
+ };
  
+-static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, unsigned long arg)
++static long __snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd,
++					  unsigned long arg)
+ {
+ 	void __user *argp = compat_ptr(arg);
+ 
+@@ -127,7 +128,7 @@ static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, uns
+ 	case SNDRV_TIMER_IOCTL_PAUSE:
+ 	case SNDRV_TIMER_IOCTL_PAUSE_OLD:
+ 	case SNDRV_TIMER_IOCTL_NEXT_DEVICE:
+-		return snd_timer_user_ioctl(file, cmd, (unsigned long)argp);
++		return __snd_timer_user_ioctl(file, cmd, (unsigned long)argp);
+ 	case SNDRV_TIMER_IOCTL_INFO32:
+ 		return snd_timer_user_info_compat(file, argp);
+ 	case SNDRV_TIMER_IOCTL_STATUS32:
+@@ -139,3 +140,15 @@ static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, uns
+ 	}
+ 	return -ENOIOCTLCMD;
+ }
++
++static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd,
++					unsigned long arg)
++{
++	struct snd_timer_user *tu = file->private_data;
++	long ret;
++
++	mutex_lock(&tu->ioctl_lock);
++	ret = __snd_timer_user_ioctl_compat(file, cmd, arg);
++	mutex_unlock(&tu->ioctl_lock);
++	return ret;
++}
+-- 
+2.28.0
+
+
+From 8142e9516d5dcb549b681491ca9af54407f4894c Mon Sep 17 00:00:00 2001
+From: Takashi Iwai <tiwai@suse.de>
+Date: Sun, 29 Oct 2017 11:10:43 +0100
+Subject: [PATCH 02/40] ALSA: seq: Fix nested rwsem annotation for lockdep
+ splat
+
+commit 1f20f9ff57ca23b9f5502fca85ce3977e8496cb1 upstream.
+
+syzkaller reported the lockdep splat due to the possible deadlock of
+grp->list_mutex of each sequencer client object.  Actually this is
+rather a false-positive report due to the missing nested lock
+annotations.  The sequencer client may deliver the event directly to
+another client which takes another own lock.
+
+For addressing this issue, this patch replaces the simple down_read()
+with down_read_nested().  As a lock subclass, the already existing
+"hop" can be re-used, which indicates the depth of the call.
+
+Reference: http://lkml.kernel.org/r/089e082686ac9b482e055c832617@google.com
+Reported-by: syzbot <bot+7feb8de6b4d6bf810cf098bef942cc387e79d0ad@syzkaller.appspotmail.com>
+Reported-by: Dmitry Vyukov <dvyukov@google.com>
+Signed-off-by: Takashi Iwai <tiwai@suse.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ sound/core/seq/seq_clientmgr.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/sound/core/seq/seq_clientmgr.c b/sound/core/seq/seq_clientmgr.c
+index e847b9923c19..b36de76f24e2 100644
+--- a/sound/core/seq/seq_clientmgr.c
++++ b/sound/core/seq/seq_clientmgr.c
+@@ -676,7 +676,7 @@ static int deliver_to_subscribers(struct snd_seq_client *client,
+ 	if (atomic)
+ 		read_lock(&grp->list_lock);
+ 	else
+-		down_read(&grp->list_mutex);
++		down_read_nested(&grp->list_mutex, hop);
+ 	list_for_each_entry(subs, &grp->list_head, src_list) {
+ 		/* both ports ready? */
+ 		if (atomic_read(&subs->ref_count) != 2)
+-- 
+2.28.0
+
+
+From d304c9169b3879e7ea8a1eb48001c8f40f7e74ad Mon Sep 17 00:00:00 2001
+From: Ronnie Sahlberg <lsahlber@redhat.com>
+Date: Mon, 30 Oct 2017 13:28:03 +1100
+Subject: [PATCH 03/40] cifs: check MaxPathNameComponentLength != 0 before
+ using it
+
+commit f74bc7c6679200a4a83156bb89cbf6c229fe8ec0 upstream.
+
+And fix tcon leak in error path.
+
+Signed-off-by: Ronnie Sahlberg <lsahlber@redhat.com>
+Signed-off-by: Steve French <smfrench@gmail.com>
+Reviewed-by: David Disseldorp <ddiss@samba.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/cifs/dir.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/fs/cifs/dir.c b/fs/cifs/dir.c
+index 297e05c9e2b0..49a0d6b027c1 100644
+--- a/fs/cifs/dir.c
++++ b/fs/cifs/dir.c
+@@ -193,7 +193,8 @@ check_name(struct dentry *direntry, struct cifs_tcon *tcon)
+ 	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
+ 	int i;
+ 
+-	if (unlikely(direntry->d_name.len >
++	if (unlikely(tcon->fsAttrInfo.MaxPathNameComponentLength &&
++		     direntry->d_name.len >
+ 		     le32_to_cpu(tcon->fsAttrInfo.MaxPathNameComponentLength)))
+ 		return -ENAMETOOLONG;
+ 
+@@ -509,7 +510,7 @@ cifs_atomic_open(struct inode *inode, struct dentry *direntry,
+ 
+ 	rc = check_name(direntry, tcon);
+ 	if (rc)
+-		goto out_free_xid;
++		goto out;
+ 
+ 	server = tcon->ses->server;
+ 
+-- 
+2.28.0
+
+
+From 97c5668c972476bde719276ab3e836085367f8b8 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Thu, 2 Nov 2017 00:47:03 +0000
+Subject: [PATCH 04/40] KEYS: return full count in keyring_read() if buffer is
+ too small
+
+commit 3239b6f29bdfb4b0a2ba59df995fc9e6f4df7f1f upstream.
+
+Commit e645016abc80 ("KEYS: fix writing past end of user-supplied buffer
+in keyring_read()") made keyring_read() stop corrupting userspace memory
+when the user-supplied buffer is too small.  However it also made the
+return value in that case be the short buffer size rather than the size
+required, yet keyctl_read() is actually documented to return the size
+required.  Therefore, switch it over to the documented behavior.
+
+Note that for now we continue to have it fill the short buffer, since it
+did that before (pre-v3.13) and dump_key_tree_aux() in keyutils arguably
+relies on it.
+
+Fixes: e645016abc80 ("KEYS: fix writing past end of user-supplied buffer in keyring_read()")
+Reported-by: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+Reviewed-by: James Morris <james.l.morris@oracle.com>
+Signed-off-by: James Morris <james.l.morris@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ security/keys/keyring.c | 39 +++++++++++++++++++--------------------
+ 1 file changed, 19 insertions(+), 20 deletions(-)
+
+diff --git a/security/keys/keyring.c b/security/keys/keyring.c
+index ef828238cdc0..d5264f950ce1 100644
+--- a/security/keys/keyring.c
++++ b/security/keys/keyring.c
+@@ -452,34 +452,33 @@ static long keyring_read(const struct key *keyring,
+ 			 char __user *buffer, size_t buflen)
+ {
+ 	struct keyring_read_iterator_context ctx;
+-	unsigned long nr_keys;
+-	int ret;
++	long ret;
+ 
+ 	kenter("{%d},,%zu", key_serial(keyring), buflen);
+ 
+ 	if (buflen & (sizeof(key_serial_t) - 1))
+ 		return -EINVAL;
+ 
+-	nr_keys = keyring->keys.nr_leaves_on_tree;
+-	if (nr_keys == 0)
+-		return 0;
+-
+-	/* Calculate how much data we could return */
+-	if (!buffer || !buflen)
+-		return nr_keys * sizeof(key_serial_t);
+-
+-	/* Copy the IDs of the subscribed keys into the buffer */
+-	ctx.buffer = (key_serial_t __user *)buffer;
+-	ctx.buflen = buflen;
+-	ctx.count = 0;
+-	ret = assoc_array_iterate(&keyring->keys, keyring_read_iterator, &ctx);
+-	if (ret < 0) {
+-		kleave(" = %d [iterate]", ret);
+-		return ret;
++	/* Copy as many key IDs as fit into the buffer */
++	if (buffer && buflen) {
++		ctx.buffer = (key_serial_t __user *)buffer;
++		ctx.buflen = buflen;
++		ctx.count = 0;
++		ret = assoc_array_iterate(&keyring->keys,
++					  keyring_read_iterator, &ctx);
++		if (ret < 0) {
++			kleave(" = %ld [iterate]", ret);
++			return ret;
++		}
+ 	}
+ 
+-	kleave(" = %zu [ok]", ctx.count);
+-	return ctx.count;
++	/* Return the size of the buffer needed */
++	ret = keyring->keys.nr_leaves_on_tree * sizeof(key_serial_t);
++	if (ret <= buflen)
++		kleave("= %ld [ok]", ret);
++	else
++		kleave("= %ld [buffer too small]", ret);
++	return ret;
+ }
+ 
+ /*
+-- 
+2.28.0
+
+
+From 618b930317fbea5561f9e5b07b26468d595ec110 Mon Sep 17 00:00:00 2001
+From: Eric Biggers <ebiggers@google.com>
+Date: Thu, 2 Nov 2017 00:47:19 +0000
+Subject: [PATCH 05/40] KEYS: fix out-of-bounds read during ASN.1 parsing
+
+commit 2eb9eabf1e868fda15808954fb29b0f105ed65f1 upstream.
+
+syzkaller with KASAN reported an out-of-bounds read in
+asn1_ber_decoder().  It can be reproduced by the following command,
+assuming CONFIG_X509_CERTIFICATE_PARSER=y and CONFIG_KASAN=y:
+
+    keyctl add asymmetric desc $'\x30\x30' @s
+
+The bug is that the length of an ASN.1 data value isn't validated in the
+case where it is encoded using the short form, causing the decoder to
+read past the end of the input buffer.  Fix it by validating the length.
+
+The bug report was:
+
+    BUG: KASAN: slab-out-of-bounds in asn1_ber_decoder+0x10cb/0x1730 lib/asn1_decoder.c:233
+    Read of size 1 at addr ffff88003cccfa02 by task syz-executor0/6818
+
+    CPU: 1 PID: 6818 Comm: syz-executor0 Not tainted 4.14.0-rc7-00008-g5f479447d983 #2
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS Bochs 01/01/2011
+    Call Trace:
+     __dump_stack lib/dump_stack.c:16 [inline]
+     dump_stack+0xb3/0x10b lib/dump_stack.c:52
+     print_address_description+0x79/0x2a0 mm/kasan/report.c:252
+     kasan_report_error mm/kasan/report.c:351 [inline]
+     kasan_report+0x236/0x340 mm/kasan/report.c:409
+     __asan_report_load1_noabort+0x14/0x20 mm/kasan/report.c:427
+     asn1_ber_decoder+0x10cb/0x1730 lib/asn1_decoder.c:233
+     x509_cert_parse+0x1db/0x650 crypto/asymmetric_keys/x509_cert_parser.c:89
+     x509_key_preparse+0x64/0x7a0 crypto/asymmetric_keys/x509_public_key.c:174
+     asymmetric_key_preparse+0xcb/0x1a0 crypto/asymmetric_keys/asymmetric_type.c:388
+     key_create_or_update+0x347/0xb20 security/keys/key.c:855
+     SYSC_add_key security/keys/keyctl.c:122 [inline]
+     SyS_add_key+0x1cd/0x340 security/keys/keyctl.c:62
+     entry_SYSCALL_64_fastpath+0x1f/0xbe
+    RIP: 0033:0x447c89
+    RSP: 002b:00007fca7a5d3bd8 EFLAGS: 00000246 ORIG_RAX: 00000000000000f8
+    RAX: ffffffffffffffda RBX: 00007fca7a5d46cc RCX: 0000000000447c89
+    RDX: 0000000020006f4a RSI: 0000000020006000 RDI: 0000000020001ff5
+    RBP: 0000000000000046 R08: fffffffffffffffd R09: 0000000000000000
+    R10: 0000000000000002 R11: 0000000000000246 R12: 0000000000000000
+    R13: 0000000000000000 R14: 00007fca7a5d49c0 R15: 00007fca7a5d4700
+
+Fixes: 42d5ec27f873 ("X.509: Add an ASN.1 decoder")
+Signed-off-by: Eric Biggers <ebiggers@google.com>
+Signed-off-by: David Howells <dhowells@redhat.com>
+Signed-off-by: James Morris <james.l.morris@oracle.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ lib/asn1_decoder.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/lib/asn1_decoder.c b/lib/asn1_decoder.c
+index 554522934c44..faa2a3f017f8 100644
+--- a/lib/asn1_decoder.c
++++ b/lib/asn1_decoder.c
+@@ -283,6 +283,9 @@ next_op:
+ 				if (unlikely(len > datalen - dp))
+ 					goto data_overrun_error;
+ 			}
++		} else {
++			if (unlikely(len > datalen - dp))
++				goto data_overrun_error;
+ 		}
+ 
+ 		if (flags & FLAG_CONS) {
+-- 
+2.28.0
+
+
+From 97d64b7f2fdf945c40c5dc2004defec5f260cb6d Mon Sep 17 00:00:00 2001
+From: Ricard Wanderlof <ricard.wanderlof@axis.com>
+Date: Thu, 7 Sep 2017 15:31:38 +0200
+Subject: [PATCH 06/40] ASoC: adau17x1: Workaround for noise bug in ADC
+
+commit 1e6f4fc06f6411adf98bbbe7fcd79442cd2b2a75 upstream.
+
+The ADC in the ADAU1361 (and possibly other Analog Devices codecs)
+exhibits a cyclic variation in the noise floor (in our test setup between
+-87 and -93 dB), a new value being attained within this range whenever a
+new capture stream is started. The cycle repeats after about 10 or 11
+restarts.
+
+The workaround recommended by the manufacturer is to toggle the ADOSR bit
+in the Converter Control 0 register each time a new capture stream is
+started.
+
+I have verified that the patch fixes this problem on the ADAU1361, and
+according to the manufacturer toggling the bit in question in this manner
+will at least have no detrimental effect on other chips served by this
+driver.
+
+Signed-off-by: Ricard Wanderlof <ricardw@axis.com>
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ sound/soc/codecs/adau17x1.c | 24 +++++++++++++++++++++++-
+ sound/soc/codecs/adau17x1.h |  2 ++
+ 2 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/sound/soc/codecs/adau17x1.c b/sound/soc/codecs/adau17x1.c
+index fcf05b254ecd..0b9e13eb0a0a 100644
+--- a/sound/soc/codecs/adau17x1.c
++++ b/sound/soc/codecs/adau17x1.c
+@@ -89,6 +89,27 @@ static int adau17x1_pll_event(struct snd_soc_dapm_widget *w,
+ 	return 0;
+ }
+ 
++static int adau17x1_adc_fixup(struct snd_soc_dapm_widget *w,
++	struct snd_kcontrol *kcontrol, int event)
++{
++	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
++	struct adau *adau = snd_soc_codec_get_drvdata(codec);
++
++	/*
++	 * If we are capturing, toggle the ADOSR bit in Converter Control 0 to
++	 * avoid losing SNR (workaround from ADI). This must be done after
++	 * the ADC(s) have been enabled. According to the data sheet, it is
++	 * normally illegal to set this bit when the sampling rate is 96 kHz,
++	 * but according to ADI it is acceptable for this workaround.
++	 */
++	regmap_update_bits(adau->regmap, ADAU17X1_CONVERTER0,
++		ADAU17X1_CONVERTER0_ADOSR, ADAU17X1_CONVERTER0_ADOSR);
++	regmap_update_bits(adau->regmap, ADAU17X1_CONVERTER0,
++		ADAU17X1_CONVERTER0_ADOSR, 0);
++
++	return 0;
++}
++
+ static const char * const adau17x1_mono_stereo_text[] = {
+ 	"Stereo",
+ 	"Mono Left Channel (L+R)",
+@@ -120,7 +141,8 @@ static const struct snd_soc_dapm_widget adau17x1_dapm_widgets[] = {
+ 	SND_SOC_DAPM_MUX("Right DAC Mode Mux", SND_SOC_NOPM, 0, 0,
+ 		&adau17x1_dac_mode_mux),
+ 
+-	SND_SOC_DAPM_ADC("Left Decimator", NULL, ADAU17X1_ADC_CONTROL, 0, 0),
++	SND_SOC_DAPM_ADC_E("Left Decimator", NULL, ADAU17X1_ADC_CONTROL, 0, 0,
++			   adau17x1_adc_fixup, SND_SOC_DAPM_POST_PMU),
+ 	SND_SOC_DAPM_ADC("Right Decimator", NULL, ADAU17X1_ADC_CONTROL, 1, 0),
+ 	SND_SOC_DAPM_DAC("Left DAC", NULL, ADAU17X1_DAC_CONTROL0, 0, 0),
+ 	SND_SOC_DAPM_DAC("Right DAC", NULL, ADAU17X1_DAC_CONTROL0, 1, 0),
+diff --git a/sound/soc/codecs/adau17x1.h b/sound/soc/codecs/adau17x1.h
+index e13583e6ff56..6b46461cdc03 100644
+--- a/sound/soc/codecs/adau17x1.h
++++ b/sound/soc/codecs/adau17x1.h
+@@ -123,5 +123,7 @@ bool adau17x1_has_dsp(struct adau *adau);
+ 
+ #define ADAU17X1_CONVERTER0_CONVSR_MASK		0x7
+ 
++#define ADAU17X1_CONVERTER0_ADOSR		BIT(3)
++
+ 
+ #endif
+-- 
+2.28.0
+
+
+From 581ac5f431c9b01a820ee10581b042328d870230 Mon Sep 17 00:00:00 2001
+From: Mark Rutland <mark.rutland@arm.com>
+Date: Thu, 2 Nov 2017 16:12:03 +0000
+Subject: [PATCH 07/40] arm64: ensure __dump_instr() checks addr_limit
+
+commit 7a7003b1da010d2b0d1dc8bf21c10f5c73b389f1 upstream.
+
+It's possible for a user to deliberately trigger __dump_instr with a
+chosen kernel address.
+
+Let's avoid problems resulting from this by using get_user() rather than
+__get_user(), ensuring that we don't erroneously access kernel memory.
+
+Where we use __dump_instr() on kernel text, we already switch to
+KERNEL_DS, so this shouldn't adversely affect those cases.
+
+Fixes: 60ffc30d5652810d ("arm64: Exception handling")
+Acked-by: Will Deacon <will.deacon@arm.com>
+Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm64/kernel/traps.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index ca7f0ac5f708..210826d5bba5 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -129,7 +129,7 @@ static void dump_instr(const char *lvl, struct pt_regs *regs)
+ 	for (i = -4; i < 1; i++) {
+ 		unsigned int val, bad;
+ 
+-		bad = __get_user(val, &((u32 *)addr)[i]);
++		bad = get_user(val, &((u32 *)addr)[i]);
+ 
+ 		if (!bad)
+ 			p += sprintf(p, i == 0 ? "(%08x) " : "%08x ", val);
+-- 
+2.28.0
+
+
+From 4e351b8dd8b773669c3f0c5e50e4e61031f9e43e Mon Sep 17 00:00:00 2001
+From: Yan Markman <ymarkman@marvell.com>
+Date: Sun, 16 Oct 2016 00:22:32 +0300
+Subject: [PATCH 08/40] ARM: dts: mvebu: pl310-cache disable double-linefill
+
+commit cda80a82ac3e89309706c027ada6ab232be1d640 upstream.
+
+Under heavy system stress mvebu SoC using Cortex A9 sporadically
+encountered instability issues.
+
+The "double linefill" feature of L2 cache was identified as causing
+dependency between read and write which lead to the deadlock.
+
+Especially, it was the cause of deadlock seen under heavy PCIe traffic,
+as this dependency violates PCIE overtaking rule.
+
+Fixes: c8f5a878e554 ("ARM: mvebu: use DT properties to fine-tune the L2 configuration")
+Signed-off-by: Yan Markman <ymarkman@marvell.com>
+Signed-off-by: Igal Liberman <igall@marvell.com>
+Signed-off-by: Nadav Haklai <nadavh@marvell.com>
+[gregory.clement@free-electrons.com: reformulate commit log, add Armada
+375 and add Fixes tag]
+Signed-off-by: Gregory CLEMENT <gregory.clement@free-electrons.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/boot/dts/armada-375.dtsi | 4 ++--
+ arch/arm/boot/dts/armada-38x.dtsi | 4 ++--
+ arch/arm/boot/dts/armada-39x.dtsi | 4 ++--
+ 3 files changed, 6 insertions(+), 6 deletions(-)
+
 diff --git a/arch/arm/boot/dts/armada-375.dtsi b/arch/arm/boot/dts/armada-375.dtsi
 index cc952cf8ec30..024f1b75b0a3 100644
 --- a/arch/arm/boot/dts/armada-375.dtsi
@@ -58,6 +529,59 @@ index dc6efd386dbc..e67f1fd7a4d1 100644
  				prefetch-data = <1>;
  			};
  
+-- 
+2.28.0
+
+
+From cc7d9933400f9b7f16e4d36cb6974395c3116695 Mon Sep 17 00:00:00 2001
+From: Arnd Bergmann <arnd@arndb.de>
+Date: Fri, 20 Oct 2017 21:17:05 +0100
+Subject: [PATCH 09/40] ARM: 8715/1: add a private asm/unaligned.h
+
+commit 1cce91dfc8f7990ca3aea896bfb148f240b12860 upstream.
+
+The asm-generic/unaligned.h header provides two different implementations
+for accessing unaligned variables: the access_ok.h version used when
+CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS is set pretends that all pointers
+are in fact aligned, while the le_struct.h version convinces gcc that the
+alignment of a pointer is '1', to make it issue the correct load/store
+instructions depending on the architecture flags.
+
+On ARMv5 and older, we always use the second version, to let the compiler
+use byte accesses. On ARMv6 and newer, we currently use the access_ok.h
+version, so the compiler can use any instruction including stm/ldm and
+ldrd/strd that will cause an alignment trap. This trap can significantly
+impact performance when we have to do a lot of fixups and, worse, has
+led to crashes in the LZ4 decompressor code that does not have a trap
+handler.
+
+This adds an ARM specific version of asm/unaligned.h that uses the
+le_struct.h/be_struct.h implementation unconditionally. This should lead
+to essentially the same code on ARMv6+ as before, with the exception of
+using regular load/store instructions instead of the trapping instructions
+multi-register variants.
+
+The crash in the LZ4 decompressor code was probably introduced by the
+patch replacing the LZ4 implementation, commit 4e1a33b105dd ("lib: update
+LZ4 compressor module"), so linux-4.11 and higher would be affected most.
+However, we probably want to have this backported to all older stable
+kernels as well, to help with the performance issues.
+
+There are two follow-ups that I think we should also work on, but not
+backport to stable kernels, first to change the asm-generic version of
+the header to remove the ARM special case, and second to review all
+other uses of CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS to see if they
+might be affected by the same problem on ARM.
+
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/include/asm/Kbuild      |  1 -
+ arch/arm/include/asm/unaligned.h | 27 +++++++++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+ create mode 100644 arch/arm/include/asm/unaligned.h
+
 diff --git a/arch/arm/include/asm/Kbuild b/arch/arm/include/asm/Kbuild
 index bd425302c97a..628a38a11a70 100644
 --- a/arch/arm/include/asm/Kbuild
@@ -100,6 +624,511 @@ index 000000000000..ab905ffcf193
 +#endif
 +
 +#endif /* __ASM_ARM_UNALIGNED_H */
+-- 
+2.28.0
+
+
+From fa312b481b2b4e1eeb35aa9c436df1d39f1c8333 Mon Sep 17 00:00:00 2001
+From: Ashish Samant <ashish.samant@oracle.com>
+Date: Thu, 2 Nov 2017 15:59:37 -0700
+Subject: [PATCH 10/40] ocfs2: fstrim: Fix start offset of first cluster group
+ during fstrim
+
+commit 105ddc93f06ebe3e553f58563d11ed63dbcd59f0 upstream.
+
+The first cluster group descriptor is not stored at the start of the
+group but at an offset from the start.  We need to take this into
+account while doing fstrim on the first cluster group.  Otherwise we
+will wrongly start fstrim a few blocks after the desired start block and
+the range can cross over into the next cluster group and zero out the
+group descriptor there.  This can cause filesytem corruption that cannot
+be fixed by fsck.
+
+Link: http://lkml.kernel.org/r/1507835579-7308-1-git-send-email-ashish.samant@oracle.com
+Signed-off-by: Ashish Samant <ashish.samant@oracle.com>
+Reviewed-by: Junxiao Bi <junxiao.bi@oracle.com>
+Reviewed-by: Joseph Qi <jiangqi903@gmail.com>
+Cc: Mark Fasheh <mfasheh@versity.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ocfs2/alloc.c | 24 ++++++++++++++++++------
+ 1 file changed, 18 insertions(+), 6 deletions(-)
+
+diff --git a/fs/ocfs2/alloc.c b/fs/ocfs2/alloc.c
+index 86181d6526dc..93e6f029a322 100644
+--- a/fs/ocfs2/alloc.c
++++ b/fs/ocfs2/alloc.c
+@@ -7270,13 +7270,24 @@ out:
+ 
+ static int ocfs2_trim_extent(struct super_block *sb,
+ 			     struct ocfs2_group_desc *gd,
+-			     u32 start, u32 count)
++			     u64 group, u32 start, u32 count)
+ {
+ 	u64 discard, bcount;
++	struct ocfs2_super *osb = OCFS2_SB(sb);
+ 
+ 	bcount = ocfs2_clusters_to_blocks(sb, count);
+-	discard = le64_to_cpu(gd->bg_blkno) +
+-			ocfs2_clusters_to_blocks(sb, start);
++	discard = ocfs2_clusters_to_blocks(sb, start);
++
++	/*
++	 * For the first cluster group, the gd->bg_blkno is not at the start
++	 * of the group, but at an offset from the start. If we add it while
++	 * calculating discard for first group, we will wrongly start fstrim a
++	 * few blocks after the desried start block and the range can cross
++	 * over into the next cluster group. So, add it only if this is not
++	 * the first cluster group.
++	 */
++	if (group != osb->first_cluster_group_blkno)
++		discard += le64_to_cpu(gd->bg_blkno);
+ 
+ 	trace_ocfs2_trim_extent(sb, (unsigned long long)discard, bcount);
+ 
+@@ -7284,7 +7295,7 @@ static int ocfs2_trim_extent(struct super_block *sb,
+ }
+ 
+ static int ocfs2_trim_group(struct super_block *sb,
+-			    struct ocfs2_group_desc *gd,
++			    struct ocfs2_group_desc *gd, u64 group,
+ 			    u32 start, u32 max, u32 minbits)
+ {
+ 	int ret = 0, count = 0, next;
+@@ -7303,7 +7314,7 @@ static int ocfs2_trim_group(struct super_block *sb,
+ 		next = ocfs2_find_next_bit(bitmap, max, start);
+ 
+ 		if ((next - start) >= minbits) {
+-			ret = ocfs2_trim_extent(sb, gd,
++			ret = ocfs2_trim_extent(sb, gd, group,
+ 						start, next - start);
+ 			if (ret < 0) {
+ 				mlog_errno(ret);
+@@ -7401,7 +7412,8 @@ int ocfs2_trim_fs(struct super_block *sb, struct fstrim_range *range)
+ 		}
+ 
+ 		gd = (struct ocfs2_group_desc *)gd_bh->b_data;
+-		cnt = ocfs2_trim_group(sb, gd, first_bit, last_bit, minlen);
++		cnt = ocfs2_trim_group(sb, gd, group,
++				       first_bit, last_bit, minlen);
+ 		brelse(gd_bh);
+ 		gd_bh = NULL;
+ 		if (cnt < 0) {
+-- 
+2.28.0
+
+
+From 6e6eba5ba14579f1fede964d189a7153444fb3b6 Mon Sep 17 00:00:00 2001
+From: Namhyung Kim <namhyung@kernel.org>
+Date: Tue, 2 Aug 2016 11:43:17 +0900
+Subject: [PATCH 11/40] perf tools: Fix build failure on perl script context
+
+commit b581c01fff646b5075d65359c8667de9c667da9e upstream.
+
+On my Archlinux machine, perf faild to build like below:
+
+    CC       scripts/perl/Perf-Trace-Util/Context.o
+  In file included from /usr/lib/perl5/core/perl/CORE/perl.h:3905:0,
+                   from Context.xs:23:
+  /usr/lib/perl5/core/perl/CORE/inline.h: In function :
+  /usr/lib/perl5/core/perl/CORE/cop.h:612:13: warning: declaration of 'av'
+                                  shadows a previous local [-Werror-shadow]
+             AV *av =3D GvAV(PL_defgv);
+                 ^
+  /usr/lib/perl5/core/perl/CORE/inline.h:526:5: note: in expansion of
+                                  macro 'CX_POP_SAVEARRAY'
+         CX_POP_SAVEARRAY(cx);
+         ^~~~~~~~~~~~~~~~
+  In file included from /usr/lib/perl5/core/perl/CORE/perl.h:5853:0,
+                   from Context.xs:23:
+  /usr/lib/perl5/core/perl/CORE/inline.h:518:9: note:
+                                  shadowed declaration is here
+         AV *av;
+             ^~
+
+What I did to fix is adding '-Wno-shadow' as the error message said it's
+the cause of the failure.  Since it's from the perl (not perf) code
+base, we don't have the control so I just wanted to ignore the warning
+when compiling perl scripting code.
+
+Committer note:
+
+This also fixes the build on Fedora Rawhide.
+
+Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20160802024317.31725-1-namhyung@kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Cc: Tuomas Tynkkynen <tuomas.tynkkynen@iki.fi>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ tools/perf/scripts/perl/Perf-Trace-Util/Build | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/tools/perf/scripts/perl/Perf-Trace-Util/Build b/tools/perf/scripts/perl/Perf-Trace-Util/Build
+index 928e110179cb..34faecf774ae 100644
+--- a/tools/perf/scripts/perl/Perf-Trace-Util/Build
++++ b/tools/perf/scripts/perl/Perf-Trace-Util/Build
+@@ -1,3 +1,5 @@
+ libperf-y += Context.o
+ 
+-CFLAGS_Context.o += $(PERL_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes -Wno-unused-parameter -Wno-nested-externs -Wno-undef -Wno-switch-default
++CFLAGS_Context.o += $(PERL_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes
++CFLAGS_Context.o += -Wno-unused-parameter -Wno-nested-externs -Wno-undef
++CFLAGS_Context.o += -Wno-switch-default -Wno-shadow
+-- 
+2.28.0
+
+
+From 031b02bc16aeeb34c8038026cbbca1e6430c9d75 Mon Sep 17 00:00:00 2001
+From: Kasin Li <donglil@codeaurora.org>
+Date: Mon, 19 Jun 2017 15:36:53 -0600
+Subject: [PATCH 12/40] drm/msm: Fix potential buffer overflow issue
+
+commit 4a630fadbb29d9efaedb525f1a8f7449ad107641 upstream.
+
+In function submit_create, if nr_cmds or nr_bos is assigned with
+negative value, the allocated buffer may be small than intended.
+Using this buffer will lead to buffer overflow issue.
+
+Signed-off-by: Kasin Li <donglil@codeaurora.org>
+Signed-off-by: Jordan Crouse <jcrouse@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/msm/msm_gem_submit.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index fed44d4e5b72..34edb4a4ccd4 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -34,10 +34,13 @@ static inline void __user *to_user_ptr(u64 address)
+ }
+ 
+ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+-		struct msm_gpu *gpu, int nr)
++		struct msm_gpu *gpu, uint32_t nr)
+ {
+ 	struct msm_gem_submit *submit;
+-	int sz = sizeof(*submit) + (nr * sizeof(submit->bos[0]));
++	uint64_t sz = sizeof(*submit) + (nr * sizeof(submit->bos[0]));
++
++	if (sz > SIZE_MAX)
++		return NULL;
+ 
+ 	submit = kmalloc(sz, GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
+ 	if (submit) {
+-- 
+2.28.0
+
+
+From ded34f972348b0f252256bee161839c1aa5d8ae4 Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@oracle.com>
+Date: Fri, 30 Jun 2017 10:59:15 +0300
+Subject: [PATCH 13/40] drm/msm: fix an integer overflow test
+
+commit 65e93108891e571f177c202add9288eda9ac4100 upstream.
+
+We recently added an integer overflow check but it needs an additional
+tweak to work properly on 32 bit systems.
+
+The problem is that we're doing the right hand side of the assignment as
+type unsigned long so the max it will have an integer overflow instead
+of being larger than SIZE_MAX.  That means the "sz > SIZE_MAX" condition
+is never true even on 32 bit systems.  We need to first cast it to u64
+and then do the math.
+
+Fixes: 4a630fadbb29 ("drm/msm: Fix potential buffer overflow issue")
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Acked-by: Jordan Crouse <jcrouse@codeaurora.org>
+Signed-off-by: Rob Clark <robdclark@gmail.com>
+Cc: Ben Hutchings <ben@decadent.org.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/msm/msm_gem_submit.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
+index 34edb4a4ccd4..f4eaccb191d4 100644
+--- a/drivers/gpu/drm/msm/msm_gem_submit.c
++++ b/drivers/gpu/drm/msm/msm_gem_submit.c
+@@ -37,7 +37,7 @@ static struct msm_gem_submit *submit_create(struct drm_device *dev,
+ 		struct msm_gpu *gpu, uint32_t nr)
+ {
+ 	struct msm_gem_submit *submit;
+-	uint64_t sz = sizeof(*submit) + (nr * sizeof(submit->bos[0]));
++	uint64_t sz = sizeof(*submit) + ((u64)nr * sizeof(submit->bos[0]));
+ 
+ 	if (sz > SIZE_MAX)
+ 		return NULL;
+-- 
+2.28.0
+
+
+From a48fce6623805e047ef15760dc0335a5c5b694a3 Mon Sep 17 00:00:00 2001
+From: "Steven Rostedt (VMware)" <rostedt@goodmis.org>
+Date: Tue, 17 Oct 2017 14:55:24 -0400
+Subject: [PATCH 14/40] tracing/samples: Fix creation and deletion of
+ simple_thread_fn creation
+
+commit 6575257c60e1a26a5319ccf2b5ce5b6449001017 upstream.
+
+Commit 7496946a8 ("tracing: Add samples of DECLARE_EVENT_CLASS() and
+DEFINE_EVENT()") added template examples for all the events. It created a
+DEFINE_EVENT_FN() example which reused the foo_bar_reg and foo_bar_unreg
+functions.
+
+Enabling both the TRACE_EVENT_FN() and DEFINE_EVENT_FN() example trace
+events caused the foo_bar_reg to be called twice, creating the test thread
+twice. The foo_bar_unreg would remove it only once, even if it was called
+multiple times, leaving a thread existing when the module is unloaded,
+causing an oops.
+
+Add a ref count and allow foo_bar_reg() and foo_bar_unreg() be called by
+multiple trace events.
+
+Fixes: 7496946a8 ("tracing: Add samples of DECLARE_EVENT_CLASS() and DEFINE_EVENT()")
+Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ samples/trace_events/trace-events-sample.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/samples/trace_events/trace-events-sample.c b/samples/trace_events/trace-events-sample.c
+index 880a7d1d27d2..d69715d99e4d 100644
+--- a/samples/trace_events/trace-events-sample.c
++++ b/samples/trace_events/trace-events-sample.c
+@@ -78,28 +78,36 @@ static int simple_thread_fn(void *arg)
+ }
+ 
+ static DEFINE_MUTEX(thread_mutex);
++static bool simple_thread_cnt;
+ 
+ void foo_bar_reg(void)
+ {
++	mutex_lock(&thread_mutex);
++	if (simple_thread_cnt++)
++		goto out;
++
+ 	pr_info("Starting thread for foo_bar_fn\n");
+ 	/*
+ 	 * We shouldn't be able to start a trace when the module is
+ 	 * unloading (there's other locks to prevent that). But
+ 	 * for consistency sake, we still take the thread_mutex.
+ 	 */
+-	mutex_lock(&thread_mutex);
+ 	simple_tsk_fn = kthread_run(simple_thread_fn, NULL, "event-sample-fn");
++ out:
+ 	mutex_unlock(&thread_mutex);
+ }
+ 
+ void foo_bar_unreg(void)
+ {
+-	pr_info("Killing thread for foo_bar_fn\n");
+-	/* protect against module unloading */
+ 	mutex_lock(&thread_mutex);
++	if (--simple_thread_cnt)
++		goto out;
++
++	pr_info("Killing thread for foo_bar_fn\n");
+ 	if (simple_tsk_fn)
+ 		kthread_stop(simple_tsk_fn);
+ 	simple_tsk_fn = NULL;
++ out:
+ 	mutex_unlock(&thread_mutex);
+ }
+ 
+-- 
+2.28.0
+
+
+From b83c2880b34884c42bdd0ac28932d3e70743cc9b Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Fri, 27 Oct 2017 20:35:31 -0700
+Subject: [PATCH 15/40] Fix tracing sample code warning.
+
+commit a0cb2b5c390151837b08e5f7bca4a6ecddbcd39c upstream.
+
+Commit 6575257c60e1 ("tracing/samples: Fix creation and deletion of
+simple_thread_fn creation") introduced a new warning due to using a
+boolean as a counter.
+
+Just make it "int".
+
+Fixes: 6575257c60e1 ("tracing/samples: Fix creation and deletion of simple_thread_fn creation")
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ samples/trace_events/trace-events-sample.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/samples/trace_events/trace-events-sample.c b/samples/trace_events/trace-events-sample.c
+index d69715d99e4d..4ccff66523c9 100644
+--- a/samples/trace_events/trace-events-sample.c
++++ b/samples/trace_events/trace-events-sample.c
+@@ -78,7 +78,7 @@ static int simple_thread_fn(void *arg)
+ }
+ 
+ static DEFINE_MUTEX(thread_mutex);
+-static bool simple_thread_cnt;
++static int simple_thread_cnt;
+ 
+ void foo_bar_reg(void)
+ {
+-- 
+2.28.0
+
+
+From ba28f16cfa2a410ba8aff60c2918417b91e05871 Mon Sep 17 00:00:00 2001
+From: Grygorii Strashko <grygorii.strashko@ti.com>
+Date: Sat, 7 Oct 2017 22:37:43 +0000
+Subject: [PATCH 16/40] PM / wakeirq: report a wakeup_event on dedicated wekup
+ irq
+
+[ Upstream commit 09bb6e93956ae5175b96905b723ec879c3ca0765 ]
+
+There are two reasons for reporting wakeup event when dedicated wakeup
+IRQ is triggered:
+
+- wakeup events accounting, so proper statistical data will be
+  displayed in sysfs and debugfs;
+
+- there are small window when System is entering suspend during which
+  dedicated wakeup IRQ can be lost:
+
+dpm_suspend_noirq()
+  |- device_wakeup_arm_wake_irqs()
+      |- dev_pm_arm_wake_irq(X)
+         |- IRQ is enabled and marked as wakeup source
+[1]...
+  |- suspend_device_irqs()
+     |- suspend_device_irq(X)
+	|- irqd_set(X, IRQD_WAKEUP_ARMED);
+	   |- wakup IRQ armed
+
+The wakeup IRQ can be lost if it's triggered at point [1]
+and not armed yet.
+
+Hence, fix above cases by adding simple pm_wakeup_event() call in
+handle_threaded_wake_irq().
+
+Fixes: 4990d4fe327b (PM / Wakeirq: Add automated device wake IRQ handling)
+Signed-off-by: Grygorii Strashko <grygorii.strashko@ti.com>
+Tested-by: Keerthy <j-keerthy@ti.com>
+[ tony@atomide.com: added missing return to avoid warnings ]
+Tested-by: Tony Lindgren <tony@atomide.com>
+Signed-off-by: Tony Lindgren <tony@atomide.com>
+Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/base/power/wakeirq.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/base/power/wakeirq.c b/drivers/base/power/wakeirq.c
+index 404d94c6c8bc..feba1b211898 100644
+--- a/drivers/base/power/wakeirq.c
++++ b/drivers/base/power/wakeirq.c
+@@ -141,6 +141,13 @@ static irqreturn_t handle_threaded_wake_irq(int irq, void *_wirq)
+ 	struct wake_irq *wirq = _wirq;
+ 	int res;
+ 
++	/* Maybe abort suspend? */
++	if (irqd_is_wakeup_set(irq_get_irq_data(irq))) {
++		pm_wakeup_event(wirq->dev, 0);
++
++		return IRQ_HANDLED;
++	}
++
+ 	/* We don't want RPM_ASYNC or RPM_NOWAIT here */
+ 	res = pm_runtime_resume(wirq->dev);
+ 	if (res < 0)
+-- 
+2.28.0
+
+
+From a3e021504fcf75123eb05f10ce794d63e5a0c405 Mon Sep 17 00:00:00 2001
+From: Arnd Bergmann <arnd@arndb.de>
+Date: Sat, 7 Oct 2017 22:37:44 +0000
+Subject: [PATCH 17/40] mmc: s3cmci: include linux/interrupt.h for
+ tasklet_struct
+
+[ Upstream commit e1c6ec26b853e9062f0b3daaf695c546d0702953 ]
+
+I got this new build error on today's linux-next
+
+drivers/mmc/host/s3cmci.h:69:24: error: field 'pio_tasklet' has incomplete type
+  struct tasklet_struct pio_tasklet;
+drivers/mmc/host/s3cmci.c: In function 's3cmci_enable_irq':
+drivers/mmc/host/s3cmci.c:390:4: error: implicit declaration of function 'enable_irq';did you mean 'enable_imask'? [-Werror=implicit-function-declaration]
+
+While I haven't found out why this happened now and not earlier, the
+solution is obvious, we should include the header that defines
+the structure.
+
+Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mmc/host/s3cmci.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/mmc/host/s3cmci.c b/drivers/mmc/host/s3cmci.c
+index 6291d5042ef2..6fed41bd016a 100644
+--- a/drivers/mmc/host/s3cmci.c
++++ b/drivers/mmc/host/s3cmci.c
+@@ -21,6 +21,7 @@
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
+ #include <linux/gpio.h>
++#include <linux/interrupt.h>
+ #include <linux/irq.h>
+ #include <linux/io.h>
+ 
+-- 
+2.28.0
+
+
+From ed414aeb5291ae1e1733bb24d8801b0167a454f0 Mon Sep 17 00:00:00 2001
+From: Ulf Hansson <ulf.hansson@linaro.org>
+Date: Sat, 7 Oct 2017 22:37:44 +0000
+Subject: [PATCH 18/40] ARM: pxa: Don't rely on public mmc header to include
+ leds.h
+
+[ Upstream commit 40d727a2defa176b78159d445bcf7afcc2ed9021 ]
+
+Some of the pxa platforms, balloon3, colibri-pxa270-income, corgi,
+trizeps4, vpac270, zeus and zylonite depends on leds.h. Explicitly include
+it instead of relying on the public mmc header host.h.
+
+Cc: Daniel Mack <daniel@zonque.org>
+Cc: Haojian Zhuang <haojian.zhuang@gmail.com>
+Cc: Robert Jarzmik <robert.jarzmik@free.fr>
+Cc: <linux-arm-kernel@lists.infradead.org>
+Signed-off-by: Ulf Hansson <ulf.hansson@linaro.org>
+Acked-by: Robert Jarzmik <robert.jarzmik@free.fr>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/mach-pxa/balloon3.c              | 1 +
+ arch/arm/mach-pxa/colibri-pxa270-income.c | 1 +
+ arch/arm/mach-pxa/corgi.c                 | 1 +
+ arch/arm/mach-pxa/trizeps4.c              | 1 +
+ arch/arm/mach-pxa/vpac270.c               | 1 +
+ arch/arm/mach-pxa/zeus.c                  | 1 +
+ arch/arm/mach-pxa/zylonite.c              | 1 +
+ 7 files changed, 7 insertions(+)
+
 diff --git a/arch/arm/mach-pxa/balloon3.c b/arch/arm/mach-pxa/balloon3.c
 index a727282bfa99..761d7d64d643 100644
 --- a/arch/arm/mach-pxa/balloon3.c
@@ -184,84 +1213,463 @@ index e20359a7433c..d7f0a7d87ef2 100644
  #include <linux/init.h>
  #include <linux/platform_device.h>
  #include <linux/gpio.h>
-diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
-index ca7f0ac5f708..210826d5bba5 100644
---- a/arch/arm64/kernel/traps.c
-+++ b/arch/arm64/kernel/traps.c
-@@ -129,7 +129,7 @@ static void dump_instr(const char *lvl, struct pt_regs *regs)
- 	for (i = -4; i < 1; i++) {
- 		unsigned int val, bad;
+-- 
+2.28.0
+
+
+From 8800aba5029239cdf209381e19b8d3a93fe4e765 Mon Sep 17 00:00:00 2001
+From: Linus Walleij <linus.walleij@linaro.org>
+Date: Sat, 7 Oct 2017 22:37:44 +0000
+Subject: [PATCH 19/40] mfd: ab8500-sysctrl: Handle probe deferral
+
+[ Upstream commit 7e9c40c63933a643908d686bd89dfc2315e8c70a ]
+
+In the current boot, clients making use of the AB8500 sysctrl
+may be probed before the ab8500-sysctrl driver. This gives them
+-EINVAL, but should rather give -EPROBE_DEFER.
+
+Before this, the abx500 clock driver didn't probe properly,
+and as a result the codec driver in turn using the clocks did
+not probe properly. After this patch, everything probes
+properly.
+
+Also add OF compatible-string probing. This driver is all
+device tree, so let's just make a drive-by-fix of that as
+well.
+
+Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
+Signed-off-by: Lee Jones <lee.jones@linaro.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mfd/ab8500-sysctrl.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/mfd/ab8500-sysctrl.c b/drivers/mfd/ab8500-sysctrl.c
+index 0d1825696153..405ce78c1ef4 100644
+--- a/drivers/mfd/ab8500-sysctrl.c
++++ b/drivers/mfd/ab8500-sysctrl.c
+@@ -99,7 +99,7 @@ int ab8500_sysctrl_read(u16 reg, u8 *value)
+ 	u8 bank;
  
--		bad = __get_user(val, &((u32 *)addr)[i]);
-+		bad = get_user(val, &((u32 *)addr)[i]);
+ 	if (sysctrl_dev == NULL)
+-		return -EINVAL;
++		return -EPROBE_DEFER;
  
- 		if (!bad)
- 			p += sprintf(p, i == 0 ? "(%08x) " : "%08x ", val);
-diff --git a/drivers/base/power/wakeirq.c b/drivers/base/power/wakeirq.c
-index 404d94c6c8bc..feba1b211898 100644
---- a/drivers/base/power/wakeirq.c
-+++ b/drivers/base/power/wakeirq.c
-@@ -141,6 +141,13 @@ static irqreturn_t handle_threaded_wake_irq(int irq, void *_wirq)
- 	struct wake_irq *wirq = _wirq;
- 	int res;
+ 	bank = (reg >> 8);
+ 	if (!valid_bank(bank))
+@@ -115,11 +115,13 @@ int ab8500_sysctrl_write(u16 reg, u8 mask, u8 value)
+ 	u8 bank;
  
-+	/* Maybe abort suspend? */
-+	if (irqd_is_wakeup_set(irq_get_irq_data(irq))) {
-+		pm_wakeup_event(wirq->dev, 0);
-+
-+		return IRQ_HANDLED;
+ 	if (sysctrl_dev == NULL)
+-		return -EINVAL;
++		return -EPROBE_DEFER;
+ 
+ 	bank = (reg >> 8);
+-	if (!valid_bank(bank))
++	if (!valid_bank(bank)) {
++		pr_err("invalid bank\n");
+ 		return -EINVAL;
 +	}
-+
- 	/* We don't want RPM_ASYNC or RPM_NOWAIT here */
- 	res = pm_runtime_resume(wirq->dev);
- 	if (res < 0)
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
-index bb0da76051a1..e5da6f19b9b8 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
-@@ -284,6 +284,10 @@ static void amdgpu_vce_idle_work_handler(struct work_struct *work)
- 			amdgpu_dpm_enable_vce(adev, false);
- 		} else {
- 			amdgpu_asic_set_vce_clocks(adev, 0, 0);
-+			amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-+							    AMD_PG_STATE_GATE);
-+			amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-+							    AMD_CG_STATE_GATE);
- 		}
- 	} else {
- 		schedule_delayed_work(&adev->vce.idle_work,
-@@ -315,6 +319,11 @@ static void amdgpu_vce_note_usage(struct amdgpu_device *adev)
- 			amdgpu_dpm_enable_vce(adev, true);
- 		} else {
- 			amdgpu_asic_set_vce_clocks(adev, 53300, 40000);
-+			amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-+							    AMD_CG_STATE_UNGATE);
-+			amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
-+							    AMD_PG_STATE_UNGATE);
-+
- 		}
- 	}
- }
-diff --git a/drivers/gpu/drm/msm/msm_gem_submit.c b/drivers/gpu/drm/msm/msm_gem_submit.c
-index fed44d4e5b72..f4eaccb191d4 100644
---- a/drivers/gpu/drm/msm/msm_gem_submit.c
-+++ b/drivers/gpu/drm/msm/msm_gem_submit.c
-@@ -34,10 +34,13 @@ static inline void __user *to_user_ptr(u64 address)
+ 
+ 	return abx500_mask_and_set_register_interruptible(sysctrl_dev, bank,
+ 		(u8)(reg & 0xFF), mask, value);
+@@ -180,9 +182,15 @@ static int ab8500_sysctrl_remove(struct platform_device *pdev)
+ 	return 0;
  }
  
- static struct msm_gem_submit *submit_create(struct drm_device *dev,
--		struct msm_gpu *gpu, int nr)
-+		struct msm_gpu *gpu, uint32_t nr)
- {
- 	struct msm_gem_submit *submit;
--	int sz = sizeof(*submit) + (nr * sizeof(submit->bos[0]));
-+	uint64_t sz = sizeof(*submit) + ((u64)nr * sizeof(submit->bos[0]));
++static const struct of_device_id ab8500_sysctrl_match[] = {
++	{ .compatible = "stericsson,ab8500-sysctrl", },
++	{}
++};
 +
-+	if (sz > SIZE_MAX)
-+		return NULL;
+ static struct platform_driver ab8500_sysctrl_driver = {
+ 	.driver = {
+ 		.name = "ab8500-sysctrl",
++		.of_match_table = ab8500_sysctrl_match,
+ 	},
+ 	.probe = ab8500_sysctrl_probe,
+ 	.remove = ab8500_sysctrl_remove,
+-- 
+2.28.0
+
+
+From f9776d7ee5f50da18bebf5f81e4d8b1f9a13a592 Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Sat, 7 Oct 2017 22:37:44 +0000
+Subject: [PATCH 20/40] mfd: axp20x: Fix axp288 PEK_DBR and PEK_DBF irqs being
+ swapped
+
+[ Upstream commit 1af468ebe45591651ec3bafc2e9ddc6fdef70ae0 ]
+
+The R in PEK_DBR stands for rising, so it should be mapped to
+AXP288_IRQ_POKP where the last P stands for positive edge.
+
+Likewise PEK_DBF should be mapped to the falling edge, aka the
+_N_egative edge, so it should be mapped to AXP288_IRQ_POKN.
+
+This fixes the inverted powerbutton status reporting by the
+axp20x-pek driver.
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Acked-by: Chen-Yu Tsai <wens@csie.org>
+Signed-off-by: Lee Jones <lee.jones@linaro.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/mfd/axp20x.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/mfd/axp20x.c b/drivers/mfd/axp20x.c
+index 9842199e2e6c..89a2dd4d212a 100644
+--- a/drivers/mfd/axp20x.c
++++ b/drivers/mfd/axp20x.c
+@@ -164,14 +164,14 @@ static struct resource axp22x_pek_resources[] = {
+ static struct resource axp288_power_button_resources[] = {
+ 	{
+ 		.name	= "PEK_DBR",
+-		.start	= AXP288_IRQ_POKN,
+-		.end	= AXP288_IRQ_POKN,
++		.start	= AXP288_IRQ_POKP,
++		.end	= AXP288_IRQ_POKP,
+ 		.flags	= IORESOURCE_IRQ,
+ 	},
+ 	{
+ 		.name	= "PEK_DBF",
+-		.start	= AXP288_IRQ_POKP,
+-		.end	= AXP288_IRQ_POKP,
++		.start	= AXP288_IRQ_POKN,
++		.end	= AXP288_IRQ_POKN,
+ 		.flags	= IORESOURCE_IRQ,
+ 	},
+ };
+-- 
+2.28.0
+
+
+From a76eb0e8655ef8cf58917549f667e8c9a9be1fc6 Mon Sep 17 00:00:00 2001
+From: Larry Finger <Larry.Finger@lwfinger.net>
+Date: Sat, 7 Oct 2017 22:37:45 +0000
+Subject: [PATCH 21/40] staging: rtl8712u: Fix endian settings for structs
+ describing network packets
+
+[ Upstream commit 221c46d28957bd6e2158abc2179ce4a8c9ce07d3 ]
+
+The headers describing a number of network packets do not have the
+correct endian settings for several types of data.
+
+Signed-off-by: Larry Finger <Larry.Finger@lwfinger.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/staging/rtl8712/ieee80211.h | 84 ++++++++++++++---------------
+ 1 file changed, 42 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/staging/rtl8712/ieee80211.h b/drivers/staging/rtl8712/ieee80211.h
+index d374824c4f33..7b16c05b5e8b 100644
+--- a/drivers/staging/rtl8712/ieee80211.h
++++ b/drivers/staging/rtl8712/ieee80211.h
+@@ -143,52 +143,52 @@ struct ieee_ibss_seq {
+ };
  
- 	submit = kmalloc(sz, GFP_TEMPORARY | __GFP_NOWARN | __GFP_NORETRY);
- 	if (submit) {
+ struct ieee80211_hdr {
+-	u16 frame_ctl;
+-	u16 duration_id;
++	__le16 frame_ctl;
++	__le16 duration_id;
+ 	u8 addr1[ETH_ALEN];
+ 	u8 addr2[ETH_ALEN];
+ 	u8 addr3[ETH_ALEN];
+-	u16 seq_ctl;
++	__le16 seq_ctl;
+ 	u8 addr4[ETH_ALEN];
+-} __packed;
++}  __packed __aligned(2);
+ 
+ struct ieee80211_hdr_3addr {
+-	u16 frame_ctl;
+-	u16 duration_id;
++	__le16 frame_ctl;
++	__le16 duration_id;
+ 	u8 addr1[ETH_ALEN];
+ 	u8 addr2[ETH_ALEN];
+ 	u8 addr3[ETH_ALEN];
+-	u16 seq_ctl;
+-} __packed;
++	__le16 seq_ctl;
++}  __packed __aligned(2);
+ 
+ 
+ struct	ieee80211_hdr_qos {
+-	u16 frame_ctl;
+-	u16 duration_id;
++	__le16 frame_ctl;
++	__le16 duration_id;
+ 	u8 addr1[ETH_ALEN];
+ 	u8 addr2[ETH_ALEN];
+ 	u8 addr3[ETH_ALEN];
+-	u16 seq_ctl;
++	__le16 seq_ctl;
+ 	u8 addr4[ETH_ALEN];
+-	u16	qc;
+-}  __packed;
++	__le16	qc;
++}   __packed __aligned(2);
+ 
+ struct  ieee80211_hdr_3addr_qos {
+-	u16 frame_ctl;
+-	u16 duration_id;
++	__le16 frame_ctl;
++	__le16 duration_id;
+ 	u8  addr1[ETH_ALEN];
+ 	u8  addr2[ETH_ALEN];
+ 	u8  addr3[ETH_ALEN];
+-	u16 seq_ctl;
+-	u16 qc;
++	__le16 seq_ctl;
++	__le16 qc;
+ }  __packed;
+ 
+ struct eapol {
+ 	u8 snap[6];
+-	u16 ethertype;
++	__be16 ethertype;
+ 	u8 version;
+ 	u8 type;
+-	u16 length;
++	__le16 length;
+ } __packed;
+ 
+ 
+@@ -528,13 +528,13 @@ struct ieee80211_security {
+  */
+ 
+ struct ieee80211_header_data {
+-	u16 frame_ctl;
+-	u16 duration_id;
++	__le16 frame_ctl;
++	__le16 duration_id;
+ 	u8 addr1[6];
+ 	u8 addr2[6];
+ 	u8 addr3[6];
+-	u16 seq_ctrl;
+-};
++	__le16 seq_ctrl;
++} __packed __aligned(2);
+ 
+ #define BEACON_PROBE_SSID_ID_POSITION 12
+ 
+@@ -566,18 +566,18 @@ struct ieee80211_info_element {
+ /*
+  * These are the data types that can make up management packets
+  *
+-	u16 auth_algorithm;
+-	u16 auth_sequence;
+-	u16 beacon_interval;
+-	u16 capability;
++	__le16 auth_algorithm;
++	__le16 auth_sequence;
++	__le16 beacon_interval;
++	__le16 capability;
+ 	u8 current_ap[ETH_ALEN];
+-	u16 listen_interval;
++	__le16 listen_interval;
+ 	struct {
+ 		u16 association_id:14, reserved:2;
+ 	} __packed;
+-	u32 time_stamp[2];
+-	u16 reason;
+-	u16 status;
++	__le32 time_stamp[2];
++	__le16 reason;
++	__le16 status;
+ */
+ 
+ #define IEEE80211_DEFAULT_TX_ESSID "Penguin"
+@@ -585,16 +585,16 @@ struct ieee80211_info_element {
+ 
+ struct ieee80211_authentication {
+ 	struct ieee80211_header_data header;
+-	u16 algorithm;
+-	u16 transaction;
+-	u16 status;
++	__le16 algorithm;
++	__le16 transaction;
++	__le16 status;
+ } __packed;
+ 
+ struct ieee80211_probe_response {
+ 	struct ieee80211_header_data header;
+-	u32 time_stamp[2];
+-	u16 beacon_interval;
+-	u16 capability;
++	__le32 time_stamp[2];
++	__le16 beacon_interval;
++	__le16 capability;
+ 	struct ieee80211_info_element info_element;
+ } __packed;
+ 
+@@ -604,16 +604,16 @@ struct ieee80211_probe_request {
+ 
+ struct ieee80211_assoc_request_frame {
+ 	struct ieee80211_hdr_3addr header;
+-	u16 capability;
+-	u16 listen_interval;
++	__le16 capability;
++	__le16 listen_interval;
+ 	struct ieee80211_info_element_hdr info_element;
+ } __packed;
+ 
+ struct ieee80211_assoc_response_frame {
+ 	struct ieee80211_hdr_3addr header;
+-	u16 capability;
+-	u16 status;
+-	u16 aid;
++	__le16 capability;
++	__le16 status;
++	__le16 aid;
+ } __packed;
+ 
+ struct ieee80211_txb {
+-- 
+2.28.0
+
+
+From 5624ea1610407db30f1adaf896f6d9c3cb66f072 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Sat, 7 Oct 2017 22:37:45 +0000
+Subject: [PATCH 22/40] ext4: fix stripe-unaligned allocations
+
+[ Upstream commit d9b22cf9f5466a057f2a4f1e642b469fa9d73117 ]
+
+When a filesystem is created using:
+
+	mkfs.ext4 -b 4096 -E stride=512 <dev>
+
+and we try to allocate 64MB extent, we will end up directly in
+ext4_mb_complex_scan_group(). This is because the request is detected
+as power-of-two allocation (so we start in ext4_mb_regular_allocator()
+with ac_criteria == 0) however the check before
+ext4_mb_simple_scan_group() refuses the direct buddy scan because the
+allocation request is too large. Since cr == 0, the check whether we
+should use ext4_mb_scan_aligned() fails as well and we fall back to
+ext4_mb_complex_scan_group().
+
+Fix the problem by checking for upper limit on power-of-two requests
+directly when detecting them.
+
+Reported-by: Ross Zwisler <ross.zwisler@linux.intel.com>
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ext4/mballoc.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
+index 84cd77663e1f..1ba82dc5afa3 100644
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@ -2136,8 +2136,10 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
+ 	 * We search using buddy data only if the order of the request
+ 	 * is greater than equal to the sbi_s_mb_order2_reqs
+ 	 * You can tune it via /sys/fs/ext4/<partition>/mb_order2_req
++	 * We also support searching for power-of-two requests only for
++	 * requests upto maximum buddy size we have constructed.
+ 	 */
+-	if (i >= sbi->s_mb_order2_reqs) {
++	if (i >= sbi->s_mb_order2_reqs && i <= sb->s_blocksize_bits + 2) {
+ 		/*
+ 		 * This should tell if fe_len is exactly power of 2
+ 		 */
+@@ -2207,7 +2209,7 @@ repeat:
+ 			}
+ 
+ 			ac->ac_groups_scanned++;
+-			if (cr == 0 && ac->ac_2order < sb->s_blocksize_bits+2)
++			if (cr == 0)
+ 				ext4_mb_simple_scan_group(ac, &e4b);
+ 			else if (cr == 1 && sbi->s_stripe &&
+ 					!(ac->ac_g_ex.fe_len % sbi->s_stripe))
+-- 
+2.28.0
+
+
+From 358008062202cb21054cb8130c1e5f184a3784c2 Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Sat, 7 Oct 2017 22:37:45 +0000
+Subject: [PATCH 23/40] ext4: do not use stripe_width if it is not set
+
+[ Upstream commit 5469d7c3087ecaf760f54b447f11af6061b7c897 ]
+
+Avoid using stripe_width for sbi->s_stripe value if it is not actually
+set. It prevents using the stride for sbi->s_stripe.
+
+Signed-off-by: Jan Kara <jack@suse.cz>
+Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ext4/super.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 32941cd6d34b..8bdb0cc2722f 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -2499,9 +2499,9 @@ static unsigned long ext4_get_stripe_size(struct ext4_sb_info *sbi)
+ 
+ 	if (sbi->s_stripe && sbi->s_stripe <= sbi->s_blocks_per_group)
+ 		ret = sbi->s_stripe;
+-	else if (stripe_width <= sbi->s_blocks_per_group)
++	else if (stripe_width && stripe_width <= sbi->s_blocks_per_group)
+ 		ret = stripe_width;
+-	else if (stride <= sbi->s_blocks_per_group)
++	else if (stride && stride <= sbi->s_blocks_per_group)
+ 		ret = stride;
+ 	else
+ 		ret = 0;
+-- 
+2.28.0
+
+
+From dec5fcf11b454ebdac7bdf40775bc589dffe2980 Mon Sep 17 00:00:00 2001
+From: Chris Brandt <chris.brandt@renesas.com>
+Date: Sat, 7 Oct 2017 22:37:45 +0000
+Subject: [PATCH 24/40] i2c: riic: correctly finish transfers
+
+[ Upstream commit 71ccea095ea1d4efd004dab971be6d599e06fc3f ]
+
+This fixes the condition where the controller has not fully completed its
+final transfer and leaves the bus and controller in a undesirable state.
+
+At the end of the last transmitted byte, the existing driver would just
+signal for a STOP condition to be transmitted then immediately signal
+completion. However, the full STOP procedure might not have fully taken
+place by the time the runtime PM shuts off the peripheral clock, leaving
+the bus in a suspended state.
+
+Alternatively, the STOP condition on the bus may have completed, but when
+the next transaction is requested by the upper layer, not all the
+necessary register cleanup was finished from the last transfer which made
+the driver return BUS BUSY when it really wasn't.
+
+This patch now makes all transmit and receive transactions wait for the
+STOP condition to fully complete before signaling a completed transaction.
+With this new method, runtime PM no longer seems to be an issue.
+
+Fixes: 310c18a41450 ("i2c: riic: add driver")
+Signed-off-by: Chris Brandt <chris.brandt@renesas.com>
+Reviewed-by: Wolfram Sang <wsa+renesas@sang-engineering.com>
+Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/i2c/busses/i2c-riic.c | 30 +++++++++++++++++++++++-------
+ 1 file changed, 23 insertions(+), 7 deletions(-)
+
 diff --git a/drivers/i2c/busses/i2c-riic.c b/drivers/i2c/busses/i2c-riic.c
 index d7e3af671543..d8803c3bbfdc 100644
 --- a/drivers/i2c/busses/i2c-riic.c
@@ -336,55 +1744,121 @@ index d7e3af671543..d8803c3bbfdc 100644
  	{ .res_num = 5, .isr = riic_tend_isr, .name = "riic-nack" },
  };
  
-diff --git a/drivers/media/pci/bt8xx/dvb-bt8xx.c b/drivers/media/pci/bt8xx/dvb-bt8xx.c
-index d407244fd1bc..bd0f5b195188 100644
---- a/drivers/media/pci/bt8xx/dvb-bt8xx.c
-+++ b/drivers/media/pci/bt8xx/dvb-bt8xx.c
-@@ -680,6 +680,7 @@ static void frontend_init(struct dvb_bt8xx_card *card, u32 type)
- 		/*	DST is not a frontend, attaching the ASIC	*/
- 		if (dvb_attach(dst_attach, state, &card->dvb_adapter) == NULL) {
- 			pr_err("%s: Could not find a Twinhan DST\n", __func__);
-+			kfree(state);
- 			break;
+-- 
+2.28.0
+
+
+From 3b7d9a95ccd38436295ab6598c526dac83504556 Mon Sep 17 00:00:00 2001
+From: Rex Zhu <Rex.Zhu@amd.com>
+Date: Sat, 7 Oct 2017 22:37:46 +0000
+Subject: [PATCH 25/40] drm/amdgpu: when dpm disabled, also need to stop/start
+ vce.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+[ Upstream commit 28ed5504ab4b211a4e589e648e5ebd1e0caa7a6a ]
+
+Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
+Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
+Acked-by: Christian König <christian.koenig@amd.com>
+Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index bb0da76051a1..e5da6f19b9b8 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -284,6 +284,10 @@ static void amdgpu_vce_idle_work_handler(struct work_struct *work)
+ 			amdgpu_dpm_enable_vce(adev, false);
+ 		} else {
+ 			amdgpu_asic_set_vce_clocks(adev, 0, 0);
++			amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
++							    AMD_PG_STATE_GATE);
++			amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
++							    AMD_CG_STATE_GATE);
  		}
- 		/*	Attach other DST peripherals if any		*/
-diff --git a/drivers/media/platform/exynos4-is/fimc-is.c b/drivers/media/platform/exynos4-is/fimc-is.c
-index 49658ca39e51..a851f20dca23 100644
---- a/drivers/media/platform/exynos4-is/fimc-is.c
-+++ b/drivers/media/platform/exynos4-is/fimc-is.c
-@@ -815,12 +815,13 @@ static int fimc_is_probe(struct platform_device *pdev)
- 	is->irq = irq_of_parse_and_map(dev->of_node, 0);
- 	if (!is->irq) {
- 		dev_err(dev, "no irq found\n");
--		return -EINVAL;
-+		ret = -EINVAL;
-+		goto err_iounmap;
+ 	} else {
+ 		schedule_delayed_work(&adev->vce.idle_work,
+@@ -315,6 +319,11 @@ static void amdgpu_vce_note_usage(struct amdgpu_device *adev)
+ 			amdgpu_dpm_enable_vce(adev, true);
+ 		} else {
+ 			amdgpu_asic_set_vce_clocks(adev, 53300, 40000);
++			amdgpu_set_clockgating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
++							    AMD_CG_STATE_UNGATE);
++			amdgpu_set_powergating_state(adev, AMD_IP_BLOCK_TYPE_VCE,
++							    AMD_PG_STATE_UNGATE);
++
+ 		}
  	}
- 
- 	ret = fimc_is_get_clocks(is);
- 	if (ret < 0)
--		return ret;
-+		goto err_iounmap;
- 
- 	platform_set_drvdata(pdev, is);
- 
-@@ -880,6 +881,8 @@ err_irq:
- 	free_irq(is->irq, is);
- err_clk:
- 	fimc_is_put_clocks(is);
-+err_iounmap:
-+	iounmap(is->pmu_regs);
- 	return ret;
  }
+-- 
+2.28.0
+
+
+From 0806eaf13850334e477ea0589812b2c316e0b388 Mon Sep 17 00:00:00 2001
+From: Taeung Song <treeze.taeung@gmail.com>
+Date: Sat, 7 Oct 2017 22:37:46 +0000
+Subject: [PATCH 26/40] perf tools: Only increase index if
+ perf_evsel__new_idx() succeeds
+
+[ Upstream commit 75fc5ae5cc53fff71041ecadeb3354a2b4c9fe42 ]
+
+Signed-off-by: Taeung Song <treeze.taeung@gmail.com>
+Cc: Jiri Olsa <jolsa@kernel.org>
+Cc: Namhyung Kim <namhyung@kernel.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Wang Nan <wangnan0@huawei.com>
+Link: http://lkml.kernel.org/r/1485952447-7013-2-git-send-email-treeze.taeung@gmail.com
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ tools/perf/util/parse-events.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
+index 38304b7e4f81..e81dfb2e239c 100644
+--- a/tools/perf/util/parse-events.c
++++ b/tools/perf/util/parse-events.c
+@@ -291,10 +291,11 @@ __add_event(struct list_head *list, int *idx,
  
-@@ -935,6 +938,7 @@ static int fimc_is_remove(struct platform_device *pdev)
- 	fimc_is_unregister_subdevs(is);
- 	vb2_dma_contig_cleanup_ctx(is->alloc_ctx);
- 	fimc_is_put_clocks(is);
-+	iounmap(is->pmu_regs);
- 	fimc_is_debugfs_remove(is);
- 	release_firmware(is->fw.f_w);
- 	fimc_is_free_cpu_memory(is);
+ 	event_attr_init(attr);
+ 
+-	evsel = perf_evsel__new_idx(attr, (*idx)++);
++	evsel = perf_evsel__new_idx(attr, *idx);
+ 	if (!evsel)
+ 		return NULL;
+ 
++	(*idx)++;
+ 	evsel->cpus     = cpu_map__get(cpus);
+ 	evsel->own_cpus = cpu_map__get(cpus);
+ 
+-- 
+2.28.0
+
+
+From 762d0762b9bb055962526c5fdd71a28d371c3df3 Mon Sep 17 00:00:00 2001
+From: Oleh Kravchenko <oleg@kaa.org.ua>
+Date: Sat, 7 Oct 2017 22:37:46 +0000
+Subject: [PATCH 27/40] cx231xx: Fix I2C on Internal Master 3 Bus
+
+[ Upstream commit 6c5da8031a3abfad259190d35f83d89568b72ee2 ]
+
+Internal Master 3 Bus can send and receive only 4 bytes per time.
+
+Signed-off-by: Oleh Kravchenko <oleg@kaa.org.ua>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/media/usb/cx231xx/cx231xx-core.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
 diff --git a/drivers/media/usb/cx231xx/cx231xx-core.c b/drivers/media/usb/cx231xx/cx231xx-core.c
 index 19b0293312a0..07670117f922 100644
 --- a/drivers/media/usb/cx231xx/cx231xx-core.c
@@ -403,130 +1877,67 @@ index 19b0293312a0..07670117f922 100644
  		unsend_size = 0;
  		pdata = ven_req->pBuff;
  
-diff --git a/drivers/mfd/ab8500-sysctrl.c b/drivers/mfd/ab8500-sysctrl.c
-index 0d1825696153..405ce78c1ef4 100644
---- a/drivers/mfd/ab8500-sysctrl.c
-+++ b/drivers/mfd/ab8500-sysctrl.c
-@@ -99,7 +99,7 @@ int ab8500_sysctrl_read(u16 reg, u8 *value)
- 	u8 bank;
- 
- 	if (sysctrl_dev == NULL)
--		return -EINVAL;
-+		return -EPROBE_DEFER;
- 
- 	bank = (reg >> 8);
- 	if (!valid_bank(bank))
-@@ -115,11 +115,13 @@ int ab8500_sysctrl_write(u16 reg, u8 mask, u8 value)
- 	u8 bank;
- 
- 	if (sysctrl_dev == NULL)
--		return -EINVAL;
-+		return -EPROBE_DEFER;
- 
- 	bank = (reg >> 8);
--	if (!valid_bank(bank))
-+	if (!valid_bank(bank)) {
-+		pr_err("invalid bank\n");
- 		return -EINVAL;
-+	}
- 
- 	return abx500_mask_and_set_register_interruptible(sysctrl_dev, bank,
- 		(u8)(reg & 0xFF), mask, value);
-@@ -180,9 +182,15 @@ static int ab8500_sysctrl_remove(struct platform_device *pdev)
- 	return 0;
- }
- 
-+static const struct of_device_id ab8500_sysctrl_match[] = {
-+	{ .compatible = "stericsson,ab8500-sysctrl", },
-+	{}
-+};
-+
- static struct platform_driver ab8500_sysctrl_driver = {
- 	.driver = {
- 		.name = "ab8500-sysctrl",
-+		.of_match_table = ab8500_sysctrl_match,
- 	},
- 	.probe = ab8500_sysctrl_probe,
- 	.remove = ab8500_sysctrl_remove,
-diff --git a/drivers/mfd/axp20x.c b/drivers/mfd/axp20x.c
-index 9842199e2e6c..89a2dd4d212a 100644
---- a/drivers/mfd/axp20x.c
-+++ b/drivers/mfd/axp20x.c
-@@ -164,14 +164,14 @@ static struct resource axp22x_pek_resources[] = {
- static struct resource axp288_power_button_resources[] = {
- 	{
- 		.name	= "PEK_DBR",
--		.start	= AXP288_IRQ_POKN,
--		.end	= AXP288_IRQ_POKN,
-+		.start	= AXP288_IRQ_POKP,
-+		.end	= AXP288_IRQ_POKP,
- 		.flags	= IORESOURCE_IRQ,
- 	},
- 	{
- 		.name	= "PEK_DBF",
--		.start	= AXP288_IRQ_POKP,
--		.end	= AXP288_IRQ_POKP,
-+		.start	= AXP288_IRQ_POKN,
-+		.end	= AXP288_IRQ_POKN,
- 		.flags	= IORESOURCE_IRQ,
- 	},
- };
-diff --git a/drivers/misc/mei/client.c b/drivers/misc/mei/client.c
-index 2ff39fbc70d1..df268365e04e 100644
---- a/drivers/misc/mei/client.c
-+++ b/drivers/misc/mei/client.c
-@@ -1300,6 +1300,9 @@ int mei_cl_notify_request(struct mei_cl *cl, struct file *file, u8 request)
- 		return -EOPNOTSUPP;
- 	}
- 
-+	if (!mei_cl_is_connected(cl))
-+		return -ENODEV;
-+
- 	rets = pm_runtime_get(dev->dev);
- 	if (rets < 0 && rets != -EINPROGRESS) {
- 		pm_runtime_put_noidle(dev->dev);
-diff --git a/drivers/mmc/host/s3cmci.c b/drivers/mmc/host/s3cmci.c
-index 6291d5042ef2..6fed41bd016a 100644
---- a/drivers/mmc/host/s3cmci.c
-+++ b/drivers/mmc/host/s3cmci.c
-@@ -21,6 +21,7 @@
- #include <linux/debugfs.h>
- #include <linux/seq_file.h>
- #include <linux/gpio.h>
-+#include <linux/interrupt.h>
- #include <linux/irq.h>
- #include <linux/io.h>
- 
-diff --git a/drivers/platform/x86/intel_mid_thermal.c b/drivers/platform/x86/intel_mid_thermal.c
-index 9f713b832ba3..5c768c4627d3 100644
---- a/drivers/platform/x86/intel_mid_thermal.c
-+++ b/drivers/platform/x86/intel_mid_thermal.c
-@@ -550,6 +550,7 @@ static const struct platform_device_id therm_id_table[] = {
- 	{ "msic_thermal", 1 },
- 	{ }
- };
-+MODULE_DEVICE_TABLE(platform, therm_id_table);
- 
- static struct platform_driver mid_thermal_driver = {
- 	.driver = {
-diff --git a/drivers/s390/block/dasd.c b/drivers/s390/block/dasd.c
-index 84c13dffa3a8..e7a6f1222642 100644
---- a/drivers/s390/block/dasd.c
-+++ b/drivers/s390/block/dasd.c
-@@ -1635,8 +1635,11 @@ void dasd_int_handler(struct ccw_device *cdev, unsigned long intparm,
- 	/* check for for attention message */
- 	if (scsw_dstat(&irb->scsw) & DEV_STAT_ATTENTION) {
- 		device = dasd_device_from_cdev_locked(cdev);
--		device->discipline->check_attention(device, irb->esw.esw1.lpum);
--		dasd_put_device(device);
-+		if (!IS_ERR(device)) {
-+			device->discipline->check_attention(device,
-+							    irb->esw.esw1.lpum);
-+			dasd_put_device(device);
-+		}
- 	}
- 
- 	if (!cqr)
+-- 
+2.28.0
+
+
+From fff544c8cf6848c0ac1293d0f2e2b64629a64604 Mon Sep 17 00:00:00 2001
+From: Jan Beulich <JBeulich@suse.com>
+Date: Sat, 7 Oct 2017 22:37:47 +0000
+Subject: [PATCH 28/40] xen/manage: correct return value check on
+ xenbus_scanf()
+
+[ Upstream commit 4fed1b125eb6252bde478665fc05d4819f774fa8 ]
+
+A negative return value indicates an error; in fact the function at
+present won't ever return zero.
+
+Signed-off-by: Jan Beulich <jbeulich@suse.com>
+Reviewed-by: Juergen Gross <jgross@suse.com>
+Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/xen/manage.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/xen/manage.c b/drivers/xen/manage.c
+index e12bd3635f83..e8850b0e3272 100644
+--- a/drivers/xen/manage.c
++++ b/drivers/xen/manage.c
+@@ -275,7 +275,7 @@ static void sysrq_handler(struct xenbus_watch *watch, const char **vec,
+ 	err = xenbus_transaction_start(&xbt);
+ 	if (err)
+ 		return;
+-	if (!xenbus_scanf(xbt, "control", "sysrq", "%c", &sysrq_key)) {
++	if (xenbus_scanf(xbt, "control", "sysrq", "%c", &sysrq_key) < 0) {
+ 		pr_err("Unable to read sysrq code in control/sysrq\n");
+ 		xenbus_transaction_end(xbt, 1);
+ 		return;
+-- 
+2.28.0
+
+
+From d1f96c30ce2d33b3e138363417d4a2ba67b619b8 Mon Sep 17 00:00:00 2001
+From: Raghava Aditya Renukunta <RaghavaAditya.Renukunta@microsemi.com>
+Date: Sat, 7 Oct 2017 22:37:47 +0000
+Subject: [PATCH 29/40] scsi: aacraid: Process Error for response I/O
+
+[ Upstream commit 4ec57fb4edaec523f0f78a0449a3b063749ac58b ]
+
+Make sure that the driver processes error conditions even in the fast
+response path for response from the adapter.
+
+Signed-off-by: Raghava Aditya Renukunta <RaghavaAditya.Renukunta@microsemi.com>
+Signed-off-by: Dave Carroll <David.Carroll@microsemi.com>
+Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/scsi/aacraid/aachba.c | 289 ++++++++++++++++++----------------
+ 1 file changed, 151 insertions(+), 138 deletions(-)
+
 diff --git a/drivers/scsi/aacraid/aachba.c b/drivers/scsi/aacraid/aachba.c
 index e4c243748a97..de33801ca31e 100644
 --- a/drivers/scsi/aacraid/aachba.c
@@ -858,6 +2269,141 @@ index e4c243748a97..de33801ca31e 100644
  	/*
  	 * OR in the scsi status (already shifted up a bit)
  	 */
+-- 
+2.28.0
+
+
+From 28a8fc6416ab191ce5ee34e709067dde9ec0e563 Mon Sep 17 00:00:00 2001
+From: Javier Martinez Canillas <javier@osg.samsung.com>
+Date: Sat, 7 Oct 2017 22:37:47 +0000
+Subject: [PATCH 30/40] platform/x86: intel_mid_thermal: Fix module autoload
+
+[ Upstream commit a93151a72061e944a4915458b1b1d6d505c03bbf ]
+
+If the driver is built as a module, autoload won't work because the module
+alias information is not filled. So user-space can't match the registered
+device with the corresponding module.
+
+Export the module alias information using the MODULE_DEVICE_TABLE() macro.
+
+Before this patch:
+
+$ modinfo drivers/platform/x86/intel_mid_thermal.ko | grep alias
+$
+
+After this patch:
+
+$ modinfo drivers/platform/x86/intel_mid_thermal.ko | grep alias
+alias:          platform:msic_thermal
+
+Signed-off-by: Javier Martinez Canillas <javier@osg.samsung.com>
+Signed-off-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/platform/x86/intel_mid_thermal.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/platform/x86/intel_mid_thermal.c b/drivers/platform/x86/intel_mid_thermal.c
+index 9f713b832ba3..5c768c4627d3 100644
+--- a/drivers/platform/x86/intel_mid_thermal.c
++++ b/drivers/platform/x86/intel_mid_thermal.c
+@@ -550,6 +550,7 @@ static const struct platform_device_id therm_id_table[] = {
+ 	{ "msic_thermal", 1 },
+ 	{ }
+ };
++MODULE_DEVICE_TABLE(platform, therm_id_table);
+ 
+ static struct platform_driver mid_thermal_driver = {
+ 	.driver = {
+-- 
+2.28.0
+
+
+From 2d1d45396585549eaa6d01d9889a31c46237a96e Mon Sep 17 00:00:00 2001
+From: Yang Sheng <yang.sheng@intel.com>
+Date: Sat, 7 Oct 2017 22:37:48 +0000
+Subject: [PATCH 31/40] staging: lustre: llite: don't invoke direct_IO for the
+ EOF case
+
+[ Upstream commit 77759771fb95420d23876cb104ab65c022613325 ]
+
+The function generic_file_read_iter() does not check EOF
+before invoke direct_IO callback. So we have to check it
+ourselves.
+
+Signed-off-by: Yang Sheng <yang.sheng@intel.com>
+Intel-bug-id: https://jira.hpdd.intel.com/browse/LU-8969
+Reviewed-on: https://review.whamcloud.com/24552
+Reviewed-by: Bob Glossman <bob.glossman@intel.com>
+Reviewed-by: Bobi Jam <bobijam@hotmail.com>
+Reviewed-by: Oleg Drokin <oleg.drokin@intel.com>
+Signed-off-by: James Simmons <jsimmons@infradead.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/staging/lustre/lustre/llite/rw26.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/staging/lustre/lustre/llite/rw26.c b/drivers/staging/lustre/lustre/llite/rw26.c
+index 3da4c01e2159..adeefb31cbad 100644
+--- a/drivers/staging/lustre/lustre/llite/rw26.c
++++ b/drivers/staging/lustre/lustre/llite/rw26.c
+@@ -376,6 +376,10 @@ static ssize_t ll_direct_IO_26(struct kiocb *iocb, struct iov_iter *iter,
+ 	if (!lli->lli_has_smd)
+ 		return -EBADF;
+ 
++	/* Check EOF by ourselves */
++	if (iov_iter_rw(iter) == READ && file_offset >= i_size_read(inode))
++		return 0;
++
+ 	/* FIXME: io smaller than PAGE_SIZE is broken on ia64 ??? */
+ 	if ((file_offset & ~CFS_PAGE_MASK) || (count & ~CFS_PAGE_MASK))
+ 		return -EINVAL;
+-- 
+2.28.0
+
+
+From efa8f1b7a65a9e603821b9f7952bd7f74127dcd3 Mon Sep 17 00:00:00 2001
+From: frank zago <fzago@cray.com>
+Date: Sat, 7 Oct 2017 22:37:48 +0000
+Subject: [PATCH 32/40] staging: lustre: hsm: stack overrun in
+ hai_dump_data_field
+
+[ Upstream commit 22aadb91c0a0055935109c175f5446abfb130702 ]
+
+The function hai_dump_data_field will do a stack buffer
+overrun when cat'ing /sys/fs/lustre/.../hsm/actions if an action has
+some data in it.
+
+hai_dump_data_field uses snprintf. But there is no check for
+truncation, and the value returned by snprintf is used as-is.  The
+coordinator code calls hai_dump_data_field with 12 bytes in the
+buffer. The 6th byte of data is printed incompletely to make room for
+the terminating NUL. However snprintf still returns 2, so when
+hai_dump_data_field writes the final NUL, it does it outside the
+reserved buffer, in the 13th byte of the buffer. This stack buffer
+overrun hangs my VM.
+
+Fix by checking that there is enough room for the next 2 characters
+plus the NUL terminator. Don't print half bytes. Change the format to
+02X instead of .2X, which makes more sense.
+
+Signed-off-by: frank zago <fzago@cray.com>
+Intel-bug-id: https://jira.hpdd.intel.com/browse/LU-8171
+Reviewed-on: http://review.whamcloud.com/20338
+Reviewed-by: John L. Hammond <john.hammond@intel.com>
+Reviewed-by: Jean-Baptiste Riaux <riaux.jb@intel.com>
+Reviewed-by: Oleg Drokin <oleg.drokin@intel.com>
+Signed-off-by: James Simmons <jsimmons@infradead.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ .../lustre/lustre/include/lustre/lustre_user.h | 18 ++++++++----------
+ 1 file changed, 8 insertions(+), 10 deletions(-)
+
 diff --git a/drivers/staging/lustre/lustre/include/lustre/lustre_user.h b/drivers/staging/lustre/lustre/include/lustre/lustre_user.h
 index 80f8ec529424..8ed4558238fc 100644
 --- a/drivers/staging/lustre/lustre/include/lustre/lustre_user.h
@@ -894,6 +2440,46 @@ index 80f8ec529424..8ed4558238fc 100644
  	return buffer;
  }
  
+-- 
+2.28.0
+
+
+From 2d097e5f5c039618a49a37f7ee457bc4e5f48d1d Mon Sep 17 00:00:00 2001
+From: Alexander Boyko <alexander.boyko@seagate.com>
+Date: Sat, 7 Oct 2017 22:37:48 +0000
+Subject: [PATCH 33/40] staging: lustre: ptlrpc: skip lock if export failed
+
+[ Upstream commit 4c43c27ddc461d8473cedd70f2549614641dfbc7 ]
+
+This patch resolves IO vs eviction race.
+After eviction failed export stayed at stale list,
+a client had IO processing and reconnected during it.
+A client sent brw rpc with last lock cookie and new connection.
+The lock with failed export was found and assert was happened.
+ (ost_handler.c:1812:ost_prolong_lock_one())
+  ASSERTION( lock->l_export == opd->opd_exp ) failed:
+
+ 1. Skip the lock at ldlm_handle2lock if lock export failed.
+ 2. Validation of lock for IO was added at hpreq_check(). The lock
+    searching is based on granted interval tree. If server doesn`t
+    have a valid lock, it reply to client with ESTALE.
+
+Signed-off-by: Alexander Boyko <alexander.boyko@seagate.com>
+Intel-bug-id: https://jira.hpdd.intel.com/browse/LU-7702
+Seagate-bug-id: MRP-2787
+Reviewed-on: http://review.whamcloud.com/18120
+Reviewed-by: Fan Yong <fan.yong@intel.com>
+Reviewed-by: Vitaly Fertman <vitaly.fertman@seagate.com>
+Reviewed-by: Oleg Drokin <oleg.drokin@intel.com>
+Signed-off-by: James Simmons <jsimmons@infradead.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ .../staging/lustre/lustre/ldlm/ldlm_lock.c    |  7 +++++++
+ .../staging/lustre/lustre/ptlrpc/service.c    | 21 +++++++------------
+ 2 files changed, 15 insertions(+), 13 deletions(-)
+
 diff --git a/drivers/staging/lustre/lustre/ldlm/ldlm_lock.c b/drivers/staging/lustre/lustre/ldlm/ldlm_lock.c
 index 7f8c70056ffd..040553d6e316 100644
 --- a/drivers/staging/lustre/lustre/ldlm/ldlm_lock.c
@@ -912,21 +2498,6 @@ index 7f8c70056ffd..040553d6e316 100644
  	/* It's unlikely but possible that someone marked the lock as
  	 * destroyed after we did handle2object on it */
  	if (flags == 0 && ((lock->l_flags & LDLM_FL_DESTROYED) == 0)) {
-diff --git a/drivers/staging/lustre/lustre/llite/rw26.c b/drivers/staging/lustre/lustre/llite/rw26.c
-index 3da4c01e2159..adeefb31cbad 100644
---- a/drivers/staging/lustre/lustre/llite/rw26.c
-+++ b/drivers/staging/lustre/lustre/llite/rw26.c
-@@ -376,6 +376,10 @@ static ssize_t ll_direct_IO_26(struct kiocb *iocb, struct iov_iter *iter,
- 	if (!lli->lli_has_smd)
- 		return -EBADF;
- 
-+	/* Check EOF by ourselves */
-+	if (iov_iter_rw(iter) == READ && file_offset >= i_size_read(inode))
-+		return 0;
-+
- 	/* FIXME: io smaller than PAGE_SIZE is broken on ia64 ??? */
- 	if ((file_offset & ~CFS_PAGE_MASK) || (count & ~CFS_PAGE_MASK))
- 		return -EINVAL;
 diff --git a/drivers/staging/lustre/lustre/ptlrpc/service.c b/drivers/staging/lustre/lustre/ptlrpc/service.c
 index f45898f17793..6d3c25ccb297 100644
 --- a/drivers/staging/lustre/lustre/ptlrpc/service.c
@@ -960,172 +2531,259 @@ index f45898f17793..6d3c25ccb297 100644
  		}
  
  		spin_lock_bh(&req->rq_export->exp_rpc_lock);
-diff --git a/drivers/staging/rtl8712/ieee80211.h b/drivers/staging/rtl8712/ieee80211.h
-index d374824c4f33..7b16c05b5e8b 100644
---- a/drivers/staging/rtl8712/ieee80211.h
-+++ b/drivers/staging/rtl8712/ieee80211.h
-@@ -143,52 +143,52 @@ struct ieee_ibss_seq {
- };
+-- 
+2.28.0
+
+
+From 0e97077574c6e991274b37972d1c0241332610fb Mon Sep 17 00:00:00 2001
+From: Arvind Yadav <arvind.yadav.cs@gmail.com>
+Date: Sat, 7 Oct 2017 22:37:48 +0000
+Subject: [PATCH 34/40] exynos4-is: fimc-is: Unmap region obtained by
+ of_iomap()
+
+[ Upstream commit 4742575cde1f3cee0ea6b41af42781672315b04b ]
+
+Free memory mapping, if fimc_is_probe is not successful.
+
+Signed-off-by: Arvind Yadav <arvind.yadav.cs@gmail.com>
+Signed-off-by: Sylwester Nawrocki <s.nawrocki@samsung.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/media/platform/exynos4-is/fimc-is.c | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/media/platform/exynos4-is/fimc-is.c b/drivers/media/platform/exynos4-is/fimc-is.c
+index 49658ca39e51..a851f20dca23 100644
+--- a/drivers/media/platform/exynos4-is/fimc-is.c
++++ b/drivers/media/platform/exynos4-is/fimc-is.c
+@@ -815,12 +815,13 @@ static int fimc_is_probe(struct platform_device *pdev)
+ 	is->irq = irq_of_parse_and_map(dev->of_node, 0);
+ 	if (!is->irq) {
+ 		dev_err(dev, "no irq found\n");
+-		return -EINVAL;
++		ret = -EINVAL;
++		goto err_iounmap;
+ 	}
  
- struct ieee80211_hdr {
--	u16 frame_ctl;
--	u16 duration_id;
-+	__le16 frame_ctl;
-+	__le16 duration_id;
- 	u8 addr1[ETH_ALEN];
- 	u8 addr2[ETH_ALEN];
- 	u8 addr3[ETH_ALEN];
--	u16 seq_ctl;
-+	__le16 seq_ctl;
- 	u8 addr4[ETH_ALEN];
--} __packed;
-+}  __packed __aligned(2);
+ 	ret = fimc_is_get_clocks(is);
+ 	if (ret < 0)
+-		return ret;
++		goto err_iounmap;
  
- struct ieee80211_hdr_3addr {
--	u16 frame_ctl;
--	u16 duration_id;
-+	__le16 frame_ctl;
-+	__le16 duration_id;
- 	u8 addr1[ETH_ALEN];
- 	u8 addr2[ETH_ALEN];
- 	u8 addr3[ETH_ALEN];
--	u16 seq_ctl;
--} __packed;
-+	__le16 seq_ctl;
-+}  __packed __aligned(2);
+ 	platform_set_drvdata(pdev, is);
  
+@@ -880,6 +881,8 @@ err_irq:
+ 	free_irq(is->irq, is);
+ err_clk:
+ 	fimc_is_put_clocks(is);
++err_iounmap:
++	iounmap(is->pmu_regs);
+ 	return ret;
+ }
  
- struct	ieee80211_hdr_qos {
--	u16 frame_ctl;
--	u16 duration_id;
-+	__le16 frame_ctl;
-+	__le16 duration_id;
- 	u8 addr1[ETH_ALEN];
- 	u8 addr2[ETH_ALEN];
- 	u8 addr3[ETH_ALEN];
--	u16 seq_ctl;
-+	__le16 seq_ctl;
- 	u8 addr4[ETH_ALEN];
--	u16	qc;
--}  __packed;
-+	__le16	qc;
-+}   __packed __aligned(2);
+@@ -935,6 +938,7 @@ static int fimc_is_remove(struct platform_device *pdev)
+ 	fimc_is_unregister_subdevs(is);
+ 	vb2_dma_contig_cleanup_ctx(is->alloc_ctx);
+ 	fimc_is_put_clocks(is);
++	iounmap(is->pmu_regs);
+ 	fimc_is_debugfs_remove(is);
+ 	release_firmware(is->fw.f_w);
+ 	fimc_is_free_cpu_memory(is);
+-- 
+2.28.0
+
+
+From 45a012ace954efc08670fd6cd5698facbcdb119c Mon Sep 17 00:00:00 2001
+From: Alexander Usyskin <alexander.usyskin@intel.com>
+Date: Sat, 7 Oct 2017 22:37:48 +0000
+Subject: [PATCH 35/40] mei: return error on notification request to a
+ disconnected client
+
+[ Upstream commit 7c47d2ca0feca767479329da23523ed798acb854 ]
+
+Request for a notification from a disconnected client will be ignored
+silently by the FW but the caller should know that the operation hasn't
+succeeded.
+
+Signed-off-by: Alexander Usyskin <alexander.usyskin@intel.com>
+Signed-off-by: Tomas Winkler <tomas.winkler@intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/misc/mei/client.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/misc/mei/client.c b/drivers/misc/mei/client.c
+index 2ff39fbc70d1..df268365e04e 100644
+--- a/drivers/misc/mei/client.c
++++ b/drivers/misc/mei/client.c
+@@ -1300,6 +1300,9 @@ int mei_cl_notify_request(struct mei_cl *cl, struct file *file, u8 request)
+ 		return -EOPNOTSUPP;
+ 	}
  
- struct  ieee80211_hdr_3addr_qos {
--	u16 frame_ctl;
--	u16 duration_id;
-+	__le16 frame_ctl;
-+	__le16 duration_id;
- 	u8  addr1[ETH_ALEN];
- 	u8  addr2[ETH_ALEN];
- 	u8  addr3[ETH_ALEN];
--	u16 seq_ctl;
--	u16 qc;
-+	__le16 seq_ctl;
-+	__le16 qc;
- }  __packed;
++	if (!mei_cl_is_connected(cl))
++		return -ENODEV;
++
+ 	rets = pm_runtime_get(dev->dev);
+ 	if (rets < 0 && rets != -EINPROGRESS) {
+ 		pm_runtime_put_noidle(dev->dev);
+-- 
+2.28.0
+
+
+From 4b7a35866b0ca4205ec5bacd2a5531caf19a463f Mon Sep 17 00:00:00 2001
+From: Stefan Haberland <sth@linux.vnet.ibm.com>
+Date: Sat, 7 Oct 2017 22:37:49 +0000
+Subject: [PATCH 36/40] s390/dasd: check for device error pointer within state
+ change interrupts
+
+[ Upstream commit 2202134e48a3b50320aeb9e3dd1186833e9d7e66 ]
+
+Check if the device pointer is valid. Just a sanity check since we already
+are in the int handler of the device.
+
+Signed-off-by: Stefan Haberland <sth@linux.vnet.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/s390/block/dasd.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/s390/block/dasd.c b/drivers/s390/block/dasd.c
+index 84c13dffa3a8..e7a6f1222642 100644
+--- a/drivers/s390/block/dasd.c
++++ b/drivers/s390/block/dasd.c
+@@ -1635,8 +1635,11 @@ void dasd_int_handler(struct ccw_device *cdev, unsigned long intparm,
+ 	/* check for for attention message */
+ 	if (scsw_dstat(&irb->scsw) & DEV_STAT_ATTENTION) {
+ 		device = dasd_device_from_cdev_locked(cdev);
+-		device->discipline->check_attention(device, irb->esw.esw1.lpum);
+-		dasd_put_device(device);
++		if (!IS_ERR(device)) {
++			device->discipline->check_attention(device,
++							    irb->esw.esw1.lpum);
++			dasd_put_device(device);
++		}
+ 	}
  
- struct eapol {
- 	u8 snap[6];
--	u16 ethertype;
-+	__be16 ethertype;
- 	u8 version;
- 	u8 type;
--	u16 length;
-+	__le16 length;
- } __packed;
- 
- 
-@@ -528,13 +528,13 @@ struct ieee80211_security {
-  */
- 
- struct ieee80211_header_data {
--	u16 frame_ctl;
--	u16 duration_id;
-+	__le16 frame_ctl;
-+	__le16 duration_id;
- 	u8 addr1[6];
- 	u8 addr2[6];
- 	u8 addr3[6];
--	u16 seq_ctrl;
--};
-+	__le16 seq_ctrl;
-+} __packed __aligned(2);
- 
- #define BEACON_PROBE_SSID_ID_POSITION 12
- 
-@@ -566,18 +566,18 @@ struct ieee80211_info_element {
- /*
-  * These are the data types that can make up management packets
-  *
--	u16 auth_algorithm;
--	u16 auth_sequence;
--	u16 beacon_interval;
--	u16 capability;
-+	__le16 auth_algorithm;
-+	__le16 auth_sequence;
-+	__le16 beacon_interval;
-+	__le16 capability;
- 	u8 current_ap[ETH_ALEN];
--	u16 listen_interval;
-+	__le16 listen_interval;
- 	struct {
- 		u16 association_id:14, reserved:2;
- 	} __packed;
--	u32 time_stamp[2];
--	u16 reason;
--	u16 status;
-+	__le32 time_stamp[2];
-+	__le16 reason;
-+	__le16 status;
- */
- 
- #define IEEE80211_DEFAULT_TX_ESSID "Penguin"
-@@ -585,16 +585,16 @@ struct ieee80211_info_element {
- 
- struct ieee80211_authentication {
- 	struct ieee80211_header_data header;
--	u16 algorithm;
--	u16 transaction;
--	u16 status;
-+	__le16 algorithm;
-+	__le16 transaction;
-+	__le16 status;
- } __packed;
- 
- struct ieee80211_probe_response {
- 	struct ieee80211_header_data header;
--	u32 time_stamp[2];
--	u16 beacon_interval;
--	u16 capability;
-+	__le32 time_stamp[2];
-+	__le16 beacon_interval;
-+	__le16 capability;
- 	struct ieee80211_info_element info_element;
- } __packed;
- 
-@@ -604,16 +604,16 @@ struct ieee80211_probe_request {
- 
- struct ieee80211_assoc_request_frame {
- 	struct ieee80211_hdr_3addr header;
--	u16 capability;
--	u16 listen_interval;
-+	__le16 capability;
-+	__le16 listen_interval;
- 	struct ieee80211_info_element_hdr info_element;
- } __packed;
- 
- struct ieee80211_assoc_response_frame {
- 	struct ieee80211_hdr_3addr header;
--	u16 capability;
--	u16 status;
--	u16 aid;
-+	__le16 capability;
-+	__le16 status;
-+	__le16 aid;
- } __packed;
- 
- struct ieee80211_txb {
+ 	if (!cqr)
+-- 
+2.28.0
+
+
+From 298455f466cbdf41cff7be9ec8c1dd6a3c5ed6b0 Mon Sep 17 00:00:00 2001
+From: Sudip Mukherjee <sudipm.mukherjee@gmail.com>
+Date: Sat, 7 Oct 2017 22:37:49 +0000
+Subject: [PATCH 37/40] bt8xx: fix memory leak
+
+[ Upstream commit 6792eb0cf9310ec240b7e7c9bfa86dff4c758c68 ]
+
+If dvb_attach() fails then we were just printing an error message and
+exiting but the memory allocated to state was not released.
+
+Signed-off-by: Sudip Mukherjee <sudip.mukherjee@codethink.co.uk>
+Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
+Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/media/pci/bt8xx/dvb-bt8xx.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/media/pci/bt8xx/dvb-bt8xx.c b/drivers/media/pci/bt8xx/dvb-bt8xx.c
+index d407244fd1bc..bd0f5b195188 100644
+--- a/drivers/media/pci/bt8xx/dvb-bt8xx.c
++++ b/drivers/media/pci/bt8xx/dvb-bt8xx.c
+@@ -680,6 +680,7 @@ static void frontend_init(struct dvb_bt8xx_card *card, u32 type)
+ 		/*	DST is not a frontend, attaching the ASIC	*/
+ 		if (dvb_attach(dst_attach, state, &card->dvb_adapter) == NULL) {
+ 			pr_err("%s: Could not find a Twinhan DST\n", __func__);
++			kfree(state);
+ 			break;
+ 		}
+ 		/*	Attach other DST peripherals if any		*/
+-- 
+2.28.0
+
+
+From 883706dcda17fdecce9c308d1743a90f9780f383 Mon Sep 17 00:00:00 2001
+From: Juergen Gross <jgross@suse.com>
+Date: Tue, 30 May 2017 20:52:26 +0200
+Subject: [PATCH 38/40] xen: don't print error message in case of missing
+ Xenstore entry
+
+[ Upstream commit 4e93b6481c87ea5afde944a32b4908357ec58992 ]
+
+When registering for the Xenstore watch of the node control/sysrq the
+handler will be called at once. Don't issue an error message if the
+Xenstore node isn't there, as it will be created only when an event
+is being triggered.
+
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Signed-off-by: Juergen Gross <jgross@suse.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/xen/manage.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/xen/manage.c b/drivers/xen/manage.c
+index e8850b0e3272..2dd285827169 100644
+--- a/drivers/xen/manage.c
++++ b/drivers/xen/manage.c
+@@ -275,8 +275,16 @@ static void sysrq_handler(struct xenbus_watch *watch, const char **vec,
+ 	err = xenbus_transaction_start(&xbt);
+ 	if (err)
+ 		return;
+-	if (xenbus_scanf(xbt, "control", "sysrq", "%c", &sysrq_key) < 0) {
+-		pr_err("Unable to read sysrq code in control/sysrq\n");
++	err = xenbus_scanf(xbt, "control", "sysrq", "%c", &sysrq_key);
++	if (err < 0) {
++		/*
++		 * The Xenstore watch fires directly after registering it and
++		 * after a suspend/resume cycle. So ENOENT is no error but
++		 * might happen in those cases.
++		 */
++		if (err != -ENOENT)
++			pr_err("Error %d reading sysrq code in control/sysrq\n",
++			       err);
+ 		xenbus_transaction_end(xbt, 1);
+ 		return;
+ 	}
+-- 
+2.28.0
+
+
+From 2ed81e62b2ab5b4942bbeb533469d88663e84a9f Mon Sep 17 00:00:00 2001
+From: Larry Finger <Larry.Finger@lwfinger.net>
+Date: Fri, 10 Feb 2017 21:30:27 -0600
+Subject: [PATCH 39/40] staging: r8712u: Fix Sparse warning in rtl871x_xmit.c
+
+[ Upstream commit 07222e535831b916221dd2a48a3047ec7e45dc72 ]
+
+Sparse reports the following:
+  CHECK   drivers/staging/rtl8712/rtl871x_xmit.c
+drivers/staging/rtl8712/rtl871x_xmit.c:350:44: warning: restricted __le32 degrades to integer
+drivers/staging/rtl8712/rtl871x_xmit.c:491:23: warning: incorrect type in initializer (different base types)
+drivers/staging/rtl8712/rtl871x_xmit.c:491:23:    expected unsigned short [usertype] *fctrl
+drivers/staging/rtl8712/rtl871x_xmit.c:491:23:    got restricted __le16 *<noident>
+drivers/staging/rtl8712/rtl871x_xmit.c:580:36: warning: incorrect type in assignment (different base types)
+drivers/staging/rtl8712/rtl871x_xmit.c:580:36:    expected unsigned short [unsigned] [short] [usertype] <noident>
+drivers/staging/rtl8712/rtl871x_xmit.c:580:36:    got restricted __be16 [usertype] <noident>
+
+Signed-off-by: Larry Finger <Larry.Finger@lwfinger.net>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/staging/rtl8712/rtl871x_xmit.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
 diff --git a/drivers/staging/rtl8712/rtl871x_xmit.c b/drivers/staging/rtl8712/rtl871x_xmit.c
 index 68d65d230fe3..d3ad89c7b8af 100644
 --- a/drivers/staging/rtl8712/rtl871x_xmit.c
@@ -1158,400 +2816,31 @@ index 68d65d230fe3..d3ad89c7b8af 100644
  	return SNAP_SIZE + sizeof(u16);
  }
  
-diff --git a/drivers/xen/manage.c b/drivers/xen/manage.c
-index e12bd3635f83..2dd285827169 100644
---- a/drivers/xen/manage.c
-+++ b/drivers/xen/manage.c
-@@ -275,8 +275,16 @@ static void sysrq_handler(struct xenbus_watch *watch, const char **vec,
- 	err = xenbus_transaction_start(&xbt);
- 	if (err)
- 		return;
--	if (!xenbus_scanf(xbt, "control", "sysrq", "%c", &sysrq_key)) {
--		pr_err("Unable to read sysrq code in control/sysrq\n");
-+	err = xenbus_scanf(xbt, "control", "sysrq", "%c", &sysrq_key);
-+	if (err < 0) {
-+		/*
-+		 * The Xenstore watch fires directly after registering it and
-+		 * after a suspend/resume cycle. So ENOENT is no error but
-+		 * might happen in those cases.
-+		 */
-+		if (err != -ENOENT)
-+			pr_err("Error %d reading sysrq code in control/sysrq\n",
-+			       err);
- 		xenbus_transaction_end(xbt, 1);
- 		return;
- 	}
-diff --git a/fs/cifs/dir.c b/fs/cifs/dir.c
-index 297e05c9e2b0..49a0d6b027c1 100644
---- a/fs/cifs/dir.c
-+++ b/fs/cifs/dir.c
-@@ -193,7 +193,8 @@ check_name(struct dentry *direntry, struct cifs_tcon *tcon)
- 	struct cifs_sb_info *cifs_sb = CIFS_SB(direntry->d_sb);
- 	int i;
+-- 
+2.28.0
+
+
+From c54d0707aa09a824413ebb4195c98bfb9b9e1fc0 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Wed, 8 Nov 2017 10:06:31 +0100
+Subject: [PATCH 40/40] Linux 4.4.97
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 12dfe1dcbaca..fb1a40d64ba8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+-SUBLEVEL = 96
++SUBLEVEL = 97
+ EXTRAVERSION =
+ NAME = Blurry Fish Butt
  
--	if (unlikely(direntry->d_name.len >
-+	if (unlikely(tcon->fsAttrInfo.MaxPathNameComponentLength &&
-+		     direntry->d_name.len >
- 		     le32_to_cpu(tcon->fsAttrInfo.MaxPathNameComponentLength)))
- 		return -ENAMETOOLONG;
- 
-@@ -509,7 +510,7 @@ cifs_atomic_open(struct inode *inode, struct dentry *direntry,
- 
- 	rc = check_name(direntry, tcon);
- 	if (rc)
--		goto out_free_xid;
-+		goto out;
- 
- 	server = tcon->ses->server;
- 
-diff --git a/fs/ext4/mballoc.c b/fs/ext4/mballoc.c
-index 84cd77663e1f..1ba82dc5afa3 100644
---- a/fs/ext4/mballoc.c
-+++ b/fs/ext4/mballoc.c
-@@ -2136,8 +2136,10 @@ ext4_mb_regular_allocator(struct ext4_allocation_context *ac)
- 	 * We search using buddy data only if the order of the request
- 	 * is greater than equal to the sbi_s_mb_order2_reqs
- 	 * You can tune it via /sys/fs/ext4/<partition>/mb_order2_req
-+	 * We also support searching for power-of-two requests only for
-+	 * requests upto maximum buddy size we have constructed.
- 	 */
--	if (i >= sbi->s_mb_order2_reqs) {
-+	if (i >= sbi->s_mb_order2_reqs && i <= sb->s_blocksize_bits + 2) {
- 		/*
- 		 * This should tell if fe_len is exactly power of 2
- 		 */
-@@ -2207,7 +2209,7 @@ repeat:
- 			}
- 
- 			ac->ac_groups_scanned++;
--			if (cr == 0 && ac->ac_2order < sb->s_blocksize_bits+2)
-+			if (cr == 0)
- 				ext4_mb_simple_scan_group(ac, &e4b);
- 			else if (cr == 1 && sbi->s_stripe &&
- 					!(ac->ac_g_ex.fe_len % sbi->s_stripe))
-diff --git a/fs/ext4/super.c b/fs/ext4/super.c
-index 32941cd6d34b..8bdb0cc2722f 100644
---- a/fs/ext4/super.c
-+++ b/fs/ext4/super.c
-@@ -2499,9 +2499,9 @@ static unsigned long ext4_get_stripe_size(struct ext4_sb_info *sbi)
- 
- 	if (sbi->s_stripe && sbi->s_stripe <= sbi->s_blocks_per_group)
- 		ret = sbi->s_stripe;
--	else if (stripe_width <= sbi->s_blocks_per_group)
-+	else if (stripe_width && stripe_width <= sbi->s_blocks_per_group)
- 		ret = stripe_width;
--	else if (stride <= sbi->s_blocks_per_group)
-+	else if (stride && stride <= sbi->s_blocks_per_group)
- 		ret = stride;
- 	else
- 		ret = 0;
-diff --git a/fs/ocfs2/alloc.c b/fs/ocfs2/alloc.c
-index 86181d6526dc..93e6f029a322 100644
---- a/fs/ocfs2/alloc.c
-+++ b/fs/ocfs2/alloc.c
-@@ -7270,13 +7270,24 @@ out:
- 
- static int ocfs2_trim_extent(struct super_block *sb,
- 			     struct ocfs2_group_desc *gd,
--			     u32 start, u32 count)
-+			     u64 group, u32 start, u32 count)
- {
- 	u64 discard, bcount;
-+	struct ocfs2_super *osb = OCFS2_SB(sb);
- 
- 	bcount = ocfs2_clusters_to_blocks(sb, count);
--	discard = le64_to_cpu(gd->bg_blkno) +
--			ocfs2_clusters_to_blocks(sb, start);
-+	discard = ocfs2_clusters_to_blocks(sb, start);
-+
-+	/*
-+	 * For the first cluster group, the gd->bg_blkno is not at the start
-+	 * of the group, but at an offset from the start. If we add it while
-+	 * calculating discard for first group, we will wrongly start fstrim a
-+	 * few blocks after the desried start block and the range can cross
-+	 * over into the next cluster group. So, add it only if this is not
-+	 * the first cluster group.
-+	 */
-+	if (group != osb->first_cluster_group_blkno)
-+		discard += le64_to_cpu(gd->bg_blkno);
- 
- 	trace_ocfs2_trim_extent(sb, (unsigned long long)discard, bcount);
- 
-@@ -7284,7 +7295,7 @@ static int ocfs2_trim_extent(struct super_block *sb,
- }
- 
- static int ocfs2_trim_group(struct super_block *sb,
--			    struct ocfs2_group_desc *gd,
-+			    struct ocfs2_group_desc *gd, u64 group,
- 			    u32 start, u32 max, u32 minbits)
- {
- 	int ret = 0, count = 0, next;
-@@ -7303,7 +7314,7 @@ static int ocfs2_trim_group(struct super_block *sb,
- 		next = ocfs2_find_next_bit(bitmap, max, start);
- 
- 		if ((next - start) >= minbits) {
--			ret = ocfs2_trim_extent(sb, gd,
-+			ret = ocfs2_trim_extent(sb, gd, group,
- 						start, next - start);
- 			if (ret < 0) {
- 				mlog_errno(ret);
-@@ -7401,7 +7412,8 @@ int ocfs2_trim_fs(struct super_block *sb, struct fstrim_range *range)
- 		}
- 
- 		gd = (struct ocfs2_group_desc *)gd_bh->b_data;
--		cnt = ocfs2_trim_group(sb, gd, first_bit, last_bit, minlen);
-+		cnt = ocfs2_trim_group(sb, gd, group,
-+				       first_bit, last_bit, minlen);
- 		brelse(gd_bh);
- 		gd_bh = NULL;
- 		if (cnt < 0) {
-diff --git a/lib/asn1_decoder.c b/lib/asn1_decoder.c
-index 554522934c44..faa2a3f017f8 100644
---- a/lib/asn1_decoder.c
-+++ b/lib/asn1_decoder.c
-@@ -283,6 +283,9 @@ next_op:
- 				if (unlikely(len > datalen - dp))
- 					goto data_overrun_error;
- 			}
-+		} else {
-+			if (unlikely(len > datalen - dp))
-+				goto data_overrun_error;
- 		}
- 
- 		if (flags & FLAG_CONS) {
-diff --git a/samples/trace_events/trace-events-sample.c b/samples/trace_events/trace-events-sample.c
-index 880a7d1d27d2..4ccff66523c9 100644
---- a/samples/trace_events/trace-events-sample.c
-+++ b/samples/trace_events/trace-events-sample.c
-@@ -78,28 +78,36 @@ static int simple_thread_fn(void *arg)
- }
- 
- static DEFINE_MUTEX(thread_mutex);
-+static int simple_thread_cnt;
- 
- void foo_bar_reg(void)
- {
-+	mutex_lock(&thread_mutex);
-+	if (simple_thread_cnt++)
-+		goto out;
-+
- 	pr_info("Starting thread for foo_bar_fn\n");
- 	/*
- 	 * We shouldn't be able to start a trace when the module is
- 	 * unloading (there's other locks to prevent that). But
- 	 * for consistency sake, we still take the thread_mutex.
- 	 */
--	mutex_lock(&thread_mutex);
- 	simple_tsk_fn = kthread_run(simple_thread_fn, NULL, "event-sample-fn");
-+ out:
- 	mutex_unlock(&thread_mutex);
- }
- 
- void foo_bar_unreg(void)
- {
--	pr_info("Killing thread for foo_bar_fn\n");
--	/* protect against module unloading */
- 	mutex_lock(&thread_mutex);
-+	if (--simple_thread_cnt)
-+		goto out;
-+
-+	pr_info("Killing thread for foo_bar_fn\n");
- 	if (simple_tsk_fn)
- 		kthread_stop(simple_tsk_fn);
- 	simple_tsk_fn = NULL;
-+ out:
- 	mutex_unlock(&thread_mutex);
- }
- 
-diff --git a/security/keys/keyring.c b/security/keys/keyring.c
-index ef828238cdc0..d5264f950ce1 100644
---- a/security/keys/keyring.c
-+++ b/security/keys/keyring.c
-@@ -452,34 +452,33 @@ static long keyring_read(const struct key *keyring,
- 			 char __user *buffer, size_t buflen)
- {
- 	struct keyring_read_iterator_context ctx;
--	unsigned long nr_keys;
--	int ret;
-+	long ret;
- 
- 	kenter("{%d},,%zu", key_serial(keyring), buflen);
- 
- 	if (buflen & (sizeof(key_serial_t) - 1))
- 		return -EINVAL;
- 
--	nr_keys = keyring->keys.nr_leaves_on_tree;
--	if (nr_keys == 0)
--		return 0;
--
--	/* Calculate how much data we could return */
--	if (!buffer || !buflen)
--		return nr_keys * sizeof(key_serial_t);
--
--	/* Copy the IDs of the subscribed keys into the buffer */
--	ctx.buffer = (key_serial_t __user *)buffer;
--	ctx.buflen = buflen;
--	ctx.count = 0;
--	ret = assoc_array_iterate(&keyring->keys, keyring_read_iterator, &ctx);
--	if (ret < 0) {
--		kleave(" = %d [iterate]", ret);
--		return ret;
-+	/* Copy as many key IDs as fit into the buffer */
-+	if (buffer && buflen) {
-+		ctx.buffer = (key_serial_t __user *)buffer;
-+		ctx.buflen = buflen;
-+		ctx.count = 0;
-+		ret = assoc_array_iterate(&keyring->keys,
-+					  keyring_read_iterator, &ctx);
-+		if (ret < 0) {
-+			kleave(" = %ld [iterate]", ret);
-+			return ret;
-+		}
- 	}
- 
--	kleave(" = %zu [ok]", ctx.count);
--	return ctx.count;
-+	/* Return the size of the buffer needed */
-+	ret = keyring->keys.nr_leaves_on_tree * sizeof(key_serial_t);
-+	if (ret <= buflen)
-+		kleave("= %ld [ok]", ret);
-+	else
-+		kleave("= %ld [buffer too small]", ret);
-+	return ret;
- }
- 
- /*
-diff --git a/sound/core/seq/seq_clientmgr.c b/sound/core/seq/seq_clientmgr.c
-index e847b9923c19..b36de76f24e2 100644
---- a/sound/core/seq/seq_clientmgr.c
-+++ b/sound/core/seq/seq_clientmgr.c
-@@ -676,7 +676,7 @@ static int deliver_to_subscribers(struct snd_seq_client *client,
- 	if (atomic)
- 		read_lock(&grp->list_lock);
- 	else
--		down_read(&grp->list_mutex);
-+		down_read_nested(&grp->list_mutex, hop);
- 	list_for_each_entry(subs, &grp->list_head, src_list) {
- 		/* both ports ready? */
- 		if (atomic_read(&subs->ref_count) != 2)
-diff --git a/sound/core/timer_compat.c b/sound/core/timer_compat.c
-index 2e908225d754..0b4b028e8e98 100644
---- a/sound/core/timer_compat.c
-+++ b/sound/core/timer_compat.c
-@@ -106,7 +106,8 @@ enum {
- #endif /* CONFIG_X86_X32 */
- };
- 
--static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, unsigned long arg)
-+static long __snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd,
-+					  unsigned long arg)
- {
- 	void __user *argp = compat_ptr(arg);
- 
-@@ -127,7 +128,7 @@ static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, uns
- 	case SNDRV_TIMER_IOCTL_PAUSE:
- 	case SNDRV_TIMER_IOCTL_PAUSE_OLD:
- 	case SNDRV_TIMER_IOCTL_NEXT_DEVICE:
--		return snd_timer_user_ioctl(file, cmd, (unsigned long)argp);
-+		return __snd_timer_user_ioctl(file, cmd, (unsigned long)argp);
- 	case SNDRV_TIMER_IOCTL_INFO32:
- 		return snd_timer_user_info_compat(file, argp);
- 	case SNDRV_TIMER_IOCTL_STATUS32:
-@@ -139,3 +140,15 @@ static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, uns
- 	}
- 	return -ENOIOCTLCMD;
- }
-+
-+static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd,
-+					unsigned long arg)
-+{
-+	struct snd_timer_user *tu = file->private_data;
-+	long ret;
-+
-+	mutex_lock(&tu->ioctl_lock);
-+	ret = __snd_timer_user_ioctl_compat(file, cmd, arg);
-+	mutex_unlock(&tu->ioctl_lock);
-+	return ret;
-+}
-diff --git a/sound/soc/codecs/adau17x1.c b/sound/soc/codecs/adau17x1.c
-index fcf05b254ecd..0b9e13eb0a0a 100644
---- a/sound/soc/codecs/adau17x1.c
-+++ b/sound/soc/codecs/adau17x1.c
-@@ -89,6 +89,27 @@ static int adau17x1_pll_event(struct snd_soc_dapm_widget *w,
- 	return 0;
- }
- 
-+static int adau17x1_adc_fixup(struct snd_soc_dapm_widget *w,
-+	struct snd_kcontrol *kcontrol, int event)
-+{
-+	struct snd_soc_codec *codec = snd_soc_dapm_to_codec(w->dapm);
-+	struct adau *adau = snd_soc_codec_get_drvdata(codec);
-+
-+	/*
-+	 * If we are capturing, toggle the ADOSR bit in Converter Control 0 to
-+	 * avoid losing SNR (workaround from ADI). This must be done after
-+	 * the ADC(s) have been enabled. According to the data sheet, it is
-+	 * normally illegal to set this bit when the sampling rate is 96 kHz,
-+	 * but according to ADI it is acceptable for this workaround.
-+	 */
-+	regmap_update_bits(adau->regmap, ADAU17X1_CONVERTER0,
-+		ADAU17X1_CONVERTER0_ADOSR, ADAU17X1_CONVERTER0_ADOSR);
-+	regmap_update_bits(adau->regmap, ADAU17X1_CONVERTER0,
-+		ADAU17X1_CONVERTER0_ADOSR, 0);
-+
-+	return 0;
-+}
-+
- static const char * const adau17x1_mono_stereo_text[] = {
- 	"Stereo",
- 	"Mono Left Channel (L+R)",
-@@ -120,7 +141,8 @@ static const struct snd_soc_dapm_widget adau17x1_dapm_widgets[] = {
- 	SND_SOC_DAPM_MUX("Right DAC Mode Mux", SND_SOC_NOPM, 0, 0,
- 		&adau17x1_dac_mode_mux),
- 
--	SND_SOC_DAPM_ADC("Left Decimator", NULL, ADAU17X1_ADC_CONTROL, 0, 0),
-+	SND_SOC_DAPM_ADC_E("Left Decimator", NULL, ADAU17X1_ADC_CONTROL, 0, 0,
-+			   adau17x1_adc_fixup, SND_SOC_DAPM_POST_PMU),
- 	SND_SOC_DAPM_ADC("Right Decimator", NULL, ADAU17X1_ADC_CONTROL, 1, 0),
- 	SND_SOC_DAPM_DAC("Left DAC", NULL, ADAU17X1_DAC_CONTROL0, 0, 0),
- 	SND_SOC_DAPM_DAC("Right DAC", NULL, ADAU17X1_DAC_CONTROL0, 1, 0),
-diff --git a/sound/soc/codecs/adau17x1.h b/sound/soc/codecs/adau17x1.h
-index e13583e6ff56..6b46461cdc03 100644
---- a/sound/soc/codecs/adau17x1.h
-+++ b/sound/soc/codecs/adau17x1.h
-@@ -123,5 +123,7 @@ bool adau17x1_has_dsp(struct adau *adau);
- 
- #define ADAU17X1_CONVERTER0_CONVSR_MASK		0x7
- 
-+#define ADAU17X1_CONVERTER0_ADOSR		BIT(3)
-+
- 
- #endif
-diff --git a/tools/perf/scripts/perl/Perf-Trace-Util/Build b/tools/perf/scripts/perl/Perf-Trace-Util/Build
-index 928e110179cb..34faecf774ae 100644
---- a/tools/perf/scripts/perl/Perf-Trace-Util/Build
-+++ b/tools/perf/scripts/perl/Perf-Trace-Util/Build
-@@ -1,3 +1,5 @@
- libperf-y += Context.o
- 
--CFLAGS_Context.o += $(PERL_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes -Wno-unused-parameter -Wno-nested-externs -Wno-undef -Wno-switch-default
-+CFLAGS_Context.o += $(PERL_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes
-+CFLAGS_Context.o += -Wno-unused-parameter -Wno-nested-externs -Wno-undef
-+CFLAGS_Context.o += -Wno-switch-default -Wno-shadow
-diff --git a/tools/perf/util/parse-events.c b/tools/perf/util/parse-events.c
-index 38304b7e4f81..e81dfb2e239c 100644
---- a/tools/perf/util/parse-events.c
-+++ b/tools/perf/util/parse-events.c
-@@ -291,10 +291,11 @@ __add_event(struct list_head *list, int *idx,
- 
- 	event_attr_init(attr);
- 
--	evsel = perf_evsel__new_idx(attr, (*idx)++);
-+	evsel = perf_evsel__new_idx(attr, *idx);
- 	if (!evsel)
- 		return NULL;
- 
-+	(*idx)++;
- 	evsel->cpus     = cpu_map__get(cpus);
- 	evsel->own_cpus = cpu_map__get(cpus);
- 
+-- 
+2.28.0
+

@@ -1,69 +1,298 @@
-diff --git a/Makefile b/Makefile
-index 55500e023f61..69f4ace70276 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 4
--SUBLEVEL = 104
-+SUBLEVEL = 105
- EXTRAVERSION =
- NAME = Blurry Fish Butt
+From f80f34d8ba92b29f84228f91f9b6c0e0fca5c641 Mon Sep 17 00:00:00 2001
+From: Coly Li <colyli@suse.de>
+Date: Mon, 30 Oct 2017 14:46:31 -0700
+Subject: [PATCH 01/48] bcache: only permit to recovery read error when cache
+ device is clean
+
+commit d59b23795933678c9638fd20c942d2b4f3cd6185 upstream.
+
+When bcache does read I/Os, for example in writeback or writethrough mode,
+if a read request on cache device is failed, bcache will try to recovery
+the request by reading from cached device. If the data on cached device is
+not synced with cache device, then requester will get a stale data.
+
+For critical storage system like database, providing stale data from
+recovery may result an application level data corruption, which is
+unacceptible.
+
+With this patch, for a failed read request in writeback or writethrough
+mode, recovery a recoverable read request only happens when cache device
+is clean. That is to say, all data on cached device is up to update.
+
+For other cache modes in bcache, read request will never hit
+cached_dev_read_error(), they don't need this patch.
+
+Please note, because cache mode can be switched arbitrarily in run time, a
+writethrough mode might be switched from a writeback mode. Therefore
+checking dc->has_data in writethrough mode still makes sense.
+
+Changelog:
+V4: Fix parens error pointed by Michael Lyle.
+v3: By response from Kent Oversteet, he thinks recovering stale data is a
+    bug to fix, and option to permit it is unnecessary. So this version
+    the sysfs file is removed.
+v2: rename sysfs entry from allow_stale_data_on_failure  to
+    allow_stale_data_on_failure, and fix the confusing commit log.
+v1: initial patch posted.
+
+[small change to patch comment spelling by mlyle]
+
+Signed-off-by: Coly Li <colyli@suse.de>
+Signed-off-by: Michael Lyle <mlyle@lyle.org>
+Reported-by: Arne Wolf <awolf@lenovo.com>
+Reviewed-by: Michael Lyle <mlyle@lyle.org>
+Cc: Kent Overstreet <kent.overstreet@gmail.com>
+Cc: Nix <nix@esperi.org.uk>
+Cc: Kai Krakow <hurikhan77@gmail.com>
+Cc: Eric Wheeler <bcache@lists.ewheeler.net>
+Cc: Junhui Tang <tang.junhui@zte.com.cn>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/bcache/request.c | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 6c4c7caea693..3bd2e4f55f2c 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -707,8 +707,16 @@ static void cached_dev_read_error(struct closure *cl)
+ {
+ 	struct search *s = container_of(cl, struct search, cl);
+ 	struct bio *bio = &s->bio.bio;
++	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
  
-diff --git a/arch/arm/mach-omap1/dma.c b/arch/arm/mach-omap1/dma.c
-index 7b02ed218a42..0c120b2ea2f9 100644
---- a/arch/arm/mach-omap1/dma.c
-+++ b/arch/arm/mach-omap1/dma.c
-@@ -31,7 +31,6 @@
- #include "soc.h"
+-	if (s->recoverable) {
++	/*
++	 * If cache device is dirty (dc->has_dirty is non-zero), then
++	 * recovery a failed read request from cached device may get a
++	 * stale data back. So read failure recovery is only permitted
++	 * when cache device is clean.
++	 */
++	if (s->recoverable &&
++	    (dc && !atomic_read(&dc->has_dirty))) {
+ 		/* Retry from the backing device: */
+ 		trace_bcache_read_retry(s->orig_bio);
  
- #define OMAP1_DMA_BASE			(0xfffed800)
--#define OMAP1_LOGICAL_DMA_CH_COUNT	17
+-- 
+2.28.0
+
+
+From 3f7477e64478c7d22642a97c25eb43649d2a480c Mon Sep 17 00:00:00 2001
+From: Rui Hua <huarui.dev@gmail.com>
+Date: Fri, 24 Nov 2017 15:14:26 -0800
+Subject: [PATCH 02/48] bcache: recover data from backing when data is clean
+
+commit e393aa2446150536929140739f09c6ecbcbea7f0 upstream.
+
+When we send a read request and hit the clean data in cache device, there
+is a situation called cache read race in bcache(see the commit in the tail
+of cache_look_up(), the following explaination just copy from there):
+The bucket we're reading from might be reused while our bio is in flight,
+and we could then end up reading the wrong data. We guard against this
+by checking (in bch_cache_read_endio()) if the pointer is stale again;
+if so, we treat it as an error (s->iop.error = -EINTR) and reread from
+the backing device (but we don't pass that error up anywhere)
+
+It should be noted that cache read race happened under normal
+circumstances, not the circumstance when SSD failed, it was counted
+and shown in  /sys/fs/bcache/XXX/internal/cache_read_races.
+
+Without this patch, when we use writeback mode, we will never reread from
+the backing device when cache read race happened, until the whole cache
+device is clean, because the condition
+(s->recoverable && (dc && !atomic_read(&dc->has_dirty))) is false in
+cached_dev_read_error(). In this situation, the s->iop.error(= -EINTR)
+will be passed up, at last, user will receive -EINTR when it's bio end,
+this is not suitable, and wield to up-application.
+
+In this patch, we use s->read_dirty_data to judge whether the read
+request hit dirty data in cache device, it is safe to reread data from
+the backing device when the read request hit clean data. This can not
+only handle cache read race, but also recover data when failed read
+request from cache device.
+
+[edited by mlyle to fix up whitespace, commit log title, comment
+spelling]
+
+Fixes: d59b23795933 ("bcache: only permit to recovery read error when cache device is clean")
+Signed-off-by: Hua Rui <huarui.dev@gmail.com>
+Reviewed-by: Michael Lyle <mlyle@lyle.org>
+Reviewed-by: Coly Li <colyli@suse.de>
+Signed-off-by: Michael Lyle <mlyle@lyle.org>
+Signed-off-by: Jens Axboe <axboe@kernel.dk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/md/bcache/request.c | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
+index 3bd2e4f55f2c..525ce56524ba 100644
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@ -707,16 +707,15 @@ static void cached_dev_read_error(struct closure *cl)
+ {
+ 	struct search *s = container_of(cl, struct search, cl);
+ 	struct bio *bio = &s->bio.bio;
+-	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
  
- static u32 enable_1510_mode;
+ 	/*
+-	 * If cache device is dirty (dc->has_dirty is non-zero), then
+-	 * recovery a failed read request from cached device may get a
+-	 * stale data back. So read failure recovery is only permitted
+-	 * when cache device is clean.
++	 * If read request hit dirty data (s->read_dirty_data is true),
++	 * then recovery a failed read request from cached device may
++	 * get a stale data back. So read failure recovery is only
++	 * permitted when read request hit clean data in cache device,
++	 * or when cache read race happened.
+ 	 */
+-	if (s->recoverable &&
+-	    (dc && !atomic_read(&dc->has_dirty))) {
++	if (s->recoverable && !s->read_dirty_data) {
+ 		/* Retry from the backing device: */
+ 		trace_bcache_read_retry(s->orig_bio);
  
-@@ -311,8 +310,6 @@ static int __init omap1_system_dma_init(void)
- 		goto exit_iounmap;
+-- 
+2.28.0
+
+
+From 636b080991ee8511ad55a670da379f1123c7fc0b Mon Sep 17 00:00:00 2001
+From: Hans de Goede <hdegoede@redhat.com>
+Date: Tue, 14 Nov 2017 19:27:22 +0100
+Subject: [PATCH 03/48] uas: Always apply US_FL_NO_ATA_1X quirk to Seagate
+ devices
+
+commit 7fee72d5e8f1e7b8d8212e28291b1a0243ecf2f1 upstream.
+
+We've been adding this as a quirk on a per device basis hoping that
+newer disk enclosures would do better, but that has not happened,
+so simply apply this quirk to all Seagate devices.
+
+Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/storage/uas-detect.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/drivers/usb/storage/uas-detect.h b/drivers/usb/storage/uas-detect.h
+index a155cd02bce2..ecc83c405a8b 100644
+--- a/drivers/usb/storage/uas-detect.h
++++ b/drivers/usb/storage/uas-detect.h
+@@ -111,6 +111,10 @@ static int uas_use_uas_driver(struct usb_interface *intf,
+ 		}
  	}
  
--	d->lch_count		= OMAP1_LOGICAL_DMA_CH_COUNT;
--
- 	/* Valid attributes for omap1 plus processors */
- 	if (cpu_is_omap15xx())
- 		d->dev_caps = ENABLE_1510_MODE;
-@@ -329,13 +326,14 @@ static int __init omap1_system_dma_init(void)
- 	d->dev_caps		|= CLEAR_CSR_ON_READ;
- 	d->dev_caps		|= IS_WORD_16;
++	/* All Seagate disk enclosures have broken ATA pass-through support */
++	if (le16_to_cpu(udev->descriptor.idVendor) == 0x0bc2)
++		flags |= US_FL_NO_ATA_1X;
++
+ 	usb_stor_adjust_quirks(udev, &flags);
  
--	if (cpu_is_omap15xx())
--		d->chan_count = 9;
--	else if (cpu_is_omap16xx() || cpu_is_omap7xx()) {
--		if (!(d->dev_caps & ENABLE_1510_MODE))
--			d->chan_count = 16;
-+	/* available logical channels */
-+	if (cpu_is_omap15xx()) {
-+		d->lch_count = 9;
-+	} else {
-+		if (d->dev_caps & ENABLE_1510_MODE)
-+			d->lch_count = 9;
- 		else
--			d->chan_count = 9;
-+			d->lch_count = 16;
- 	}
+ 	if (flags & US_FL_IGNORE_UAS) {
+-- 
+2.28.0
+
+
+From a8293de0ee1f91f73f908ca522e038cab2a40b13 Mon Sep 17 00:00:00 2001
+From: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Date: Tue, 14 Nov 2017 01:31:15 -0500
+Subject: [PATCH 04/48] usb: quirks: Add no-lpm quirk for KY-688 USB 3.1 Type-C
+ Hub
+
+commit e43a12f1793ae1fe006e26fe9327a8840a92233c upstream.
+
+KY-688 USB 3.1 Type-C Hub internally uses a Genesys Logic hub to connect
+to Realtek r8153.
+
+Similar to commit ("7496cfe5431f2 usb: quirks: Add no-lpm quirk for Moshi
+USB to Ethernet Adapter"), no-lpm can make r8153 ethernet work.
+
+Signed-off-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/core/quirks.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/usb/core/quirks.c b/drivers/usb/core/quirks.c
+index 37c418e581fb..50010282c010 100644
+--- a/drivers/usb/core/quirks.c
++++ b/drivers/usb/core/quirks.c
+@@ -151,6 +151,9 @@ static const struct usb_device_id usb_quirk_list[] = {
+ 	/* appletouch */
+ 	{ USB_DEVICE(0x05ac, 0x021a), .driver_info = USB_QUIRK_RESET_RESUME },
  
- 	p = dma_plat_info;
-diff --git a/arch/s390/include/asm/pci_insn.h b/arch/s390/include/asm/pci_insn.h
-index 649eb62c52b3..9e02cb7955c1 100644
---- a/arch/s390/include/asm/pci_insn.h
-+++ b/arch/s390/include/asm/pci_insn.h
-@@ -81,6 +81,6 @@ int zpci_refresh_trans(u64 fn, u64 addr, u64 range);
- int zpci_load(u64 *data, u64 req, u64 offset);
- int zpci_store(u64 data, u64 req, u64 offset);
- int zpci_store_block(const u64 *data, u64 req, u64 offset);
--void zpci_set_irq_ctrl(u16 ctl, char *unused, u8 isc);
-+int zpci_set_irq_ctrl(u16 ctl, char *unused, u8 isc);
++	/* Genesys Logic hub, internally used by KY-688 USB 3.1 Type-C Hub */
++	{ USB_DEVICE(0x05e3, 0x0612), .driver_info = USB_QUIRK_NO_LPM },
++
+ 	/* Genesys Logic hub, internally used by Moshi USB to Ethernet Adapter */
+ 	{ USB_DEVICE(0x05e3, 0x0616), .driver_info = USB_QUIRK_NO_LPM },
  
- #endif
+-- 
+2.28.0
+
+
+From ef3567cc5284b4171e5eb86637c55a72e50ef3cd Mon Sep 17 00:00:00 2001
+From: Matt Wilson <msw@amazon.com>
+Date: Mon, 13 Nov 2017 11:31:31 -0800
+Subject: [PATCH 05/48] serial: 8250_pci: Add Amazon PCI serial device ID
+
+commit 3bfd1300abfe3adb18e84a89d97a0e82a22124bb upstream.
+
+This device will be used in future Amazon EC2 instances as the primary
+serial port (i.e., data sent to this port will be available via the
+GetConsoleOuput [1] EC2 API).
+
+[1] http://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_GetConsoleOutput.html
+
+Signed-off-by: Matt Wilson <msw@amazon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/tty/serial/8250/8250_pci.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/tty/serial/8250/8250_pci.c b/drivers/tty/serial/8250/8250_pci.c
+index cf3da51a3536..7025f47fa284 100644
+--- a/drivers/tty/serial/8250/8250_pci.c
++++ b/drivers/tty/serial/8250/8250_pci.c
+@@ -5797,6 +5797,9 @@ static struct pci_device_id serial_pci_tbl[] = {
+ 	{ PCI_DEVICE(0x1601, 0x0800), .driver_data = pbn_b0_4_1250000 },
+ 	{ PCI_DEVICE(0x1601, 0xa801), .driver_data = pbn_b0_4_1250000 },
+ 
++	/* Amazon PCI serial device */
++	{ PCI_DEVICE(0x1d0f, 0x8250), .driver_data = pbn_b0_1_115200 },
++
+ 	/*
+ 	 * These entries match devices with class COMMUNICATION_SERIAL,
+ 	 * COMMUNICATION_MODEM or COMMUNICATION_MULTISERIAL
+-- 
+2.28.0
+
+
+From 9e51ee1b76efc7b5e9404010793a39fde0e03cb7 Mon Sep 17 00:00:00 2001
+From: Heiko Carstens <heiko.carstens@de.ibm.com>
+Date: Mon, 11 Sep 2017 11:24:22 +0200
+Subject: [PATCH 06/48] s390/runtime instrumentation: simplify task exit
+ handling
+
+commit 8d9047f8b967ce6181fd824ae922978e1b055cc0 upstream.
+
+Free data structures required for runtime instrumentation from
+arch_release_task_struct(). This allows to simplify the code a bit,
+and also makes the semantics a bit easier: arch_release_task_struct()
+is never called from the task that is being removed.
+
+In addition this allows to get rid of exit_thread() in a later patch.
+
+Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/s390/include/asm/runtime_instr.h |  4 +++-
+ arch/s390/kernel/process.c            |  2 +-
+ arch/s390/kernel/runtime_instr.c      | 30 +++++++++++++--------------
+ 3 files changed, 19 insertions(+), 17 deletions(-)
+
 diff --git a/arch/s390/include/asm/runtime_instr.h b/arch/s390/include/asm/runtime_instr.h
 index 402ad6df4897..c54a9310d814 100644
 --- a/arch/s390/include/asm/runtime_instr.h
@@ -157,6 +386,146 @@ index 70cdb03d4acd..fd03a7569e10 100644
  		return 0;
  	}
  
+-- 
+2.28.0
+
+
+From 71ce1cac5b4db3e4004db76e3b61f47d7558438e Mon Sep 17 00:00:00 2001
+From: Sebastian Sjoholm <ssjoholm@mac.com>
+Date: Mon, 20 Nov 2017 19:29:32 +0100
+Subject: [PATCH 07/48] USB: serial: option: add Quectel BG96 id
+
+commit c654b21ede93845863597de9ad774fd30db5f2ab upstream.
+
+Quectel BG96 is an Qualcomm MDM9206 based IoT modem, supporting both
+CAT-M and NB-IoT. Tested hardware is BG96 mounted on Quectel
+development board (EVB). The USB id is added to option.c to allow
+DIAG,GPS,AT and modem communication with the BG96.
+
+Signed-off-by: Sebastian Sjoholm <ssjoholm@mac.com>
+Signed-off-by: Johan Hovold <johan@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/serial/option.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index db3d34c2c82e..ffa8ec917ff5 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -241,6 +241,7 @@ static void option_instat_callback(struct urb *urb);
+ /* These Quectel products use Quectel's vendor ID */
+ #define QUECTEL_PRODUCT_EC21			0x0121
+ #define QUECTEL_PRODUCT_EC25			0x0125
++#define QUECTEL_PRODUCT_BG96			0x0296
+ 
+ #define CMOTECH_VENDOR_ID			0x16d8
+ #define CMOTECH_PRODUCT_6001			0x6001
+@@ -1185,6 +1186,8 @@ static const struct usb_device_id option_ids[] = {
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ USB_DEVICE(QUECTEL_VENDOR_ID, QUECTEL_PRODUCT_EC25),
+ 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
++	{ USB_DEVICE(QUECTEL_VENDOR_ID, QUECTEL_PRODUCT_BG96),
++	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6001) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CMU_300) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6003),
+-- 
+2.28.0
+
+
+From 80f93e24ecfcbbb95667e7e65f75e7646fd0905e Mon Sep 17 00:00:00 2001
+From: Boshi Wang <wangboshi@huawei.com>
+Date: Fri, 20 Oct 2017 16:01:03 +0800
+Subject: [PATCH 08/48] ima: fix hash algorithm initialization
+
+[ Upstream commit ebe7c0a7be92bbd34c6ff5b55810546a0ee05bee ]
+
+The hash_setup function always sets the hash_setup_done flag, even
+when the hash algorithm is invalid.  This prevents the default hash
+algorithm defined as CONFIG_IMA_DEFAULT_HASH from being used.
+
+This patch sets hash_setup_done flag only for valid hash algorithms.
+
+Fixes: e7a2ad7eb6f4 "ima: enable support for larger default filedata hash algorithms"
+Signed-off-by: Boshi Wang <wangboshi@huawei.com>
+Signed-off-by: Mimi Zohar <zohar@linux.vnet.ibm.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ security/integrity/ima/ima_main.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
+index c21f09bf8b99..98289ba2a2e6 100644
+--- a/security/integrity/ima/ima_main.c
++++ b/security/integrity/ima/ima_main.c
+@@ -52,6 +52,8 @@ static int __init hash_setup(char *str)
+ 			ima_hash_algo = HASH_ALGO_SHA1;
+ 		else if (strncmp(str, "md5", 3) == 0)
+ 			ima_hash_algo = HASH_ALGO_MD5;
++		else
++			return 1;
+ 		goto out;
+ 	}
+ 
+@@ -61,6 +63,8 @@ static int __init hash_setup(char *str)
+ 			break;
+ 		}
+ 	}
++	if (i == HASH_ALGO__LAST)
++		return 1;
+ out:
+ 	hash_setup_done = 1;
+ 	return 1;
+-- 
+2.28.0
+
+
+From 93f45d8c67dc914ed0d83b02549474759bdfc1ac Mon Sep 17 00:00:00 2001
+From: Christian Borntraeger <borntraeger@de.ibm.com>
+Date: Mon, 30 Oct 2017 14:38:58 +0100
+Subject: [PATCH 09/48] s390/pci: do not require AIS facility
+
+[ Upstream commit 48070c73058be6de9c0d754d441ed7092dfc8f12 ]
+
+As of today QEMU does not provide the AIS facility to its guest.  This
+prevents Linux guests from using PCI devices as the ais facility is
+checked during init. As this is just a performance optimization, we can
+move the ais check into the code where we need it (calling the SIC
+instruction). This is used at initialization and on interrupt. Both
+places do not require any serialization, so we can simply skip the
+instruction.
+
+Since we will now get all interrupts, we can also avoid the 2nd scan.
+As we can have multiple interrupts in parallel we might trigger spurious
+irqs more often for the non-AIS case but the core code can handle that.
+
+Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+Reviewed-by: Pierre Morel <pmorel@linux.vnet.ibm.com>
+Reviewed-by: Halil Pasic <pasic@linux.vnet.ibm.com>
+Acked-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
+Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/s390/include/asm/pci_insn.h | 2 +-
+ arch/s390/pci/pci.c              | 5 +++--
+ arch/s390/pci/pci_insn.c         | 6 +++++-
+ 3 files changed, 9 insertions(+), 4 deletions(-)
+
+diff --git a/arch/s390/include/asm/pci_insn.h b/arch/s390/include/asm/pci_insn.h
+index 649eb62c52b3..9e02cb7955c1 100644
+--- a/arch/s390/include/asm/pci_insn.h
++++ b/arch/s390/include/asm/pci_insn.h
+@@ -81,6 +81,6 @@ int zpci_refresh_trans(u64 fn, u64 addr, u64 range);
+ int zpci_load(u64 *data, u64 req, u64 offset);
+ int zpci_store(u64 data, u64 req, u64 offset);
+ int zpci_store_block(const u64 *data, u64 req, u64 offset);
+-void zpci_set_irq_ctrl(u16 ctl, char *unused, u8 isc);
++int zpci_set_irq_ctrl(u16 ctl, char *unused, u8 isc);
+ 
+ #endif
 diff --git a/arch/s390/pci/pci.c b/arch/s390/pci/pci.c
 index f2f6720a3331..ef0499b76c50 100644
 --- a/arch/s390/pci/pci.c
@@ -208,6 +577,277 @@ index 10ca15dcab11..bc065392f7ab 100644
  }
  
  /* PCI Load */
+-- 
+2.28.0
+
+
+From 429feb597df3cefe218ed25ad7861e721c09894a Mon Sep 17 00:00:00 2001
+From: Andy Lutomirski <luto@kernel.org>
+Date: Sat, 4 Nov 2017 04:19:52 -0700
+Subject: [PATCH 10/48] selftests/x86/ldt_get: Add a few additional tests for
+ limits
+
+[ Upstream commit fec8f5ae1715a01c72ad52cb2ecd8aacaf142302 ]
+
+We weren't testing the .limit and .limit_in_pages fields very well.
+Add more tests.
+
+This addition seems to trigger the "bits 16:19 are undefined" issue
+that was fixed in an earlier patch.  I think that, at least on my
+CPU, the high nibble of the limit ends in LAR bits 16:19.
+
+Signed-off-by: Andy Lutomirski <luto@kernel.org>
+Cc: Borislav Petkov <bpetkov@suse.de>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/5601c15ea9b3113d288953fd2838b18bedf6bc67.1509794321.git.luto@kernel.org
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ tools/testing/selftests/x86/ldt_gdt.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/tools/testing/selftests/x86/ldt_gdt.c b/tools/testing/selftests/x86/ldt_gdt.c
+index 923e59eb82c7..412b845412d2 100644
+--- a/tools/testing/selftests/x86/ldt_gdt.c
++++ b/tools/testing/selftests/x86/ldt_gdt.c
+@@ -351,9 +351,24 @@ static void do_simple_tests(void)
+ 	install_invalid(&desc, false);
+ 
+ 	desc.seg_not_present = 0;
+-	desc.read_exec_only = 0;
+ 	desc.seg_32bit = 1;
++	desc.read_exec_only = 0;
++	desc.limit = 0xfffff;
++
+ 	install_valid(&desc, AR_DPL3 | AR_TYPE_RWDATA | AR_S | AR_P | AR_DB);
++
++	desc.limit_in_pages = 1;
++
++	install_valid(&desc, AR_DPL3 | AR_TYPE_RWDATA | AR_S | AR_P | AR_DB | AR_G);
++	desc.read_exec_only = 1;
++	install_valid(&desc, AR_DPL3 | AR_TYPE_RODATA | AR_S | AR_P | AR_DB | AR_G);
++	desc.contents = 1;
++	desc.read_exec_only = 0;
++	install_valid(&desc, AR_DPL3 | AR_TYPE_RWDATA_EXPDOWN | AR_S | AR_P | AR_DB | AR_G);
++	desc.read_exec_only = 1;
++	install_valid(&desc, AR_DPL3 | AR_TYPE_RODATA_EXPDOWN | AR_S | AR_P | AR_DB | AR_G);
++
++	desc.limit = 0;
+ 	install_invalid(&desc, true);
+ }
+ 
+-- 
+2.28.0
+
+
+From a96c19f5ba09e839eb6af1bccd8cea0bc00fbabc Mon Sep 17 00:00:00 2001
+From: Lukas Wunner <lukas@wunner.de>
+Date: Sat, 28 Oct 2017 11:35:49 +0200
+Subject: [PATCH 11/48] serial: 8250_fintek: Fix rs485 disablement on invalid
+ ioctl()
+
+[ Upstream commit 3236a965486ba0c6043cf2c7b51943d8b382ae29 ]
+
+This driver's ->rs485_config callback checks if SER_RS485_RTS_ON_SEND
+and SER_RS485_RTS_AFTER_SEND have the same value.  If they do, it means
+the user has passed in invalid data with the TIOCSRS485 ioctl()
+since RTS must have a different polarity when sending and when not
+sending.  In this case, rs485 mode is not enabled (the RS485_URA bit
+is not set in the RS485 Enable Register) and this is supposed to be
+signaled back to the user by clearing the SER_RS485_ENABLED bit in
+struct serial_rs485 ... except a missing tilde character is preventing
+that from happening.
+
+Fixes: 28e3fb6c4dce ("serial: Add support for Fintek F81216A LPC to 4 UART")
+Cc: Ricardo Ribalda Delgado <ricardo.ribalda@gmail.com>
+Cc: "Ji-Ze Hong (Peter Hong)" <hpeter@gmail.com>
+Signed-off-by: Lukas Wunner <lukas@wunner.de>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/tty/serial/8250/8250_fintek.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/tty/serial/8250/8250_fintek.c b/drivers/tty/serial/8250/8250_fintek.c
+index 89474399ab89..1d5a9e5fb069 100644
+--- a/drivers/tty/serial/8250/8250_fintek.c
++++ b/drivers/tty/serial/8250/8250_fintek.c
+@@ -117,7 +117,7 @@ static int fintek_8250_rs485_config(struct uart_port *port,
+ 
+ 	if ((!!(rs485->flags & SER_RS485_RTS_ON_SEND)) ==
+ 			(!!(rs485->flags & SER_RS485_RTS_AFTER_SEND)))
+-		rs485->flags &= SER_RS485_ENABLED;
++		rs485->flags &= ~SER_RS485_ENABLED;
+ 	else
+ 		config |= RS485_URA;
+ 
+-- 
+2.28.0
+
+
+From b6ca48b5cd08a6dbeab8249e83dfd16b9eb87184 Mon Sep 17 00:00:00 2001
+From: Hiromitsu Yamasaki <hiromitsu.yamasaki.ym@renesas.com>
+Date: Thu, 2 Nov 2017 10:32:36 +0100
+Subject: [PATCH 12/48] spi: sh-msiof: Fix DMA transfer size check
+
+[ Upstream commit 36735783fdb599c94b9c86824583df367c65900b ]
+
+DMA supports 32-bit words only,
+even if BITLEN1 of SITMDR2 register is 16bit.
+
+Fixes: b0d0ce8b6b91 ("spi: sh-msiof: Add DMA support")
+Signed-off-by: Hiromitsu Yamasaki <hiromitsu.yamasaki.ym@renesas.com>
+Signed-off-by: Simon Horman <horms+renesas@verge.net.au>
+Acked-by: Geert Uytterhoeven <geert+renesas@glider.be>
+Acked-by: Dirk Behme <dirk.behme@de.bosch.com>
+Signed-off-by: Mark Brown <broonie@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/spi/spi-sh-msiof.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/spi/spi-sh-msiof.c b/drivers/spi/spi-sh-msiof.c
+index d22de4c8c399..3de39bd794b6 100644
+--- a/drivers/spi/spi-sh-msiof.c
++++ b/drivers/spi/spi-sh-msiof.c
+@@ -863,7 +863,7 @@ static int sh_msiof_transfer_one(struct spi_master *master,
+ 				break;
+ 			copy32 = copy_bswap32;
+ 		} else if (bits <= 16) {
+-			if (l & 1)
++			if (l & 3)
+ 				break;
+ 			copy32 = copy_wswap32;
+ 		} else {
+-- 
+2.28.0
+
+
+From 86b9d66d1f3f4121853f46452d0a756217a55ea0 Mon Sep 17 00:00:00 2001
+From: Alexey Khoroshilov <khoroshilov@ispras.ru>
+Date: Sat, 21 Oct 2017 01:02:07 +0300
+Subject: [PATCH 13/48] usb: phy: tahvo: fix error handling in
+ tahvo_usb_probe()
+
+[ Upstream commit ce035409bfa892a2fabb89720b542e1b335c3426 ]
+
+If devm_extcon_dev_allocate() fails, we should disable clk before return.
+
+Found by Linux Driver Verification project (linuxtesting.org).
+
+Signed-off-by: Alexey Khoroshilov <khoroshilov@ispras.ru>
+Fixes: 860d2686fda7 ("usb: phy: tahvo: Use devm_extcon_dev_[allocate|register]() and replace deprecated API")
+Signed-off-by: Felipe Balbi <felipe.balbi@linux.intel.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/phy/phy-tahvo.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/usb/phy/phy-tahvo.c b/drivers/usb/phy/phy-tahvo.c
+index ab5d364f6e8c..335a1ef35224 100644
+--- a/drivers/usb/phy/phy-tahvo.c
++++ b/drivers/usb/phy/phy-tahvo.c
+@@ -368,7 +368,8 @@ static int tahvo_usb_probe(struct platform_device *pdev)
+ 	tu->extcon = devm_extcon_dev_allocate(&pdev->dev, tahvo_cable);
+ 	if (IS_ERR(tu->extcon)) {
+ 		dev_err(&pdev->dev, "failed to allocate memory for extcon\n");
+-		return -ENOMEM;
++		ret = PTR_ERR(tu->extcon);
++		goto err_disable_clk;
+ 	}
+ 
+ 	ret = devm_extcon_dev_register(&pdev->dev, tu->extcon);
+-- 
+2.28.0
+
+
+From ecd996c24a790b3c30346e45076b55ded497f207 Mon Sep 17 00:00:00 2001
+From: Aaron Sierra <asierra@xes-inc.com>
+Date: Wed, 4 Oct 2017 10:01:28 -0500
+Subject: [PATCH 14/48] serial: 8250: Preserve DLD[7:4] for PORT_XR17V35X
+
+[ Upstream commit 0ab84da2e076948c49d36197ee7d254125c53eab ]
+
+The upper four bits of the XR17V35x fractional divisor register (DLD)
+control general chip function (RS-485 direction pin polarity, multidrop
+mode, XON/XOFF parity check, and fast IR mode). Don't allow these bits
+to be clobbered when setting the baudrate.
+
+Signed-off-by: Aaron Sierra <asierra@xes-inc.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/tty/serial/8250/8250_port.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index 56ccbcefdd85..d42d66b72d5a 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -2223,8 +2223,11 @@ static void serial8250_set_divisor(struct uart_port *port, unsigned int baud,
+ 	serial_dl_write(up, quot);
+ 
+ 	/* XR17V35x UARTs have an extra fractional divisor register (DLD) */
+-	if (up->port.type == PORT_XR17V35X)
++	if (up->port.type == PORT_XR17V35X) {
++		/* Preserve bits not related to baudrate; DLD[7:4]. */
++		quot_frac |= serial_port_in(port, 0x2) & 0xf0;
+ 		serial_port_out(port, 0x2, quot_frac);
++	}
+ }
+ 
+ static unsigned int
+-- 
+2.28.0
+
+
+From c2e1be144805266fbd75fa29ad896b9671fdae8e Mon Sep 17 00:00:00 2001
+From: Dave Hansen <dave.hansen@linux.intel.com>
+Date: Wed, 18 Oct 2017 10:21:07 -0700
+Subject: [PATCH 15/48] x86/entry: Use SYSCALL_DEFINE() macros for
+ sys_modify_ldt()
+
+[ Upstream commit da20ab35180780e4a6eadc804544f1fa967f3567 ]
+
+We do not have tracepoints for sys_modify_ldt() because we define
+it directly instead of using the normal SYSCALL_DEFINEx() macros.
+
+However, there is a reason sys_modify_ldt() does not use the macros:
+it has an 'int' return type instead of 'unsigned long'.  This is
+a bug, but it's a bug cemented in the ABI.
+
+What does this mean?  If we return -EINVAL from a function that
+returns 'int', we have 0x00000000ffffffea in %rax.  But, if we
+return -EINVAL from a function returning 'unsigned long', we end
+up with 0xffffffffffffffea in %rax, which is wrong.
+
+To work around this and maintain the 'int' behavior while using
+the SYSCALL_DEFINEx() macros, so we add a cast to 'unsigned int'
+in both implementations of sys_modify_ldt().
+
+Signed-off-by: Dave Hansen <dave.hansen@linux.intel.com>
+Reviewed-by: Andy Lutomirski <luto@kernel.org>
+Reviewed-by: Brian Gerst <brgerst@gmail.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/20171018172107.1A79C532@viggo.jf.intel.com
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/include/asm/syscalls.h |  2 +-
+ arch/x86/kernel/ldt.c           | 16 +++++++++++++---
+ arch/x86/um/ldt.c               |  7 +++++--
+ 3 files changed, 19 insertions(+), 6 deletions(-)
+
 diff --git a/arch/x86/include/asm/syscalls.h b/arch/x86/include/asm/syscalls.h
 index 91dfcafe27a6..bad25bb80679 100644
 --- a/arch/x86/include/asm/syscalls.h
@@ -221,67 +861,6 @@ index 91dfcafe27a6..bad25bb80679 100644
  
  /* kernel/signal.c */
  asmlinkage long sys_rt_sigreturn(void);
-diff --git a/arch/x86/kernel/kprobes/ftrace.c b/arch/x86/kernel/kprobes/ftrace.c
-index 5f8f0b3cc674..2c0b0b645a74 100644
---- a/arch/x86/kernel/kprobes/ftrace.c
-+++ b/arch/x86/kernel/kprobes/ftrace.c
-@@ -26,7 +26,7 @@
- #include "common.h"
- 
- static nokprobe_inline
--int __skip_singlestep(struct kprobe *p, struct pt_regs *regs,
-+void __skip_singlestep(struct kprobe *p, struct pt_regs *regs,
- 		      struct kprobe_ctlblk *kcb, unsigned long orig_ip)
- {
- 	/*
-@@ -41,20 +41,21 @@ int __skip_singlestep(struct kprobe *p, struct pt_regs *regs,
- 	__this_cpu_write(current_kprobe, NULL);
- 	if (orig_ip)
- 		regs->ip = orig_ip;
--	return 1;
- }
- 
- int skip_singlestep(struct kprobe *p, struct pt_regs *regs,
- 		    struct kprobe_ctlblk *kcb)
- {
--	if (kprobe_ftrace(p))
--		return __skip_singlestep(p, regs, kcb, 0);
--	else
--		return 0;
-+	if (kprobe_ftrace(p)) {
-+		__skip_singlestep(p, regs, kcb, 0);
-+		preempt_enable_no_resched();
-+		return 1;
-+	}
-+	return 0;
- }
- NOKPROBE_SYMBOL(skip_singlestep);
- 
--/* Ftrace callback handler for kprobes */
-+/* Ftrace callback handler for kprobes -- called under preepmt disabed */
- void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
- 			   struct ftrace_ops *ops, struct pt_regs *regs)
- {
-@@ -77,13 +78,17 @@ void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
- 		/* Kprobe handler expects regs->ip = ip + 1 as breakpoint hit */
- 		regs->ip = ip + sizeof(kprobe_opcode_t);
- 
-+		/* To emulate trap based kprobes, preempt_disable here */
-+		preempt_disable();
- 		__this_cpu_write(current_kprobe, p);
- 		kcb->kprobe_status = KPROBE_HIT_ACTIVE;
--		if (!p->pre_handler || !p->pre_handler(p, regs))
-+		if (!p->pre_handler || !p->pre_handler(p, regs)) {
- 			__skip_singlestep(p, regs, kcb, orig_ip);
-+			preempt_enable_no_resched();
-+		}
- 		/*
- 		 * If pre_handler returns !0, it sets regs->ip and
--		 * resets current kprobe.
-+		 * resets current kprobe, and keep preempt count +1.
- 		 */
- 	}
- end:
 diff --git a/arch/x86/kernel/ldt.c b/arch/x86/kernel/ldt.c
 index 6acc9dd91f36..d6279593bcdd 100644
 --- a/arch/x86/kernel/ldt.c
@@ -345,6 +924,934 @@ index 836a1eb5df43..3ee234b6234d 100644
 +	/* See non-um modify_ldt() for why we do this cast */
 +	return (unsigned int)do_modify_ldt_skas(func, ptr, bytecount);
  }
+-- 
+2.28.0
+
+
+From c86fa9ed3a0fc8a48ee07309f1ea13a7df2b149f Mon Sep 17 00:00:00 2001
+From: "Gustavo A. R. Silva" <garsilva@embeddedor.com>
+Date: Mon, 16 Oct 2017 12:40:29 -0500
+Subject: [PATCH 16/48] EDAC, sb_edac: Fix missing break in switch
+
+[ Upstream commit a8e9b186f153a44690ad0363a56716e7077ad28c ]
+
+Add missing break statement in order to prevent the code from falling
+through.
+
+Signed-off-by: Gustavo A. R. Silva <garsilva@embeddedor.com>
+Cc: Qiuxu Zhuo <qiuxu.zhuo@intel.com>
+Cc: linux-edac <linux-edac@vger.kernel.org>
+Link: http://lkml.kernel.org/r/20171016174029.GA19757@embeddedor.com
+Signed-off-by: Borislav Petkov <bp@suse.de>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/edac/sb_edac.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/edac/sb_edac.c b/drivers/edac/sb_edac.c
+index ca64b174f8a3..a4e1f6939c39 100644
+--- a/drivers/edac/sb_edac.c
++++ b/drivers/edac/sb_edac.c
+@@ -1773,6 +1773,7 @@ static int ibridge_mci_bind_devs(struct mem_ctl_info *mci,
+ 			break;
+ 		case PCI_DEVICE_ID_INTEL_IBRIDGE_IMC_HA0_TA:
+ 			pvt->pci_ta = pdev;
++			break;
+ 		case PCI_DEVICE_ID_INTEL_IBRIDGE_IMC_HA0_RAS:
+ 			pvt->pci_ras = pdev;
+ 			break;
+-- 
+2.28.0
+
+
+From 1c4d7600390b79b283022978a024fdf6cc1a6f59 Mon Sep 17 00:00:00 2001
+From: Jibin Xu <jibin.xu@windriver.com>
+Date: Sun, 10 Sep 2017 20:11:42 -0700
+Subject: [PATCH 17/48] sysrq : fix Show Regs call trace on ARM
+
+[ Upstream commit b00bebbc301c8e1f74f230dc82282e56b7e7a6db ]
+
+When kernel configuration SMP,PREEMPT and DEBUG_PREEMPT are enabled,
+echo 1 >/proc/sys/kernel/sysrq
+echo p >/proc/sysrq-trigger
+kernel will print call trace as below:
+
+sysrq: SysRq : Show Regs
+BUG: using __this_cpu_read() in preemptible [00000000] code: sh/435
+caller is __this_cpu_preempt_check+0x18/0x20
+Call trace:
+[<ffffff8008088e80>] dump_backtrace+0x0/0x1d0
+[<ffffff8008089074>] show_stack+0x24/0x30
+[<ffffff8008447970>] dump_stack+0x90/0xb0
+[<ffffff8008463950>] check_preemption_disabled+0x100/0x108
+[<ffffff8008463998>] __this_cpu_preempt_check+0x18/0x20
+[<ffffff80084c9194>] sysrq_handle_showregs+0x1c/0x40
+[<ffffff80084c9c7c>] __handle_sysrq+0x12c/0x1a0
+[<ffffff80084ca140>] write_sysrq_trigger+0x60/0x70
+[<ffffff8008251e00>] proc_reg_write+0x90/0xd0
+[<ffffff80081f1788>] __vfs_write+0x48/0x90
+[<ffffff80081f241c>] vfs_write+0xa4/0x190
+[<ffffff80081f3354>] SyS_write+0x54/0xb0
+[<ffffff80080833f0>] el0_svc_naked+0x24/0x28
+
+This can be seen on a common board like an r-pi3.
+This happens because when echo p >/proc/sysrq-trigger,
+get_irq_regs() is called outside of IRQ context,
+if preemption is enabled in this situation,kernel will
+print the call trace. Since many prior discussions on
+the mailing lists have made it clear that get_irq_regs
+either just returns NULL or stale data when used outside
+of IRQ context,we simply avoid calling it outside of
+IRQ context.
+
+Signed-off-by: Jibin Xu <jibin.xu@windriver.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/tty/sysrq.c | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/tty/sysrq.c b/drivers/tty/sysrq.c
+index 1fa4128eb88e..b07f864f68e8 100644
+--- a/drivers/tty/sysrq.c
++++ b/drivers/tty/sysrq.c
+@@ -237,8 +237,10 @@ static void sysrq_handle_showallcpus(int key)
+ 	 * architecture has no support for it:
+ 	 */
+ 	if (!trigger_all_cpu_backtrace()) {
+-		struct pt_regs *regs = get_irq_regs();
++		struct pt_regs *regs = NULL;
+ 
++		if (in_irq())
++			regs = get_irq_regs();
+ 		if (regs) {
+ 			pr_info("CPU%d:\n", smp_processor_id());
+ 			show_regs(regs);
+@@ -257,7 +259,10 @@ static struct sysrq_key_op sysrq_showallcpus_op = {
+ 
+ static void sysrq_handle_showregs(int key)
+ {
+-	struct pt_regs *regs = get_irq_regs();
++	struct pt_regs *regs = NULL;
++
++	if (in_irq())
++		regs = get_irq_regs();
+ 	if (regs)
+ 		show_regs(regs);
+ 	perf_event_print_debug();
+-- 
+2.28.0
+
+
+From 7317cb116754947d459bf709e4dccad31baa64bb Mon Sep 17 00:00:00 2001
+From: Thomas Richter <tmricht@linux.vnet.ibm.com>
+Date: Wed, 13 Sep 2017 10:12:09 +0200
+Subject: [PATCH 18/48] perf test attr: Fix ignored test case result
+
+[ Upstream commit 22905582f6dd4bbd0c370fe5732c607452010c04 ]
+
+Command perf test -v 16 (Setup struct perf_event_attr test) always
+reports success even if the test case fails.  It works correctly if you
+also specify -F (for don't fork).
+
+   root@s35lp76 perf]# ./perf test -v 16
+   15: Setup struct perf_event_attr               :
+   --- start ---
+   running './tests/attr/test-record-no-delay'
+   [ perf record: Woken up 1 times to write data ]
+   [ perf record: Captured and wrote 0.002 MB /tmp/tmp4E1h7R/perf.data
+     (1 samples) ]
+   expected task=0, got 1
+   expected precise_ip=0, got 3
+   expected wakeup_events=1, got 0
+   FAILED './tests/attr/test-record-no-delay' - match failure
+   test child finished with 0
+   ---- end ----
+   Setup struct perf_event_attr: Ok
+
+The reason for the wrong error reporting is the return value of the
+system() library call. It is called in run_dir() file tests/attr.c and
+returns the exit status, in above case 0xff00.
+
+This value is given as parameter to the exit() function which can only
+handle values 0-0xff.
+
+The child process terminates with exit value of 0 and the parent does
+not detect any error.
+
+This patch corrects the error reporting and prints the correct test
+result.
+
+Signed-off-by: Thomas-Mich Richter <tmricht@linux.vnet.ibm.com>
+Acked-by: Jiri Olsa <jolsa@kernel.org>
+Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
+Cc: Hendrik Brueckner <brueckner@linux.vnet.ibm.com>
+Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
+Cc: Thomas-Mich Richter <tmricht@linux.vnet.ibm.com>
+LPU-Reference: 20170913081209.39570-2-tmricht@linux.vnet.ibm.com
+Link: http://lkml.kernel.org/n/tip-rdube6rfcjsr1nzue72c7lqn@git.kernel.org
+Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ tools/perf/tests/attr.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tools/perf/tests/attr.c b/tools/perf/tests/attr.c
+index 638875a0960a..79547c225c14 100644
+--- a/tools/perf/tests/attr.c
++++ b/tools/perf/tests/attr.c
+@@ -150,7 +150,7 @@ static int run_dir(const char *d, const char *perf)
+ 	snprintf(cmd, 3*PATH_MAX, PYTHON " %s/attr.py -d %s/attr/ -p %s %.*s",
+ 		 d, d, perf, vcnt, v);
+ 
+-	return system(cmd);
++	return system(cmd) ? TEST_FAIL : TEST_OK;
+ }
+ 
+ int test__attr(void)
+-- 
+2.28.0
+
+
+From 8633eec0ee08d6dd4148941bba4ac2b4d918826b Mon Sep 17 00:00:00 2001
+From: Masami Hiramatsu <mhiramat@kernel.org>
+Date: Tue, 19 Sep 2017 19:01:40 +0900
+Subject: [PATCH 19/48] kprobes/x86: Disable preemption in ftrace-based jprobes
+
+[ Upstream commit 5bb4fc2d8641219732eb2bb654206775a4219aca ]
+
+Disable preemption in ftrace-based jprobe handlers as
+described in Documentation/kprobes.txt:
+
+  "Probe handlers are run with preemption disabled."
+
+This will fix jprobes behavior when CONFIG_PREEMPT=y.
+
+Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
+Cc: Alexei Starovoitov <ast@fb.com>
+Cc: Alexei Starovoitov <ast@kernel.org>
+Cc: Ananth N Mavinakayanahalli <ananth@linux.vnet.ibm.com>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Cc: Paul E . McKenney <paulmck@linux.vnet.ibm.com>
+Cc: Peter Zijlstra <peterz@infradead.org>
+Cc: Steven Rostedt <rostedt@goodmis.org>
+Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: http://lkml.kernel.org/r/150581530024.32348.9863783558598926771.stgit@devbox
+Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/x86/kernel/kprobes/ftrace.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/arch/x86/kernel/kprobes/ftrace.c b/arch/x86/kernel/kprobes/ftrace.c
+index 5f8f0b3cc674..2c0b0b645a74 100644
+--- a/arch/x86/kernel/kprobes/ftrace.c
++++ b/arch/x86/kernel/kprobes/ftrace.c
+@@ -26,7 +26,7 @@
+ #include "common.h"
+ 
+ static nokprobe_inline
+-int __skip_singlestep(struct kprobe *p, struct pt_regs *regs,
++void __skip_singlestep(struct kprobe *p, struct pt_regs *regs,
+ 		      struct kprobe_ctlblk *kcb, unsigned long orig_ip)
+ {
+ 	/*
+@@ -41,20 +41,21 @@ int __skip_singlestep(struct kprobe *p, struct pt_regs *regs,
+ 	__this_cpu_write(current_kprobe, NULL);
+ 	if (orig_ip)
+ 		regs->ip = orig_ip;
+-	return 1;
+ }
+ 
+ int skip_singlestep(struct kprobe *p, struct pt_regs *regs,
+ 		    struct kprobe_ctlblk *kcb)
+ {
+-	if (kprobe_ftrace(p))
+-		return __skip_singlestep(p, regs, kcb, 0);
+-	else
+-		return 0;
++	if (kprobe_ftrace(p)) {
++		__skip_singlestep(p, regs, kcb, 0);
++		preempt_enable_no_resched();
++		return 1;
++	}
++	return 0;
+ }
+ NOKPROBE_SYMBOL(skip_singlestep);
+ 
+-/* Ftrace callback handler for kprobes */
++/* Ftrace callback handler for kprobes -- called under preepmt disabed */
+ void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
+ 			   struct ftrace_ops *ops, struct pt_regs *regs)
+ {
+@@ -77,13 +78,17 @@ void kprobe_ftrace_handler(unsigned long ip, unsigned long parent_ip,
+ 		/* Kprobe handler expects regs->ip = ip + 1 as breakpoint hit */
+ 		regs->ip = ip + sizeof(kprobe_opcode_t);
+ 
++		/* To emulate trap based kprobes, preempt_disable here */
++		preempt_disable();
+ 		__this_cpu_write(current_kprobe, p);
+ 		kcb->kprobe_status = KPROBE_HIT_ACTIVE;
+-		if (!p->pre_handler || !p->pre_handler(p, regs))
++		if (!p->pre_handler || !p->pre_handler(p, regs)) {
+ 			__skip_singlestep(p, regs, kcb, orig_ip);
++			preempt_enable_no_resched();
++		}
+ 		/*
+ 		 * If pre_handler returns !0, it sets regs->ip and
+-		 * resets current kprobe.
++		 * resets current kprobe, and keep preempt count +1.
+ 		 */
+ 	}
+ end:
+-- 
+2.28.0
+
+
+From 3a44ade54473ebda10e12dce08b203d5a60308ae Mon Sep 17 00:00:00 2001
+From: Florian Fainelli <f.fainelli@gmail.com>
+Date: Tue, 3 Jan 2017 16:34:48 -0800
+Subject: [PATCH 20/48] net: systemport: Utilize skb_put_padto()
+
+[ Upstream commit bb7da333d0a9f3bddc08f84187b7579a3f68fd24 ]
+
+Since we need to pad our packets, utilize skb_put_padto() which
+increases skb->len by how much we need to pad, allowing us to eliminate
+the test on skb->len right below.
+
+Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/broadcom/bcmsysport.c | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bcmsysport.c b/drivers/net/ethernet/broadcom/bcmsysport.c
+index 8860e74aa28f..fae1a1ff53ab 100644
+--- a/drivers/net/ethernet/broadcom/bcmsysport.c
++++ b/drivers/net/ethernet/broadcom/bcmsysport.c
+@@ -1061,13 +1061,12 @@ static netdev_tx_t bcm_sysport_xmit(struct sk_buff *skb,
+ 	 * (including FCS and tag) because the length verification is done after
+ 	 * the Broadcom tag is stripped off the ingress packet.
+ 	 */
+-	if (skb_padto(skb, ETH_ZLEN + ENET_BRCM_TAG_LEN)) {
++	if (skb_put_padto(skb, ETH_ZLEN + ENET_BRCM_TAG_LEN)) {
+ 		ret = NETDEV_TX_OK;
+ 		goto out;
+ 	}
+ 
+-	skb_len = skb->len < ETH_ZLEN + ENET_BRCM_TAG_LEN ?
+-			ETH_ZLEN + ENET_BRCM_TAG_LEN : skb->len;
++	skb_len = skb->len;
+ 
+ 	mapping = dma_map_single(kdev, skb->data, skb_len, DMA_TO_DEVICE);
+ 	if (dma_mapping_error(kdev, mapping)) {
+-- 
+2.28.0
+
+
+From e6f1055319929a7005b83a95c0e65444201964c2 Mon Sep 17 00:00:00 2001
+From: Florian Fainelli <f.fainelli@gmail.com>
+Date: Tue, 3 Jan 2017 16:34:49 -0800
+Subject: [PATCH 21/48] net: systemport: Pad packet before inserting TSB
+
+[ Upstream commit 38e5a85562a6cd911fc26d951d576551a688574c ]
+
+Inserting the TSB means adding an extra 8 bytes in front the of packet
+that is going to be used as metadata information by the TDMA engine, but
+stripped off, so it does not really help with the packet padding.
+
+For some odd packet sizes that fall below the 60 bytes payload (e.g: ARP)
+we can end-up padding them after the TSB insertion, thus making them 64
+bytes, but with the TDMA stripping off the first 8 bytes, they could
+still be smaller than 64 bytes which is required to ingress the switch.
+
+Fix this by swapping the padding and TSB insertion, guaranteeing that
+the packets have the right sizes.
+
+Fixes: 80105befdb4b ("net: systemport: add Broadcom SYSTEMPORT Ethernet MAC driver")
+Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/broadcom/bcmsysport.c | 18 +++++++++---------
+ 1 file changed, 9 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/ethernet/broadcom/bcmsysport.c b/drivers/net/ethernet/broadcom/bcmsysport.c
+index fae1a1ff53ab..027705117086 100644
+--- a/drivers/net/ethernet/broadcom/bcmsysport.c
++++ b/drivers/net/ethernet/broadcom/bcmsysport.c
+@@ -1045,15 +1045,6 @@ static netdev_tx_t bcm_sysport_xmit(struct sk_buff *skb,
+ 		goto out;
+ 	}
+ 
+-	/* Insert TSB and checksum infos */
+-	if (priv->tsb_en) {
+-		skb = bcm_sysport_insert_tsb(skb, dev);
+-		if (!skb) {
+-			ret = NETDEV_TX_OK;
+-			goto out;
+-		}
+-	}
+-
+ 	/* The Ethernet switch we are interfaced with needs packets to be at
+ 	 * least 64 bytes (including FCS) otherwise they will be discarded when
+ 	 * they enter the switch port logic. When Broadcom tags are enabled, we
+@@ -1066,6 +1057,15 @@ static netdev_tx_t bcm_sysport_xmit(struct sk_buff *skb,
+ 		goto out;
+ 	}
+ 
++	/* Insert TSB and checksum infos */
++	if (priv->tsb_en) {
++		skb = bcm_sysport_insert_tsb(skb, dev);
++		if (!skb) {
++			ret = NETDEV_TX_OK;
++			goto out;
++		}
++	}
++
+ 	skb_len = skb->len;
+ 
+ 	mapping = dma_map_single(kdev, skb->data, skb_len, DMA_TO_DEVICE);
+-- 
+2.28.0
+
+
+From e6533243f74fd2ca85387e1d332eecdf961931e4 Mon Sep 17 00:00:00 2001
+From: Peter Ujfalusi <peter.ujfalusi@ti.com>
+Date: Tue, 3 Jan 2017 13:22:34 +0200
+Subject: [PATCH 22/48] ARM: OMAP1: DMA: Correct the number of logical channels
+
+[ Upstream commit 657279778af54f35e54b07b6687918f254a2992c ]
+
+OMAP1510, OMAP5910 and OMAP310 have only 9 logical channels.
+OMAP1610, OMAP5912, OMAP1710, OMAP730, and OMAP850 have 16 logical channels
+available.
+
+The wired 17 for the lch_count must have been used to cover the 16 + 1
+dedicated LCD channel, in reality we can only use 9 or 16 channels.
+
+The d->chan_count is not used by the omap-dma stack, so we can skip the
+setup. chan_count was configured to the number of logical channels and not
+the actual number of physical channels anyways.
+
+Signed-off-by: Peter Ujfalusi <peter.ujfalusi@ti.com>
+Acked-by: Aaro Koskinen <aaro.koskinen@iki.fi>
+Signed-off-by: Tony Lindgren <tony@atomide.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ arch/arm/mach-omap1/dma.c | 16 +++++++---------
+ 1 file changed, 7 insertions(+), 9 deletions(-)
+
+diff --git a/arch/arm/mach-omap1/dma.c b/arch/arm/mach-omap1/dma.c
+index 7b02ed218a42..0c120b2ea2f9 100644
+--- a/arch/arm/mach-omap1/dma.c
++++ b/arch/arm/mach-omap1/dma.c
+@@ -31,7 +31,6 @@
+ #include "soc.h"
+ 
+ #define OMAP1_DMA_BASE			(0xfffed800)
+-#define OMAP1_LOGICAL_DMA_CH_COUNT	17
+ 
+ static u32 enable_1510_mode;
+ 
+@@ -311,8 +310,6 @@ static int __init omap1_system_dma_init(void)
+ 		goto exit_iounmap;
+ 	}
+ 
+-	d->lch_count		= OMAP1_LOGICAL_DMA_CH_COUNT;
+-
+ 	/* Valid attributes for omap1 plus processors */
+ 	if (cpu_is_omap15xx())
+ 		d->dev_caps = ENABLE_1510_MODE;
+@@ -329,13 +326,14 @@ static int __init omap1_system_dma_init(void)
+ 	d->dev_caps		|= CLEAR_CSR_ON_READ;
+ 	d->dev_caps		|= IS_WORD_16;
+ 
+-	if (cpu_is_omap15xx())
+-		d->chan_count = 9;
+-	else if (cpu_is_omap16xx() || cpu_is_omap7xx()) {
+-		if (!(d->dev_caps & ENABLE_1510_MODE))
+-			d->chan_count = 16;
++	/* available logical channels */
++	if (cpu_is_omap15xx()) {
++		d->lch_count = 9;
++	} else {
++		if (d->dev_caps & ENABLE_1510_MODE)
++			d->lch_count = 9;
+ 		else
+-			d->chan_count = 9;
++			d->lch_count = 16;
+ 	}
+ 
+ 	p = dma_plat_info;
+-- 
+2.28.0
+
+
+From c73b58cfa83e6aac20f075fe1d9d94047da80a25 Mon Sep 17 00:00:00 2001
+From: David Forster <dforster@brocade.com>
+Date: Fri, 6 Jan 2017 10:27:59 +0000
+Subject: [PATCH 23/48] vti6: fix device register to report IFLA_INFO_KIND
+
+[ Upstream commit 93e246f783e6bd1bc64fdfbfe68b18161f69b28e ]
+
+vti6 interface is registered before the rtnl_link_ops block
+is attached. As a result the resulting RTM_NEWLINK is missing
+IFLA_INFO_KIND. Re-order attachment of rtnl_link_ops block to fix.
+
+Signed-off-by: Dave Forster <dforster@brocade.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv6/ip6_vti.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/ipv6/ip6_vti.c b/net/ipv6/ip6_vti.c
+index 7ebb14def2cb..f58ad70f693e 100644
+--- a/net/ipv6/ip6_vti.c
++++ b/net/ipv6/ip6_vti.c
+@@ -189,12 +189,12 @@ static int vti6_tnl_create2(struct net_device *dev)
+ 	struct vti6_net *ip6n = net_generic(net, vti6_net_id);
+ 	int err;
+ 
++	dev->rtnl_link_ops = &vti6_link_ops;
+ 	err = register_netdevice(dev);
+ 	if (err < 0)
+ 		goto out;
+ 
+ 	strcpy(t->parms.name, dev->name);
+-	dev->rtnl_link_ops = &vti6_link_ops;
+ 
+ 	dev_hold(dev);
+ 	vti6_tnl_link(ip6n, t);
+-- 
+2.28.0
+
+
+From 1bb50d02a8d3161947d213e9627a1a98fea60ac1 Mon Sep 17 00:00:00 2001
+From: Vlad Tsyrklevich <vlad@tsyrklevich.net>
+Date: Mon, 9 Jan 2017 20:57:48 +0700
+Subject: [PATCH 24/48] net/appletalk: Fix kernel memory disclosure
+
+[ Upstream commit ce7e40c432ba84da104438f6799d460a4cad41bc ]
+
+ipddp_route structs contain alignment padding so kernel heap memory
+is leaked when they are copied to user space in
+ipddp_ioctl(SIOCFINDIPDDPRT). Change kmalloc() to kzalloc() to clear
+that memory.
+
+Signed-off-by: Vlad Tsyrklevich <vlad@tsyrklevich.net>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/appletalk/ipddp.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/appletalk/ipddp.c b/drivers/net/appletalk/ipddp.c
+index e90c6a7333d7..2e4649655181 100644
+--- a/drivers/net/appletalk/ipddp.c
++++ b/drivers/net/appletalk/ipddp.c
+@@ -191,7 +191,7 @@ static netdev_tx_t ipddp_xmit(struct sk_buff *skb, struct net_device *dev)
+  */
+ static int ipddp_create(struct ipddp_route *new_rt)
+ {
+-        struct ipddp_route *rt = kmalloc(sizeof(*rt), GFP_KERNEL);
++        struct ipddp_route *rt = kzalloc(sizeof(*rt), GFP_KERNEL);
+ 
+         if (rt == NULL)
+                 return -ENOMEM;
+-- 
+2.28.0
+
+
+From 7228df818d90cd9a79481f003055130597ca4a68 Mon Sep 17 00:00:00 2001
+From: Kazuya Mizuguchi <kazuya.mizuguchi.ks@renesas.com>
+Date: Thu, 12 Jan 2017 13:21:06 +0100
+Subject: [PATCH 25/48] ravb: Remove Rx overflow log messages
+
+[ Upstream commit 18a3ed59d09cf81a6447aadf6931bf0c9ffec5e0 ]
+
+Remove Rx overflow log messages as in an environment where logging results
+in network traffic logging may cause further overflows.
+
+Fixes: c156633f1353 ("Renesas Ethernet AVB driver proper")
+Signed-off-by: Kazuya Mizuguchi <kazuya.mizuguchi.ks@renesas.com>
+[simon: reworked changelog]
+Signed-off-by: Simon Horman <horms+renesas@verge.net.au>
+Acked-by: Sergei Shtylyov <sergei.shtylyov@cogentembedded.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/renesas/ravb_main.c | 8 ++------
+ 1 file changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/renesas/ravb_main.c b/drivers/net/ethernet/renesas/ravb_main.c
+index 585e90f8341d..f735dfcb64ae 100644
+--- a/drivers/net/ethernet/renesas/ravb_main.c
++++ b/drivers/net/ethernet/renesas/ravb_main.c
+@@ -831,14 +831,10 @@ static int ravb_poll(struct napi_struct *napi, int budget)
+ 	/* Receive error message handling */
+ 	priv->rx_over_errors =  priv->stats[RAVB_BE].rx_over_errors;
+ 	priv->rx_over_errors += priv->stats[RAVB_NC].rx_over_errors;
+-	if (priv->rx_over_errors != ndev->stats.rx_over_errors) {
++	if (priv->rx_over_errors != ndev->stats.rx_over_errors)
+ 		ndev->stats.rx_over_errors = priv->rx_over_errors;
+-		netif_err(priv, rx_err, ndev, "Receive Descriptor Empty\n");
+-	}
+-	if (priv->rx_fifo_errors != ndev->stats.rx_fifo_errors) {
++	if (priv->rx_fifo_errors != ndev->stats.rx_fifo_errors)
+ 		ndev->stats.rx_fifo_errors = priv->rx_fifo_errors;
+-		netif_err(priv, rx_err, ndev, "Receive FIFO Overflow\n");
+-	}
+ out:
+ 	return budget - quota;
+ }
+-- 
+2.28.0
+
+
+From f2fb416f4af6f957caa7efc9ed51c37cb1e40a2b Mon Sep 17 00:00:00 2001
+From: Benjamin Coddington <bcodding@redhat.com>
+Date: Thu, 5 Jan 2017 10:20:16 -0500
+Subject: [PATCH 26/48] nfs: Don't take a reference on fl->fl_file for LOCK
+ operation
+
+[ Upstream commit 4b09ec4b14a168bf2c687e1f598140c3c11e9222 ]
+
+I have reports of a crash that look like __fput() was called twice for
+a NFSv4.0 file.  It seems possible that the state manager could try to
+reclaim a lock and take a reference on the fl->fl_file at the same time the
+file is being released if, during the close(), a signal interrupts the wait
+for outstanding IO while removing locks which then skips the removal
+of that lock.
+
+Since 83bfff23e9ed ("nfs4: have do_vfs_lock take an inode pointer") has
+removed the need to traverse fl->fl_file->f_inode in nfs4_lock_done(),
+taking that reference is no longer necessary.
+
+Signed-off-by: Benjamin Coddington <bcodding@redhat.com>
+Reviewed-by: Jeff Layton <jlayton@redhat.com>
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/nfs/nfs4proc.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 6fef53f18dcf..8ef6f70c9e25 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -38,7 +38,6 @@
+ #include <linux/mm.h>
+ #include <linux/delay.h>
+ #include <linux/errno.h>
+-#include <linux/file.h>
+ #include <linux/string.h>
+ #include <linux/ratelimit.h>
+ #include <linux/printk.h>
+@@ -5738,7 +5737,6 @@ static struct nfs4_lockdata *nfs4_alloc_lockdata(struct file_lock *fl,
+ 	p->server = server;
+ 	atomic_inc(&lsp->ls_count);
+ 	p->ctx = get_nfs_open_context(ctx);
+-	get_file(fl->fl_file);
+ 	memcpy(&p->fl, fl, sizeof(p->fl));
+ 	return p;
+ out_free_seqid:
+@@ -5851,7 +5849,6 @@ static void nfs4_lock_release(void *calldata)
+ 		nfs_free_seqid(data->arg.lock_seqid);
+ 	nfs4_put_lock_state(data->lsp);
+ 	put_nfs_open_context(data->ctx);
+-	fput(data->fl.fl_file);
+ 	kfree(data);
+ 	dprintk("%s: done!\n", __func__);
+ }
+-- 
+2.28.0
+
+
+From 48222dd037f5410402a16f8bd41ec7b4d4446d03 Mon Sep 17 00:00:00 2001
+From: Christoffer Dall <christoffer.dall@linaro.org>
+Date: Mon, 9 Jan 2017 12:18:56 +0100
+Subject: [PATCH 27/48] KVM: arm/arm64: Fix occasional warning from the timer
+ work function
+
+[ Upstream commit 63e41226afc3f7a044b70325566fa86ac3142538 ]
+
+When a VCPU blocks (WFI) and has programmed the vtimer, we program a
+soft timer to expire in the future to wake up the vcpu thread when
+appropriate.  Because such as wake up involves a vcpu kick, and the
+timer expire function can get called from interrupt context, and the
+kick may sleep, we have to schedule the kick in the work function.
+
+The work function currently has a warning that gets raised if it turns
+out that the timer shouldn't fire when it's run, which was added because
+the idea was that in that case the work should never have been cancelled.
+
+However, it turns out that this whole thing is racy and we can get
+spurious warnings.  The problem is that we clear the armed flag in the
+work function, which may run in parallel with the
+kvm_timer_unschedule->timer_disarm() call.  This results in a possible
+situation where the timer_disarm() call does not call
+cancel_work_sync(), which effectively synchronizes the completion of the
+work function with running the VCPU.  As a result, the VCPU thread
+proceeds before the work function completees, causing changes to the
+timer state such that kvm_timer_should_fire(vcpu) returns false in the
+work function.
+
+All we do in the work function is to kick the VCPU, and an occasional
+rare extra kick never harmed anyone.  Since the race above is extremely
+rare, we don't bother checking if the race happens but simply remove the
+check and the clearing of the armed flag from the work function.
+
+Reported-by: Matthias Brugger <mbrugger@suse.com>
+Reviewed-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Christoffer Dall <christoffer.dall@linaro.org>
+Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ virt/kvm/arm/arch_timer.c | 3 ---
+ 1 file changed, 3 deletions(-)
+
+diff --git a/virt/kvm/arm/arch_timer.c b/virt/kvm/arm/arch_timer.c
+index a7b9022b5c8f..7f38db2a46c8 100644
+--- a/virt/kvm/arm/arch_timer.c
++++ b/virt/kvm/arm/arch_timer.c
+@@ -84,9 +84,6 @@ static void kvm_timer_inject_irq_work(struct work_struct *work)
+ 	struct kvm_vcpu *vcpu;
+ 
+ 	vcpu = container_of(work, struct kvm_vcpu, arch.timer_cpu.expired);
+-	vcpu->arch.timer_cpu.armed = false;
+-
+-	WARN_ON(!kvm_timer_should_fire(vcpu));
+ 
+ 	/*
+ 	 * If the vcpu is blocked we want to wake it up so that it will see
+-- 
+2.28.0
+
+
+From e26d58f897cad5132c98a909bc205de4ab6ce2ea Mon Sep 17 00:00:00 2001
+From: Trond Myklebust <trond.myklebust@primarydata.com>
+Date: Fri, 13 Jan 2017 13:31:32 -0500
+Subject: [PATCH 28/48] NFSv4: Fix client recovery when server reboots multiple
+ times
+
+[ Upstream commit c6180a6237174f481dc856ed6e890d8196b6f0fb ]
+
+If the server reboots multiple times, the client should rely on the
+server to tell it that it cannot reclaim state as per section 9.6.3.4
+in RFC7530 and section 8.4.2.1 in RFC5661.
+Currently, the client is being to conservative, and is assuming that
+if the server reboots while state recovery is in progress, then it must
+ignore state that was not recovered before the reboot.
+
+Signed-off-by: Trond Myklebust <trond.myklebust@primarydata.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/nfs/nfs4state.c | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/fs/nfs/nfs4state.c b/fs/nfs/nfs4state.c
+index e8d1d6c5000c..9a0b219ff74d 100644
+--- a/fs/nfs/nfs4state.c
++++ b/fs/nfs/nfs4state.c
+@@ -1680,7 +1680,6 @@ static int nfs4_recovery_handle_error(struct nfs_client *clp, int error)
+ 			break;
+ 		case -NFS4ERR_STALE_CLIENTID:
+ 			set_bit(NFS4CLNT_LEASE_EXPIRED, &clp->cl_state);
+-			nfs4_state_clear_reclaim_reboot(clp);
+ 			nfs4_state_start_reclaim_reboot(clp);
+ 			break;
+ 		case -NFS4ERR_EXPIRED:
+-- 
+2.28.0
+
+
+From 7e9236c001520e38379a4f1da99a621d75794384 Mon Sep 17 00:00:00 2001
+From: Andrzej Hajda <a.hajda@samsung.com>
+Date: Tue, 17 Jan 2017 15:15:20 +0100
+Subject: [PATCH 29/48] drm/exynos/decon5433: set STANDALONE_UPDATE_F on output
+ enablement
+
+[ Upstream commit 11d8bcef7a0399e1d2519f207fd575fc404306b4 ]
+
+DECON_TV requires STANDALONE_UPDATE after output enabling, otherwise it does
+not start. This change is neutral for DECON.
+
+Signed-off-by: Andrzej Hajda <a.hajda@samsung.com>
+Signed-off-by: Inki Dae <inki.dae@samsung.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/gpu/drm/exynos/exynos5433_drm_decon.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/gpu/drm/exynos/exynos5433_drm_decon.c b/drivers/gpu/drm/exynos/exynos5433_drm_decon.c
+index fbe1b3174f75..34cebcdc2fc4 100644
+--- a/drivers/gpu/drm/exynos/exynos5433_drm_decon.c
++++ b/drivers/gpu/drm/exynos/exynos5433_drm_decon.c
+@@ -180,6 +180,8 @@ static void decon_commit(struct exynos_drm_crtc *crtc)
+ 
+ 	/* enable output and display signal */
+ 	decon_set_bits(ctx, DECON_VIDCON0, VIDCON0_ENVID | VIDCON0_ENVID_F, ~0);
++
++	decon_set_bits(ctx, DECON_UPDATE, STANDALONE_UPDATE_F, ~0);
+ }
+ 
+ static void decon_win_set_pixfmt(struct decon_context *ctx, unsigned int win,
+-- 
+2.28.0
+
+
+From e5afc84f644c1eb23a58f2d8609d061bdc0fe7b8 Mon Sep 17 00:00:00 2001
+From: Colin Ian King <colin.king@canonical.com>
+Date: Fri, 20 Jan 2017 13:01:57 +0000
+Subject: [PATCH 30/48] net: sctp: fix array overrun read on sctp_timer_tbl
+
+[ Upstream commit 0e73fc9a56f22f2eec4d2b2910c649f7af67b74d ]
+
+The comparison on the timeout can lead to an array overrun
+read on sctp_timer_tbl because of an off-by-one error. Fix
+this by using < instead of <= and also compare to the array
+size rather than SCTP_EVENT_TIMEOUT_MAX.
+
+Fixes CoverityScan CID#1397639 ("Out-of-bounds read")
+
+Signed-off-by: Colin Ian King <colin.king@canonical.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/sctp/debug.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/sctp/debug.c b/net/sctp/debug.c
+index 95d7b15dad21..e371a0d90068 100644
+--- a/net/sctp/debug.c
++++ b/net/sctp/debug.c
+@@ -166,7 +166,7 @@ static const char *const sctp_timer_tbl[] = {
+ /* Lookup timer debug name. */
+ const char *sctp_tname(const sctp_subtype_t id)
+ {
+-	if (id.timeout <= SCTP_EVENT_TIMEOUT_MAX)
++	if (id.timeout < ARRAY_SIZE(sctp_timer_tbl))
+ 		return sctp_timer_tbl[id.timeout];
+ 	return "unknown_timer";
+ }
+-- 
+2.28.0
+
+
+From ca083606101930bf1bc1f539fec73f3dff869895 Mon Sep 17 00:00:00 2001
+From: Parthasarathy Bhuvaragan <parthasarathy.bhuvaragan@ericsson.com>
+Date: Tue, 24 Jan 2017 13:00:48 +0100
+Subject: [PATCH 31/48] tipc: fix cleanup at module unload
+
+[ Upstream commit 35e22e49a5d6a741ebe7f2dd280b2052c3003ef7 ]
+
+In tipc_server_stop(), we iterate over the connections with limiting
+factor as server's idr_in_use. We ignore the fact that this variable
+is decremented in tipc_close_conn(), leading to premature exit.
+
+In this commit, we iterate until the we have no connections left.
+
+Acked-by: Ying Xue <ying.xue@windriver.com>
+Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+Tested-by: John Thompson <thompa.atl@gmail.com>
+Signed-off-by: Parthasarathy Bhuvaragan <parthasarathy.bhuvaragan@ericsson.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/tipc/server.c | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/net/tipc/server.c b/net/tipc/server.c
+index 50f5b0ca7b3c..c416e5184a3f 100644
+--- a/net/tipc/server.c
++++ b/net/tipc/server.c
+@@ -618,14 +618,12 @@ int tipc_server_start(struct tipc_server *s)
+ void tipc_server_stop(struct tipc_server *s)
+ {
+ 	struct tipc_conn *con;
+-	int total = 0;
+ 	int id;
+ 
+ 	spin_lock_bh(&s->idr_lock);
+-	for (id = 0; total < s->idr_in_use; id++) {
++	for (id = 0; s->idr_in_use; id++) {
+ 		con = idr_find(&s->conn_idr, id);
+ 		if (con) {
+-			total++;
+ 			spin_unlock_bh(&s->idr_lock);
+ 			tipc_close_conn(con);
+ 			spin_lock_bh(&s->idr_lock);
+-- 
+2.28.0
+
+
+From bc42f67b73cb875d63ea450cac0ec389b7ed9f21 Mon Sep 17 00:00:00 2001
+From: Iago Abal <mail@iagoabal.eu>
+Date: Wed, 11 Jan 2017 14:00:21 +0100
+Subject: [PATCH 32/48] dmaengine: pl330: fix double lock
+
+[ Upstream commit 91539eb1fda2d530d3b268eef542c5414e54bf1a ]
+
+The static bug finder EBA (http://www.iagoabal.eu/eba/) reported the
+following double-lock bug:
+
+    Double lock:
+    1. spin_lock_irqsave(pch->lock, flags) at pl330_free_chan_resources:2236;
+    2. call to function `pl330_release_channel' immediately after;
+    3. call to function `dma_pl330_rqcb' in line 1753;
+    4. spin_lock_irqsave(pch->lock, flags) at dma_pl330_rqcb:1505.
+
+I have fixed it as suggested by Marek Szyprowski.
+
+First, I have replaced `pch->lock' with `pl330->lock' in functions
+`pl330_alloc_chan_resources' and `pl330_free_chan_resources'. This avoids
+the double-lock by acquiring a different lock than `dma_pl330_rqcb'.
+
+NOTE that, as a result, `pl330_free_chan_resources' executes
+`list_splice_tail_init' on `pch->work_list' under lock `pl330->lock',
+whereas in the rest of the code `pch->work_list' is protected by
+`pch->lock'. I don't know if this may cause race conditions. Similarly
+`pch->cyclic' is written by `pl330_alloc_chan_resources' under
+`pl330->lock' but read by `pl330_tx_submit' under `pch->lock'.
+
+Second, I have removed locking from `pl330_request_channel' and
+`pl330_release_channel' functions. Function `pl330_request_channel' is
+only called from `pl330_alloc_chan_resources', so the lock is already
+held. Function `pl330_release_channel' is called from
+`pl330_free_chan_resources', which already holds the lock, and from
+`pl330_del'. Function `pl330_del' is called in an error path of
+`pl330_probe' and at the end of `pl330_remove', but I assume that there
+cannot be concurrent accesses to the protected data at those points.
+
+Signed-off-by: Iago Abal <mail@iagoabal.eu>
+Reviewed-by: Marek Szyprowski <m.szyprowski@samsung.com>
+Signed-off-by: Vinod Koul <vinod.koul@intel.com>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/dma/pl330.c | 19 ++++++-------------
+ 1 file changed, 6 insertions(+), 13 deletions(-)
+
 diff --git a/drivers/dma/pl330.c b/drivers/dma/pl330.c
 index 8250950aab8b..66d84bcf9bbf 100644
 --- a/drivers/dma/pl330.c
@@ -442,109 +1949,236 @@ index 8250950aab8b..66d84bcf9bbf 100644
  	pm_runtime_mark_last_busy(pch->dmac->ddma.dev);
  	pm_runtime_put_autosuspend(pch->dmac->ddma.dev);
  }
-diff --git a/drivers/edac/sb_edac.c b/drivers/edac/sb_edac.c
-index ca64b174f8a3..a4e1f6939c39 100644
---- a/drivers/edac/sb_edac.c
-+++ b/drivers/edac/sb_edac.c
-@@ -1773,6 +1773,7 @@ static int ibridge_mci_bind_devs(struct mem_ctl_info *mci,
- 			break;
- 		case PCI_DEVICE_ID_INTEL_IBRIDGE_IMC_HA0_TA:
- 			pvt->pci_ta = pdev;
-+			break;
- 		case PCI_DEVICE_ID_INTEL_IBRIDGE_IMC_HA0_RAS:
- 			pvt->pci_ras = pdev;
- 			break;
-diff --git a/drivers/gpu/drm/exynos/exynos5433_drm_decon.c b/drivers/gpu/drm/exynos/exynos5433_drm_decon.c
-index fbe1b3174f75..34cebcdc2fc4 100644
---- a/drivers/gpu/drm/exynos/exynos5433_drm_decon.c
-+++ b/drivers/gpu/drm/exynos/exynos5433_drm_decon.c
-@@ -180,6 +180,8 @@ static void decon_commit(struct exynos_drm_crtc *crtc)
+-- 
+2.28.0
+
+
+From 1b7dbabf0242e7742decae10555886474de8628d Mon Sep 17 00:00:00 2001
+From: Jason Baron <jbaron@akamai.com>
+Date: Tue, 24 Jan 2017 21:49:41 -0500
+Subject: [PATCH 33/48] tcp: correct memory barrier usage in tcp_check_space()
+
+[ Upstream commit 56d806222ace4c3aeae516cd7a855340fb2839d8 ]
+
+sock_reset_flag() maps to __clear_bit() not the atomic version clear_bit().
+Thus, we need smp_mb(), smp_mb__after_atomic() is not sufficient.
+
+Fixes: 3c7151275c0c ("tcp: add memory barriers to write space paths")
+Cc: Eric Dumazet <eric.dumazet@gmail.com>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: Jason Baron <jbaron@akamai.com>
+Acked-by: Eric Dumazet <edumazet@google.com>
+Reported-by: Oleg Nesterov <oleg@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ net/ipv4/tcp_input.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 9e8d70160d20..71290fb7d500 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -4942,7 +4942,7 @@ static void tcp_check_space(struct sock *sk)
+ 	if (sock_flag(sk, SOCK_QUEUE_SHRUNK)) {
+ 		sock_reset_flag(sk, SOCK_QUEUE_SHRUNK);
+ 		/* pairs with tcp_poll() */
+-		smp_mb__after_atomic();
++		smp_mb();
+ 		if (sk->sk_socket &&
+ 		    test_bit(SOCK_NOSPACE, &sk->sk_socket->flags))
+ 			tcp_new_space(sk);
+-- 
+2.28.0
+
+
+From cc4add389789f89018fa6705cd8e02d6b6cab67d Mon Sep 17 00:00:00 2001
+From: Jan Kara <jack@suse.cz>
+Date: Wed, 8 Feb 2017 14:30:53 -0800
+Subject: [PATCH 34/48] mm: avoid returning VM_FAULT_RETRY from ->page_mkwrite
+ handlers
+
+[ Upstream commit 0911d0041c22922228ca52a977d7b0b0159fee4b ]
+
+Some ->page_mkwrite handlers may return VM_FAULT_RETRY as its return
+code (GFS2 or Lustre can definitely do this).  However VM_FAULT_RETRY
+from ->page_mkwrite is completely unhandled by the mm code and results
+in locking and writeably mapping the page which definitely is not what
+the caller wanted.
+
+Fix Lustre and block_page_mkwrite_ret() used by other filesystems
+(notably GFS2) to return VM_FAULT_NOPAGE instead which results in
+bailing out from the fault code, the CPU then retries the access, and we
+fault again effectively doing what the handler wanted.
+
+Link: http://lkml.kernel.org/r/20170203150729.15863-1-jack@suse.cz
+Signed-off-by: Jan Kara <jack@suse.cz>
+Reported-by: Al Viro <viro@ZenIV.linux.org.uk>
+Reviewed-by: Jinshan Xiong <jinshan.xiong@intel.com>
+Cc: Matthew Wilcox <willy@infradead.org>
+Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/staging/lustre/lustre/llite/llite_mmap.c | 4 +---
+ include/linux/buffer_head.h                      | 4 +---
+ 2 files changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/staging/lustre/lustre/llite/llite_mmap.c b/drivers/staging/lustre/lustre/llite/llite_mmap.c
+index 7df978371c9a..44fffbd1bc74 100644
+--- a/drivers/staging/lustre/lustre/llite/llite_mmap.c
++++ b/drivers/staging/lustre/lustre/llite/llite_mmap.c
+@@ -402,15 +402,13 @@ static int ll_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 		result = VM_FAULT_LOCKED;
+ 		break;
+ 	case -ENODATA:
++	case -EAGAIN:
+ 	case -EFAULT:
+ 		result = VM_FAULT_NOPAGE;
+ 		break;
+ 	case -ENOMEM:
+ 		result = VM_FAULT_OOM;
+ 		break;
+-	case -EAGAIN:
+-		result = VM_FAULT_RETRY;
+-		break;
+ 	default:
+ 		result = VM_FAULT_SIGBUS;
+ 		break;
+diff --git a/include/linux/buffer_head.h b/include/linux/buffer_head.h
+index 89d9aa9e79bf..6fe974dbe741 100644
+--- a/include/linux/buffer_head.h
++++ b/include/linux/buffer_head.h
+@@ -234,12 +234,10 @@ static inline int block_page_mkwrite_return(int err)
+ {
+ 	if (err == 0)
+ 		return VM_FAULT_LOCKED;
+-	if (err == -EFAULT)
++	if (err == -EFAULT || err == -EAGAIN)
+ 		return VM_FAULT_NOPAGE;
+ 	if (err == -ENOMEM)
+ 		return VM_FAULT_OOM;
+-	if (err == -EAGAIN)
+-		return VM_FAULT_RETRY;
+ 	/* -ENOSPC, -EDQUOT, -EIO ... */
+ 	return VM_FAULT_SIGBUS;
+ }
+-- 
+2.28.0
+
+
+From 5d036ccddc5d54e540c0bd4fe4c242f9e0f3aa18 Mon Sep 17 00:00:00 2001
+From: Ross Lagerwall <ross.lagerwall@citrix.com>
+Date: Wed, 8 Feb 2017 10:57:37 +0000
+Subject: [PATCH 35/48] xen-netfront: Improve error handling during
+ initialization
+
+[ Upstream commit e2e004acc7cbe3c531e752a270a74e95cde3ea48 ]
+
+This fixes a crash when running out of grant refs when creating many
+queues across many netdevs.
+
+* If creating queues fails (i.e. there are no grant refs available),
+call xenbus_dev_fatal() to ensure that the xenbus device is set to the
+closed state.
+* If no queues are created, don't call xennet_disconnect_backend as
+netdev->real_num_tx_queues will not have been set correctly.
+* If setup_netfront() fails, ensure that all the queues created are
+cleaned up, not just those that have been set up.
+* If any queues were set up and an error occurs, call
+xennet_destroy_queues() to clean up the napi context.
+* If any fatal error occurs, unregister and destroy the netdev to avoid
+leaving around a half setup network device.
+
+Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
+Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/xen-netfront.c | 29 +++++++++++------------------
+ 1 file changed, 11 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/xen-netfront.c b/drivers/net/xen-netfront.c
+index 34a062ccb11d..18263581d434 100644
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@ -1840,27 +1840,19 @@ static int talk_to_netback(struct xenbus_device *dev,
+ 		xennet_destroy_queues(info);
  
- 	/* enable output and display signal */
- 	decon_set_bits(ctx, DECON_VIDCON0, VIDCON0_ENVID | VIDCON0_ENVID_F, ~0);
-+
-+	decon_set_bits(ctx, DECON_UPDATE, STANDALONE_UPDATE_F, ~0);
+ 	err = xennet_create_queues(info, &num_queues);
+-	if (err < 0)
+-		goto destroy_ring;
++	if (err < 0) {
++		xenbus_dev_fatal(dev, err, "creating queues");
++		kfree(info->queues);
++		info->queues = NULL;
++		goto out;
++	}
+ 
+ 	/* Create shared ring, alloc event channel -- for each queue */
+ 	for (i = 0; i < num_queues; ++i) {
+ 		queue = &info->queues[i];
+ 		err = setup_netfront(dev, queue, feature_split_evtchn);
+-		if (err) {
+-			/* setup_netfront() will tidy up the current
+-			 * queue on error, but we need to clean up
+-			 * those already allocated.
+-			 */
+-			if (i > 0) {
+-				rtnl_lock();
+-				netif_set_real_num_tx_queues(info->netdev, i);
+-				rtnl_unlock();
+-				goto destroy_ring;
+-			} else {
+-				goto out;
+-			}
+-		}
++		if (err)
++			goto destroy_ring;
+ 	}
+ 
+ again:
+@@ -1950,9 +1942,10 @@ abort_transaction_no_dev_fatal:
+ 	xenbus_transaction_end(xbt, 1);
+  destroy_ring:
+ 	xennet_disconnect_backend(info);
+-	kfree(info->queues);
+-	info->queues = NULL;
++	xennet_destroy_queues(info);
+  out:
++	unregister_netdev(info->netdev);
++	xennet_free_netdev(info->netdev);
+ 	return err;
  }
  
- static void decon_win_set_pixfmt(struct decon_context *ctx, unsigned int win,
-diff --git a/drivers/md/bcache/request.c b/drivers/md/bcache/request.c
-index 6c4c7caea693..525ce56524ba 100644
---- a/drivers/md/bcache/request.c
-+++ b/drivers/md/bcache/request.c
-@@ -708,7 +708,14 @@ static void cached_dev_read_error(struct closure *cl)
- 	struct search *s = container_of(cl, struct search, cl);
- 	struct bio *bio = &s->bio.bio;
- 
--	if (s->recoverable) {
-+	/*
-+	 * If read request hit dirty data (s->read_dirty_data is true),
-+	 * then recovery a failed read request from cached device may
-+	 * get a stale data back. So read failure recovery is only
-+	 * permitted when read request hit clean data in cache device,
-+	 * or when cache read race happened.
-+	 */
-+	if (s->recoverable && !s->read_dirty_data) {
- 		/* Retry from the backing device: */
- 		trace_bcache_read_retry(s->orig_bio);
- 
-diff --git a/drivers/net/appletalk/ipddp.c b/drivers/net/appletalk/ipddp.c
-index e90c6a7333d7..2e4649655181 100644
---- a/drivers/net/appletalk/ipddp.c
-+++ b/drivers/net/appletalk/ipddp.c
-@@ -191,7 +191,7 @@ static netdev_tx_t ipddp_xmit(struct sk_buff *skb, struct net_device *dev)
-  */
- static int ipddp_create(struct ipddp_route *new_rt)
- {
--        struct ipddp_route *rt = kmalloc(sizeof(*rt), GFP_KERNEL);
-+        struct ipddp_route *rt = kzalloc(sizeof(*rt), GFP_KERNEL);
- 
-         if (rt == NULL)
-                 return -ENOMEM;
-diff --git a/drivers/net/ethernet/broadcom/bcmsysport.c b/drivers/net/ethernet/broadcom/bcmsysport.c
-index 8860e74aa28f..027705117086 100644
---- a/drivers/net/ethernet/broadcom/bcmsysport.c
-+++ b/drivers/net/ethernet/broadcom/bcmsysport.c
-@@ -1045,15 +1045,6 @@ static netdev_tx_t bcm_sysport_xmit(struct sk_buff *skb,
- 		goto out;
- 	}
- 
--	/* Insert TSB and checksum infos */
--	if (priv->tsb_en) {
--		skb = bcm_sysport_insert_tsb(skb, dev);
--		if (!skb) {
--			ret = NETDEV_TX_OK;
--			goto out;
--		}
--	}
--
- 	/* The Ethernet switch we are interfaced with needs packets to be at
- 	 * least 64 bytes (including FCS) otherwise they will be discarded when
- 	 * they enter the switch port logic. When Broadcom tags are enabled, we
-@@ -1061,13 +1052,21 @@ static netdev_tx_t bcm_sysport_xmit(struct sk_buff *skb,
- 	 * (including FCS and tag) because the length verification is done after
- 	 * the Broadcom tag is stripped off the ingress packet.
- 	 */
--	if (skb_padto(skb, ETH_ZLEN + ENET_BRCM_TAG_LEN)) {
-+	if (skb_put_padto(skb, ETH_ZLEN + ENET_BRCM_TAG_LEN)) {
- 		ret = NETDEV_TX_OK;
- 		goto out;
- 	}
- 
--	skb_len = skb->len < ETH_ZLEN + ENET_BRCM_TAG_LEN ?
--			ETH_ZLEN + ENET_BRCM_TAG_LEN : skb->len;
-+	/* Insert TSB and checksum infos */
-+	if (priv->tsb_en) {
-+		skb = bcm_sysport_insert_tsb(skb, dev);
-+		if (!skb) {
-+			ret = NETDEV_TX_OK;
-+			goto out;
-+		}
-+	}
-+
-+	skb_len = skb->len;
- 
- 	mapping = dma_map_single(kdev, skb->data, skb_len, DMA_TO_DEVICE);
- 	if (dma_mapping_error(kdev, mapping)) {
+-- 
+2.28.0
+
+
+From 33621da4d4ef5901e81b610b2a8ad565ed666035 Mon Sep 17 00:00:00 2001
+From: Rui Sousa <rui.sousa@nxp.com>
+Date: Mon, 13 Feb 2017 10:01:25 +0800
+Subject: [PATCH 36/48] net: fec: fix multicast filtering hardware setup
+
+[ Upstream commit 01f8902bcf3ff124d0aeb88a774180ebcec20ace ]
+
+Fix hardware setup of multicast address hash:
+- Never clear the hardware hash (to avoid packet loss)
+- Construct the hash register values in software and then write once
+to hardware
+
+Signed-off-by: Rui Sousa <rui.sousa@nxp.com>
+Signed-off-by: Fugang Duan <fugang.duan@nxp.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Signed-off-by: Sasha Levin <alexander.levin@verizon.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/ethernet/freescale/fec_main.c | 23 +++++++++--------------
+ 1 file changed, 9 insertions(+), 14 deletions(-)
+
 diff --git a/drivers/net/ethernet/freescale/fec_main.c b/drivers/net/ethernet/freescale/fec_main.c
 index ab716042bdd2..458e2d97d096 100644
 --- a/drivers/net/ethernet/freescale/fec_main.c
@@ -594,187 +2228,363 @@ index ab716042bdd2..458e2d97d096 100644
  }
  
  /* Set a MAC change in hardware. */
-diff --git a/drivers/net/ethernet/renesas/ravb_main.c b/drivers/net/ethernet/renesas/ravb_main.c
-index 585e90f8341d..f735dfcb64ae 100644
---- a/drivers/net/ethernet/renesas/ravb_main.c
-+++ b/drivers/net/ethernet/renesas/ravb_main.c
-@@ -831,14 +831,10 @@ static int ravb_poll(struct napi_struct *napi, int budget)
- 	/* Receive error message handling */
- 	priv->rx_over_errors =  priv->stats[RAVB_BE].rx_over_errors;
- 	priv->rx_over_errors += priv->stats[RAVB_NC].rx_over_errors;
--	if (priv->rx_over_errors != ndev->stats.rx_over_errors) {
-+	if (priv->rx_over_errors != ndev->stats.rx_over_errors)
- 		ndev->stats.rx_over_errors = priv->rx_over_errors;
--		netif_err(priv, rx_err, ndev, "Receive Descriptor Empty\n");
--	}
--	if (priv->rx_fifo_errors != ndev->stats.rx_fifo_errors) {
-+	if (priv->rx_fifo_errors != ndev->stats.rx_fifo_errors)
- 		ndev->stats.rx_fifo_errors = priv->rx_fifo_errors;
--		netif_err(priv, rx_err, ndev, "Receive FIFO Overflow\n");
--	}
- out:
- 	return budget - quota;
- }
-diff --git a/drivers/net/xen-netfront.c b/drivers/net/xen-netfront.c
-index 34a062ccb11d..fd221cc4cb79 100644
---- a/drivers/net/xen-netfront.c
-+++ b/drivers/net/xen-netfront.c
-@@ -1840,27 +1840,19 @@ static int talk_to_netback(struct xenbus_device *dev,
- 		xennet_destroy_queues(info);
+-- 
+2.28.0
+
+
+From 40012163e52ac30f64e0cbb1472040fd292f8e78 Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Wed, 6 Dec 2017 17:33:18 +0100
+Subject: [PATCH 37/48] Revert "ocfs2: should wait dio before inode lock in
+ ocfs2_setattr()"
+
+This reverts commit c4baa4a5870cb02f713def1620052bfca7a82bbb which is
+commit 28f5a8a7c033cbf3e32277f4cc9c6afd74f05300 upstream.
+
+It shouldn't be applied to the 4.4-stable tree.
+
+Ben and Alex write:
+
+> Now that ocfs2_setattr() calls this outside of the inode locked region,
+> what prevents another task adding a new dio request immediately
+> afterward?
+>
+
+In the kernel 4.6, firstly, we use the inode_lock() in do_truncate() to
+prevent another bio to be issued from this node.
+Furthermore, we use the ocfs2_rw_lock() and ocfs2_inode_lock() in ocfs2_setattr()
+to guarantee no more bio will be issued from the other nodes in this cluster.
+
+> Also, ocfs2_dio_end_io_write() was introduced in 4.6 and it looks like
+> the dio completion path didn't previously take the inode lock.  So it
+> doesn't look this fix is needed in 3.18 or 4.4.
+
+Yes, ocfs2_dio_end_io_write() was introduced in 4.6 and the problem this patch
+fixes is only exist in the kernel 4.6 and above 4.6.
+
+Reported-by: Ben Hutchings <ben.hutchings@codethink.co.uk>
+Cc: Alex Chen <alex.chen@huawei.com>
+Cc: Jun Piao <piaojun@huawei.com>
+Cc: Joseph Qi <jiangqi903@gmail.com>
+Cc: Changwei Ge <ge.changwei@h3c.com>
+Cc: Mark Fasheh <mfasheh@versity.com>
+Cc: Joel Becker <jlbec@evilplan.org>
+Cc: Junxiao Bi <junxiao.bi@oracle.com>
+Cc: Andrew Morton <akpm@linux-foundation.org>
+Cc: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ fs/ocfs2/file.c | 9 ++-------
+ 1 file changed, 2 insertions(+), 7 deletions(-)
+
+diff --git a/fs/ocfs2/file.c b/fs/ocfs2/file.c
+index 501ecc4a1ac4..1d738723a41a 100644
+--- a/fs/ocfs2/file.c
++++ b/fs/ocfs2/file.c
+@@ -1166,13 +1166,6 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
+ 	}
+ 	size_change = S_ISREG(inode->i_mode) && attr->ia_valid & ATTR_SIZE;
+ 	if (size_change) {
+-		/*
+-		 * Here we should wait dio to finish before inode lock
+-		 * to avoid a deadlock between ocfs2_setattr() and
+-		 * ocfs2_dio_end_io_write()
+-		 */
+-		inode_dio_wait(inode);
+-
+ 		status = ocfs2_rw_lock(inode, 1);
+ 		if (status < 0) {
+ 			mlog_errno(status);
+@@ -1193,6 +1186,8 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
+ 		if (status)
+ 			goto bail_unlock;
  
- 	err = xennet_create_queues(info, &num_queues);
--	if (err < 0)
--		goto destroy_ring;
-+	if (err < 0) {
-+		xenbus_dev_fatal(dev, err, "creating queues");
-+		kfree(info->queues);
-+		info->queues = NULL;
++		inode_dio_wait(inode);
++
+ 		if (i_size_read(inode) >= attr->ia_size) {
+ 			if (ocfs2_should_order_data(inode)) {
+ 				status = ocfs2_begin_ordered_truncate(inode,
+-- 
+2.28.0
+
+
+From 6a85ba4157a08350657f7e5d3bc20e9d3acc2b60 Mon Sep 17 00:00:00 2001
+From: Mike Looijmans <mike.looijmans@topic.nl>
+Date: Thu, 9 Nov 2017 13:16:46 +0100
+Subject: [PATCH 38/48] usb: hub: Cycle HUB power when initialization fails
+
+commit 973593a960ddac0f14f0d8877d2d0abe0afda795 upstream.
+
+Sometimes the USB device gets confused about the state of the initialization and
+the connection fails. In particular, the device thinks that it's already set up
+and running while the host thinks the device still needs to be configured. To
+work around this issue, power-cycle the hub's output to issue a sort of "reset"
+to the device. This makes the device restart its state machine and then the
+initialization succeeds.
+
+This fixes problems where the kernel reports a list of errors like this:
+
+usb 1-1.3: device not accepting address 19, error -71
+
+The end result is a non-functioning device. After this patch, the sequence
+becomes like this:
+
+usb 1-1.3: new high-speed USB device number 18 using ci_hdrc
+usb 1-1.3: device not accepting address 18, error -71
+usb 1-1.3: new high-speed USB device number 19 using ci_hdrc
+usb 1-1.3: device not accepting address 19, error -71
+usb 1-1-port3: attempt power cycle
+usb 1-1.3: new high-speed USB device number 21 using ci_hdrc
+usb-storage 1-1.3:1.2: USB Mass Storage device detected
+
+Signed-off-by: Mike Looijmans <mike.looijmans@topic.nl>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/core/hub.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 22e61786354a..0f38f577c047 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -4858,6 +4858,15 @@ loop:
+ 		usb_put_dev(udev);
+ 		if ((status == -ENOTCONN) || (status == -ENOTSUPP))
+ 			break;
++
++		/* When halfway through our retry count, power-cycle the port */
++		if (i == (SET_CONFIG_TRIES / 2) - 1) {
++			dev_info(&port_dev->dev, "attempt power cycle\n");
++			usb_hub_set_port_power(hdev, hub, port1, false);
++			msleep(2 * hub_power_on_good_delay(hub));
++			usb_hub_set_port_power(hdev, hub, port1, true);
++			msleep(hub_power_on_good_delay(hub));
++		}
+ 	}
+ 	if (hub->hdev->parent ||
+ 			!hcd->driver->port_handed_over ||
+-- 
+2.28.0
+
+
+From a1f03a9bcfa4becab9255c15a27caff7d9d4f667 Mon Sep 17 00:00:00 2001
+From: Yu Chen <chenyu56@huawei.com>
+Date: Fri, 1 Dec 2017 13:41:20 +0200
+Subject: [PATCH 39/48] usb: xhci: fix panic in
+ xhci_free_virt_devices_depth_first
+
+commit 80e457699a8dbdd70f2d26911e46f538645c55fc upstream.
+
+Check vdev->real_port 0 to avoid panic
+[    9.261347] [<ffffff800884a390>] xhci_free_virt_devices_depth_first+0x58/0x108
+[    9.261352] [<ffffff800884a814>] xhci_mem_cleanup+0x1bc/0x570
+[    9.261355] [<ffffff8008842de8>] xhci_stop+0x140/0x1c8
+[    9.261365] [<ffffff80087ed304>] usb_remove_hcd+0xfc/0x1d0
+[    9.261369] [<ffffff80088551c4>] xhci_plat_remove+0x6c/0xa8
+[    9.261377] [<ffffff80086e928c>] platform_drv_remove+0x2c/0x70
+[    9.261384] [<ffffff80086e6ea0>] __device_release_driver+0x80/0x108
+[    9.261387] [<ffffff80086e7a1c>] device_release_driver+0x2c/0x40
+[    9.261392] [<ffffff80086e5f28>] bus_remove_device+0xe0/0x120
+[    9.261396] [<ffffff80086e2e34>] device_del+0x114/0x210
+[    9.261399] [<ffffff80086e9e00>] platform_device_del+0x30/0xa0
+[    9.261403] [<ffffff8008810bdc>] dwc3_otg_work+0x204/0x488
+[    9.261407] [<ffffff80088133fc>] event_work+0x304/0x5b8
+[    9.261414] [<ffffff80080e31b0>] process_one_work+0x148/0x490
+[    9.261417] [<ffffff80080e3548>] worker_thread+0x50/0x4a0
+[    9.261421] [<ffffff80080e9ea0>] kthread+0xe8/0x100
+[    9.261427] [<ffffff8008083680>] ret_from_fork+0x10/0x50
+
+The problem can occur if xhci_plat_remove() is called shortly after
+xhci_plat_probe(). While xhci_free_virt_devices_depth_first been
+called before the device has been setup and get real_port initialized.
+The problem occurred on Hikey960 and was reproduced by Guenter Roeck
+on Kevin with chromeos-4.4.
+
+Fixes: ee8665e28e8d ("xhci: free xhci virtual devices with leaf nodes first")
+Cc: Guenter Roeck <groeck@google.com>
+Reviewed-by: Guenter Roeck <groeck@chromium.org>
+Tested-by: Guenter Roeck <linux@roeck-us.net>
+Signed-off-by: Fan Ning <fanning4@hisilicon.com>
+Signed-off-by: Li Rui <lirui39@hisilicon.com>
+Signed-off-by: yangdi <yangdi10@hisilicon.com>
+Signed-off-by: Yu Chen <chenyu56@huawei.com>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/host/xhci-mem.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
+index cf6bbaff42d0..6a07570a90e6 100644
+--- a/drivers/usb/host/xhci-mem.c
++++ b/drivers/usb/host/xhci-mem.c
+@@ -981,6 +981,12 @@ void xhci_free_virt_devices_depth_first(struct xhci_hcd *xhci, int slot_id)
+ 	if (!vdev)
+ 		return;
+ 
++	if (vdev->real_port == 0 ||
++			vdev->real_port > HCS_MAX_PORTS(xhci->hcs_params1)) {
++		xhci_dbg(xhci, "Bad vdev->real_port.\n");
 +		goto out;
 +	}
- 
- 	/* Create shared ring, alloc event channel -- for each queue */
- 	for (i = 0; i < num_queues; ++i) {
- 		queue = &info->queues[i];
- 		err = setup_netfront(dev, queue, feature_split_evtchn);
--		if (err) {
--			/* setup_netfront() will tidy up the current
--			 * queue on error, but we need to clean up
--			 * those already allocated.
--			 */
--			if (i > 0) {
--				rtnl_lock();
--				netif_set_real_num_tx_queues(info->netdev, i);
--				rtnl_unlock();
--				goto destroy_ring;
--			} else {
--				goto out;
--			}
--		}
-+		if (err)
-+			goto destroy_ring;
++
+ 	tt_list_head = &(xhci->rh_bw[vdev->real_port - 1].tts);
+ 	list_for_each_entry_safe(tt_info, next, tt_list_head, tt_list) {
+ 		/* is this a hub device that added a tt_info to the tts list */
+@@ -994,6 +1000,7 @@ void xhci_free_virt_devices_depth_first(struct xhci_hcd *xhci, int slot_id)
+ 			}
+ 		}
  	}
- 
- again:
-@@ -1950,9 +1942,9 @@ abort_transaction_no_dev_fatal:
- 	xenbus_transaction_end(xbt, 1);
-  destroy_ring:
- 	xennet_disconnect_backend(info);
--	kfree(info->queues);
--	info->queues = NULL;
-+	xennet_destroy_queues(info);
-  out:
-+	device_unregister(&dev->dev);
- 	return err;
++out:
+ 	/* we are now at a leaf device */
+ 	xhci_free_virt_device(xhci, slot_id);
  }
- 
-diff --git a/drivers/spi/spi-sh-msiof.c b/drivers/spi/spi-sh-msiof.c
-index d22de4c8c399..3de39bd794b6 100644
---- a/drivers/spi/spi-sh-msiof.c
-+++ b/drivers/spi/spi-sh-msiof.c
-@@ -863,7 +863,7 @@ static int sh_msiof_transfer_one(struct spi_master *master,
- 				break;
- 			copy32 = copy_bswap32;
- 		} else if (bits <= 16) {
--			if (l & 1)
-+			if (l & 3)
- 				break;
- 			copy32 = copy_wswap32;
- 		} else {
-diff --git a/drivers/staging/lustre/lustre/llite/llite_mmap.c b/drivers/staging/lustre/lustre/llite/llite_mmap.c
-index 7df978371c9a..44fffbd1bc74 100644
---- a/drivers/staging/lustre/lustre/llite/llite_mmap.c
-+++ b/drivers/staging/lustre/lustre/llite/llite_mmap.c
-@@ -402,15 +402,13 @@ static int ll_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
- 		result = VM_FAULT_LOCKED;
- 		break;
- 	case -ENODATA:
-+	case -EAGAIN:
- 	case -EFAULT:
- 		result = VM_FAULT_NOPAGE;
- 		break;
- 	case -ENOMEM:
- 		result = VM_FAULT_OOM;
- 		break;
--	case -EAGAIN:
--		result = VM_FAULT_RETRY;
--		break;
- 	default:
- 		result = VM_FAULT_SIGBUS;
- 		break;
-diff --git a/drivers/tty/serial/8250/8250_fintek.c b/drivers/tty/serial/8250/8250_fintek.c
-index 89474399ab89..1d5a9e5fb069 100644
---- a/drivers/tty/serial/8250/8250_fintek.c
-+++ b/drivers/tty/serial/8250/8250_fintek.c
-@@ -117,7 +117,7 @@ static int fintek_8250_rs485_config(struct uart_port *port,
- 
- 	if ((!!(rs485->flags & SER_RS485_RTS_ON_SEND)) ==
- 			(!!(rs485->flags & SER_RS485_RTS_AFTER_SEND)))
--		rs485->flags &= SER_RS485_ENABLED;
-+		rs485->flags &= ~SER_RS485_ENABLED;
- 	else
- 		config |= RS485_URA;
- 
-diff --git a/drivers/tty/serial/8250/8250_pci.c b/drivers/tty/serial/8250/8250_pci.c
-index cf3da51a3536..7025f47fa284 100644
---- a/drivers/tty/serial/8250/8250_pci.c
-+++ b/drivers/tty/serial/8250/8250_pci.c
-@@ -5797,6 +5797,9 @@ static struct pci_device_id serial_pci_tbl[] = {
- 	{ PCI_DEVICE(0x1601, 0x0800), .driver_data = pbn_b0_4_1250000 },
- 	{ PCI_DEVICE(0x1601, 0xa801), .driver_data = pbn_b0_4_1250000 },
- 
-+	/* Amazon PCI serial device */
-+	{ PCI_DEVICE(0x1d0f, 0x8250), .driver_data = pbn_b0_1_115200 },
-+
- 	/*
- 	 * These entries match devices with class COMMUNICATION_SERIAL,
- 	 * COMMUNICATION_MODEM or COMMUNICATION_MULTISERIAL
-diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
-index 56ccbcefdd85..d42d66b72d5a 100644
---- a/drivers/tty/serial/8250/8250_port.c
-+++ b/drivers/tty/serial/8250/8250_port.c
-@@ -2223,8 +2223,11 @@ static void serial8250_set_divisor(struct uart_port *port, unsigned int baud,
- 	serial_dl_write(up, quot);
- 
- 	/* XR17V35x UARTs have an extra fractional divisor register (DLD) */
--	if (up->port.type == PORT_XR17V35X)
-+	if (up->port.type == PORT_XR17V35X) {
-+		/* Preserve bits not related to baudrate; DLD[7:4]. */
-+		quot_frac |= serial_port_in(port, 0x2) & 0xf0;
- 		serial_port_out(port, 0x2, quot_frac);
-+	}
- }
- 
- static unsigned int
-diff --git a/drivers/tty/sysrq.c b/drivers/tty/sysrq.c
-index 1fa4128eb88e..b07f864f68e8 100644
---- a/drivers/tty/sysrq.c
-+++ b/drivers/tty/sysrq.c
-@@ -237,8 +237,10 @@ static void sysrq_handle_showallcpus(int key)
- 	 * architecture has no support for it:
- 	 */
- 	if (!trigger_all_cpu_backtrace()) {
--		struct pt_regs *regs = get_irq_regs();
-+		struct pt_regs *regs = NULL;
- 
-+		if (in_irq())
-+			regs = get_irq_regs();
- 		if (regs) {
- 			pr_info("CPU%d:\n", smp_processor_id());
- 			show_regs(regs);
-@@ -257,7 +259,10 @@ static struct sysrq_key_op sysrq_showallcpus_op = {
- 
- static void sysrq_handle_showregs(int key)
- {
--	struct pt_regs *regs = get_irq_regs();
-+	struct pt_regs *regs = NULL;
-+
-+	if (in_irq())
-+		regs = get_irq_regs();
- 	if (regs)
- 		show_regs(regs);
- 	perf_event_print_debug();
+-- 
+2.28.0
+
+
+From ddaa1ae2eb7ffb4e270fdc9593c3d1138f61fb31 Mon Sep 17 00:00:00 2001
+From: Mathias Nyman <mathias.nyman@linux.intel.com>
+Date: Fri, 12 Feb 2016 16:40:14 +0200
+Subject: [PATCH 40/48] usb: Add USB 3.1 Precision time measurement capability
+ descriptor support
+
+commit faee822c5a7ab99de25cd34fcde3f8d37b6b9923 upstream.
+
+USB 3.1 devices that support precision time measurement have an
+additional PTM cabaility descriptor as part of the full BOS descriptor
+
+Look for this descriptor while parsing the BOS descriptor, and store it in
+struct usb_hub_bos if it exists.
+
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/core/config.c    |  3 +++
+ include/linux/usb.h          |  1 +
+ include/uapi/linux/usb/ch9.h | 10 ++++++++++
+ 3 files changed, 14 insertions(+)
+
 diff --git a/drivers/usb/core/config.c b/drivers/usb/core/config.c
-index 5172bec612eb..b1ece1f618c8 100644
+index 5172bec612eb..b568a1c442ff 100644
+--- a/drivers/usb/core/config.c
++++ b/drivers/usb/core/config.c
+@@ -959,6 +959,9 @@ int usb_get_bos_descriptor(struct usb_device *dev)
+ 			dev->bos->ss_id =
+ 				(struct usb_ss_container_id_descriptor *)buffer;
+ 			break;
++		case USB_PTM_CAP_TYPE:
++			dev->bos->ptm_cap =
++				(struct usb_ptm_cap_descriptor *)buffer;
+ 		default:
+ 			break;
+ 		}
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 8c75af6b7d5b..092b5658b9c3 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -330,6 +330,7 @@ struct usb_host_bos {
+ 	struct usb_ss_cap_descriptor	*ss_cap;
+ 	struct usb_ssp_cap_descriptor	*ssp_cap;
+ 	struct usb_ss_container_id_descriptor	*ss_id;
++	struct usb_ptm_cap_descriptor	*ptm_cap;
+ };
+ 
+ int __usb_get_extra_descriptor(char *buffer, unsigned size,
+diff --git a/include/uapi/linux/usb/ch9.h b/include/uapi/linux/usb/ch9.h
+index 91ab75c1013c..0ae800f60021 100644
+--- a/include/uapi/linux/usb/ch9.h
++++ b/include/uapi/linux/usb/ch9.h
+@@ -895,6 +895,16 @@ struct usb_ssp_cap_descriptor {
+ #define USB_SSP_SUBLINK_SPEED_LSM	(0xff << 16)	/* Lanespeed mantissa */
+ } __attribute__((packed));
+ 
++/*
++ * Precision time measurement capability descriptor: advertised by devices and
++ * hubs that support PTM
++ */
++#define	USB_PTM_CAP_TYPE	0xb
++struct usb_ptm_cap_descriptor {
++	__u8  bLength;
++	__u8  bDescriptorType;
++	__u8  bDevCapabilityType;
++} __attribute__((packed));
+ 
+ /*-------------------------------------------------------------------------*/
+ 
+-- 
+2.28.0
+
+
+From f044af8c1dc3f12d933dfae4e51ab2ebab95e5db Mon Sep 17 00:00:00 2001
+From: John Youn <John.Youn@synopsys.com>
+Date: Fri, 5 Feb 2016 17:05:12 -0800
+Subject: [PATCH 41/48] usb: ch9: Add size macro for SSP dev cap descriptor
+
+commit 446fa3a95df1e8b78f25e1babc41e46edd200821 upstream.
+
+The SuperspeedPlus Device Capability Descriptor has a variable size
+depending on the number of sublink speed attributes.
+
+This patch adds a macro to calculate that size. The macro takes one
+argument, the Sublink Speed Attribute Count (SSAC) as reported by the
+descriptor in bmAttributes[4:0].
+
+See USB 3.1 9.6.2.5, Table 9-19.
+
+Signed-off-by: John Youn <johnyoun@synopsys.com>
+Signed-off-by: Felipe Balbi <balbi@kernel.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/uapi/linux/usb/ch9.h | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/include/uapi/linux/usb/ch9.h b/include/uapi/linux/usb/ch9.h
+index 0ae800f60021..3e4f8af54611 100644
+--- a/include/uapi/linux/usb/ch9.h
++++ b/include/uapi/linux/usb/ch9.h
+@@ -906,6 +906,12 @@ struct usb_ptm_cap_descriptor {
+ 	__u8  bDevCapabilityType;
+ } __attribute__((packed));
+ 
++/*
++ * The size of the descriptor for the Sublink Speed Attribute Count
++ * (SSAC) specified in bmAttributes[4:0].
++ */
++#define USB_DT_USB_SSP_CAP_SIZE(ssac)	(16 + ssac * 4)
++
+ /*-------------------------------------------------------------------------*/
+ 
+ /* USB_DT_WIRELESS_ENDPOINT_COMP:  companion descriptor associated with
+-- 
+2.28.0
+
+
+From 9d812f7bef8c01cd8ca1b57e1e3c3df4bc8ffd34 Mon Sep 17 00:00:00 2001
+From: Masakazu Mokuno <masakazu.mokuno@gmail.com>
+Date: Fri, 10 Nov 2017 01:25:50 +0900
+Subject: [PATCH 42/48] USB: core: Add type-specific length check of BOS
+ descriptors
+
+commit 81cf4a45360f70528f1f64ba018d61cb5767249a upstream.
+
+As most of BOS descriptors are longer in length than their header
+'struct usb_dev_cap_header', comparing solely with it is not sufficient
+to avoid out-of-bounds access to BOS descriptors.
+
+This patch adds descriptor type specific length check in
+usb_get_bos_descriptor() to fix the issue.
+
+Signed-off-by: Masakazu Mokuno <masakazu.mokuno@gmail.com>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/core/config.c    | 28 ++++++++++++++++++++++++----
+ include/uapi/linux/usb/ch9.h |  3 +++
+ 2 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/usb/core/config.c b/drivers/usb/core/config.c
+index b568a1c442ff..b1ece1f618c8 100644
 --- a/drivers/usb/core/config.c
 +++ b/drivers/usb/core/config.c
 @@ -871,14 +871,25 @@ void usb_release_bos_descriptor(struct usb_device *dev)
@@ -827,7 +2637,7 @@ index 5172bec612eb..b1ece1f618c8 100644
  		case USB_CAP_TYPE_WIRELESS_USB:
  			/* Wireless USB cap descriptor is handled by wusb */
  			break;
-@@ -952,13 +969,19 @@ int usb_get_bos_descriptor(struct usb_device *dev)
+@@ -952,8 +969,11 @@ int usb_get_bos_descriptor(struct usb_device *dev)
  				(struct usb_ss_cap_descriptor *)buffer;
  			break;
  		case USB_SSP_CAP_TYPE:
@@ -841,19 +2651,53 @@ index 5172bec612eb..b1ece1f618c8 100644
  			break;
  		case CONTAINER_ID_TYPE:
  			dev->bos->ss_id =
- 				(struct usb_ss_container_id_descriptor *)buffer;
- 			break;
-+		case USB_PTM_CAP_TYPE:
-+			dev->bos->ptm_cap =
-+				(struct usb_ptm_cap_descriptor *)buffer;
- 		default:
- 			break;
- 		}
+diff --git a/include/uapi/linux/usb/ch9.h b/include/uapi/linux/usb/ch9.h
+index 3e4f8af54611..ec6c8543732f 100644
+--- a/include/uapi/linux/usb/ch9.h
++++ b/include/uapi/linux/usb/ch9.h
+@@ -812,6 +812,8 @@ struct usb_wireless_cap_descriptor {	/* Ultra Wide Band */
+ 	__u8  bReserved;
+ } __attribute__((packed));
+ 
++#define USB_DT_USB_WIRELESS_CAP_SIZE	11
++
+ /* USB 2.0 Extension descriptor */
+ #define	USB_CAP_TYPE_EXT		2
+ 
+@@ -1007,6 +1009,7 @@ enum usb3_link_state {
+ 	USB3_LPM_U3
+ };
+ 
++#define USB_DT_USB_PTM_ID_SIZE		3
+ /*
+  * A U1 timeout of 0x0 means the parent hub will reject any transitions to U1.
+  * 0xff means the parent hub will accept transitions to U1, but will not
+-- 
+2.28.0
+
+
+From 2ee8d2acf3efc2ddcd571845e8663a101cdde86e Mon Sep 17 00:00:00 2001
+From: Mateusz Berezecki <mateuszb@fastmail.fm>
+Date: Wed, 21 Dec 2016 09:19:14 -0800
+Subject: [PATCH 43/48] USB: Increase usbfs transfer limit
+
+commit 1129d270cbfbb7e2b1ec3dede4a13930bdd10e41 upstream.
+
+Promote a variable keeping track of USB transfer memory usage to a
+wider data type and allow for higher bandwidth transfers from a large
+number of USB devices connected to a single host.
+
+Signed-off-by: Mateusz Berezecki <mateuszb@fastmail.fm>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/core/devio.c | 43 +++++++++++++++-------------------------
+ 1 file changed, 16 insertions(+), 27 deletions(-)
+
 diff --git a/drivers/usb/core/devio.c b/drivers/usb/core/devio.c
-index f4c3a37e00ba..ad2e6d235c30 100644
+index f4c3a37e00ba..77e045cf0e4f 100644
 --- a/drivers/usb/core/devio.c
 +++ b/drivers/usb/core/devio.c
-@@ -113,42 +113,38 @@ enum snoop_when {
+@@ -113,42 +113,35 @@ enum snoop_when {
  #define USB_DEVICE_DEV		MKDEV(USB_DEVICE_MAJOR, 0)
  
  /* Limit on the total amount of memory we can allocate for transfers */
@@ -863,10 +2707,9 @@ index f4c3a37e00ba..ad2e6d235c30 100644
  MODULE_PARM_DESC(usbfs_memory_mb,
  		"maximum MB allowed for usbfs buffers (0 = no limit)");
  
- /* Hard limit, necessary to avoid arithmetic overflow */
+-/* Hard limit, necessary to avoid arithmetic overflow */
 -#define USBFS_XFER_MAX		(UINT_MAX / 2 - 1000000)
-+#define USBFS_XFER_MAX         (UINT_MAX / 2 - 1000000)
- 
+-
 -static atomic_t usbfs_memory_usage;	/* Total memory currently allocated */
 +static atomic64_t usbfs_memory_usage;	/* Total memory currently allocated */
  
@@ -912,7 +2755,7 @@ index f4c3a37e00ba..ad2e6d235c30 100644
  }
  
  static int connected(struct usb_dev_state *ps)
-@@ -1077,7 +1073,7 @@ static int proc_bulk(struct usb_dev_state *ps, void __user *arg)
+@@ -1077,7 +1070,7 @@ static int proc_bulk(struct usb_dev_state *ps, void __user *arg)
  	if (!usb_maxpacket(dev, pipe, !(bulk.ep & USB_DIR_IN)))
  		return -EINVAL;
  	len1 = bulk.len;
@@ -921,7 +2764,100 @@ index f4c3a37e00ba..ad2e6d235c30 100644
  		return -EINVAL;
  	ret = usbfs_increase_memory_usage(len1 + sizeof(struct urb));
  	if (ret)
-@@ -1297,13 +1293,19 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
+@@ -1424,10 +1417,6 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
+ 		return -EINVAL;
+ 	}
+ 
+-	if (uurb->buffer_length >= USBFS_XFER_MAX) {
+-		ret = -EINVAL;
+-		goto error;
+-	}
+ 	if (uurb->buffer_length > 0 &&
+ 			!access_ok(is_in ? VERIFY_WRITE : VERIFY_READ,
+ 				uurb->buffer, uurb->buffer_length)) {
+-- 
+2.28.0
+
+
+From c0493eb552e0ad84c86e8fb3b9b9817c57a52d18 Mon Sep 17 00:00:00 2001
+From: Dan Carpenter <dan.carpenter@oracle.com>
+Date: Fri, 22 Sep 2017 23:43:25 +0300
+Subject: [PATCH 44/48] USB: devio: Prevent integer overflow in
+ proc_do_submiturb()
+
+commit 57999d1107c1e60c2ca7088f2ac0f819e2f554b3 upstream.
+
+There used to be an integer overflow check in proc_do_submiturb() but
+we removed it.  It turns out that it's still required.  The
+uurb->buffer_length variable is a signed integer and it's controlled by
+the user.  It can lead to an integer overflow when we do:
+
+	num_sgs = DIV_ROUND_UP(uurb->buffer_length, USB_SG_SIZE);
+
+If we strip away the macro then that line looks like this:
+
+	num_sgs = (uurb->buffer_length + USB_SG_SIZE - 1) / USB_SG_SIZE;
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+It's the first addition which can overflow.
+
+Fixes: 1129d270cbfb ("USB: Increase usbfs transfer limit")
+Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/core/devio.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/usb/core/devio.c b/drivers/usb/core/devio.c
+index 77e045cf0e4f..7e7b73f227d8 100644
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -118,6 +118,9 @@ module_param(usbfs_memory_mb, uint, 0644);
+ MODULE_PARM_DESC(usbfs_memory_mb,
+ 		"maximum MB allowed for usbfs buffers (0 = no limit)");
+ 
++/* Hard limit, necessary to avoid arithmetic overflow */
++#define USBFS_XFER_MAX         (UINT_MAX / 2 - 1000000)
++
+ static atomic64_t usbfs_memory_usage;	/* Total memory currently allocated */
+ 
+ /* Check whether it's okay to allocate more memory for a transfer */
+@@ -1298,6 +1301,8 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
+ 				USBDEVFS_URB_ZERO_PACKET |
+ 				USBDEVFS_URB_NO_INTERRUPT))
+ 		return -EINVAL;
++	if ((unsigned int)uurb->buffer_length >= USBFS_XFER_MAX)
++		return -EINVAL;
+ 	if (uurb->buffer_length > 0 && !uurb->buffer)
+ 		return -EINVAL;
+ 	if (!(uurb->type == USBDEVFS_URB_TYPE_CONTROL &&
+-- 
+2.28.0
+
+
+From 43135100f117f73177ed8687cdead02772b4e09f Mon Sep 17 00:00:00 2001
+From: Oliver Neukum <oneukum@suse.com>
+Date: Thu, 23 Nov 2017 16:39:52 +0100
+Subject: [PATCH 45/48] USB: usbfs: Filter flags passed in from user space
+
+commit 446f666da9f019ce2ffd03800995487e79a91462 upstream.
+
+USBDEVFS_URB_ISO_ASAP must be accepted only for ISO endpoints.
+Improve sanity checking.
+
+Reported-by: Andrey Konovalov <andreyknvl@google.com>
+Signed-off-by: Oliver Neukum <oneukum@suse.com>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/core/devio.c | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/usb/core/devio.c b/drivers/usb/core/devio.c
+index 7e7b73f227d8..ad2e6d235c30 100644
+--- a/drivers/usb/core/devio.c
++++ b/drivers/usb/core/devio.c
+@@ -1293,14 +1293,18 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
  	int number_of_packets = 0;
  	unsigned int stream_id = 0;
  	void *buf;
@@ -933,6 +2869,7 @@ index f4c3a37e00ba..ad2e6d235c30 100644
  				USBDEVFS_URB_NO_FSBR |
  				USBDEVFS_URB_ZERO_PACKET |
 -				USBDEVFS_URB_NO_INTERRUPT))
+-		return -EINVAL;
 +				USBDEVFS_URB_NO_INTERRUPT;
 +	/* USBDEVFS_URB_ISO_ASAP is a special case */
 +	if (uurb->type == USBDEVFS_URB_TYPE_ISO)
@@ -941,55 +2878,36 @@ index f4c3a37e00ba..ad2e6d235c30 100644
 +	if (uurb->flags & ~mask)
 +			return -EINVAL;
 +
-+	if ((unsigned int)uurb->buffer_length >= USBFS_XFER_MAX)
+ 	if ((unsigned int)uurb->buffer_length >= USBFS_XFER_MAX)
  		return -EINVAL;
  	if (uurb->buffer_length > 0 && !uurb->buffer)
- 		return -EINVAL;
-@@ -1424,10 +1426,6 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
- 		return -EINVAL;
- 	}
- 
--	if (uurb->buffer_length >= USBFS_XFER_MAX) {
--		ret = -EINVAL;
--		goto error;
--	}
- 	if (uurb->buffer_length > 0 &&
- 			!access_ok(is_in ? VERIFY_WRITE : VERIFY_READ,
- 				uurb->buffer, uurb->buffer_length)) {
-diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
-index 22e61786354a..0f38f577c047 100644
---- a/drivers/usb/core/hub.c
-+++ b/drivers/usb/core/hub.c
-@@ -4858,6 +4858,15 @@ loop:
- 		usb_put_dev(udev);
- 		if ((status == -ENOTCONN) || (status == -ENOTSUPP))
- 			break;
-+
-+		/* When halfway through our retry count, power-cycle the port */
-+		if (i == (SET_CONFIG_TRIES / 2) - 1) {
-+			dev_info(&port_dev->dev, "attempt power cycle\n");
-+			usb_hub_set_port_power(hdev, hub, port1, false);
-+			msleep(2 * hub_power_on_good_delay(hub));
-+			usb_hub_set_port_power(hdev, hub, port1, true);
-+			msleep(hub_power_on_good_delay(hub));
-+		}
- 	}
- 	if (hub->hdev->parent ||
- 			!hcd->driver->port_handed_over ||
-diff --git a/drivers/usb/core/quirks.c b/drivers/usb/core/quirks.c
-index 37c418e581fb..50010282c010 100644
---- a/drivers/usb/core/quirks.c
-+++ b/drivers/usb/core/quirks.c
-@@ -151,6 +151,9 @@ static const struct usb_device_id usb_quirk_list[] = {
- 	/* appletouch */
- 	{ USB_DEVICE(0x05ac, 0x021a), .driver_info = USB_QUIRK_RESET_RESUME },
- 
-+	/* Genesys Logic hub, internally used by KY-688 USB 3.1 Type-C Hub */
-+	{ USB_DEVICE(0x05e3, 0x0612), .driver_info = USB_QUIRK_NO_LPM },
-+
- 	/* Genesys Logic hub, internally used by Moshi USB to Ethernet Adapter */
- 	{ USB_DEVICE(0x05e3, 0x0616), .driver_info = USB_QUIRK_NO_LPM },
- 
+-- 
+2.28.0
+
+
+From e1cadf7c4af2e51f5ac6f078a128d4b71bbaa601 Mon Sep 17 00:00:00 2001
+From: Colin Ian King <colin.king@canonical.com>
+Date: Tue, 7 Nov 2017 16:45:04 +0000
+Subject: [PATCH 46/48] usb: host: fix incorrect updating of offset
+
+commit 1d5a31582ef046d3b233f0da1a68ae26519b2f0a upstream.
+
+The variable temp is incorrectly being updated, instead it should
+be offset otherwise the loop just reads the same capability value
+and loops forever.  Thanks to Alan Stern for pointing out the
+correct fix to my original fix.  Fix also cleans up clang warning:
+
+drivers/usb/host/ehci-dbg.c:840:4: warning: Value stored to 'temp'
+is never read
+
+Fixes: d49d43174400 ("USB: misc ehci updates")
+Signed-off-by: Colin Ian King <colin.king@canonical.com>
+Acked-by: Alan Stern <stern@rowland.harvard.edu>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/host/ehci-dbg.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
 diff --git a/drivers/usb/host/ehci-dbg.c b/drivers/usb/host/ehci-dbg.c
 index b26b96e25a13..8e0b9377644b 100644
 --- a/drivers/usb/host/ehci-dbg.c
@@ -1003,362 +2921,75 @@ index b26b96e25a13..8e0b9377644b 100644
  		}
  	}
  #endif
-diff --git a/drivers/usb/host/xhci-mem.c b/drivers/usb/host/xhci-mem.c
-index cf6bbaff42d0..6a07570a90e6 100644
---- a/drivers/usb/host/xhci-mem.c
-+++ b/drivers/usb/host/xhci-mem.c
-@@ -981,6 +981,12 @@ void xhci_free_virt_devices_depth_first(struct xhci_hcd *xhci, int slot_id)
- 	if (!vdev)
- 		return;
- 
-+	if (vdev->real_port == 0 ||
-+			vdev->real_port > HCS_MAX_PORTS(xhci->hcs_params1)) {
-+		xhci_dbg(xhci, "Bad vdev->real_port.\n");
-+		goto out;
-+	}
-+
- 	tt_list_head = &(xhci->rh_bw[vdev->real_port - 1].tts);
- 	list_for_each_entry_safe(tt_info, next, tt_list_head, tt_list) {
- 		/* is this a hub device that added a tt_info to the tts list */
-@@ -994,6 +1000,7 @@ void xhci_free_virt_devices_depth_first(struct xhci_hcd *xhci, int slot_id)
- 			}
- 		}
- 	}
-+out:
- 	/* we are now at a leaf device */
- 	xhci_free_virt_device(xhci, slot_id);
- }
-diff --git a/drivers/usb/phy/phy-tahvo.c b/drivers/usb/phy/phy-tahvo.c
-index ab5d364f6e8c..335a1ef35224 100644
---- a/drivers/usb/phy/phy-tahvo.c
-+++ b/drivers/usb/phy/phy-tahvo.c
-@@ -368,7 +368,8 @@ static int tahvo_usb_probe(struct platform_device *pdev)
- 	tu->extcon = devm_extcon_dev_allocate(&pdev->dev, tahvo_cable);
- 	if (IS_ERR(tu->extcon)) {
- 		dev_err(&pdev->dev, "failed to allocate memory for extcon\n");
--		return -ENOMEM;
-+		ret = PTR_ERR(tu->extcon);
-+		goto err_disable_clk;
- 	}
- 
- 	ret = devm_extcon_dev_register(&pdev->dev, tu->extcon);
-diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
-index db3d34c2c82e..ffa8ec917ff5 100644
---- a/drivers/usb/serial/option.c
-+++ b/drivers/usb/serial/option.c
-@@ -241,6 +241,7 @@ static void option_instat_callback(struct urb *urb);
- /* These Quectel products use Quectel's vendor ID */
- #define QUECTEL_PRODUCT_EC21			0x0121
- #define QUECTEL_PRODUCT_EC25			0x0125
-+#define QUECTEL_PRODUCT_BG96			0x0296
- 
- #define CMOTECH_VENDOR_ID			0x16d8
- #define CMOTECH_PRODUCT_6001			0x6001
-@@ -1185,6 +1186,8 @@ static const struct usb_device_id option_ids[] = {
- 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
- 	{ USB_DEVICE(QUECTEL_VENDOR_ID, QUECTEL_PRODUCT_EC25),
- 	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
-+	{ USB_DEVICE(QUECTEL_VENDOR_ID, QUECTEL_PRODUCT_BG96),
-+	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
- 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6001) },
- 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CMU_300) },
- 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6003),
-diff --git a/drivers/usb/storage/uas-detect.h b/drivers/usb/storage/uas-detect.h
-index a155cd02bce2..ecc83c405a8b 100644
---- a/drivers/usb/storage/uas-detect.h
-+++ b/drivers/usb/storage/uas-detect.h
-@@ -111,6 +111,10 @@ static int uas_use_uas_driver(struct usb_interface *intf,
- 		}
- 	}
- 
-+	/* All Seagate disk enclosures have broken ATA pass-through support */
-+	if (le16_to_cpu(udev->descriptor.idVendor) == 0x0bc2)
-+		flags |= US_FL_NO_ATA_1X;
-+
- 	usb_stor_adjust_quirks(udev, &flags);
- 
- 	if (flags & US_FL_IGNORE_UAS) {
-diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
-index 6fef53f18dcf..8ef6f70c9e25 100644
---- a/fs/nfs/nfs4proc.c
-+++ b/fs/nfs/nfs4proc.c
-@@ -38,7 +38,6 @@
- #include <linux/mm.h>
- #include <linux/delay.h>
- #include <linux/errno.h>
--#include <linux/file.h>
- #include <linux/string.h>
- #include <linux/ratelimit.h>
- #include <linux/printk.h>
-@@ -5738,7 +5737,6 @@ static struct nfs4_lockdata *nfs4_alloc_lockdata(struct file_lock *fl,
- 	p->server = server;
- 	atomic_inc(&lsp->ls_count);
- 	p->ctx = get_nfs_open_context(ctx);
--	get_file(fl->fl_file);
- 	memcpy(&p->fl, fl, sizeof(p->fl));
- 	return p;
- out_free_seqid:
-@@ -5851,7 +5849,6 @@ static void nfs4_lock_release(void *calldata)
- 		nfs_free_seqid(data->arg.lock_seqid);
- 	nfs4_put_lock_state(data->lsp);
- 	put_nfs_open_context(data->ctx);
--	fput(data->fl.fl_file);
- 	kfree(data);
- 	dprintk("%s: done!\n", __func__);
- }
-diff --git a/fs/nfs/nfs4state.c b/fs/nfs/nfs4state.c
-index e8d1d6c5000c..9a0b219ff74d 100644
---- a/fs/nfs/nfs4state.c
-+++ b/fs/nfs/nfs4state.c
-@@ -1680,7 +1680,6 @@ static int nfs4_recovery_handle_error(struct nfs_client *clp, int error)
- 			break;
- 		case -NFS4ERR_STALE_CLIENTID:
- 			set_bit(NFS4CLNT_LEASE_EXPIRED, &clp->cl_state);
--			nfs4_state_clear_reclaim_reboot(clp);
- 			nfs4_state_start_reclaim_reboot(clp);
- 			break;
- 		case -NFS4ERR_EXPIRED:
-diff --git a/fs/ocfs2/file.c b/fs/ocfs2/file.c
-index 501ecc4a1ac4..1d738723a41a 100644
---- a/fs/ocfs2/file.c
-+++ b/fs/ocfs2/file.c
-@@ -1166,13 +1166,6 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
- 	}
- 	size_change = S_ISREG(inode->i_mode) && attr->ia_valid & ATTR_SIZE;
- 	if (size_change) {
--		/*
--		 * Here we should wait dio to finish before inode lock
--		 * to avoid a deadlock between ocfs2_setattr() and
--		 * ocfs2_dio_end_io_write()
--		 */
--		inode_dio_wait(inode);
--
- 		status = ocfs2_rw_lock(inode, 1);
- 		if (status < 0) {
- 			mlog_errno(status);
-@@ -1193,6 +1186,8 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
- 		if (status)
- 			goto bail_unlock;
- 
-+		inode_dio_wait(inode);
-+
- 		if (i_size_read(inode) >= attr->ia_size) {
- 			if (ocfs2_should_order_data(inode)) {
- 				status = ocfs2_begin_ordered_truncate(inode,
-diff --git a/include/linux/buffer_head.h b/include/linux/buffer_head.h
-index 89d9aa9e79bf..6fe974dbe741 100644
---- a/include/linux/buffer_head.h
-+++ b/include/linux/buffer_head.h
-@@ -234,12 +234,10 @@ static inline int block_page_mkwrite_return(int err)
- {
- 	if (err == 0)
- 		return VM_FAULT_LOCKED;
--	if (err == -EFAULT)
-+	if (err == -EFAULT || err == -EAGAIN)
- 		return VM_FAULT_NOPAGE;
- 	if (err == -ENOMEM)
- 		return VM_FAULT_OOM;
--	if (err == -EAGAIN)
--		return VM_FAULT_RETRY;
- 	/* -ENOSPC, -EDQUOT, -EIO ... */
- 	return VM_FAULT_SIGBUS;
- }
-diff --git a/include/linux/usb.h b/include/linux/usb.h
-index 8c75af6b7d5b..092b5658b9c3 100644
---- a/include/linux/usb.h
-+++ b/include/linux/usb.h
-@@ -330,6 +330,7 @@ struct usb_host_bos {
- 	struct usb_ss_cap_descriptor	*ss_cap;
- 	struct usb_ssp_cap_descriptor	*ssp_cap;
- 	struct usb_ss_container_id_descriptor	*ss_id;
-+	struct usb_ptm_cap_descriptor	*ptm_cap;
- };
- 
- int __usb_get_extra_descriptor(char *buffer, unsigned size,
-diff --git a/include/uapi/linux/usb/ch9.h b/include/uapi/linux/usb/ch9.h
-index 91ab75c1013c..ec6c8543732f 100644
---- a/include/uapi/linux/usb/ch9.h
-+++ b/include/uapi/linux/usb/ch9.h
-@@ -812,6 +812,8 @@ struct usb_wireless_cap_descriptor {	/* Ultra Wide Band */
- 	__u8  bReserved;
- } __attribute__((packed));
- 
-+#define USB_DT_USB_WIRELESS_CAP_SIZE	11
-+
- /* USB 2.0 Extension descriptor */
- #define	USB_CAP_TYPE_EXT		2
- 
-@@ -895,6 +897,22 @@ struct usb_ssp_cap_descriptor {
- #define USB_SSP_SUBLINK_SPEED_LSM	(0xff << 16)	/* Lanespeed mantissa */
- } __attribute__((packed));
- 
-+/*
-+ * Precision time measurement capability descriptor: advertised by devices and
-+ * hubs that support PTM
-+ */
-+#define	USB_PTM_CAP_TYPE	0xb
-+struct usb_ptm_cap_descriptor {
-+	__u8  bLength;
-+	__u8  bDescriptorType;
-+	__u8  bDevCapabilityType;
-+} __attribute__((packed));
-+
-+/*
-+ * The size of the descriptor for the Sublink Speed Attribute Count
-+ * (SSAC) specified in bmAttributes[4:0].
-+ */
-+#define USB_DT_USB_SSP_CAP_SIZE(ssac)	(16 + ssac * 4)
- 
- /*-------------------------------------------------------------------------*/
- 
-@@ -991,6 +1009,7 @@ enum usb3_link_state {
- 	USB3_LPM_U3
- };
- 
-+#define USB_DT_USB_PTM_ID_SIZE		3
- /*
-  * A U1 timeout of 0x0 means the parent hub will reject any transitions to U1.
-  * 0xff means the parent hub will accept transitions to U1, but will not
-diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
-index 9e8d70160d20..71290fb7d500 100644
---- a/net/ipv4/tcp_input.c
-+++ b/net/ipv4/tcp_input.c
-@@ -4942,7 +4942,7 @@ static void tcp_check_space(struct sock *sk)
- 	if (sock_flag(sk, SOCK_QUEUE_SHRUNK)) {
- 		sock_reset_flag(sk, SOCK_QUEUE_SHRUNK);
- 		/* pairs with tcp_poll() */
--		smp_mb__after_atomic();
-+		smp_mb();
- 		if (sk->sk_socket &&
- 		    test_bit(SOCK_NOSPACE, &sk->sk_socket->flags))
- 			tcp_new_space(sk);
-diff --git a/net/ipv6/ip6_vti.c b/net/ipv6/ip6_vti.c
-index 7ebb14def2cb..f58ad70f693e 100644
---- a/net/ipv6/ip6_vti.c
-+++ b/net/ipv6/ip6_vti.c
-@@ -189,12 +189,12 @@ static int vti6_tnl_create2(struct net_device *dev)
- 	struct vti6_net *ip6n = net_generic(net, vti6_net_id);
- 	int err;
- 
-+	dev->rtnl_link_ops = &vti6_link_ops;
- 	err = register_netdevice(dev);
- 	if (err < 0)
- 		goto out;
- 
- 	strcpy(t->parms.name, dev->name);
--	dev->rtnl_link_ops = &vti6_link_ops;
- 
- 	dev_hold(dev);
- 	vti6_tnl_link(ip6n, t);
-diff --git a/net/sctp/debug.c b/net/sctp/debug.c
-index 95d7b15dad21..e371a0d90068 100644
---- a/net/sctp/debug.c
-+++ b/net/sctp/debug.c
-@@ -166,7 +166,7 @@ static const char *const sctp_timer_tbl[] = {
- /* Lookup timer debug name. */
- const char *sctp_tname(const sctp_subtype_t id)
- {
--	if (id.timeout <= SCTP_EVENT_TIMEOUT_MAX)
-+	if (id.timeout < ARRAY_SIZE(sctp_timer_tbl))
- 		return sctp_timer_tbl[id.timeout];
- 	return "unknown_timer";
- }
-diff --git a/net/tipc/server.c b/net/tipc/server.c
-index 50f5b0ca7b3c..c416e5184a3f 100644
---- a/net/tipc/server.c
-+++ b/net/tipc/server.c
-@@ -618,14 +618,12 @@ int tipc_server_start(struct tipc_server *s)
- void tipc_server_stop(struct tipc_server *s)
- {
- 	struct tipc_conn *con;
--	int total = 0;
- 	int id;
- 
- 	spin_lock_bh(&s->idr_lock);
--	for (id = 0; total < s->idr_in_use; id++) {
-+	for (id = 0; s->idr_in_use; id++) {
- 		con = idr_find(&s->conn_idr, id);
- 		if (con) {
--			total++;
- 			spin_unlock_bh(&s->idr_lock);
- 			tipc_close_conn(con);
- 			spin_lock_bh(&s->idr_lock);
-diff --git a/security/integrity/ima/ima_main.c b/security/integrity/ima/ima_main.c
-index c21f09bf8b99..98289ba2a2e6 100644
---- a/security/integrity/ima/ima_main.c
-+++ b/security/integrity/ima/ima_main.c
-@@ -52,6 +52,8 @@ static int __init hash_setup(char *str)
- 			ima_hash_algo = HASH_ALGO_SHA1;
- 		else if (strncmp(str, "md5", 3) == 0)
- 			ima_hash_algo = HASH_ALGO_MD5;
-+		else
-+			return 1;
- 		goto out;
- 	}
- 
-@@ -61,6 +63,8 @@ static int __init hash_setup(char *str)
- 			break;
- 		}
- 	}
-+	if (i == HASH_ALGO__LAST)
-+		return 1;
- out:
- 	hash_setup_done = 1;
- 	return 1;
-diff --git a/tools/perf/tests/attr.c b/tools/perf/tests/attr.c
-index 638875a0960a..79547c225c14 100644
---- a/tools/perf/tests/attr.c
-+++ b/tools/perf/tests/attr.c
-@@ -150,7 +150,7 @@ static int run_dir(const char *d, const char *perf)
- 	snprintf(cmd, 3*PATH_MAX, PYTHON " %s/attr.py -d %s/attr/ -p %s %.*s",
- 		 d, d, perf, vcnt, v);
- 
--	return system(cmd);
-+	return system(cmd) ? TEST_FAIL : TEST_OK;
+-- 
+2.28.0
+
+
+From da57b1f7e74fe050f2996614b19fb780f4174639 Mon Sep 17 00:00:00 2001
+From: Vitaly Kuznetsov <vkuznets@redhat.com>
+Date: Thu, 11 May 2017 13:58:06 +0200
+Subject: [PATCH 47/48] xen-netfront: avoid crashing on resume after a failure
+ in talk_to_netback()
+
+commit d86b5672b1adb98b4cdd6fbf0224bbfb03db6e2e upstream.
+
+Unavoidable crashes in netfront_resume() and netback_changed() after a
+previous fail in talk_to_netback() (e.g. when we fail to read MAC from
+xenstore) were discovered. The failure path in talk_to_netback() does
+unregister/free for netdev but we don't reset drvdata and we try accessing
+it after resume.
+
+Fix the bug by removing the whole xen device completely with
+device_unregister(), this guarantees we won't have any calls into netfront
+after a failure.
+
+Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+Cc: Ben Hutchings <ben.hutchings@codethink.co.uk>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/net/xen-netfront.c | 3 +--
+ 1 file changed, 1 insertion(+), 2 deletions(-)
+
+diff --git a/drivers/net/xen-netfront.c b/drivers/net/xen-netfront.c
+index 18263581d434..fd221cc4cb79 100644
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@ -1944,8 +1944,7 @@ abort_transaction_no_dev_fatal:
+ 	xennet_disconnect_backend(info);
+ 	xennet_destroy_queues(info);
+  out:
+-	unregister_netdev(info->netdev);
+-	xennet_free_netdev(info->netdev);
++	device_unregister(&dev->dev);
+ 	return err;
  }
  
- int test__attr(void)
-diff --git a/tools/testing/selftests/x86/ldt_gdt.c b/tools/testing/selftests/x86/ldt_gdt.c
-index 923e59eb82c7..412b845412d2 100644
---- a/tools/testing/selftests/x86/ldt_gdt.c
-+++ b/tools/testing/selftests/x86/ldt_gdt.c
-@@ -351,9 +351,24 @@ static void do_simple_tests(void)
- 	install_invalid(&desc, false);
+-- 
+2.28.0
+
+
+From 69b0bf95a51eb4b0890b3979531aed932cf51d7f Mon Sep 17 00:00:00 2001
+From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date: Sat, 9 Dec 2017 18:42:44 +0100
+Subject: [PATCH 48/48] Linux 4.4.105
+
+---
+ Makefile | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Makefile b/Makefile
+index 55500e023f61..69f4ace70276 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+-SUBLEVEL = 104
++SUBLEVEL = 105
+ EXTRAVERSION =
+ NAME = Blurry Fish Butt
  
- 	desc.seg_not_present = 0;
--	desc.read_exec_only = 0;
- 	desc.seg_32bit = 1;
-+	desc.read_exec_only = 0;
-+	desc.limit = 0xfffff;
-+
- 	install_valid(&desc, AR_DPL3 | AR_TYPE_RWDATA | AR_S | AR_P | AR_DB);
-+
-+	desc.limit_in_pages = 1;
-+
-+	install_valid(&desc, AR_DPL3 | AR_TYPE_RWDATA | AR_S | AR_P | AR_DB | AR_G);
-+	desc.read_exec_only = 1;
-+	install_valid(&desc, AR_DPL3 | AR_TYPE_RODATA | AR_S | AR_P | AR_DB | AR_G);
-+	desc.contents = 1;
-+	desc.read_exec_only = 0;
-+	install_valid(&desc, AR_DPL3 | AR_TYPE_RWDATA_EXPDOWN | AR_S | AR_P | AR_DB | AR_G);
-+	desc.read_exec_only = 1;
-+	install_valid(&desc, AR_DPL3 | AR_TYPE_RODATA_EXPDOWN | AR_S | AR_P | AR_DB | AR_G);
-+
-+	desc.limit = 0;
- 	install_invalid(&desc, true);
- }
- 
-diff --git a/virt/kvm/arm/arch_timer.c b/virt/kvm/arm/arch_timer.c
-index a7b9022b5c8f..7f38db2a46c8 100644
---- a/virt/kvm/arm/arch_timer.c
-+++ b/virt/kvm/arm/arch_timer.c
-@@ -84,9 +84,6 @@ static void kvm_timer_inject_irq_work(struct work_struct *work)
- 	struct kvm_vcpu *vcpu;
- 
- 	vcpu = container_of(work, struct kvm_vcpu, arch.timer_cpu.expired);
--	vcpu->arch.timer_cpu.armed = false;
--
--	WARN_ON(!kvm_timer_should_fire(vcpu));
- 
- 	/*
- 	 * If the vcpu is blocked we want to wake it up so that it will see
+-- 
+2.28.0
+
