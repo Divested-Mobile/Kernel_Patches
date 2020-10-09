@@ -1,397 +1,208 @@
-From 724ff9cbfe1f7a2adbab969f94ee9c2a2592a757 Mon Sep 17 00:00:00 2001
-From: Jens Axboe <axboe@kernel.dk>
-Date: Tue, 4 Dec 2018 20:06:48 -0700
-Subject: [PATCH 01/42] blk-mq: fix corruption with direct issue
-
-commit ffe81d45322cc3cb140f0db080a4727ea284661e upstream.
-
-If we attempt a direct issue to a SCSI device, and it returns BUSY, then
-we queue the request up normally. However, the SCSI layer may have
-already setup SG tables etc for this particular command. If we later
-merge with this request, then the old tables are no longer valid. Once
-we issue the IO, we only read/write the original part of the request,
-not the new state of it.
-
-This causes data corruption, and is most often noticed with the file
-system complaining about the just read data being invalid:
-
-[  235.934465] EXT4-fs error (device sda1): ext4_iget:4831: inode #7142: comm dpkg-query: bad extra_isize 24937 (inode size 256)
-
-because most of it is garbage...
-
-This doesn't happen from the normal issue path, as we will simply defer
-the request to the hardware queue dispatch list if we fail. Once it's on
-the dispatch list, we never merge with it.
-
-Fix this from the direct issue path by flagging the request as
-REQ_NOMERGE so we don't change the size of it before issue.
-
-See also:
-  https://bugzilla.kernel.org/show_bug.cgi?id=201685
-
-Tested-by: Guenter Roeck <linux@roeck-us.net>
-Fixes: 6ce3dd6eec1 ("blk-mq: issue directly if hw queue isn't busy in case of 'none'")
-Cc: stable@vger.kernel.org
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- block/blk-mq.c | 26 +++++++++++++++++++++++++-
- 1 file changed, 25 insertions(+), 1 deletion(-)
-
-diff --git a/block/blk-mq.c b/block/blk-mq.c
-index e3c39ea8e17b..d020fffbbcc6 100644
---- a/block/blk-mq.c
-+++ b/block/blk-mq.c
-@@ -1698,6 +1698,15 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
- 		break;
- 	case BLK_STS_RESOURCE:
- 	case BLK_STS_DEV_RESOURCE:
-+		/*
-+		 * If direct dispatch fails, we cannot allow any merging on
-+		 * this IO. Drivers (like SCSI) may have set up permanent state
-+		 * for this request, like SG tables and mappings, and if we
-+		 * merge to it later on then we'll still only do IO to the
-+		 * original part.
-+		 */
-+		rq->cmd_flags |= REQ_NOMERGE;
-+
- 		blk_mq_update_dispatch_busy(hctx, true);
- 		__blk_mq_requeue_request(rq);
- 		break;
-@@ -1710,6 +1719,18 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
- 	return ret;
- }
+diff --git a/Makefile b/Makefile
+index d2b4efcfb388..34bc4c752c49 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 19
+-SUBLEVEL = 7
++SUBLEVEL = 8
+ EXTRAVERSION =
+ NAME = "People's Front"
  
-+/*
-+ * Don't allow direct dispatch of anything but regular reads/writes,
-+ * as some of the other commands can potentially share request space
-+ * with data we need for the IO scheduler. If we attempt a direct dispatch
-+ * on those and fail, we can't safely add it to the scheduler afterwards
-+ * without potentially overwriting data that the driver has already written.
-+ */
-+static bool blk_rq_can_direct_dispatch(struct request *rq)
-+{
-+	return req_op(rq) == REQ_OP_READ || req_op(rq) == REQ_OP_WRITE;
-+}
-+
- static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
- 						struct request *rq,
- 						blk_qc_t *cookie,
-@@ -1731,7 +1752,7 @@ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
- 		goto insert;
- 	}
+diff --git a/arch/arc/Kconfig b/arch/arc/Kconfig
+index a045f3086047..a90c4f126050 100644
+--- a/arch/arc/Kconfig
++++ b/arch/arc/Kconfig
+@@ -111,7 +111,7 @@ endmenu
  
--	if (q->elevator && !bypass_insert)
-+	if (!blk_rq_can_direct_dispatch(rq) || (q->elevator && !bypass_insert))
- 		goto insert;
+ choice
+ 	prompt "ARC Instruction Set"
+-	default ISA_ARCOMPACT
++	default ISA_ARCV2
  
- 	if (!blk_mq_get_dispatch_budget(hctx))
-@@ -1793,6 +1814,9 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
- 		struct request *rq = list_first_entry(list, struct request,
- 				queuelist);
+ config ISA_ARCOMPACT
+ 	bool "ARCompact ISA"
+diff --git a/arch/arc/Makefile b/arch/arc/Makefile
+index 644815c0516e..16e6cc22e25c 100644
+--- a/arch/arc/Makefile
++++ b/arch/arc/Makefile
+@@ -6,7 +6,7 @@
+ # published by the Free Software Foundation.
+ #
  
-+		if (!blk_rq_can_direct_dispatch(rq))
-+			break;
-+
- 		list_del_init(&rq->queuelist);
- 		ret = blk_mq_request_issue_directly(rq);
- 		if (ret != BLK_STS_OK) {
--- 
-2.28.0
-
-
-From f2d12a0ba143056d14a916ddee701888c6532dc2 Mon Sep 17 00:00:00 2001
-From: Linus Torvalds <torvalds@linux-foundation.org>
-Date: Fri, 30 Nov 2018 12:13:15 -0800
-Subject: [PATCH 02/42] test_hexdump: use memcpy instead of strncpy
-
-commit b1286ed7158e9b62787508066283ab0b8850b518 upstream.
-
-New versions of gcc reasonably warn about the odd pattern of
-
-	strncpy(p, q, strlen(q));
-
-which really doesn't make sense: the strncpy() ends up being just a slow
-and odd way to write memcpy() in this case.
-
-Apparently there was a patch for this floating around earlier, but it
-got lost.
-
-Acked-again-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- lib/test_hexdump.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/lib/test_hexdump.c b/lib/test_hexdump.c
-index 626f580b4ff7..5144899d3c6b 100644
---- a/lib/test_hexdump.c
-+++ b/lib/test_hexdump.c
-@@ -99,7 +99,7 @@ static void __init test_hexdump_prepare_test(size_t len, int rowsize,
- 		const char *q = *result++;
- 		size_t amount = strlen(q);
+-KBUILD_DEFCONFIG := nsim_700_defconfig
++KBUILD_DEFCONFIG := nsim_hs_defconfig
  
--		strncpy(p, q, amount);
-+		memcpy(p, q, amount);
- 		p += amount;
- 
- 		*p++ = ' ';
--- 
-2.28.0
-
-
-From 0448ad42d6a16c920035807422b4e0f1e00fd785 Mon Sep 17 00:00:00 2001
-From: Linus Torvalds <torvalds@linux-foundation.org>
-Date: Fri, 30 Nov 2018 14:45:01 -0800
-Subject: [PATCH 03/42] unifdef: use memcpy instead of strncpy
-
-commit 38c7b224ce22c25fed04007839edf974bd13439d upstream.
-
-New versions of gcc reasonably warn about the odd pattern of
-
-	strncpy(p, q, strlen(q));
-
-which really doesn't make sense: the strncpy() ends up being just a slow
-and odd way to write memcpy() in this case.
-
-There was a comment about _why_ the code used strncpy - to avoid the
-terminating NUL byte, but memcpy does the same and avoids the warning.
-
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- scripts/unifdef.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/scripts/unifdef.c b/scripts/unifdef.c
-index 7493c0ee51cc..db00e3e30a59 100644
---- a/scripts/unifdef.c
-+++ b/scripts/unifdef.c
-@@ -395,7 +395,7 @@ usage(void)
-  * When we have processed a group that starts off with a known-false
-  * #if/#elif sequence (which has therefore been deleted) followed by a
-  * #elif that we don't understand and therefore must keep, we edit the
-- * latter into a #if to keep the nesting correct. We use strncpy() to
-+ * latter into a #if to keep the nesting correct. We use memcpy() to
-  * overwrite the 4 byte token "elif" with "if  " without a '\0' byte.
-  *
-  * When we find a true #elif in a group, the following block will
-@@ -450,7 +450,7 @@ static void Idrop (void) { Fdrop();  ignoreon(); }
- static void Itrue (void) { Ftrue();  ignoreon(); }
- static void Ifalse(void) { Ffalse(); ignoreon(); }
- /* modify this line */
--static void Mpass (void) { strncpy(keyword, "if  ", 4); Pelif(); }
-+static void Mpass (void) { memcpy(keyword, "if  ", 4); Pelif(); }
- static void Mtrue (void) { keywordedit("else");  state(IS_TRUE_MIDDLE); }
- static void Melif (void) { keywordedit("endif"); state(IS_FALSE_TRAILER); }
- static void Melse (void) { keywordedit("endif"); state(IS_FALSE_ELSE); }
--- 
-2.28.0
-
-
-From 61c963ab59fd7272bb752ea4099e5e64d9e452c5 Mon Sep 17 00:00:00 2001
-From: Sagi Grimberg <sagi@grimberg.me>
-Date: Wed, 14 Nov 2018 10:17:01 -0800
-Subject: [PATCH 04/42] iser: set sector for ambiguous mr status errors
-
-commit 24c3456c8d5ee6fc1933ca40f7b4406130682668 upstream.
-
-If for some reason we failed to query the mr status, we need to make sure
-to provide sufficient information for an ambiguous error (guard error on
-sector 0).
-
-Fixes: 0a7a08ad6f5f ("IB/iser: Implement check_protection")
-Cc: <stable@vger.kernel.org>
-Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
-Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
-Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/ulp/iser/iser_verbs.c | 7 +++----
- 1 file changed, 3 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
-index b686a4aaffe8..bee8c0b1d6a5 100644
---- a/drivers/infiniband/ulp/iser/iser_verbs.c
-+++ b/drivers/infiniband/ulp/iser/iser_verbs.c
-@@ -1123,7 +1123,9 @@ u8 iser_check_task_pi_status(struct iscsi_iser_task *iser_task,
- 					 IB_MR_CHECK_SIG_STATUS, &mr_status);
- 		if (ret) {
- 			pr_err("ib_check_mr_status failed, ret %d\n", ret);
--			goto err;
-+			/* Not a lot we can do, return ambiguous guard error */
-+			*sector = 0;
-+			return 0x1;
- 		}
- 
- 		if (mr_status.fail_status & IB_MR_CHECK_SIG_STATUS) {
-@@ -1151,9 +1153,6 @@ u8 iser_check_task_pi_status(struct iscsi_iser_task *iser_task,
- 	}
- 
- 	return 0;
--err:
--	/* Not alot we can do here, return ambiguous guard error */
--	return 0x1;
- }
- 
- void iser_err_comp(struct ib_wc *wc, const char *type)
--- 
-2.28.0
-
-
-From ac8edc62e8134aac60a0370ca1442f6e29a1feb9 Mon Sep 17 00:00:00 2001
-From: Andrea Parri <andrea.parri@amarulasolutions.com>
-Date: Thu, 22 Nov 2018 17:10:31 +0100
-Subject: [PATCH 05/42] uprobes: Fix handle_swbp() vs. unregister() +
- register() race once more
-
-commit 09d3f015d1e1b4fee7e9bbdcf54201d239393391 upstream.
-
-Commit:
-
-  142b18ddc8143 ("uprobes: Fix handle_swbp() vs unregister() + register() race")
-
-added the UPROBE_COPY_INSN flag, and corresponding smp_wmb() and smp_rmb()
-memory barriers, to ensure that handle_swbp() uses fully-initialized
-uprobes only.
-
-However, the smp_rmb() is mis-placed: this barrier should be placed
-after handle_swbp() has tested for the flag, thus guaranteeing that
-(program-order) subsequent loads from the uprobe can see the initial
-stores performed by prepare_uprobe().
-
-Move the smp_rmb() accordingly.  Also amend the comments associated
-to the two memory barriers to indicate their actual locations.
-
-Signed-off-by: Andrea Parri <andrea.parri@amarulasolutions.com>
-Acked-by: Oleg Nesterov <oleg@redhat.com>
-Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
-Cc: Andrew Morton <akpm@linux-foundation.org>
-Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
-Cc: Jiri Olsa <jolsa@redhat.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Stephane Eranian <eranian@google.com>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: Vince Weaver <vincent.weaver@maine.edu>
-Cc: stable@kernel.org
-Fixes: 142b18ddc8143 ("uprobes: Fix handle_swbp() vs unregister() + register() race")
-Link: http://lkml.kernel.org/r/20181122161031.15179-1-andrea.parri@amarulasolutions.com
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/events/uprobes.c | 12 ++++++++++--
- 1 file changed, 10 insertions(+), 2 deletions(-)
-
-diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
-index 3207a4d26849..578d4ac54484 100644
---- a/kernel/events/uprobes.c
-+++ b/kernel/events/uprobes.c
-@@ -616,7 +616,7 @@ static int prepare_uprobe(struct uprobe *uprobe, struct file *file,
- 	BUG_ON((uprobe->offset & ~PAGE_MASK) +
- 			UPROBE_SWBP_INSN_SIZE > PAGE_SIZE);
- 
--	smp_wmb(); /* pairs with rmb() in find_active_uprobe() */
-+	smp_wmb(); /* pairs with the smp_rmb() in handle_swbp() */
- 	set_bit(UPROBE_COPY_INSN, &uprobe->flags);
- 
-  out:
-@@ -1914,10 +1914,18 @@ static void handle_swbp(struct pt_regs *regs)
- 	 * After we hit the bp, _unregister + _register can install the
- 	 * new and not-yet-analyzed uprobe at the same address, restart.
- 	 */
--	smp_rmb(); /* pairs with wmb() in install_breakpoint() */
- 	if (unlikely(!test_bit(UPROBE_COPY_INSN, &uprobe->flags)))
- 		goto out;
- 
-+	/*
-+	 * Pairs with the smp_wmb() in prepare_uprobe().
-+	 *
-+	 * Guarantees that if we see the UPROBE_COPY_INSN bit set, then
-+	 * we must also see the stores to &uprobe->arch performed by the
-+	 * prepare_uprobe() call.
-+	 */
-+	smp_rmb();
-+
- 	/* Tracing handlers use ->utask to communicate with fetch methods */
- 	if (!get_utask())
- 		goto out;
--- 
-2.28.0
-
-
-From 86e42924160397148957ac80a588fe45fafcac6a Mon Sep 17 00:00:00 2001
-From: Frieder Schrempf <frieder.schrempf@kontron.de>
-Date: Tue, 27 Nov 2018 07:44:52 +0000
-Subject: [PATCH 06/42] mtd: nand: Fix memory allocation in nanddev_bbt_init()
-
-commit 40b412897ccb4b98b2cfb2a0aaabed58dd9e2086 upstream.
-
-Fix the size of the buffer allocated to store the in-memory BBT.
-This bug was previously hidden by a different bug, that was fixed in
-commit d098093ba06e ("mtd: nand: Fix nanddev_neraseblocks()").
-
-Fixes: 9c3736a3de21 ("mtd: nand: Add core infrastructure to deal with NAND devices")
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Frieder Schrempf <frieder.schrempf@kontron.de>
-Acked-by: Miquel Raynal <miquel.raynal@bootlin.com>
-Signed-off-by: Boris Brezillon <boris.brezillon@bootlin.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/mtd/nand/bbt.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/mtd/nand/bbt.c b/drivers/mtd/nand/bbt.c
-index 56cde38b92c0..044adf913854 100644
---- a/drivers/mtd/nand/bbt.c
-+++ b/drivers/mtd/nand/bbt.c
-@@ -27,7 +27,8 @@ int nanddev_bbt_init(struct nand_device *nand)
- 	unsigned int nwords = DIV_ROUND_UP(nblocks * bits_per_block,
- 					   BITS_PER_LONG);
- 
--	nand->bbt.cache = kzalloc(nwords, GFP_KERNEL);
-+	nand->bbt.cache = kcalloc(nwords, sizeof(*nand->bbt.cache),
-+				  GFP_KERNEL);
- 	if (!nand->bbt.cache)
- 		return -ENOMEM;
- 
--- 
-2.28.0
-
-
-From 2858d1891eb52cfd4f9b1ec2f4d44b1afcd3f529 Mon Sep 17 00:00:00 2001
-From: Masami Hiramatsu <mhiramat@kernel.org>
-Date: Thu, 29 Nov 2018 14:39:33 +0900
-Subject: [PATCH 07/42] arm64: ftrace: Fix to enable syscall events on arm64
-
-commit 874bfc6e5422d2421f7e4d5ea318d30e91679dfe upstream.
-
-Since commit 4378a7d4be30 ("arm64: implement syscall wrappers")
-introduced "__arm64_" prefix to all syscall wrapper symbols in
-sys_call_table, syscall tracer can not find corresponding
-metadata from syscall name. In the result, we have no syscall
-ftrace events on arm64 kernel, and some bpf testcases are failed
-on arm64.
-
-To fix this issue, this introduces custom
-arch_syscall_match_sym_name() which skips first 8 bytes when
-comparing the syscall and symbol names.
-
-Fixes: 4378a7d4be30 ("arm64: implement syscall wrappers")
-Reported-by: Naresh Kamboju <naresh.kamboju@linaro.org>
-Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
-Acked-by: Will Deacon <will.deacon@arm.com>
-Tested-by: Naresh Kamboju <naresh.kamboju@linaro.org>
-Cc: stable@vger.kernel.org
-Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm64/include/asm/ftrace.h | 13 +++++++++++++
- 1 file changed, 13 insertions(+)
-
+ cflags-y	+= -fno-common -pipe -fno-builtin -mmedium-calls -D__linux__
+ cflags-$(CONFIG_ISA_ARCOMPACT)	+= -mA7
+diff --git a/arch/arc/configs/axs101_defconfig b/arch/arc/configs/axs101_defconfig
+index 41bc08be6a3b..020d4493edfd 100644
+--- a/arch/arc/configs/axs101_defconfig
++++ b/arch/arc/configs/axs101_defconfig
+@@ -14,6 +14,7 @@ CONFIG_PERF_EVENTS=y
+ # CONFIG_VM_EVENT_COUNTERS is not set
+ # CONFIG_SLUB_DEBUG is not set
+ # CONFIG_COMPAT_BRK is not set
++CONFIG_ISA_ARCOMPACT=y
+ CONFIG_MODULES=y
+ CONFIG_MODULE_FORCE_LOAD=y
+ CONFIG_MODULE_UNLOAD=y
+@@ -95,6 +96,7 @@ CONFIG_VFAT_FS=y
+ CONFIG_NTFS_FS=y
+ CONFIG_TMPFS=y
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ CONFIG_NLS_CODEPAGE_437=y
+ CONFIG_NLS_ISO8859_1=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+diff --git a/arch/arc/configs/axs103_defconfig b/arch/arc/configs/axs103_defconfig
+index 1e1c4a8011b5..666314fffc60 100644
+--- a/arch/arc/configs/axs103_defconfig
++++ b/arch/arc/configs/axs103_defconfig
+@@ -94,6 +94,7 @@ CONFIG_VFAT_FS=y
+ CONFIG_NTFS_FS=y
+ CONFIG_TMPFS=y
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ CONFIG_NLS_CODEPAGE_437=y
+ CONFIG_NLS_ISO8859_1=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+diff --git a/arch/arc/configs/axs103_smp_defconfig b/arch/arc/configs/axs103_smp_defconfig
+index 6b0c0cfd5c30..429832b8560b 100644
+--- a/arch/arc/configs/axs103_smp_defconfig
++++ b/arch/arc/configs/axs103_smp_defconfig
+@@ -97,6 +97,7 @@ CONFIG_VFAT_FS=y
+ CONFIG_NTFS_FS=y
+ CONFIG_TMPFS=y
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ CONFIG_NLS_CODEPAGE_437=y
+ CONFIG_NLS_ISO8859_1=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+diff --git a/arch/arc/configs/hsdk_defconfig b/arch/arc/configs/hsdk_defconfig
+index 1dec2b4bc5e6..2a1d2cbfee1a 100644
+--- a/arch/arc/configs/hsdk_defconfig
++++ b/arch/arc/configs/hsdk_defconfig
+@@ -65,6 +65,7 @@ CONFIG_EXT3_FS=y
+ CONFIG_VFAT_FS=y
+ CONFIG_TMPFS=y
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ CONFIG_NLS_CODEPAGE_437=y
+ CONFIG_NLS_ISO8859_1=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+diff --git a/arch/arc/configs/nps_defconfig b/arch/arc/configs/nps_defconfig
+index 31ba224bbfb4..6e84060e7c90 100644
+--- a/arch/arc/configs/nps_defconfig
++++ b/arch/arc/configs/nps_defconfig
+@@ -15,6 +15,7 @@ CONFIG_SYSCTL_SYSCALL=y
+ CONFIG_EMBEDDED=y
+ CONFIG_PERF_EVENTS=y
+ # CONFIG_COMPAT_BRK is not set
++CONFIG_ISA_ARCOMPACT=y
+ CONFIG_KPROBES=y
+ CONFIG_MODULES=y
+ CONFIG_MODULE_FORCE_LOAD=y
+@@ -73,6 +74,7 @@ CONFIG_PROC_KCORE=y
+ CONFIG_TMPFS=y
+ # CONFIG_MISC_FILESYSTEMS is not set
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ CONFIG_ROOT_NFS=y
+ CONFIG_DEBUG_INFO=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+diff --git a/arch/arc/configs/nsim_700_defconfig b/arch/arc/configs/nsim_700_defconfig
+index 8e0b8b134cd9..219c2a65294b 100644
+--- a/arch/arc/configs/nsim_700_defconfig
++++ b/arch/arc/configs/nsim_700_defconfig
+@@ -15,6 +15,7 @@ CONFIG_EMBEDDED=y
+ CONFIG_PERF_EVENTS=y
+ # CONFIG_SLUB_DEBUG is not set
+ # CONFIG_COMPAT_BRK is not set
++CONFIG_ISA_ARCOMPACT=y
+ CONFIG_KPROBES=y
+ CONFIG_MODULES=y
+ # CONFIG_LBDAF is not set
+diff --git a/arch/arc/configs/nsimosci_defconfig b/arch/arc/configs/nsimosci_defconfig
+index f14eeff7d308..35dfc6491a09 100644
+--- a/arch/arc/configs/nsimosci_defconfig
++++ b/arch/arc/configs/nsimosci_defconfig
+@@ -15,6 +15,7 @@ CONFIG_EMBEDDED=y
+ CONFIG_PERF_EVENTS=y
+ # CONFIG_SLUB_DEBUG is not set
+ # CONFIG_COMPAT_BRK is not set
++CONFIG_ISA_ARCOMPACT=y
+ CONFIG_KPROBES=y
+ CONFIG_MODULES=y
+ # CONFIG_LBDAF is not set
+@@ -66,5 +67,6 @@ CONFIG_EXT2_FS_XATTR=y
+ CONFIG_TMPFS=y
+ # CONFIG_MISC_FILESYSTEMS is not set
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+ # CONFIG_ENABLE_MUST_CHECK is not set
+diff --git a/arch/arc/configs/nsimosci_hs_defconfig b/arch/arc/configs/nsimosci_hs_defconfig
+index 025298a48305..1638e5bc9672 100644
+--- a/arch/arc/configs/nsimosci_hs_defconfig
++++ b/arch/arc/configs/nsimosci_hs_defconfig
+@@ -65,5 +65,6 @@ CONFIG_EXT2_FS_XATTR=y
+ CONFIG_TMPFS=y
+ # CONFIG_MISC_FILESYSTEMS is not set
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+ # CONFIG_ENABLE_MUST_CHECK is not set
+diff --git a/arch/arc/configs/nsimosci_hs_smp_defconfig b/arch/arc/configs/nsimosci_hs_smp_defconfig
+index df7b77b13b82..11cfbdb0f441 100644
+--- a/arch/arc/configs/nsimosci_hs_smp_defconfig
++++ b/arch/arc/configs/nsimosci_hs_smp_defconfig
+@@ -76,6 +76,7 @@ CONFIG_EXT2_FS_XATTR=y
+ CONFIG_TMPFS=y
+ # CONFIG_MISC_FILESYSTEMS is not set
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+ # CONFIG_ENABLE_MUST_CHECK is not set
+ CONFIG_FTRACE=y
+diff --git a/arch/arc/configs/tb10x_defconfig b/arch/arc/configs/tb10x_defconfig
+index a7f65313f84a..e71ade3cf9c8 100644
+--- a/arch/arc/configs/tb10x_defconfig
++++ b/arch/arc/configs/tb10x_defconfig
+@@ -19,6 +19,7 @@ CONFIG_KALLSYMS_ALL=y
+ # CONFIG_AIO is not set
+ CONFIG_EMBEDDED=y
+ # CONFIG_COMPAT_BRK is not set
++CONFIG_ISA_ARCOMPACT=y
+ CONFIG_SLAB=y
+ CONFIG_MODULES=y
+ CONFIG_MODULE_FORCE_LOAD=y
+diff --git a/arch/arc/configs/vdk_hs38_defconfig b/arch/arc/configs/vdk_hs38_defconfig
+index db47c3541f15..1e59a2e9c602 100644
+--- a/arch/arc/configs/vdk_hs38_defconfig
++++ b/arch/arc/configs/vdk_hs38_defconfig
+@@ -85,6 +85,7 @@ CONFIG_NTFS_FS=y
+ CONFIG_TMPFS=y
+ CONFIG_JFFS2_FS=y
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ CONFIG_NLS_CODEPAGE_437=y
+ CONFIG_NLS_ISO8859_1=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
+diff --git a/arch/arc/configs/vdk_hs38_smp_defconfig b/arch/arc/configs/vdk_hs38_smp_defconfig
+index a8ac5e917d9a..b5c3f6c54b03 100644
+--- a/arch/arc/configs/vdk_hs38_smp_defconfig
++++ b/arch/arc/configs/vdk_hs38_smp_defconfig
+@@ -90,6 +90,7 @@ CONFIG_NTFS_FS=y
+ CONFIG_TMPFS=y
+ CONFIG_JFFS2_FS=y
+ CONFIG_NFS_FS=y
++CONFIG_NFS_V3_ACL=y
+ CONFIG_NLS_CODEPAGE_437=y
+ CONFIG_NLS_ISO8859_1=y
+ # CONFIG_ENABLE_WARN_DEPRECATED is not set
 diff --git a/arch/arm64/include/asm/ftrace.h b/arch/arm64/include/asm/ftrace.h
 index caa955f10e19..fac54fb050d0 100644
 --- a/arch/arm64/include/asm/ftrace.h
@@ -416,215 +227,6 @@ index caa955f10e19..fac54fb050d0 100644
  #endif /* ifndef __ASSEMBLY__ */
  
  #endif /* __ASM_FTRACE_H */
--- 
-2.28.0
-
-
-From fd8152818f11435557a18311603220d8bbdf7272 Mon Sep 17 00:00:00 2001
-From: Pavankumar Kondeti <pkondeti@codeaurora.org>
-Date: Tue, 30 Oct 2018 12:24:33 +0530
-Subject: [PATCH 08/42] sched, trace: Fix prev_state output in sched_switch
- tracepoint
-
-commit 3054426dc68e5d63aa6a6e9b91ac4ec78e3f3805 upstream.
-
-commit 3f5fe9fef5b2 ("sched/debug: Fix task state recording/printout")
-tried to fix the problem introduced by a previous commit efb40f588b43
-("sched/tracing: Fix trace_sched_switch task-state printing"). However
-the prev_state output in sched_switch is still broken.
-
-task_state_index() uses fls() which considers the LSB as 1. Left
-shifting 1 by this value gives an incorrect mapping to the task state.
-Fix this by decrementing the value returned by __get_task_state()
-before shifting.
-
-Link: http://lkml.kernel.org/r/1540882473-1103-1-git-send-email-pkondeti@codeaurora.org
-
-Cc: stable@vger.kernel.org
-Fixes: 3f5fe9fef5b2 ("sched/debug: Fix task state recording/printout")
-Signed-off-by: Pavankumar Kondeti <pkondeti@codeaurora.org>
-Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/trace/events/sched.h | 12 +++++++++++-
- 1 file changed, 11 insertions(+), 1 deletion(-)
-
-diff --git a/include/trace/events/sched.h b/include/trace/events/sched.h
-index 0be866c91f62..5e1a7578c9ed 100644
---- a/include/trace/events/sched.h
-+++ b/include/trace/events/sched.h
-@@ -107,6 +107,8 @@ DEFINE_EVENT(sched_wakeup_template, sched_wakeup_new,
- #ifdef CREATE_TRACE_POINTS
- static inline long __trace_sched_switch_state(bool preempt, struct task_struct *p)
- {
-+	unsigned int state;
-+
- #ifdef CONFIG_SCHED_DEBUG
- 	BUG_ON(p != current);
- #endif /* CONFIG_SCHED_DEBUG */
-@@ -118,7 +120,15 @@ static inline long __trace_sched_switch_state(bool preempt, struct task_struct *
- 	if (preempt)
- 		return TASK_REPORT_MAX;
- 
--	return 1 << task_state_index(p);
-+	/*
-+	 * task_state_index() uses fls() and returns a value from 0-8 range.
-+	 * Decrement it by 1 (except TASK_RUNNING state i.e 0) before using
-+	 * it for left shift operation to get the correct task->state
-+	 * mapping.
-+	 */
-+	state = task_state_index(p);
-+
-+	return state ? (1 << (state - 1)) : state;
- }
- #endif /* CREATE_TRACE_POINTS */
- 
--- 
-2.28.0
-
-
-From d49297b5c77ae818f33b6ee63e418097e0ff98e8 Mon Sep 17 00:00:00 2001
-From: Zenghui Yu <yuzenghui@huawei.com>
-Date: Wed, 28 Nov 2018 03:35:23 +0000
-Subject: [PATCH 09/42] tracepoint: Use __idx instead of idx in DO_TRACE macro
- to make it unique
-
-commit 0c7a52e4d4b5c4d35b31f3c3ad32af814f1bf491 upstream.
-
-After enabling KVM event tracing, almost all of trace_kvm_exit()'s
-printk shows
-
-	"kvm_exit: IRQ: ..."
-
-even if the actual exception_type is NOT IRQ.  More specifically,
-trace_kvm_exit() is defined in virt/kvm/arm/trace.h by TRACE_EVENT.
-
-This slight problem may have existed after commit e6753f23d961
-("tracepoint: Make rcuidle tracepoint callers use SRCU"). There are
-two variables in trace_kvm_exit() and __DO_TRACE() which have the
-same name, *idx*. Thus the actual value of *idx* will be overwritten
-when tracing. Fix it by adding a simple prefix.
-
-Cc: Joel Fernandes <joel@joelfernandes.org>
-Cc: Wang Haibin <wanghaibin.wang@huawei.com>
-Cc: linux-trace-devel@vger.kernel.org
-Cc: stable@vger.kernel.org
-Fixes: e6753f23d961 ("tracepoint: Make rcuidle tracepoint callers use SRCU")
-Reviewed-by: Joel Fernandes (Google) <joel@joelfernandes.org>
-Signed-off-by: Zenghui Yu <yuzenghui@huawei.com>
-Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/tracepoint.h | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/include/linux/tracepoint.h b/include/linux/tracepoint.h
-index 538ba1a58f5b..e9de8ad0bad7 100644
---- a/include/linux/tracepoint.h
-+++ b/include/linux/tracepoint.h
-@@ -166,7 +166,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
- 		struct tracepoint_func *it_func_ptr;			\
- 		void *it_func;						\
- 		void *__data;						\
--		int __maybe_unused idx = 0;				\
-+		int __maybe_unused __idx = 0;				\
- 									\
- 		if (!(cond))						\
- 			return;						\
-@@ -182,7 +182,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
- 		 * doesn't work from the idle path.			\
- 		 */							\
- 		if (rcuidle) {						\
--			idx = srcu_read_lock_notrace(&tracepoint_srcu);	\
-+			__idx = srcu_read_lock_notrace(&tracepoint_srcu);\
- 			rcu_irq_enter_irqson();				\
- 		}							\
- 									\
-@@ -198,7 +198,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
- 									\
- 		if (rcuidle) {						\
- 			rcu_irq_exit_irqson();				\
--			srcu_read_unlock_notrace(&tracepoint_srcu, idx);\
-+			srcu_read_unlock_notrace(&tracepoint_srcu, __idx);\
- 		}							\
- 									\
- 		preempt_enable_notrace();				\
--- 
-2.28.0
-
-
-From 8e847e8c745696fc403412d03382e51f8524758f Mon Sep 17 00:00:00 2001
-From: Mathias Kresin <dev@kresin.me>
-Date: Mon, 26 Nov 2018 11:25:40 +0100
-Subject: [PATCH 10/42] MIPS: ralink: Fix mt7620 nd_sd pinmux
-
-commit 7d35baa4e9ec4b717bc0e58a39cdb6a1c50f5465 upstream.
-
-In case the nd_sd group is set to the sd-card function, Pins 45 + 46 are
-configured as GPIOs. If they are blocked by the sd function, they can't
-be used as GPIOs.
-
-Reported-by: Kristian Evensen <kristian.evensen@gmail.com>
-Signed-off-by: Mathias Kresin <dev@kresin.me>
-Signed-off-by: Paul Burton <paul.burton@mips.com>
-Fixes: f576fb6a0700 ("MIPS: ralink: cleanup the soc specific pinmux data")
-Patchwork: https://patchwork.linux-mips.org/patch/21220/
-Cc: John Crispin <john@phrozen.org>
-Cc: Ralf Baechle <ralf@linux-mips.org>
-Cc: James Hogan <jhogan@kernel.org>
-Cc: linux-mips@linux-mips.org
-Cc: linux-kernel@vger.kernel.org
-Cc: stable@vger.kernel.org # v3.18+
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/mips/ralink/mt7620.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/mips/ralink/mt7620.c b/arch/mips/ralink/mt7620.c
-index 41b71c4352c2..c1ce6f43642b 100644
---- a/arch/mips/ralink/mt7620.c
-+++ b/arch/mips/ralink/mt7620.c
-@@ -84,7 +84,7 @@ static struct rt2880_pmx_func pcie_rst_grp[] = {
- };
- static struct rt2880_pmx_func nd_sd_grp[] = {
- 	FUNC("nand", MT7620_GPIO_MODE_NAND, 45, 15),
--	FUNC("sd", MT7620_GPIO_MODE_SD, 45, 15)
-+	FUNC("sd", MT7620_GPIO_MODE_SD, 47, 13)
- };
- 
- static struct rt2880_pmx_group mt7620a_pinmux_data[] = {
--- 
-2.28.0
-
-
-From a41e946e93806a7fae0a67af381230ae899f07ea Mon Sep 17 00:00:00 2001
-From: "Dmitry V. Levin" <ldv@altlinux.org>
-Date: Wed, 21 Nov 2018 22:14:39 +0300
-Subject: [PATCH 11/42] mips: fix mips_get_syscall_arg o32 check
-
-commit c50cbd85cd7027d32ac5945bb60217936b4f7eaf upstream.
-
-When checking for TIF_32BIT_REGS flag, mips_get_syscall_arg() should
-use the task specified as its argument instead of the current task.
-
-This potentially affects all syscall_get_arguments() users
-who specify tasks different from the current.
-
-Fixes: c0ff3c53d4f99 ("MIPS: Enable HAVE_ARCH_TRACEHOOK.")
-Signed-off-by: Dmitry V. Levin <ldv@altlinux.org>
-Signed-off-by: Paul Burton <paul.burton@mips.com>
-Patchwork: https://patchwork.linux-mips.org/patch/21185/
-Cc: Elvira Khabirova <lineprinter@altlinux.org>
-Cc: Ralf Baechle <ralf@linux-mips.org>
-Cc: James Hogan <jhogan@kernel.org>
-Cc: linux-mips@linux-mips.org
-Cc: linux-kernel@vger.kernel.org
-Cc: stable@vger.kernel.org # v3.13+
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/mips/include/asm/syscall.h | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
 diff --git a/arch/mips/include/asm/syscall.h b/arch/mips/include/asm/syscall.h
 index 0170602a1e4e..6cf8ffb5367e 100644
 --- a/arch/mips/include/asm/syscall.h
@@ -638,37 +240,292 @@ index 0170602a1e4e..6cf8ffb5367e 100644
  			return get_user(*arg, (int *)usp + n);
  		else
  #endif
--- 
-2.28.0
-
-
-From a990756426665b86baa14e23ff2de2c3f8243ff7 Mon Sep 17 00:00:00 2001
-From: Michael Guralnik <michaelgur@mellanox.com>
-Date: Wed, 21 Nov 2018 15:03:54 +0200
-Subject: [PATCH 12/42] IB/mlx5: Avoid load failure due to unknown link width
-
-commit db7a691a1551a748cb92d9c89c6b190ea87e28d5 upstream.
-
-If the firmware reports a connection width that is not 1x, 4x, 8x or 12x
-it causes the driver to fail during initialization.
-
-To prevent this failure every time a new width is introduced to the RDMA
-stack, we will set a default 4x width for these widths which ar unknown to
-the driver.
-
-This is needed to allow to run old kernels with new firmware.
-
-Cc: <stable@vger.kernel.org> # 4.1
-Fixes: 1b5daf11b015 ("IB/mlx5: Avoid using the MAD_IFC command under ISSI > 0 mode")
-Signed-off-by: Michael Guralnik <michaelgur@mellanox.com>
-Reviewed-by: Majd Dibbiny <majd@mellanox.com>
-Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
-Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/hw/mlx5/main.c | 29 +++++++++++------------------
- 1 file changed, 11 insertions(+), 18 deletions(-)
-
+diff --git a/arch/mips/ralink/mt7620.c b/arch/mips/ralink/mt7620.c
+index 41b71c4352c2..c1ce6f43642b 100644
+--- a/arch/mips/ralink/mt7620.c
++++ b/arch/mips/ralink/mt7620.c
+@@ -84,7 +84,7 @@ static struct rt2880_pmx_func pcie_rst_grp[] = {
+ };
+ static struct rt2880_pmx_func nd_sd_grp[] = {
+ 	FUNC("nand", MT7620_GPIO_MODE_NAND, 45, 15),
+-	FUNC("sd", MT7620_GPIO_MODE_SD, 45, 15)
++	FUNC("sd", MT7620_GPIO_MODE_SD, 47, 13)
+ };
+ 
+ static struct rt2880_pmx_group mt7620a_pinmux_data[] = {
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 4397fa0c448f..f1d3fe5a0c65 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -1663,20 +1663,23 @@ static u64 *avic_get_physical_id_entry(struct kvm_vcpu *vcpu,
+ static int avic_init_access_page(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm *kvm = vcpu->kvm;
+-	int ret;
++	int ret = 0;
+ 
++	mutex_lock(&kvm->slots_lock);
+ 	if (kvm->arch.apic_access_page_done)
+-		return 0;
++		goto out;
+ 
+-	ret = x86_set_memory_region(kvm,
+-				    APIC_ACCESS_PAGE_PRIVATE_MEMSLOT,
+-				    APIC_DEFAULT_PHYS_BASE,
+-				    PAGE_SIZE);
++	ret = __x86_set_memory_region(kvm,
++				      APIC_ACCESS_PAGE_PRIVATE_MEMSLOT,
++				      APIC_DEFAULT_PHYS_BASE,
++				      PAGE_SIZE);
+ 	if (ret)
+-		return ret;
++		goto out;
+ 
+ 	kvm->arch.apic_access_page_done = true;
+-	return 0;
++out:
++	mutex_unlock(&kvm->slots_lock);
++	return ret;
+ }
+ 
+ static int avic_init_backing_page(struct kvm_vcpu *vcpu)
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index e3c39ea8e17b..23a53b67cf0d 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1747,7 +1747,7 @@ insert:
+ 	if (bypass_insert)
+ 		return BLK_STS_RESOURCE;
+ 
+-	blk_mq_sched_insert_request(rq, false, run_queue, false);
++	blk_mq_request_bypass_insert(rq, run_queue);
+ 	return BLK_STS_OK;
+ }
+ 
+@@ -1763,7 +1763,7 @@ static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
+ 
+ 	ret = __blk_mq_try_issue_directly(hctx, rq, cookie, false);
+ 	if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE)
+-		blk_mq_sched_insert_request(rq, false, true, false);
++		blk_mq_request_bypass_insert(rq, true);
+ 	else if (ret != BLK_STS_OK)
+ 		blk_mq_end_request(rq, ret);
+ 
+@@ -1798,7 +1798,8 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
+ 		if (ret != BLK_STS_OK) {
+ 			if (ret == BLK_STS_RESOURCE ||
+ 					ret == BLK_STS_DEV_RESOURCE) {
+-				list_add(&rq->queuelist, list);
++				blk_mq_request_bypass_insert(rq,
++							list_empty(list));
+ 				break;
+ 			}
+ 			blk_mq_end_request(rq, ret);
+diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+index 4cc45a1d21db..59445c83f023 100644
+--- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
++++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
+@@ -374,6 +374,8 @@ dm_dp_add_mst_connector(struct drm_dp_mst_topology_mgr *mgr,
+ 		master->connector_id);
+ 
+ 	aconnector->mst_encoder = dm_dp_create_fake_mst_encoder(master);
++	drm_connector_attach_encoder(&aconnector->base,
++				     &aconnector->mst_encoder->base);
+ 
+ 	/*
+ 	 * TODO: understand why this one is needed
+diff --git a/drivers/gpu/drm/ast/ast_main.c b/drivers/gpu/drm/ast/ast_main.c
+index dac355812adc..373700c05a00 100644
+--- a/drivers/gpu/drm/ast/ast_main.c
++++ b/drivers/gpu/drm/ast/ast_main.c
+@@ -583,7 +583,8 @@ void ast_driver_unload(struct drm_device *dev)
+ 	drm_mode_config_cleanup(dev);
+ 
+ 	ast_mm_fini(ast);
+-	pci_iounmap(dev->pdev, ast->ioregs);
++	if (ast->ioregs != ast->regs + AST_IO_MM_OFFSET)
++		pci_iounmap(dev->pdev, ast->ioregs);
+ 	pci_iounmap(dev->pdev, ast->regs);
+ 	kfree(ast);
+ }
+diff --git a/drivers/gpu/drm/drm_auth.c b/drivers/gpu/drm/drm_auth.c
+index d9c0f7573905..1669c42c40ed 100644
+--- a/drivers/gpu/drm/drm_auth.c
++++ b/drivers/gpu/drm/drm_auth.c
+@@ -142,6 +142,7 @@ static int drm_new_set_master(struct drm_device *dev, struct drm_file *fpriv)
+ 
+ 	lockdep_assert_held_once(&dev->master_mutex);
+ 
++	WARN_ON(fpriv->is_master);
+ 	old_master = fpriv->master;
+ 	fpriv->master = drm_master_create(dev);
+ 	if (!fpriv->master) {
+@@ -170,6 +171,7 @@ out_err:
+ 	/* drop references and restore old master on failure */
+ 	drm_master_put(&fpriv->master);
+ 	fpriv->master = old_master;
++	fpriv->is_master = 0;
+ 
+ 	return ret;
+ }
+diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
+index 05520202c967..191b314f9e9e 100644
+--- a/drivers/gpu/drm/meson/meson_crtc.c
++++ b/drivers/gpu/drm/meson/meson_crtc.c
+@@ -45,6 +45,7 @@ struct meson_crtc {
+ 	struct drm_crtc base;
+ 	struct drm_pending_vblank_event *event;
+ 	struct meson_drm *priv;
++	bool enabled;
+ };
+ #define to_meson_crtc(x) container_of(x, struct meson_crtc, base)
+ 
+@@ -80,8 +81,7 @@ static const struct drm_crtc_funcs meson_crtc_funcs = {
+ 
+ };
+ 
+-static void meson_crtc_atomic_enable(struct drm_crtc *crtc,
+-				     struct drm_crtc_state *old_state)
++static void meson_crtc_enable(struct drm_crtc *crtc)
+ {
+ 	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
+ 	struct drm_crtc_state *crtc_state = crtc->state;
+@@ -101,6 +101,22 @@ static void meson_crtc_atomic_enable(struct drm_crtc *crtc,
+ 	writel_bits_relaxed(VPP_POSTBLEND_ENABLE, VPP_POSTBLEND_ENABLE,
+ 			    priv->io_base + _REG(VPP_MISC));
+ 
++	drm_crtc_vblank_on(crtc);
++
++	meson_crtc->enabled = true;
++}
++
++static void meson_crtc_atomic_enable(struct drm_crtc *crtc,
++				     struct drm_crtc_state *old_state)
++{
++	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
++	struct meson_drm *priv = meson_crtc->priv;
++
++	DRM_DEBUG_DRIVER("\n");
++
++	if (!meson_crtc->enabled)
++		meson_crtc_enable(crtc);
++
+ 	priv->viu.osd1_enabled = true;
+ }
+ 
+@@ -110,6 +126,8 @@ static void meson_crtc_atomic_disable(struct drm_crtc *crtc,
+ 	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
+ 	struct meson_drm *priv = meson_crtc->priv;
+ 
++	drm_crtc_vblank_off(crtc);
++
+ 	priv->viu.osd1_enabled = false;
+ 	priv->viu.osd1_commit = false;
+ 
+@@ -124,6 +142,8 @@ static void meson_crtc_atomic_disable(struct drm_crtc *crtc,
+ 
+ 		crtc->state->event = NULL;
+ 	}
++
++	meson_crtc->enabled = false;
+ }
+ 
+ static void meson_crtc_atomic_begin(struct drm_crtc *crtc,
+@@ -132,6 +152,9 @@ static void meson_crtc_atomic_begin(struct drm_crtc *crtc,
+ 	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
+ 	unsigned long flags;
+ 
++	if (crtc->state->enable && !meson_crtc->enabled)
++		meson_crtc_enable(crtc);
++
+ 	if (crtc->state->event) {
+ 		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+ 
+diff --git a/drivers/gpu/drm/meson/meson_dw_hdmi.c b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+index df7247cd93f9..2cb2ad26d716 100644
+--- a/drivers/gpu/drm/meson/meson_dw_hdmi.c
++++ b/drivers/gpu/drm/meson/meson_dw_hdmi.c
+@@ -706,6 +706,7 @@ static const struct regmap_config meson_dw_hdmi_regmap_config = {
+ 	.reg_read = meson_dw_hdmi_reg_read,
+ 	.reg_write = meson_dw_hdmi_reg_write,
+ 	.max_register = 0x10000,
++	.fast_io = true,
+ };
+ 
+ static bool meson_hdmi_connector_is_available(struct device *dev)
+diff --git a/drivers/gpu/drm/meson/meson_venc.c b/drivers/gpu/drm/meson/meson_venc.c
+index 514245e69b38..14aac661f38b 100644
+--- a/drivers/gpu/drm/meson/meson_venc.c
++++ b/drivers/gpu/drm/meson/meson_venc.c
+@@ -71,6 +71,7 @@
+  */
+ 
+ /* HHI Registers */
++#define HHI_GCLK_MPEG2		0x148 /* 0x52 offset in data sheet */
+ #define HHI_VDAC_CNTL0		0x2F4 /* 0xbd offset in data sheet */
+ #define HHI_VDAC_CNTL1		0x2F8 /* 0xbe offset in data sheet */
+ #define HHI_HDMI_PHY_CNTL0	0x3a0 /* 0xe8 offset in data sheet */
+@@ -1529,10 +1530,12 @@ unsigned int meson_venci_get_field(struct meson_drm *priv)
+ void meson_venc_enable_vsync(struct meson_drm *priv)
+ {
+ 	writel_relaxed(2, priv->io_base + _REG(VENC_INTCTRL));
++	regmap_update_bits(priv->hhi, HHI_GCLK_MPEG2, BIT(25), BIT(25));
+ }
+ 
+ void meson_venc_disable_vsync(struct meson_drm *priv)
+ {
++	regmap_update_bits(priv->hhi, HHI_GCLK_MPEG2, BIT(25), 0);
+ 	writel_relaxed(0, priv->io_base + _REG(VENC_INTCTRL));
+ }
+ 
+diff --git a/drivers/gpu/drm/meson/meson_viu.c b/drivers/gpu/drm/meson/meson_viu.c
+index 6bcfa527c180..26a0857878bf 100644
+--- a/drivers/gpu/drm/meson/meson_viu.c
++++ b/drivers/gpu/drm/meson/meson_viu.c
+@@ -184,18 +184,18 @@ void meson_viu_set_osd_lut(struct meson_drm *priv, enum viu_lut_sel_e lut_sel,
+ 	if (lut_sel == VIU_LUT_OSD_OETF) {
+ 		writel(0, priv->io_base + _REG(addr_port));
+ 
+-		for (i = 0; i < 20; i++)
++		for (i = 0; i < (OSD_OETF_LUT_SIZE / 2); i++)
+ 			writel(r_map[i * 2] | (r_map[i * 2 + 1] << 16),
+ 				priv->io_base + _REG(data_port));
+ 
+ 		writel(r_map[OSD_OETF_LUT_SIZE - 1] | (g_map[0] << 16),
+ 			priv->io_base + _REG(data_port));
+ 
+-		for (i = 0; i < 20; i++)
++		for (i = 0; i < (OSD_OETF_LUT_SIZE / 2); i++)
+ 			writel(g_map[i * 2 + 1] | (g_map[i * 2 + 2] << 16),
+ 				priv->io_base + _REG(data_port));
+ 
+-		for (i = 0; i < 20; i++)
++		for (i = 0; i < (OSD_OETF_LUT_SIZE / 2); i++)
+ 			writel(b_map[i * 2] | (b_map[i * 2 + 1] << 16),
+ 				priv->io_base + _REG(data_port));
+ 
+@@ -211,18 +211,18 @@ void meson_viu_set_osd_lut(struct meson_drm *priv, enum viu_lut_sel_e lut_sel,
+ 	} else if (lut_sel == VIU_LUT_OSD_EOTF) {
+ 		writel(0, priv->io_base + _REG(addr_port));
+ 
+-		for (i = 0; i < 20; i++)
++		for (i = 0; i < (OSD_EOTF_LUT_SIZE / 2); i++)
+ 			writel(r_map[i * 2] | (r_map[i * 2 + 1] << 16),
+ 				priv->io_base + _REG(data_port));
+ 
+ 		writel(r_map[OSD_EOTF_LUT_SIZE - 1] | (g_map[0] << 16),
+ 			priv->io_base + _REG(data_port));
+ 
+-		for (i = 0; i < 20; i++)
++		for (i = 0; i < (OSD_EOTF_LUT_SIZE / 2); i++)
+ 			writel(g_map[i * 2 + 1] | (g_map[i * 2 + 2] << 16),
+ 				priv->io_base + _REG(data_port));
+ 
+-		for (i = 0; i < 20; i++)
++		for (i = 0; i < (OSD_EOTF_LUT_SIZE / 2); i++)
+ 			writel(b_map[i * 2] | (b_map[i * 2 + 1] << 16),
+ 				priv->io_base + _REG(data_port));
+ 
 diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
 index c414f3809e5c..50be240df331 100644
 --- a/drivers/infiniband/hw/mlx5/main.c
@@ -727,55 +584,407 @@ index c414f3809e5c..50be240df331 100644
  	err = mlx5_query_port_ib_proto_oper(mdev, &props->active_speed, port);
  	if (err)
  		goto out;
--- 
-2.28.0
-
-
-From 81f966235412fb541bc65007d37d2a3075b60ac3 Mon Sep 17 00:00:00 2001
-From: "Steven Rostedt (VMware)" <rostedt@goodmis.org>
-Date: Thu, 29 Nov 2018 08:50:27 -0500
-Subject: [PATCH 13/42] tracing/fgraph: Fix set_graph_function from showing
- interrupts
-
-commit 5cf99a0f3161bc3ae2391269d134d6bf7e26f00e upstream.
-
-The tracefs file set_graph_function is used to only function graph functions
-that are listed in that file (or all functions if the file is empty). The
-way this is implemented is that the function graph tracer looks at every
-function, and if the current depth is zero and the function matches
-something in the file then it will trace that function. When other functions
-are called, the depth will be greater than zero (because the original
-function will be at depth zero), and all functions will be traced where the
-depth is greater than zero.
-
-The issue is that when a function is first entered, and the handler that
-checks this logic is called, the depth is set to zero. If an interrupt comes
-in and a function in the interrupt handler is traced, its depth will be
-greater than zero and it will automatically be traced, even if the original
-function was not. But because the logic only looks at depth it may trace
-interrupts when it should not be.
-
-The recent design change of the function graph tracer to fix other bugs
-caused the depth to be zero while the function graph callback handler is
-being called for a longer time, widening the race of this happening. This
-bug was actually there for a longer time, but because the race window was so
-small it seldom happened. The Fixes tag below is for the commit that widen
-the race window, because that commit belongs to a series that will also help
-fix the original bug.
-
-Cc: stable@kernel.org
-Fixes: 39eb456dacb5 ("function_graph: Use new curr_ret_depth to manage depth instead of curr_ret_stack")
-Reported-by: Joe Lawrence <joe.lawrence@redhat.com>
-Tested-by: Joe Lawrence <joe.lawrence@redhat.com>
-Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/trace/trace.h                 | 57 ++++++++++++++++++++++++++--
- kernel/trace/trace_functions_graph.c |  4 ++
- kernel/trace/trace_irqsoff.c         |  2 +
- kernel/trace/trace_sched_wakeup.c    |  2 +
- 4 files changed, 62 insertions(+), 3 deletions(-)
-
+diff --git a/drivers/infiniband/ulp/iser/iser_verbs.c b/drivers/infiniband/ulp/iser/iser_verbs.c
+index b686a4aaffe8..bee8c0b1d6a5 100644
+--- a/drivers/infiniband/ulp/iser/iser_verbs.c
++++ b/drivers/infiniband/ulp/iser/iser_verbs.c
+@@ -1123,7 +1123,9 @@ u8 iser_check_task_pi_status(struct iscsi_iser_task *iser_task,
+ 					 IB_MR_CHECK_SIG_STATUS, &mr_status);
+ 		if (ret) {
+ 			pr_err("ib_check_mr_status failed, ret %d\n", ret);
+-			goto err;
++			/* Not a lot we can do, return ambiguous guard error */
++			*sector = 0;
++			return 0x1;
+ 		}
+ 
+ 		if (mr_status.fail_status & IB_MR_CHECK_SIG_STATUS) {
+@@ -1151,9 +1153,6 @@ u8 iser_check_task_pi_status(struct iscsi_iser_task *iser_task,
+ 	}
+ 
+ 	return 0;
+-err:
+-	/* Not alot we can do here, return ambiguous guard error */
+-	return 0x1;
+ }
+ 
+ void iser_err_comp(struct ib_wc *wc, const char *type)
+diff --git a/drivers/input/joystick/xpad.c b/drivers/input/joystick/xpad.c
+index d4b9db487b16..cfc8b94527b9 100644
+--- a/drivers/input/joystick/xpad.c
++++ b/drivers/input/joystick/xpad.c
+@@ -480,18 +480,18 @@ static const u8 xboxone_hori_init[] = {
+ };
+ 
+ /*
+- * This packet is required for some of the PDP pads to start
++ * This packet is required for most (all?) of the PDP pads to start
+  * sending input reports. These pads include: (0x0e6f:0x02ab),
+- * (0x0e6f:0x02a4).
++ * (0x0e6f:0x02a4), (0x0e6f:0x02a6).
+  */
+ static const u8 xboxone_pdp_init1[] = {
+ 	0x0a, 0x20, 0x00, 0x03, 0x00, 0x01, 0x14
+ };
+ 
+ /*
+- * This packet is required for some of the PDP pads to start
++ * This packet is required for most (all?) of the PDP pads to start
+  * sending input reports. These pads include: (0x0e6f:0x02ab),
+- * (0x0e6f:0x02a4).
++ * (0x0e6f:0x02a4), (0x0e6f:0x02a6).
+  */
+ static const u8 xboxone_pdp_init2[] = {
+ 	0x06, 0x20, 0x00, 0x02, 0x01, 0x00
+@@ -527,12 +527,8 @@ static const struct xboxone_init_packet xboxone_init_packets[] = {
+ 	XBOXONE_INIT_PKT(0x0e6f, 0x0165, xboxone_hori_init),
+ 	XBOXONE_INIT_PKT(0x0f0d, 0x0067, xboxone_hori_init),
+ 	XBOXONE_INIT_PKT(0x0000, 0x0000, xboxone_fw2015_init),
+-	XBOXONE_INIT_PKT(0x0e6f, 0x02ab, xboxone_pdp_init1),
+-	XBOXONE_INIT_PKT(0x0e6f, 0x02ab, xboxone_pdp_init2),
+-	XBOXONE_INIT_PKT(0x0e6f, 0x02a4, xboxone_pdp_init1),
+-	XBOXONE_INIT_PKT(0x0e6f, 0x02a4, xboxone_pdp_init2),
+-	XBOXONE_INIT_PKT(0x0e6f, 0x02a6, xboxone_pdp_init1),
+-	XBOXONE_INIT_PKT(0x0e6f, 0x02a6, xboxone_pdp_init2),
++	XBOXONE_INIT_PKT(0x0e6f, 0x0000, xboxone_pdp_init1),
++	XBOXONE_INIT_PKT(0x0e6f, 0x0000, xboxone_pdp_init2),
+ 	XBOXONE_INIT_PKT(0x24c6, 0x541a, xboxone_rumblebegin_init),
+ 	XBOXONE_INIT_PKT(0x24c6, 0x542a, xboxone_rumblebegin_init),
+ 	XBOXONE_INIT_PKT(0x24c6, 0x543a, xboxone_rumblebegin_init),
+diff --git a/drivers/input/keyboard/cros_ec_keyb.c b/drivers/input/keyboard/cros_ec_keyb.c
+index 81be6f781f0b..d56001181598 100644
+--- a/drivers/input/keyboard/cros_ec_keyb.c
++++ b/drivers/input/keyboard/cros_ec_keyb.c
+@@ -493,7 +493,8 @@ static int cros_ec_keyb_register_bs(struct cros_ec_keyb *ckdev)
+ 	for (i = 0; i < ARRAY_SIZE(cros_ec_keyb_bs); i++) {
+ 		const struct cros_ec_bs_map *map = &cros_ec_keyb_bs[i];
+ 
+-		if (buttons & BIT(map->bit))
++		if ((map->ev_type == EV_KEY && (buttons & BIT(map->bit))) ||
++		    (map->ev_type == EV_SW && (switches & BIT(map->bit))))
+ 			input_set_capability(idev, map->ev_type, map->code);
+ 	}
+ 
+diff --git a/drivers/input/keyboard/matrix_keypad.c b/drivers/input/keyboard/matrix_keypad.c
+index f51ae09596ef..403452ef00e6 100644
+--- a/drivers/input/keyboard/matrix_keypad.c
++++ b/drivers/input/keyboard/matrix_keypad.c
+@@ -407,7 +407,7 @@ matrix_keypad_parse_dt(struct device *dev)
+ 	struct matrix_keypad_platform_data *pdata;
+ 	struct device_node *np = dev->of_node;
+ 	unsigned int *gpios;
+-	int i, nrow, ncol;
++	int ret, i, nrow, ncol;
+ 
+ 	if (!np) {
+ 		dev_err(dev, "device lacks DT data\n");
+@@ -452,12 +452,19 @@ matrix_keypad_parse_dt(struct device *dev)
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 
+-	for (i = 0; i < pdata->num_row_gpios; i++)
+-		gpios[i] = of_get_named_gpio(np, "row-gpios", i);
++	for (i = 0; i < nrow; i++) {
++		ret = of_get_named_gpio(np, "row-gpios", i);
++		if (ret < 0)
++			return ERR_PTR(ret);
++		gpios[i] = ret;
++	}
+ 
+-	for (i = 0; i < pdata->num_col_gpios; i++)
+-		gpios[pdata->num_row_gpios + i] =
+-			of_get_named_gpio(np, "col-gpios", i);
++	for (i = 0; i < ncol; i++) {
++		ret = of_get_named_gpio(np, "col-gpios", i);
++		if (ret < 0)
++			return ERR_PTR(ret);
++		gpios[nrow + i] = ret;
++	}
+ 
+ 	pdata->row_gpios = gpios;
+ 	pdata->col_gpios = &gpios[pdata->num_row_gpios];
+@@ -484,10 +491,8 @@ static int matrix_keypad_probe(struct platform_device *pdev)
+ 	pdata = dev_get_platdata(&pdev->dev);
+ 	if (!pdata) {
+ 		pdata = matrix_keypad_parse_dt(&pdev->dev);
+-		if (IS_ERR(pdata)) {
+-			dev_err(&pdev->dev, "no platform data defined\n");
++		if (IS_ERR(pdata))
+ 			return PTR_ERR(pdata);
+-		}
+ 	} else if (!pdata->keymap_data) {
+ 		dev_err(&pdev->dev, "no keymap data defined\n");
+ 		return -EINVAL;
+diff --git a/drivers/input/mouse/elan_i2c_core.c b/drivers/input/mouse/elan_i2c_core.c
+index b0f9d19b3410..a94b6494e71a 100644
+--- a/drivers/input/mouse/elan_i2c_core.c
++++ b/drivers/input/mouse/elan_i2c_core.c
+@@ -1348,6 +1348,9 @@ static const struct acpi_device_id elan_acpi_id[] = {
+ 	{ "ELAN0618", 0 },
+ 	{ "ELAN061C", 0 },
+ 	{ "ELAN061D", 0 },
++	{ "ELAN061E", 0 },
++	{ "ELAN0620", 0 },
++	{ "ELAN0621", 0 },
+ 	{ "ELAN0622", 0 },
+ 	{ "ELAN1000", 0 },
+ 	{ }
+diff --git a/drivers/input/mouse/synaptics.c b/drivers/input/mouse/synaptics.c
+index 5e85f3cca867..c42813d50591 100644
+--- a/drivers/input/mouse/synaptics.c
++++ b/drivers/input/mouse/synaptics.c
+@@ -170,6 +170,7 @@ static const char * const smbus_pnp_ids[] = {
+ 	"LEN0048", /* X1 Carbon 3 */
+ 	"LEN0046", /* X250 */
+ 	"LEN004a", /* W541 */
++	"LEN005b", /* P50 */
+ 	"LEN0071", /* T480 */
+ 	"LEN0072", /* X1 Carbon Gen 5 (2017) - Elan/ALPS trackpoint */
+ 	"LEN0073", /* X1 Carbon G5 (Elantech) */
+diff --git a/drivers/mtd/nand/bbt.c b/drivers/mtd/nand/bbt.c
+index 56cde38b92c0..044adf913854 100644
+--- a/drivers/mtd/nand/bbt.c
++++ b/drivers/mtd/nand/bbt.c
+@@ -27,7 +27,8 @@ int nanddev_bbt_init(struct nand_device *nand)
+ 	unsigned int nwords = DIV_ROUND_UP(nblocks * bits_per_block,
+ 					   BITS_PER_LONG);
+ 
+-	nand->bbt.cache = kzalloc(nwords, GFP_KERNEL);
++	nand->bbt.cache = kcalloc(nwords, sizeof(*nand->bbt.cache),
++				  GFP_KERNEL);
+ 	if (!nand->bbt.cache)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_main.c b/drivers/net/ethernet/intel/i40e/i40e_main.c
+index 6eccfa82ca94..3c342700bf5f 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -1409,7 +1409,7 @@ void __i40e_del_filter(struct i40e_vsi *vsi, struct i40e_mac_filter *f)
+ 	}
+ 
+ 	vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
+-	set_bit(__I40E_MACVLAN_SYNC_PENDING, vsi->state);
++	set_bit(__I40E_MACVLAN_SYNC_PENDING, vsi->back->state);
+ }
+ 
+ /**
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index f3cae733ae2d..9acb5b44ce4c 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -167,7 +167,11 @@ lpfc_config_port_prep(struct lpfc_hba *phba)
+ 		       sizeof(phba->wwpn));
+ 	}
+ 
+-	phba->sli3_options = 0x0;
++	/*
++	 * Clear all option bits except LPFC_SLI3_BG_ENABLED,
++	 * which was already set in lpfc_get_cfgparam()
++	 */
++	phba->sli3_options &= (uint32_t)LPFC_SLI3_BG_ENABLED;
+ 
+ 	/* Setup and issue mailbox READ REV command */
+ 	lpfc_read_rev(phba, pmb);
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index a95c823cd1a4..be2bac9355cd 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -4969,7 +4969,6 @@ lpfc_sli_config_port(struct lpfc_hba *phba, int sli_mode)
+ 		phba->sli3_options &= ~(LPFC_SLI3_NPIV_ENABLED |
+ 					LPFC_SLI3_HBQ_ENABLED |
+ 					LPFC_SLI3_CRP_ENABLED |
+-					LPFC_SLI3_BG_ENABLED |
+ 					LPFC_SLI3_DSS_ENABLED);
+ 		if (rc != MBX_SUCCESS) {
+ 			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
+diff --git a/drivers/tty/serial/kgdboc.c b/drivers/tty/serial/kgdboc.c
+index f4d0ef695225..8a111ab33b50 100644
+--- a/drivers/tty/serial/kgdboc.c
++++ b/drivers/tty/serial/kgdboc.c
+@@ -128,24 +128,6 @@ static void kgdboc_unregister_kbd(void)
+ #define kgdboc_restore_input()
+ #endif /* ! CONFIG_KDB_KEYBOARD */
+ 
+-static int kgdboc_option_setup(char *opt)
+-{
+-	if (!opt) {
+-		pr_err("kgdboc: config string not provided\n");
+-		return -EINVAL;
+-	}
+-
+-	if (strlen(opt) >= MAX_CONFIG_LEN) {
+-		printk(KERN_ERR "kgdboc: config string too long\n");
+-		return -ENOSPC;
+-	}
+-	strcpy(config, opt);
+-
+-	return 0;
+-}
+-
+-__setup("kgdboc=", kgdboc_option_setup);
+-
+ static void cleanup_kgdboc(void)
+ {
+ 	if (kgdb_unregister_nmi_console())
+@@ -159,15 +141,13 @@ static int configure_kgdboc(void)
+ {
+ 	struct tty_driver *p;
+ 	int tty_line = 0;
+-	int err;
++	int err = -ENODEV;
+ 	char *cptr = config;
+ 	struct console *cons;
+ 
+-	err = kgdboc_option_setup(config);
+-	if (err || !strlen(config) || isspace(config[0]))
++	if (!strlen(config) || isspace(config[0]))
+ 		goto noconfig;
+ 
+-	err = -ENODEV;
+ 	kgdboc_io_ops.is_console = 0;
+ 	kgdb_tty_driver = NULL;
+ 
+@@ -316,6 +296,25 @@ static struct kgdb_io kgdboc_io_ops = {
+ };
+ 
+ #ifdef CONFIG_KGDB_SERIAL_CONSOLE
++static int kgdboc_option_setup(char *opt)
++{
++	if (!opt) {
++		pr_err("config string not provided\n");
++		return -EINVAL;
++	}
++
++	if (strlen(opt) >= MAX_CONFIG_LEN) {
++		pr_err("config string too long\n");
++		return -ENOSPC;
++	}
++	strcpy(config, opt);
++
++	return 0;
++}
++
++__setup("kgdboc=", kgdboc_option_setup);
++
++
+ /* This is only available if kgdboc is a built in for early debugging */
+ static int __init kgdboc_early_init(char *opt)
+ {
+diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
+index d385778b628c..3ec712cba58e 100644
+--- a/fs/btrfs/tree-checker.c
++++ b/fs/btrfs/tree-checker.c
+@@ -389,13 +389,11 @@ static int check_block_group_item(struct btrfs_fs_info *fs_info,
+ 
+ 	/*
+ 	 * Here we don't really care about alignment since extent allocator can
+-	 * handle it.  We care more about the size, as if one block group is
+-	 * larger than maximum size, it's must be some obvious corruption.
++	 * handle it.  We care more about the size.
+ 	 */
+-	if (key->offset > BTRFS_MAX_DATA_CHUNK_SIZE || key->offset == 0) {
++	if (key->offset == 0) {
+ 		block_group_err(fs_info, leaf, slot,
+-			"invalid block group size, have %llu expect (0, %llu]",
+-				key->offset, BTRFS_MAX_DATA_CHUNK_SIZE);
++				"invalid block group size 0");
+ 		return -EUCLEAN;
+ 	}
+ 
+diff --git a/include/linux/tracepoint.h b/include/linux/tracepoint.h
+index 538ba1a58f5b..e9de8ad0bad7 100644
+--- a/include/linux/tracepoint.h
++++ b/include/linux/tracepoint.h
+@@ -166,7 +166,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
+ 		struct tracepoint_func *it_func_ptr;			\
+ 		void *it_func;						\
+ 		void *__data;						\
+-		int __maybe_unused idx = 0;				\
++		int __maybe_unused __idx = 0;				\
+ 									\
+ 		if (!(cond))						\
+ 			return;						\
+@@ -182,7 +182,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
+ 		 * doesn't work from the idle path.			\
+ 		 */							\
+ 		if (rcuidle) {						\
+-			idx = srcu_read_lock_notrace(&tracepoint_srcu);	\
++			__idx = srcu_read_lock_notrace(&tracepoint_srcu);\
+ 			rcu_irq_enter_irqson();				\
+ 		}							\
+ 									\
+@@ -198,7 +198,7 @@ static inline struct tracepoint *tracepoint_ptr_deref(tracepoint_ptr_t *p)
+ 									\
+ 		if (rcuidle) {						\
+ 			rcu_irq_exit_irqson();				\
+-			srcu_read_unlock_notrace(&tracepoint_srcu, idx);\
++			srcu_read_unlock_notrace(&tracepoint_srcu, __idx);\
+ 		}							\
+ 									\
+ 		preempt_enable_notrace();				\
+diff --git a/include/trace/events/sched.h b/include/trace/events/sched.h
+index 0be866c91f62..5e1a7578c9ed 100644
+--- a/include/trace/events/sched.h
++++ b/include/trace/events/sched.h
+@@ -107,6 +107,8 @@ DEFINE_EVENT(sched_wakeup_template, sched_wakeup_new,
+ #ifdef CREATE_TRACE_POINTS
+ static inline long __trace_sched_switch_state(bool preempt, struct task_struct *p)
+ {
++	unsigned int state;
++
+ #ifdef CONFIG_SCHED_DEBUG
+ 	BUG_ON(p != current);
+ #endif /* CONFIG_SCHED_DEBUG */
+@@ -118,7 +120,15 @@ static inline long __trace_sched_switch_state(bool preempt, struct task_struct *
+ 	if (preempt)
+ 		return TASK_REPORT_MAX;
+ 
+-	return 1 << task_state_index(p);
++	/*
++	 * task_state_index() uses fls() and returns a value from 0-8 range.
++	 * Decrement it by 1 (except TASK_RUNNING state i.e 0) before using
++	 * it for left shift operation to get the correct task->state
++	 * mapping.
++	 */
++	state = task_state_index(p);
++
++	return state ? (1 << (state - 1)) : state;
+ }
+ #endif /* CREATE_TRACE_POINTS */
+ 
+diff --git a/kernel/events/uprobes.c b/kernel/events/uprobes.c
+index 3207a4d26849..578d4ac54484 100644
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@ -616,7 +616,7 @@ static int prepare_uprobe(struct uprobe *uprobe, struct file *file,
+ 	BUG_ON((uprobe->offset & ~PAGE_MASK) +
+ 			UPROBE_SWBP_INSN_SIZE > PAGE_SIZE);
+ 
+-	smp_wmb(); /* pairs with rmb() in find_active_uprobe() */
++	smp_wmb(); /* pairs with the smp_rmb() in handle_swbp() */
+ 	set_bit(UPROBE_COPY_INSN, &uprobe->flags);
+ 
+  out:
+@@ -1914,10 +1914,18 @@ static void handle_swbp(struct pt_regs *regs)
+ 	 * After we hit the bp, _unregister + _register can install the
+ 	 * new and not-yet-analyzed uprobe at the same address, restart.
+ 	 */
+-	smp_rmb(); /* pairs with wmb() in install_breakpoint() */
+ 	if (unlikely(!test_bit(UPROBE_COPY_INSN, &uprobe->flags)))
+ 		goto out;
+ 
++	/*
++	 * Pairs with the smp_wmb() in prepare_uprobe().
++	 *
++	 * Guarantees that if we see the UPROBE_COPY_INSN bit set, then
++	 * we must also see the stores to &uprobe->arch performed by the
++	 * prepare_uprobe() call.
++	 */
++	smp_rmb();
++
+ 	/* Tracing handlers use ->utask to communicate with fetch methods */
+ 	if (!get_utask())
+ 		goto out;
 diff --git a/kernel/trace/trace.h b/kernel/trace/trace.h
 index 3b8c0e24ab30..447bd96ee658 100644
 --- a/kernel/trace/trace.h
@@ -851,7 +1060,7 @@ index 3b8c0e24ab30..447bd96ee658 100644
  		/*
  		 * If no irqs are to be traced, but a set_graph_function
  		 * is set, and called by an interrupt handler, we still
-@@ -872,6 +913,13 @@ static inline int ftrace_graph_addr(unsigned long addr)
+@@ -872,6 +913,13 @@ out:
  	return ret;
  }
  
@@ -941,759 +1150,19 @@ index a86b303e6c67..7d04b9890755 100644
  	if (!func_prolog_preempt_disable(tr, &data, &pc))
  		return;
  
--- 
-2.28.0
-
-
-From 94be4764b4bbcb49f2932e38c814a2ff32734487 Mon Sep 17 00:00:00 2001
-From: Sam Bobroff <sbobroff@linux.ibm.com>
-Date: Mon, 5 Nov 2018 16:57:47 +1100
-Subject: [PATCH 14/42] drm/ast: Fix incorrect free on ioregs
-
-commit dc25ab067645eabd037f1a23d49a666f9e0b8c68 upstream.
-
-If the platform has no IO space, ioregs is placed next to the already
-allocated regs. In this case, it should not be separately freed.
-
-This prevents a kernel warning from __vunmap "Trying to vfree()
-nonexistent vm area" when unloading the driver.
-
-Fixes: 0dd68309b9c5 ("drm/ast: Try to use MMIO registers when PIO isn't supported")
-
-Signed-off-by: Sam Bobroff <sbobroff@linux.ibm.com>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Dave Airlie <airlied@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/ast/ast_main.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/gpu/drm/ast/ast_main.c b/drivers/gpu/drm/ast/ast_main.c
-index dac355812adc..373700c05a00 100644
---- a/drivers/gpu/drm/ast/ast_main.c
-+++ b/drivers/gpu/drm/ast/ast_main.c
-@@ -583,7 +583,8 @@ void ast_driver_unload(struct drm_device *dev)
- 	drm_mode_config_cleanup(dev);
+diff --git a/lib/test_hexdump.c b/lib/test_hexdump.c
+index 626f580b4ff7..5144899d3c6b 100644
+--- a/lib/test_hexdump.c
++++ b/lib/test_hexdump.c
+@@ -99,7 +99,7 @@ static void __init test_hexdump_prepare_test(size_t len, int rowsize,
+ 		const char *q = *result++;
+ 		size_t amount = strlen(q);
  
- 	ast_mm_fini(ast);
--	pci_iounmap(dev->pdev, ast->ioregs);
-+	if (ast->ioregs != ast->regs + AST_IO_MM_OFFSET)
-+		pci_iounmap(dev->pdev, ast->ioregs);
- 	pci_iounmap(dev->pdev, ast->regs);
- 	kfree(ast);
- }
--- 
-2.28.0
-
-
-From 8a8effbe56b1b99c3376bf78882be11c35c9c6be Mon Sep 17 00:00:00 2001
-From: Lyude Paul <lyude@redhat.com>
-Date: Mon, 19 Nov 2018 15:00:10 +0000
-Subject: [PATCH 15/42] drm/amd/dm: Don't forget to attach MST encoders
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit c9e0ab86b2e03154bb898cd2f851827783224727 upstream.
-
-The change fixed huge delay in SST daisy chain and S3 soft hang
-observed in 4.19 kernel rebase.
-
-Regression point in drm:
-drm/fb-helper: Eliminate the .best_encoder() usage
-
-The aux sequence is altered due to the failure in
-drm_connector_for_each_possible_encoder(). The failure is
-caused by missing attached encoder in the process of adding
-MST connector.
- 
-drm_dp_send_enum_path_resources() aux transaction is pushed after
-mode probe, which causes conflict to drm_dp_mst_i2c_xfer(),
-leading to the transaction timeout.
-
-Signed-off-by: Lyude Paul <lyude@redhat.com>
-Reviewed-by: Jerry (Fangzhi) Zuo <Jerry.Zuo@amd.com>
-Cc: Stable <stable@vger.kernel.org>
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
-index 4cc45a1d21db..59445c83f023 100644
---- a/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
-+++ b/drivers/gpu/drm/amd/display/amdgpu_dm/amdgpu_dm_mst_types.c
-@@ -374,6 +374,8 @@ dm_dp_add_mst_connector(struct drm_dp_mst_topology_mgr *mgr,
- 		master->connector_id);
+-		strncpy(p, q, amount);
++		memcpy(p, q, amount);
+ 		p += amount;
  
- 	aconnector->mst_encoder = dm_dp_create_fake_mst_encoder(master);
-+	drm_connector_attach_encoder(&aconnector->base,
-+				     &aconnector->mst_encoder->base);
- 
- 	/*
- 	 * TODO: understand why this one is needed
--- 
-2.28.0
-
-
-From c952979ad95bb1be30d3e65187d74034bd49c9e8 Mon Sep 17 00:00:00 2001
-From: Sergio Correia <sergio@correia.cc>
-Date: Thu, 22 Nov 2018 02:33:29 -0300
-Subject: [PATCH 16/42] drm: set is_master to 0 upon drm_new_set_master()
- failure
-
-commit 23a336b34258aba3b50ea6863cca4e81b5ef6384 upstream.
-
-When drm_new_set_master() fails, set is_master to 0, to prevent a
-possible NULL pointer deref.
-
-Here is a problematic flow: we check is_master in drm_is_current_master(),
-then proceed to call drm_lease_owner() passing master. If we do not restore
-is_master status when drm_new_set_master() fails, we may have a situation
-in which is_master will be 1 and master itself, NULL, leading to the deref
-of a NULL pointer in drm_lease_owner().
-
-This fixes the following OOPS, observed on an ArchLinux running a 4.19.2
-kernel:
-
-[   97.804282] BUG: unable to handle kernel NULL pointer dereference at 0000000000000080
-[   97.807224] PGD 0 P4D 0
-[   97.807224] Oops: 0000 [#1] PREEMPT SMP NOPTI
-[   97.807224] CPU: 0 PID: 1348 Comm: xfwm4 Tainted: P           OE     4.19.2-arch1-1-ARCH #1
-[   97.807224] Hardware name: To Be Filled By O.E.M. To Be Filled By O.E.M./AB350 Pro4, BIOS P5.10 10/16/2018
-[   97.807224] RIP: 0010:drm_lease_owner+0xd/0x20 [drm]
-[   97.807224] Code: 83 c4 18 5b 5d c3 b8 ea ff ff ff eb e2 b8 ed ff ff ff eb db e8 b4 ca 68 fb 0f 1f 40 00 0f 1f 44 00 00 48 89 f8 eb 03 48 89 d0 <48> 8b 90 80 00 00 00 48 85 d2 75 f1 c3 66 0f 1f 44 00 00 0f 1f 44
-[   97.807224] RSP: 0018:ffffb8cf08e07bb0 EFLAGS: 00010202
-[   97.807224] RAX: 0000000000000000 RBX: ffff9cf0f2586c00 RCX: ffff9cf0f2586c88
-[   97.807224] RDX: ffff9cf0ddbd8000 RSI: 0000000000000000 RDI: 0000000000000000
-[   97.807224] RBP: ffff9cf1040e9800 R08: 0000000000000000 R09: 0000000000000000
-[   97.807224] R10: ffffdeb30fd5d680 R11: ffffdeb30f5d6808 R12: ffff9cf1040e9888
-[   97.807224] R13: 0000000000000000 R14: dead000000000200 R15: ffff9cf0f2586cc8
-[   97.807224] FS:  00007f4145513180(0000) GS:ffff9cf10ea00000(0000) knlGS:0000000000000000
-[   97.807224] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-[   97.807224] CR2: 0000000000000080 CR3: 00000003d7548000 CR4: 00000000003406f0
-[   97.807224] Call Trace:
-[   97.807224]  drm_is_current_master+0x1a/0x30 [drm]
-[   97.807224]  drm_master_release+0x3e/0x130 [drm]
-[   97.807224]  drm_file_free.part.0+0x2be/0x2d0 [drm]
-[   97.807224]  drm_open+0x1ba/0x1e0 [drm]
-[   97.807224]  drm_stub_open+0xaf/0xe0 [drm]
-[   97.807224]  chrdev_open+0xa3/0x1b0
-[   97.807224]  ? cdev_put.part.0+0x20/0x20
-[   97.807224]  do_dentry_open+0x132/0x340
-[   97.807224]  path_openat+0x2d1/0x14e0
-[   97.807224]  ? mem_cgroup_commit_charge+0x7a/0x520
-[   97.807224]  do_filp_open+0x93/0x100
-[   97.807224]  ? __check_object_size+0x102/0x189
-[   97.807224]  ? _raw_spin_unlock+0x16/0x30
-[   97.807224]  do_sys_open+0x186/0x210
-[   97.807224]  do_syscall_64+0x5b/0x170
-[   97.807224]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
-[   97.807224] RIP: 0033:0x7f4147b07976
-[   97.807224] Code: 89 54 24 08 e8 7b f4 ff ff 8b 74 24 0c 48 8b 3c 24 41 89 c0 44 8b 54 24 08 b8 01 01 00 00 89 f2 48 89 fe bf 9c ff ff ff 0f 05 <48> 3d 00 f0 ff ff 77 30 44 89 c7 89 44 24 08 e8 a6 f4 ff ff 8b 44
-[   97.807224] RSP: 002b:00007ffcced96ca0 EFLAGS: 00000293 ORIG_RAX: 0000000000000101
-[   97.807224] RAX: ffffffffffffffda RBX: 00005619d5037f80 RCX: 00007f4147b07976
-[   97.807224] RDX: 0000000000000002 RSI: 00005619d46b969c RDI: 00000000ffffff9c
-[   98.040039] RBP: 0000000000000024 R08: 0000000000000000 R09: 0000000000000000
-[   98.040039] R10: 0000000000000000 R11: 0000000000000293 R12: 0000000000000024
-[   98.040039] R13: 0000000000000012 R14: 00005619d5035950 R15: 0000000000000012
-[   98.040039] Modules linked in: nct6775 hwmon_vid algif_skcipher af_alg nls_iso8859_1 nls_cp437 vfat fat uvcvideo videobuf2_vmalloc videobuf2_memops videobuf2_v4l2 videobuf2_common arc4 videodev media snd_usb_audio snd_hda_codec_hdmi snd_usbmidi_lib snd_rawmidi snd_seq_device mousedev input_leds iwlmvm mac80211 snd_hda_codec_realtek snd_hda_codec_generic snd_hda_intel snd_hda_codec edac_mce_amd kvm_amd snd_hda_core kvm iwlwifi snd_hwdep r8169 wmi_bmof cfg80211 snd_pcm irqbypass snd_timer snd libphy soundcore pinctrl_amd rfkill pcspkr sp5100_tco evdev gpio_amdpt k10temp mac_hid i2c_piix4 wmi pcc_cpufreq acpi_cpufreq vboxnetflt(OE) vboxnetadp(OE) vboxpci(OE) vboxdrv(OE) msr sg crypto_user ip_tables x_tables ext4 crc32c_generic crc16 mbcache jbd2 fscrypto uas usb_storage dm_crypt hid_generic usbhid hid
-[   98.040039]  dm_mod raid1 md_mod sd_mod crct10dif_pclmul crc32_pclmul crc32c_intel ghash_clmulni_intel pcbc ahci libahci aesni_intel aes_x86_64 libata crypto_simd cryptd glue_helper ccp xhci_pci rng_core scsi_mod xhci_hcd nvidia_drm(POE) drm_kms_helper syscopyarea sysfillrect sysimgblt fb_sys_fops drm agpgart nvidia_uvm(POE) nvidia_modeset(POE) nvidia(POE) ipmi_devintf ipmi_msghandler
-[   98.040039] CR2: 0000000000000080
-[   98.040039] ---[ end trace 3b65093b6fe62b2f ]---
-[   98.040039] RIP: 0010:drm_lease_owner+0xd/0x20 [drm]
-[   98.040039] Code: 83 c4 18 5b 5d c3 b8 ea ff ff ff eb e2 b8 ed ff ff ff eb db e8 b4 ca 68 fb 0f 1f 40 00 0f 1f 44 00 00 48 89 f8 eb 03 48 89 d0 <48> 8b 90 80 00 00 00 48 85 d2 75 f1 c3 66 0f 1f 44 00 00 0f 1f 44
-[   98.040039] RSP: 0018:ffffb8cf08e07bb0 EFLAGS: 00010202
-[   98.040039] RAX: 0000000000000000 RBX: ffff9cf0f2586c00 RCX: ffff9cf0f2586c88
-[   98.040039] RDX: ffff9cf0ddbd8000 RSI: 0000000000000000 RDI: 0000000000000000
-[   98.040039] RBP: ffff9cf1040e9800 R08: 0000000000000000 R09: 0000000000000000
-[   98.040039] R10: ffffdeb30fd5d680 R11: ffffdeb30f5d6808 R12: ffff9cf1040e9888
-[   98.040039] R13: 0000000000000000 R14: dead000000000200 R15: ffff9cf0f2586cc8
-[   98.040039] FS:  00007f4145513180(0000) GS:ffff9cf10ea00000(0000) knlGS:0000000000000000
-[   98.040039] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-[   98.040039] CR2: 0000000000000080 CR3: 00000003d7548000 CR4: 00000000003406f0
-
-Signed-off-by: Sergio Correia <sergio@correia.cc>
-Cc: stable@vger.kernel.org
-Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
-Link: https://patchwork.freedesktop.org/patch/msgid/20181122053329.2692-1-sergio@correia.cc
-Signed-off-by: Sean Paul <seanpaul@chromium.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/drm_auth.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/drivers/gpu/drm/drm_auth.c b/drivers/gpu/drm/drm_auth.c
-index d9c0f7573905..1669c42c40ed 100644
---- a/drivers/gpu/drm/drm_auth.c
-+++ b/drivers/gpu/drm/drm_auth.c
-@@ -142,6 +142,7 @@ static int drm_new_set_master(struct drm_device *dev, struct drm_file *fpriv)
- 
- 	lockdep_assert_held_once(&dev->master_mutex);
- 
-+	WARN_ON(fpriv->is_master);
- 	old_master = fpriv->master;
- 	fpriv->master = drm_master_create(dev);
- 	if (!fpriv->master) {
-@@ -170,6 +171,7 @@ static int drm_new_set_master(struct drm_device *dev, struct drm_file *fpriv)
- 	/* drop references and restore old master on failure */
- 	drm_master_put(&fpriv->master);
- 	fpriv->master = old_master;
-+	fpriv->is_master = 0;
- 
- 	return ret;
- }
--- 
-2.28.0
-
-
-From 736f04212a28d9e14b6a22f7218fb4892e1c18fe Mon Sep 17 00:00:00 2001
-From: Neil Armstrong <narmstrong@baylibre.com>
-Date: Thu, 22 Nov 2018 17:01:03 +0100
-Subject: [PATCH 17/42] drm/meson: Fixes for drm_crtc_vblank_on/off support
-
-commit 2bcd3ecab773f73211c45bb1430bb52ac641f271 upstream.
-
-Since Linux 4.17, calls to drm_crtc_vblank_on/off are mandatory, and we get
-a warning when ctrc is disabled :
-" driver forgot to call drm_crtc_vblank_off()"
-
-But, the vsync IRQ was not totally disabled due the transient hardware
-state and specific interrupt line, thus adding proper IRQ masking from
-the HHI system control registers.
-
-The last change fixes a race condition introduced by calling the added
-drm_crtc_vblank_on/off when an HPD event occurs from the HDMI connector,
-triggering a WARN_ON() in the _atomic_begin() callback when the CRTC
-is disabled, thus also triggering a WARN_ON() in drm_vblank_put() :
-
-WARNING: CPU: 0 PID: 1185 at drivers/gpu/drm/meson/meson_crtc.c:157 meson_crtc_atomic_begin+0x78/0x80
-[...]
-Call trace:
-  meson_crtc_atomic_begin+0x78/0x80
-  drm_atomic_helper_commit_planes+0x140/0x218
-  drm_atomic_helper_commit_tail+0x38/0x80
-  commit_tail+0x7c/0x80
-  drm_atomic_helper_commit+0xdc/0x150
-  drm_atomic_commit+0x54/0x60
-  restore_fbdev_mode_atomic+0x198/0x238
-  restore_fbdev_mode+0x6c/0x1c0
-  drm_fb_helper_restore_fbdev_mode_unlocked+0x7c/0xf0
-  drm_fb_helper_set_par+0x34/0x60
-  drm_fb_helper_hotplug_event.part.28+0xb8/0xc8
-  drm_fbdev_client_hotplug+0xa4/0xe0
-  drm_client_dev_hotplug+0x90/0xe0
-  drm_kms_helper_hotplug_event+0x3c/0x48
-  drm_helper_hpd_irq_event+0x134/0x168
-  dw_hdmi_top_thread_irq+0x3c/0x50
-[...]
-WARNING: CPU: 0 PID: 1185 at drivers/gpu/drm/drm_vblank.c:1026 drm_vblank_put+0xb4/0xc8
-[...]
- Call trace:
-  drm_vblank_put+0xb4/0xc8
-  drm_crtc_vblank_put+0x24/0x30
-  drm_atomic_helper_wait_for_vblanks.part.9+0x130/0x2b8
-  drm_atomic_helper_commit_tail+0x68/0x80
-[...]
-
-The issue is that vblank need to be enabled in any occurrence of :
-- atomic_enable()
-- atomic_begin() and state->enable == true, which was not the case
-
-Moving the CRTC enable code to a common function and calling in one of
-these occurrence solves this race condition and makes sure vblank is
-enabled in each call to _atomic_begin() from the HPD event leading to
-drm_atomic_helper_commit_planes().
-
-To Summarize :
-- Make sure that the CRTC code will call the drm_crtc_vblank_on()/off()
-- *Really* mask the Vsync IRQ
-- Initialize and enable vblank at the first
-  atomic_begin()/_atomic_enable()
-
-Cc: stable@vger.kernel.org # 4.17+
-Signed-off-by: Neil Armstrong <narmstrong@baylibre.com>
-Reviewed-by: Lyude Paul <lyude@redhat.com>
-[fixed typos+added cc for stable]
-Signed-off-by: Lyude Paul <lyude@redhat.com>
-Link: https://patchwork.freedesktop.org/patch/msgid/20181122160103.10993-1-narmstrong@baylibre.com
-Signed-off-by: Sean Paul <seanpaul@chromium.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/meson/meson_crtc.c | 27 +++++++++++++++++++++++++--
- drivers/gpu/drm/meson/meson_venc.c |  3 +++
- 2 files changed, 28 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/gpu/drm/meson/meson_crtc.c b/drivers/gpu/drm/meson/meson_crtc.c
-index 05520202c967..191b314f9e9e 100644
---- a/drivers/gpu/drm/meson/meson_crtc.c
-+++ b/drivers/gpu/drm/meson/meson_crtc.c
-@@ -45,6 +45,7 @@ struct meson_crtc {
- 	struct drm_crtc base;
- 	struct drm_pending_vblank_event *event;
- 	struct meson_drm *priv;
-+	bool enabled;
- };
- #define to_meson_crtc(x) container_of(x, struct meson_crtc, base)
- 
-@@ -80,8 +81,7 @@ static const struct drm_crtc_funcs meson_crtc_funcs = {
- 
- };
- 
--static void meson_crtc_atomic_enable(struct drm_crtc *crtc,
--				     struct drm_crtc_state *old_state)
-+static void meson_crtc_enable(struct drm_crtc *crtc)
- {
- 	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
- 	struct drm_crtc_state *crtc_state = crtc->state;
-@@ -101,6 +101,22 @@ static void meson_crtc_atomic_enable(struct drm_crtc *crtc,
- 	writel_bits_relaxed(VPP_POSTBLEND_ENABLE, VPP_POSTBLEND_ENABLE,
- 			    priv->io_base + _REG(VPP_MISC));
- 
-+	drm_crtc_vblank_on(crtc);
-+
-+	meson_crtc->enabled = true;
-+}
-+
-+static void meson_crtc_atomic_enable(struct drm_crtc *crtc,
-+				     struct drm_crtc_state *old_state)
-+{
-+	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
-+	struct meson_drm *priv = meson_crtc->priv;
-+
-+	DRM_DEBUG_DRIVER("\n");
-+
-+	if (!meson_crtc->enabled)
-+		meson_crtc_enable(crtc);
-+
- 	priv->viu.osd1_enabled = true;
- }
- 
-@@ -110,6 +126,8 @@ static void meson_crtc_atomic_disable(struct drm_crtc *crtc,
- 	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
- 	struct meson_drm *priv = meson_crtc->priv;
- 
-+	drm_crtc_vblank_off(crtc);
-+
- 	priv->viu.osd1_enabled = false;
- 	priv->viu.osd1_commit = false;
- 
-@@ -124,6 +142,8 @@ static void meson_crtc_atomic_disable(struct drm_crtc *crtc,
- 
- 		crtc->state->event = NULL;
- 	}
-+
-+	meson_crtc->enabled = false;
- }
- 
- static void meson_crtc_atomic_begin(struct drm_crtc *crtc,
-@@ -132,6 +152,9 @@ static void meson_crtc_atomic_begin(struct drm_crtc *crtc,
- 	struct meson_crtc *meson_crtc = to_meson_crtc(crtc);
- 	unsigned long flags;
- 
-+	if (crtc->state->enable && !meson_crtc->enabled)
-+		meson_crtc_enable(crtc);
-+
- 	if (crtc->state->event) {
- 		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
- 
-diff --git a/drivers/gpu/drm/meson/meson_venc.c b/drivers/gpu/drm/meson/meson_venc.c
-index 514245e69b38..14aac661f38b 100644
---- a/drivers/gpu/drm/meson/meson_venc.c
-+++ b/drivers/gpu/drm/meson/meson_venc.c
-@@ -71,6 +71,7 @@
-  */
- 
- /* HHI Registers */
-+#define HHI_GCLK_MPEG2		0x148 /* 0x52 offset in data sheet */
- #define HHI_VDAC_CNTL0		0x2F4 /* 0xbd offset in data sheet */
- #define HHI_VDAC_CNTL1		0x2F8 /* 0xbe offset in data sheet */
- #define HHI_HDMI_PHY_CNTL0	0x3a0 /* 0xe8 offset in data sheet */
-@@ -1529,10 +1530,12 @@ unsigned int meson_venci_get_field(struct meson_drm *priv)
- void meson_venc_enable_vsync(struct meson_drm *priv)
- {
- 	writel_relaxed(2, priv->io_base + _REG(VENC_INTCTRL));
-+	regmap_update_bits(priv->hhi, HHI_GCLK_MPEG2, BIT(25), BIT(25));
- }
- 
- void meson_venc_disable_vsync(struct meson_drm *priv)
- {
-+	regmap_update_bits(priv->hhi, HHI_GCLK_MPEG2, BIT(25), 0);
- 	writel_relaxed(0, priv->io_base + _REG(VENC_INTCTRL));
- }
- 
--- 
-2.28.0
-
-
-From ea6bb077bff27b94d2d612ace7d015fe8dba560a Mon Sep 17 00:00:00 2001
-From: Lyude Paul <lyude@redhat.com>
-Date: Sat, 24 Nov 2018 14:12:38 -0500
-Subject: [PATCH 18/42] drm/meson: Enable fast_io in
- meson_dw_hdmi_regmap_config
-
-commit 995b278e4723b26f8ebf0e7c119286d16c712747 upstream.
-
-Seeing as we use this registermap in the context of our IRQ handlers, we
-need to be using spinlocks for reading/writing registers so that we can
-still read them from IRQ handlers without having to grab any mutexes and
-accidentally sleep. We don't currently do this, as pointed out by
-lockdep:
-
-[   18.403770] BUG: sleeping function called from invalid context at kernel/locking/mutex.c:908
-[   18.406744] in_atomic(): 1, irqs_disabled(): 128, pid: 68, name: kworker/u17:0
-[   18.413864] INFO: lockdep is turned off.
-[   18.417675] irq event stamp: 12
-[   18.420778] hardirqs last  enabled at (11): [<ffff000008a4f57c>] _raw_spin_unlock_irq+0x2c/0x60
-[   18.429510] hardirqs last disabled at (12): [<ffff000008a48914>] __schedule+0xc4/0xa60
-[   18.437345] softirqs last  enabled at (0): [<ffff0000080b55e0>] copy_process.isra.4.part.5+0x4d8/0x1c50
-[   18.446684] softirqs last disabled at (0): [<0000000000000000>]           (null)
-[   18.453979] CPU: 0 PID: 68 Comm: kworker/u17:0 Tainted: G        W  O      4.20.0-rc3Lyude-Test+ #9
-[   18.469839] Hardware name: amlogic khadas-vim2/khadas-vim2, BIOS 2018.07-rc2-armbian 09/11/2018
-[   18.480037] Workqueue: hci0 hci_power_on [bluetooth]
-[   18.487138] Call trace:
-[   18.494192]  dump_backtrace+0x0/0x1b8
-[   18.501280]  show_stack+0x14/0x20
-[   18.508361]  dump_stack+0xbc/0xf4
-[   18.515427]  ___might_sleep+0x140/0x1d8
-[   18.522515]  __might_sleep+0x50/0x88
-[   18.529582]  __mutex_lock+0x60/0x870
-[   18.536621]  mutex_lock_nested+0x1c/0x28
-[   18.543660]  regmap_lock_mutex+0x10/0x18
-[   18.550696]  regmap_read+0x38/0x70
-[   18.557727]  dw_hdmi_hardirq+0x58/0x138 [dw_hdmi]
-[   18.564804]  __handle_irq_event_percpu+0xac/0x410
-[   18.571891]  handle_irq_event_percpu+0x34/0x88
-[   18.578982]  handle_irq_event+0x48/0x78
-[   18.586051]  handle_fasteoi_irq+0xac/0x160
-[   18.593061]  generic_handle_irq+0x24/0x38
-[   18.599989]  __handle_domain_irq+0x60/0xb8
-[   18.606857]  gic_handle_irq+0x50/0xa0
-[   18.613659]  el1_irq+0xb4/0x130
-[   18.620394]  debug_lockdep_rcu_enabled+0x2c/0x30
-[   18.627111]  schedule+0x38/0xa0
-[   18.633781]  schedule_timeout+0x3a8/0x510
-[   18.640389]  wait_for_common+0x15c/0x180
-[   18.646905]  wait_for_completion+0x14/0x20
-[   18.653319]  mmc_wait_for_req_done+0x28/0x168
-[   18.659693]  mmc_wait_for_req+0xa8/0xe8
-[   18.665978]  mmc_wait_for_cmd+0x64/0x98
-[   18.672180]  mmc_io_rw_direct_host+0x94/0x130
-[   18.678385]  mmc_io_rw_direct+0x10/0x18
-[   18.684516]  sdio_enable_func+0xe8/0x1d0
-[   18.690627]  btsdio_open+0x24/0xc0 [btsdio]
-[   18.696821]  hci_dev_do_open+0x64/0x598 [bluetooth]
-[   18.703025]  hci_power_on+0x50/0x270 [bluetooth]
-[   18.709163]  process_one_work+0x2a0/0x6e0
-[   18.715252]  worker_thread+0x40/0x448
-[   18.721310]  kthread+0x12c/0x130
-[   18.727326]  ret_from_fork+0x10/0x1c
-[   18.735555] ------------[ cut here ]------------
-[   18.741430] do not call blocking ops when !TASK_RUNNING; state=2 set at [<000000006265ec59>] wait_for_common+0x140/0x180
-[   18.752417] WARNING: CPU: 0 PID: 68 at kernel/sched/core.c:6096 __might_sleep+0x7c/0x88
-[   18.760553] Modules linked in: dm_mirror dm_region_hash dm_log dm_mod
-btsdio bluetooth snd_soc_hdmi_codec dw_hdmi_i2s_audio ecdh_generic
-brcmfmac brcmutil cfg80211 rfkill ir_nec_decoder meson_dw_hdmi(O)
-dw_hdmi rc_geekbox meson_rng meson_ir ao_cec rng_core rc_core cec
-leds_pwm efivars nfsd ip_tables x_tables crc32_generic f2fs uas
-meson_gxbb_wdt pwm_meson efivarfs ipv6
-[   18.799469] CPU: 0 PID: 68 Comm: kworker/u17:0 Tainted: G        W  O      4.20.0-rc3Lyude-Test+ #9
-[   18.808858] Hardware name: amlogic khadas-vim2/khadas-vim2, BIOS 2018.07-rc2-armbian 09/11/2018
-[   18.818045] Workqueue: hci0 hci_power_on [bluetooth]
-[   18.824088] pstate: 80000085 (Nzcv daIf -PAN -UAO)
-[   18.829891] pc : __might_sleep+0x7c/0x88
-[   18.835722] lr : __might_sleep+0x7c/0x88
-[   18.841256] sp : ffff000008003cb0
-[   18.846751] x29: ffff000008003cb0 x28: 0000000000000000
-[   18.852269] x27: ffff00000938e000 x26: ffff800010283000
-[   18.857726] x25: ffff800010353280 x24: ffff00000868ef50
-[   18.863166] x23: 0000000000000000 x22: 0000000000000000
-[   18.868551] x21: 0000000000000000 x20: 000000000000038c
-[   18.873850] x19: ffff000008cd08c0 x18: 0000000000000010
-[   18.879081] x17: ffff000008a68cb0 x16: 0000000000000000
-[   18.884197] x15: 0000000000aaaaaa x14: 0e200e200e200e20
-[   18.889239] x13: 0000000000000001 x12: 00000000ffffffff
-[   18.894261] x11: ffff000008adfa48 x10: 0000000000000001
-[   18.899517] x9 : ffff0000092a0158 x8 : 0000000000000000
-[   18.904674] x7 : ffff00000812136c x6 : 0000000000000000
-[   18.909895] x5 : 0000000000000000 x4 : 0000000000000001
-[   18.915080] x3 : 0000000000000007 x2 : 0000000000000007
-[   18.920269] x1 : 99ab8e9ebb6c8500 x0 : 0000000000000000
-[   18.925443] Call trace:
-[   18.929904]  __might_sleep+0x7c/0x88
-[   18.934311]  __mutex_lock+0x60/0x870
-[   18.938687]  mutex_lock_nested+0x1c/0x28
-[   18.943076]  regmap_lock_mutex+0x10/0x18
-[   18.947453]  regmap_read+0x38/0x70
-[   18.951842]  dw_hdmi_hardirq+0x58/0x138 [dw_hdmi]
-[   18.956269]  __handle_irq_event_percpu+0xac/0x410
-[   18.960712]  handle_irq_event_percpu+0x34/0x88
-[   18.965176]  handle_irq_event+0x48/0x78
-[   18.969612]  handle_fasteoi_irq+0xac/0x160
-[   18.974058]  generic_handle_irq+0x24/0x38
-[   18.978501]  __handle_domain_irq+0x60/0xb8
-[   18.982938]  gic_handle_irq+0x50/0xa0
-[   18.987351]  el1_irq+0xb4/0x130
-[   18.991734]  debug_lockdep_rcu_enabled+0x2c/0x30
-[   18.996180]  schedule+0x38/0xa0
-[   19.000609]  schedule_timeout+0x3a8/0x510
-[   19.005064]  wait_for_common+0x15c/0x180
-[   19.009513]  wait_for_completion+0x14/0x20
-[   19.013951]  mmc_wait_for_req_done+0x28/0x168
-[   19.018402]  mmc_wait_for_req+0xa8/0xe8
-[   19.022809]  mmc_wait_for_cmd+0x64/0x98
-[   19.027177]  mmc_io_rw_direct_host+0x94/0x130
-[   19.031563]  mmc_io_rw_direct+0x10/0x18
-[   19.035922]  sdio_enable_func+0xe8/0x1d0
-[   19.040294]  btsdio_open+0x24/0xc0 [btsdio]
-[   19.044742]  hci_dev_do_open+0x64/0x598 [bluetooth]
-[   19.049228]  hci_power_on+0x50/0x270 [bluetooth]
-[   19.053687]  process_one_work+0x2a0/0x6e0
-[   19.058143]  worker_thread+0x40/0x448
-[   19.062608]  kthread+0x12c/0x130
-[   19.067064]  ret_from_fork+0x10/0x1c
-[   19.071513] irq event stamp: 12
-[   19.075937] hardirqs last  enabled at (11): [<ffff000008a4f57c>] _raw_spin_unlock_irq+0x2c/0x60
-[   19.083560] hardirqs last disabled at (12): [<ffff000008a48914>] __schedule+0xc4/0xa60
-[   19.091401] softirqs last  enabled at (0): [<ffff0000080b55e0>] copy_process.isra.4.part.5+0x4d8/0x1c50
-[   19.100801] softirqs last disabled at (0): [<0000000000000000>]           (null)
-[   19.108135] ---[ end trace 38c4920787b88c75 ]---
-
-So, fix this by enabling the fast_io option in our regmap config so that
-regmap uses spinlocks for locking instead of mutexes.
-
-Signed-off-by: Lyude Paul <lyude@redhat.com>
-Fixes: 3f68be7d8e96 ("drm/meson: Add support for HDMI encoder and DW-HDMI bridge + PHY")
-Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
-Cc: Neil Armstrong <narmstrong@baylibre.com>
-Cc: Carlo Caione <carlo@caione.org>
-Cc: Kevin Hilman <khilman@baylibre.com>
-Cc: dri-devel@lists.freedesktop.org
-Cc: linux-amlogic@lists.infradead.org
-Cc: linux-arm-kernel@lists.infradead.org
-Cc: <stable@vger.kernel.org> # v4.12+
-Acked-by: Neil Armstrong <narmstrong@baylibre.com>
-Signed-off-by: Neil Armstrong <narmstrong@baylibre.com>
-Link: https://patchwork.freedesktop.org/patch/msgid/20181124191238.28276-1-lyude@redhat.com
-Signed-off-by: Sean Paul <seanpaul@chromium.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/meson/meson_dw_hdmi.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/gpu/drm/meson/meson_dw_hdmi.c b/drivers/gpu/drm/meson/meson_dw_hdmi.c
-index df7247cd93f9..2cb2ad26d716 100644
---- a/drivers/gpu/drm/meson/meson_dw_hdmi.c
-+++ b/drivers/gpu/drm/meson/meson_dw_hdmi.c
-@@ -706,6 +706,7 @@ static const struct regmap_config meson_dw_hdmi_regmap_config = {
- 	.reg_read = meson_dw_hdmi_reg_read,
- 	.reg_write = meson_dw_hdmi_reg_write,
- 	.max_register = 0x10000,
-+	.fast_io = true,
- };
- 
- static bool meson_hdmi_connector_is_available(struct device *dev)
--- 
-2.28.0
-
-
-From 212ad3d70222a7da4425306b7443c67239bce88b Mon Sep 17 00:00:00 2001
-From: Lyude Paul <lyude@redhat.com>
-Date: Sat, 24 Nov 2018 20:21:17 -0500
-Subject: [PATCH 19/42] drm/meson: Fix OOB memory accesses in
- meson_viu_set_osd_lut()
-
-commit 97b2a3180a559a33852ac0cd77904166069484fd upstream.
-
-Currently on driver bringup with KASAN enabled, meson triggers an OOB
-memory access as shown below:
-
-[  117.904528] ==================================================================
-[  117.904560] BUG: KASAN: global-out-of-bounds in meson_viu_set_osd_lut+0x7a0/0x890
-[  117.904588] Read of size 4 at addr ffff20000a63ce24 by task systemd-udevd/498
-[  117.904601]
-[  118.083372] CPU: 4 PID: 498 Comm: systemd-udevd Not tainted 4.20.0-rc3Lyude-Test+ #20
-[  118.091143] Hardware name: amlogic khadas-vim2/khadas-vim2, BIOS 2018.07-rc2-armbian 09/11/2018
-[  118.099768] Call trace:
-[  118.102181]  dump_backtrace+0x0/0x3e8
-[  118.105796]  show_stack+0x14/0x20
-[  118.109083]  dump_stack+0x130/0x1c4
-[  118.112539]  print_address_description+0x60/0x25c
-[  118.117214]  kasan_report+0x1b4/0x368
-[  118.120851]  __asan_report_load4_noabort+0x18/0x20
-[  118.125566]  meson_viu_set_osd_lut+0x7a0/0x890
-[  118.129953]  meson_viu_init+0x10c/0x290
-[  118.133741]  meson_drv_bind_master+0x474/0x748
-[  118.138141]  meson_drv_bind+0x10/0x18
-[  118.141760]  try_to_bring_up_master+0x3d8/0x768
-[  118.146249]  component_add+0x214/0x570
-[  118.149978]  meson_dw_hdmi_probe+0x18/0x20 [meson_dw_hdmi]
-[  118.155404]  platform_drv_probe+0x98/0x138
-[  118.159455]  really_probe+0x2a0/0xa70
-[  118.163070]  driver_probe_device+0x1b4/0x2d8
-[  118.167299]  __driver_attach+0x200/0x280
-[  118.171189]  bus_for_each_dev+0x10c/0x1a8
-[  118.175144]  driver_attach+0x38/0x50
-[  118.178681]  bus_add_driver+0x330/0x608
-[  118.182471]  driver_register+0x140/0x388
-[  118.186361]  __platform_driver_register+0xc8/0x108
-[  118.191117]  meson_dw_hdmi_platform_driver_init+0x1c/0x1000 [meson_dw_hdmi]
-[  118.198022]  do_one_initcall+0x12c/0x3bc
-[  118.201883]  do_init_module+0x1fc/0x638
-[  118.205673]  load_module+0x4b4c/0x6808
-[  118.209387]  __se_sys_init_module+0x2e8/0x3c0
-[  118.213699]  __arm64_sys_init_module+0x68/0x98
-[  118.218100]  el0_svc_common+0x104/0x210
-[  118.221893]  el0_svc_handler+0x48/0xb8
-[  118.225594]  el0_svc+0x8/0xc
-[  118.228429]
-[  118.229887] The buggy address belongs to the variable:
-[  118.235007]  eotf_33_linear_mapping+0x84/0xc0
-[  118.239301]
-[  118.240752] Memory state around the buggy address:
-[  118.245522]  ffff20000a63cd00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-[  118.252695]  ffff20000a63cd80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-[  118.259850] >ffff20000a63ce00: 00 00 00 00 04 fa fa fa fa fa fa fa 00 00 00 00
-[  118.267000]                                ^
-[  118.271222]  ffff20000a63ce80: 00 fa fa fa fa fa fa fa 00 00 00 00 00 00 00 00
-[  118.278393]  ffff20000a63cf00: 00 00 00 00 00 00 00 00 00 00 00 00 04 fa fa fa
-[  118.285542] ==================================================================
-[  118.292699] Disabling lock debugging due to kernel taint
-
-It seems that when looping through the OSD EOTF LUT maps, we use the
-same max iterator for OETF: 20. This is wrong though, since 20*2 is 40,
-which means that we'll stop out of bounds on the EOTF maps.
-
-But, this whole thing is already confusing enough to read through as-is,
-so let's just replace all of the hardcoded sizes with
-OSD_(OETF/EOTF)_LUT_SIZE / 2.
-
-Signed-off-by: Lyude Paul <lyude@redhat.com>
-Fixes: bbbe775ec5b5 ("drm: Add support for Amlogic Meson Graphic Controller")
-Cc: Neil Armstrong <narmstrong@baylibre.com>
-Cc: Maxime Ripard <maxime.ripard@bootlin.com>
-Cc: Carlo Caione <carlo@caione.org>
-Cc: Kevin Hilman <khilman@baylibre.com>
-Cc: dri-devel@lists.freedesktop.org
-Cc: linux-amlogic@lists.infradead.org
-Cc: linux-arm-kernel@lists.infradead.org
-Cc: <stable@vger.kernel.org> # v4.10+
-Acked-by: Neil Armstrong <narmstrong@baylibre.com>
-Signed-off-by: Neil Armstrong <narmstrong@baylibre.com>
-Link: https://patchwork.freedesktop.org/patch/msgid/20181125012117.31915-1-lyude@redhat.com
-Signed-off-by: Sean Paul <seanpaul@chromium.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/meson/meson_viu.c | 12 ++++++------
- 1 file changed, 6 insertions(+), 6 deletions(-)
-
-diff --git a/drivers/gpu/drm/meson/meson_viu.c b/drivers/gpu/drm/meson/meson_viu.c
-index 6bcfa527c180..26a0857878bf 100644
---- a/drivers/gpu/drm/meson/meson_viu.c
-+++ b/drivers/gpu/drm/meson/meson_viu.c
-@@ -184,18 +184,18 @@ void meson_viu_set_osd_lut(struct meson_drm *priv, enum viu_lut_sel_e lut_sel,
- 	if (lut_sel == VIU_LUT_OSD_OETF) {
- 		writel(0, priv->io_base + _REG(addr_port));
- 
--		for (i = 0; i < 20; i++)
-+		for (i = 0; i < (OSD_OETF_LUT_SIZE / 2); i++)
- 			writel(r_map[i * 2] | (r_map[i * 2 + 1] << 16),
- 				priv->io_base + _REG(data_port));
- 
- 		writel(r_map[OSD_OETF_LUT_SIZE - 1] | (g_map[0] << 16),
- 			priv->io_base + _REG(data_port));
- 
--		for (i = 0; i < 20; i++)
-+		for (i = 0; i < (OSD_OETF_LUT_SIZE / 2); i++)
- 			writel(g_map[i * 2 + 1] | (g_map[i * 2 + 2] << 16),
- 				priv->io_base + _REG(data_port));
- 
--		for (i = 0; i < 20; i++)
-+		for (i = 0; i < (OSD_OETF_LUT_SIZE / 2); i++)
- 			writel(b_map[i * 2] | (b_map[i * 2 + 1] << 16),
- 				priv->io_base + _REG(data_port));
- 
-@@ -211,18 +211,18 @@ void meson_viu_set_osd_lut(struct meson_drm *priv, enum viu_lut_sel_e lut_sel,
- 	} else if (lut_sel == VIU_LUT_OSD_EOTF) {
- 		writel(0, priv->io_base + _REG(addr_port));
- 
--		for (i = 0; i < 20; i++)
-+		for (i = 0; i < (OSD_EOTF_LUT_SIZE / 2); i++)
- 			writel(r_map[i * 2] | (r_map[i * 2 + 1] << 16),
- 				priv->io_base + _REG(data_port));
- 
- 		writel(r_map[OSD_EOTF_LUT_SIZE - 1] | (g_map[0] << 16),
- 			priv->io_base + _REG(data_port));
- 
--		for (i = 0; i < 20; i++)
-+		for (i = 0; i < (OSD_EOTF_LUT_SIZE / 2); i++)
- 			writel(g_map[i * 2 + 1] | (g_map[i * 2 + 2] << 16),
- 				priv->io_base + _REG(data_port));
- 
--		for (i = 0; i < 20; i++)
-+		for (i = 0; i < (OSD_EOTF_LUT_SIZE / 2); i++)
- 			writel(b_map[i * 2] | (b_map[i * 2 + 1] << 16),
- 				priv->io_base + _REG(data_port));
- 
--- 
-2.28.0
-
-
-From 10f98c134b02d11923d45ce6688c2479435e8ec9 Mon Sep 17 00:00:00 2001
-From: Andrea Arcangeli <aarcange@redhat.com>
-Date: Fri, 30 Nov 2018 14:09:25 -0800
-Subject: [PATCH 20/42] userfaultfd: use ENOENT instead of EFAULT if the atomic
- copy user fails
-
-commit 9e368259ad988356c4c95150fafd1a06af095d98 upstream.
-
-Patch series "userfaultfd shmem updates".
-
-Jann found two bugs in the userfaultfd shmem MAP_SHARED backend: the
-lack of the VM_MAYWRITE check and the lack of i_size checks.
-
-Then looking into the above we also fixed the MAP_PRIVATE case.
-
-Hugh by source review also found a data loss source if UFFDIO_COPY is
-used on shmem MAP_SHARED PROT_READ mappings (the production usages
-incidentally run with PROT_READ|PROT_WRITE, so the data loss couldn't
-happen in those production usages like with QEMU).
-
-The whole patchset is marked for stable.
-
-We verified QEMU postcopy live migration with guest running on shmem
-MAP_PRIVATE run as well as before after the fix of shmem MAP_PRIVATE.
-Regardless if it's shmem or hugetlbfs or MAP_PRIVATE or MAP_SHARED, QEMU
-unconditionally invokes a punch hole if the guest mapping is filebacked
-and a MADV_DONTNEED too (needed to get rid of the MAP_PRIVATE COWs and
-for the anon backend).
-
-This patch (of 5):
-
-We internally used EFAULT to communicate with the caller, switch to
-ENOENT, so EFAULT can be used as a non internal retval.
-
-Link: http://lkml.kernel.org/r/20181126173452.26955-2-aarcange@redhat.com
-Fixes: 4c27fe4c4c84 ("userfaultfd: shmem: add shmem_mcopy_atomic_pte for userfaultfd support")
-Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
-Reviewed-by: Mike Rapoport <rppt@linux.ibm.com>
-Reviewed-by: Hugh Dickins <hughd@google.com>
-Cc: Mike Kravetz <mike.kravetz@oracle.com>
-Cc: Jann Horn <jannh@google.com>
-Cc: Peter Xu <peterx@redhat.com>
-Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
-Cc: <stable@vger.kernel.org>
-Cc: stable@vger.kernel.org
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/hugetlb.c     | 2 +-
- mm/shmem.c       | 2 +-
- mm/userfaultfd.c | 6 +++---
- 3 files changed, 5 insertions(+), 5 deletions(-)
-
+ 		*p++ = ' ';
 diff --git a/mm/hugetlb.c b/mm/hugetlb.c
 index 1931a3d9b282..309fb8c969af 100644
 --- a/mm/hugetlb.c
@@ -1708,181 +1177,7 @@ index 1931a3d9b282..309fb8c969af 100644
  			/* don't free the page */
  			goto out;
 diff --git a/mm/shmem.c b/mm/shmem.c
-index 0b02b539072e..17f7de9c1ff0 100644
---- a/mm/shmem.c
-+++ b/mm/shmem.c
-@@ -2286,7 +2286,7 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
- 				*pagep = page;
- 				shmem_inode_unacct_blocks(inode, 1);
- 				/* don't free the page */
--				return -EFAULT;
-+				return -ENOENT;
- 			}
- 		} else {		/* mfill_zeropage_atomic */
- 			clear_highpage(page);
-diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
-index f0af11b1cdf3..22427d5a3a89 100644
---- a/mm/userfaultfd.c
-+++ b/mm/userfaultfd.c
-@@ -48,7 +48,7 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
- 
- 		/* fallback to copy_from_user outside mmap_sem */
- 		if (unlikely(ret)) {
--			ret = -EFAULT;
-+			ret = -ENOENT;
- 			*pagep = page;
- 			/* don't free the page */
- 			goto out;
-@@ -275,7 +275,7 @@ static __always_inline ssize_t __mcopy_atomic_hugetlb(struct mm_struct *dst_mm,
- 
- 		cond_resched();
- 
--		if (unlikely(err == -EFAULT)) {
-+		if (unlikely(err == -ENOENT)) {
- 			up_read(&dst_mm->mmap_sem);
- 			BUG_ON(!page);
- 
-@@ -527,7 +527,7 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
- 				       src_addr, &page, zeropage);
- 		cond_resched();
- 
--		if (unlikely(err == -EFAULT)) {
-+		if (unlikely(err == -ENOENT)) {
- 			void *page_kaddr;
- 
- 			up_read(&dst_mm->mmap_sem);
--- 
-2.28.0
-
-
-From 6e44dd02c95508f6df5eca4d46adbb75233ea181 Mon Sep 17 00:00:00 2001
-From: Andrea Arcangeli <aarcange@redhat.com>
-Date: Fri, 30 Nov 2018 14:09:28 -0800
-Subject: [PATCH 21/42] userfaultfd: shmem: allocate anonymous memory for
- MAP_PRIVATE shmem
-
-commit 5b51072e97d587186c2f5390c8c9c1fb7e179505 upstream.
-
-Userfaultfd did not create private memory when UFFDIO_COPY was invoked
-on a MAP_PRIVATE shmem mapping.  Instead it wrote to the shmem file,
-even when that had not been opened for writing.  Though, fortunately,
-that could only happen where there was a hole in the file.
-
-Fix the shmem-backed implementation of UFFDIO_COPY to create private
-memory for MAP_PRIVATE mappings.  The hugetlbfs-backed implementation
-was already correct.
-
-This change is visible to userland, if userfaultfd has been used in
-unintended ways: so it introduces a small risk of incompatibility, but
-is necessary in order to respect file permissions.
-
-An app that uses UFFDIO_COPY for anything like postcopy live migration
-won't notice the difference, and in fact it'll run faster because there
-will be no copy-on-write and memory waste in the tmpfs pagecache
-anymore.
-
-Userfaults on MAP_PRIVATE shmem keep triggering only on file holes like
-before.
-
-The real zeropage can also be built on a MAP_PRIVATE shmem mapping
-through UFFDIO_ZEROPAGE and that's safe because the zeropage pte is
-never dirty, in turn even an mprotect upgrading the vma permission from
-PROT_READ to PROT_READ|PROT_WRITE won't make the zeropage pte writable.
-
-Link: http://lkml.kernel.org/r/20181126173452.26955-3-aarcange@redhat.com
-Fixes: 4c27fe4c4c84 ("userfaultfd: shmem: add shmem_mcopy_atomic_pte for userfaultfd support")
-Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
-Reported-by: Mike Rapoport <rppt@linux.ibm.com>
-Reviewed-by: Hugh Dickins <hughd@google.com>
-Cc: <stable@vger.kernel.org>
-Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
-Cc: Jann Horn <jannh@google.com>
-Cc: Mike Kravetz <mike.kravetz@oracle.com>
-Cc: Peter Xu <peterx@redhat.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/userfaultfd.c | 15 +++++++++++++--
- 1 file changed, 13 insertions(+), 2 deletions(-)
-
-diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
-index 22427d5a3a89..43cf314cfddd 100644
---- a/mm/userfaultfd.c
-+++ b/mm/userfaultfd.c
-@@ -381,7 +381,17 @@ static __always_inline ssize_t mfill_atomic_pte(struct mm_struct *dst_mm,
- {
- 	ssize_t err;
- 
--	if (vma_is_anonymous(dst_vma)) {
-+	/*
-+	 * The normal page fault path for a shmem will invoke the
-+	 * fault, fill the hole in the file and COW it right away. The
-+	 * result generates plain anonymous memory. So when we are
-+	 * asked to fill an hole in a MAP_PRIVATE shmem mapping, we'll
-+	 * generate anonymous memory directly without actually filling
-+	 * the hole. For the MAP_PRIVATE case the robustness check
-+	 * only happens in the pagetable (to verify it's still none)
-+	 * and not in the radix tree.
-+	 */
-+	if (!(dst_vma->vm_flags & VM_SHARED)) {
- 		if (!zeropage)
- 			err = mcopy_atomic_pte(dst_mm, dst_pmd, dst_vma,
- 					       dst_addr, src_addr, page);
-@@ -486,7 +496,8 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
- 	 * dst_vma.
- 	 */
- 	err = -ENOMEM;
--	if (vma_is_anonymous(dst_vma) && unlikely(anon_vma_prepare(dst_vma)))
-+	if (!(dst_vma->vm_flags & VM_SHARED) &&
-+	    unlikely(anon_vma_prepare(dst_vma)))
- 		goto out_unlock;
- 
- 	while (src_addr < src_start + len) {
--- 
-2.28.0
-
-
-From 4ce337622f2bbc0df61b0b76aa60388f5def5646 Mon Sep 17 00:00:00 2001
-From: Andrea Arcangeli <aarcange@redhat.com>
-Date: Fri, 30 Nov 2018 14:09:37 -0800
-Subject: [PATCH 22/42] userfaultfd: shmem: add i_size checks
-
-commit e2a50c1f64145a04959df2442305d57307e5395a upstream.
-
-With MAP_SHARED: recheck the i_size after taking the PT lock, to
-serialize against truncate with the PT lock.  Delete the page from the
-pagecache if the i_size_read check fails.
-
-With MAP_PRIVATE: check the i_size after the PT lock before mapping
-anonymous memory or zeropages into the MAP_PRIVATE shmem mapping.
-
-A mostly irrelevant cleanup: like we do the delete_from_page_cache()
-pagecache removal after dropping the PT lock, the PT lock is a spinlock
-so drop it before the sleepable page lock.
-
-Link: http://lkml.kernel.org/r/20181126173452.26955-5-aarcange@redhat.com
-Fixes: 4c27fe4c4c84 ("userfaultfd: shmem: add shmem_mcopy_atomic_pte for userfaultfd support")
-Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
-Reviewed-by: Mike Rapoport <rppt@linux.ibm.com>
-Reviewed-by: Hugh Dickins <hughd@google.com>
-Reported-by: Jann Horn <jannh@google.com>
-Cc: <stable@vger.kernel.org>
-Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
-Cc: Mike Kravetz <mike.kravetz@oracle.com>
-Cc: Peter Xu <peterx@redhat.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/shmem.c       | 18 ++++++++++++++++--
- mm/userfaultfd.c | 26 ++++++++++++++++++++++++--
- 2 files changed, 40 insertions(+), 4 deletions(-)
-
-diff --git a/mm/shmem.c b/mm/shmem.c
-index 17f7de9c1ff0..723a01499458 100644
+index 0b02b539072e..b6cf0e8e685b 100644
 --- a/mm/shmem.c
 +++ b/mm/shmem.c
 @@ -2264,6 +2264,7 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
@@ -1893,6 +1188,15 @@ index 17f7de9c1ff0..723a01499458 100644
  
  	ret = -ENOMEM;
  	if (!shmem_inode_acct_block(inode, 1))
+@@ -2286,7 +2287,7 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
+ 				*pagep = page;
+ 				shmem_inode_unacct_blocks(inode, 1);
+ 				/* don't free the page */
+-				return -EFAULT;
++				return -ENOENT;
+ 			}
+ 		} else {		/* mfill_zeropage_atomic */
+ 			clear_highpage(page);
 @@ -2301,6 +2302,12 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
  	__SetPageSwapBacked(page);
  	__SetPageUptodate(page);
@@ -1906,9 +1210,20 @@ index 17f7de9c1ff0..723a01499458 100644
  	ret = mem_cgroup_try_charge_delay(page, dst_mm, gfp, &memcg, false);
  	if (ret)
  		goto out_release;
-@@ -2319,8 +2326,14 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
+@@ -2318,9 +2325,25 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
+ 	_dst_pte = mk_pte(page, dst_vma->vm_page_prot);
  	if (dst_vma->vm_flags & VM_WRITE)
  		_dst_pte = pte_mkwrite(pte_mkdirty(_dst_pte));
++	else {
++		/*
++		 * We don't set the pte dirty if the vma has no
++		 * VM_WRITE permission, so mark the page dirty or it
++		 * could be freed from under us. We could do it
++		 * unconditionally before unlock_page(), but doing it
++		 * only if VM_WRITE is not set is faster.
++		 */
++		set_page_dirty(page);
++	}
  
 -	ret = -EEXIST;
  	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
@@ -1922,7 +1237,7 @@ index 17f7de9c1ff0..723a01499458 100644
  	if (!pte_none(*dst_pte))
  		goto out_release_uncharge_unlock;
  
-@@ -2338,13 +2351,14 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
+@@ -2338,13 +2361,15 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
  
  	/* No need to invalidate - it was non-present before */
  	update_mmu_cache(dst_vma, dst_addr, dst_pte);
@@ -1934,12 +1249,13 @@ index 17f7de9c1ff0..723a01499458 100644
  	return ret;
  out_release_uncharge_unlock:
  	pte_unmap_unlock(dst_pte, ptl);
++	ClearPageDirty(page);
 +	delete_from_page_cache(page);
  out_release_uncharge:
  	mem_cgroup_cancel_charge(page, memcg, false);
  out_release:
 diff --git a/mm/userfaultfd.c b/mm/userfaultfd.c
-index 43cf314cfddd..458acda96f20 100644
+index f0af11b1cdf3..458acda96f20 100644
 --- a/mm/userfaultfd.c
 +++ b/mm/userfaultfd.c
 @@ -33,6 +33,8 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
@@ -1951,6 +1267,15 @@ index 43cf314cfddd..458acda96f20 100644
  
  	if (!*pagep) {
  		ret = -ENOMEM;
+@@ -48,7 +50,7 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
+ 
+ 		/* fallback to copy_from_user outside mmap_sem */
+ 		if (unlikely(ret)) {
+-			ret = -EFAULT;
++			ret = -ENOENT;
+ 			*pagep = page;
+ 			/* don't free the page */
+ 			goto out;
 @@ -73,8 +75,17 @@ static int mcopy_atomic_pte(struct mm_struct *dst_mm,
  	if (dst_vma->vm_flags & VM_WRITE)
  		_dst_pte = pte_mkwrite(pte_mkdirty(_dst_pte));
@@ -1994,311 +1319,88 @@ index 43cf314cfddd..458acda96f20 100644
  	if (!pte_none(*dst_pte))
  		goto out_unlock;
  	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
--- 
-2.28.0
-
-
-From 8f193a716e56f30e36a4c851e59bf6fa74af8d9f Mon Sep 17 00:00:00 2001
-From: Andrea Arcangeli <aarcange@redhat.com>
-Date: Fri, 30 Nov 2018 14:09:43 -0800
-Subject: [PATCH 23/42] userfaultfd: shmem: UFFDIO_COPY: set the page dirty if
- VM_WRITE is not set
-
-commit dcf7fe9d89763a28e0f43975b422ff141fe79e43 upstream.
-
-Set the page dirty if VM_WRITE is not set because in such case the pte
-won't be marked dirty and the page would be reclaimed without writepage
-(i.e.  swapout in the shmem case).
-
-This was found by source review.  Most apps (certainly including QEMU)
-only use UFFDIO_COPY on PROT_READ|PROT_WRITE mappings or the app can't
-modify the memory in the first place.  This is for correctness and it
-could help the non cooperative use case to avoid unexpected data loss.
-
-Link: http://lkml.kernel.org/r/20181126173452.26955-6-aarcange@redhat.com
-Reviewed-by: Hugh Dickins <hughd@google.com>
-Cc: stable@vger.kernel.org
-Fixes: 4c27fe4c4c84 ("userfaultfd: shmem: add shmem_mcopy_atomic_pte for userfaultfd support")
-Reported-by: Hugh Dickins <hughd@google.com>
-Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
-Cc: "Dr. David Alan Gilbert" <dgilbert@redhat.com>
-Cc: Jann Horn <jannh@google.com>
-Cc: Mike Kravetz <mike.kravetz@oracle.com>
-Cc: Mike Rapoport <rppt@linux.ibm.com>
-Cc: Peter Xu <peterx@redhat.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/shmem.c | 11 +++++++++++
- 1 file changed, 11 insertions(+)
-
-diff --git a/mm/shmem.c b/mm/shmem.c
-index 723a01499458..b6cf0e8e685b 100644
---- a/mm/shmem.c
-+++ b/mm/shmem.c
-@@ -2325,6 +2325,16 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
- 	_dst_pte = mk_pte(page, dst_vma->vm_page_prot);
- 	if (dst_vma->vm_flags & VM_WRITE)
- 		_dst_pte = pte_mkwrite(pte_mkdirty(_dst_pte));
-+	else {
-+		/*
-+		 * We don't set the pte dirty if the vma has no
-+		 * VM_WRITE permission, so mark the page dirty or it
-+		 * could be freed from under us. We could do it
-+		 * unconditionally before unlock_page(), but doing it
-+		 * only if VM_WRITE is not set is faster.
-+		 */
-+		set_page_dirty(page);
-+	}
+@@ -275,7 +297,7 @@ retry:
  
- 	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
+ 		cond_resched();
  
-@@ -2358,6 +2368,7 @@ static int shmem_mfill_atomic_pte(struct mm_struct *dst_mm,
- 	return ret;
- out_release_uncharge_unlock:
- 	pte_unmap_unlock(dst_pte, ptl);
-+	ClearPageDirty(page);
- 	delete_from_page_cache(page);
- out_release_uncharge:
- 	mem_cgroup_cancel_charge(page, memcg, false);
--- 
-2.28.0
-
-
-From 5eede3d09625f12385be732300fb1b8146fcdd77 Mon Sep 17 00:00:00 2001
-From: Laura Abbott <labbott@redhat.com>
-Date: Mon, 10 Sep 2018 16:20:14 -0700
-Subject: [PATCH 24/42] kgdboc: Fix restrict error
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 2dd453168643d9475028cd867c57e65956a0f7f9 upstream.
-
-There's an error when compiled with restrict:
-
-drivers/tty/serial/kgdboc.c: In function ‘configure_kgdboc’:
-drivers/tty/serial/kgdboc.c:137:2: error: ‘strcpy’ source argument is the same
-as destination [-Werror=restrict]
-  strcpy(config, opt);
-  ^~~~~~~~~~~~~~~~~~~
-
-As the error implies, this is from trying to use config as both source and
-destination. Drop the call to the function where config is the argument
-since nothing else happens in the function.
-
-Signed-off-by: Laura Abbott <labbott@redhat.com>
-Reviewed-by: Daniel Thompson <daniel.thompson@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/tty/serial/kgdboc.c | 6 ++----
- 1 file changed, 2 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/tty/serial/kgdboc.c b/drivers/tty/serial/kgdboc.c
-index f4d0ef695225..464b71ed44b3 100644
---- a/drivers/tty/serial/kgdboc.c
-+++ b/drivers/tty/serial/kgdboc.c
-@@ -159,15 +159,13 @@ static int configure_kgdboc(void)
+-		if (unlikely(err == -EFAULT)) {
++		if (unlikely(err == -ENOENT)) {
+ 			up_read(&dst_mm->mmap_sem);
+ 			BUG_ON(!page);
+ 
+@@ -381,7 +403,17 @@ static __always_inline ssize_t mfill_atomic_pte(struct mm_struct *dst_mm,
  {
- 	struct tty_driver *p;
- 	int tty_line = 0;
--	int err;
-+	int err = -ENODEV;
- 	char *cptr = config;
- 	struct console *cons;
+ 	ssize_t err;
  
--	err = kgdboc_option_setup(config);
--	if (err || !strlen(config) || isspace(config[0]))
-+	if (!strlen(config) || isspace(config[0]))
- 		goto noconfig;
+-	if (vma_is_anonymous(dst_vma)) {
++	/*
++	 * The normal page fault path for a shmem will invoke the
++	 * fault, fill the hole in the file and COW it right away. The
++	 * result generates plain anonymous memory. So when we are
++	 * asked to fill an hole in a MAP_PRIVATE shmem mapping, we'll
++	 * generate anonymous memory directly without actually filling
++	 * the hole. For the MAP_PRIVATE case the robustness check
++	 * only happens in the pagetable (to verify it's still none)
++	 * and not in the radix tree.
++	 */
++	if (!(dst_vma->vm_flags & VM_SHARED)) {
+ 		if (!zeropage)
+ 			err = mcopy_atomic_pte(dst_mm, dst_pmd, dst_vma,
+ 					       dst_addr, src_addr, page);
+@@ -486,7 +518,8 @@ retry:
+ 	 * dst_vma.
+ 	 */
+ 	err = -ENOMEM;
+-	if (vma_is_anonymous(dst_vma) && unlikely(anon_vma_prepare(dst_vma)))
++	if (!(dst_vma->vm_flags & VM_SHARED) &&
++	    unlikely(anon_vma_prepare(dst_vma)))
+ 		goto out_unlock;
  
--	err = -ENODEV;
- 	kgdboc_io_ops.is_console = 0;
- 	kgdb_tty_driver = NULL;
+ 	while (src_addr < src_start + len) {
+@@ -527,7 +560,7 @@ retry:
+ 				       src_addr, &page, zeropage);
+ 		cond_resched();
  
--- 
-2.28.0
-
-
-From e762e1407bc85ae45a6d42267cb8af468b61d891 Mon Sep 17 00:00:00 2001
-From: Laura Abbott <labbott@redhat.com>
-Date: Wed, 19 Sep 2018 18:59:01 -0700
-Subject: [PATCH 25/42] kgdboc: Fix warning with module build
-
-commit 1cd25cbb2fedbc777f3a8c3cb1ba69b645aeaa64 upstream.
-
-After 2dd453168643 ("kgdboc: Fix restrict error"), kgdboc_option_setup is
-now only used when built in, resulting in a warning when compiled as a
-module:
-
-drivers/tty/serial/kgdboc.c:134:12: warning: 'kgdboc_option_setup' defined but not used [-Wunused-function]
- static int kgdboc_option_setup(char *opt)
-            ^~~~~~~~~~~~~~~~~~~
-
-Move the function under the appropriate ifdef for builtin only.
-
-Fixes: 2dd453168643 ("kgdboc: Fix restrict error")
-Reported-by: Stephen Rothwell <sfr@canb.auug.org.au>
-Signed-off-by: Laura Abbott <labbott@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/tty/serial/kgdboc.c | 37 +++++++++++++++++++------------------
- 1 file changed, 19 insertions(+), 18 deletions(-)
-
-diff --git a/drivers/tty/serial/kgdboc.c b/drivers/tty/serial/kgdboc.c
-index 464b71ed44b3..8a111ab33b50 100644
---- a/drivers/tty/serial/kgdboc.c
-+++ b/drivers/tty/serial/kgdboc.c
-@@ -128,24 +128,6 @@ static void kgdboc_unregister_kbd(void)
- #define kgdboc_restore_input()
- #endif /* ! CONFIG_KDB_KEYBOARD */
+-		if (unlikely(err == -EFAULT)) {
++		if (unlikely(err == -ENOENT)) {
+ 			void *page_kaddr;
  
--static int kgdboc_option_setup(char *opt)
--{
--	if (!opt) {
--		pr_err("kgdboc: config string not provided\n");
--		return -EINVAL;
--	}
--
--	if (strlen(opt) >= MAX_CONFIG_LEN) {
--		printk(KERN_ERR "kgdboc: config string too long\n");
--		return -ENOSPC;
--	}
--	strcpy(config, opt);
--
--	return 0;
--}
--
--__setup("kgdboc=", kgdboc_option_setup);
--
- static void cleanup_kgdboc(void)
- {
- 	if (kgdb_unregister_nmi_console())
-@@ -314,6 +296,25 @@ static struct kgdb_io kgdboc_io_ops = {
- };
+ 			up_read(&dst_mm->mmap_sem);
+diff --git a/net/tipc/topsrv.c b/net/tipc/topsrv.c
+index 2627b5d812e9..b84c0059214f 100644
+--- a/net/tipc/topsrv.c
++++ b/net/tipc/topsrv.c
+@@ -657,7 +657,7 @@ int tipc_topsrv_start(struct net *net)
+ 	srv->max_rcvbuf_size = sizeof(struct tipc_subscr);
+ 	INIT_WORK(&srv->awork, tipc_topsrv_accept);
  
- #ifdef CONFIG_KGDB_SERIAL_CONSOLE
-+static int kgdboc_option_setup(char *opt)
-+{
-+	if (!opt) {
-+		pr_err("config string not provided\n");
-+		return -EINVAL;
-+	}
-+
-+	if (strlen(opt) >= MAX_CONFIG_LEN) {
-+		pr_err("config string too long\n");
-+		return -ENOSPC;
-+	}
-+	strcpy(config, opt);
-+
-+	return 0;
-+}
-+
-+__setup("kgdboc=", kgdboc_option_setup);
-+
-+
- /* This is only available if kgdboc is a built in for early debugging */
- static int __init kgdboc_early_init(char *opt)
- {
--- 
-2.28.0
-
-
-From 85bb1e8b7013996761d3f514faafe8862b2982f6 Mon Sep 17 00:00:00 2001
-From: Wei Wang <wawei@amazon.de>
-Date: Mon, 12 Nov 2018 12:23:14 +0000
-Subject: [PATCH 26/42] svm: Add mutex_lock to protect apic_access_page_done on
- AMD systems
-
-commit 30510387a5e45bfcf8190e03ec7aa15b295828e2 upstream.
-
-There is a race condition when accessing kvm->arch.apic_access_page_done.
-Due to it, x86_set_memory_region will fail when creating the second vcpu
-for a svm guest.
-
-Add a mutex_lock to serialize the accesses to apic_access_page_done.
-This lock is also used by vmx for the same purpose.
-
-Signed-off-by: Wei Wang <wawei@amazon.de>
-Signed-off-by: Amadeusz Juskowiak <ajusk@amazon.de>
-Signed-off-by: Julian Stecklina <jsteckli@amazon.de>
-Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
-Reviewed-by: Joerg Roedel <jroedel@suse.de>
-Cc: stable@vger.kernel.org
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/kvm/svm.c | 19 +++++++++++--------
- 1 file changed, 11 insertions(+), 8 deletions(-)
-
-diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
-index 4397fa0c448f..f1d3fe5a0c65 100644
---- a/arch/x86/kvm/svm.c
-+++ b/arch/x86/kvm/svm.c
-@@ -1663,20 +1663,23 @@ static u64 *avic_get_physical_id_entry(struct kvm_vcpu *vcpu,
- static int avic_init_access_page(struct kvm_vcpu *vcpu)
- {
- 	struct kvm *kvm = vcpu->kvm;
--	int ret;
-+	int ret = 0;
+-	strncpy(srv->name, name, strlen(name) + 1);
++	strscpy(srv->name, name, sizeof(srv->name));
+ 	tn->topsrv = srv;
+ 	atomic_set(&tn->subscription_count, 0);
  
-+	mutex_lock(&kvm->slots_lock);
- 	if (kvm->arch.apic_access_page_done)
--		return 0;
-+		goto out;
- 
--	ret = x86_set_memory_region(kvm,
--				    APIC_ACCESS_PAGE_PRIVATE_MEMSLOT,
--				    APIC_DEFAULT_PHYS_BASE,
--				    PAGE_SIZE);
-+	ret = __x86_set_memory_region(kvm,
-+				      APIC_ACCESS_PAGE_PRIVATE_MEMSLOT,
-+				      APIC_DEFAULT_PHYS_BASE,
-+				      PAGE_SIZE);
- 	if (ret)
--		return ret;
-+		goto out;
- 
- 	kvm->arch.apic_access_page_done = true;
--	return 0;
-+out:
-+	mutex_unlock(&kvm->slots_lock);
-+	return ret;
- }
- 
- static int avic_init_backing_page(struct kvm_vcpu *vcpu)
--- 
-2.28.0
-
-
-From 4c202ade1e743fc21e54c441d7f790604989db07 Mon Sep 17 00:00:00 2001
-From: Paul Moore <paul@paul-moore.com>
-Date: Wed, 28 Nov 2018 12:57:33 -0500
-Subject: [PATCH 27/42] selinux: add support for RTM_NEWCHAIN, RTM_DELCHAIN,
- and RTM_GETCHAIN
-
-commit 598e1a42e9626213565d3b22ea948ce78556512a upstream.
-
-Commit 32a4f5ecd738 ("net: sched: introduce chain object to uapi")
-added new RTM_* definitions without properly updating SELinux, this
-patch adds the necessary SELinux support.
-
-While there was a BUILD_BUG_ON() in the SELinux code to protect from
-exactly this case, it was bypassed in the broken commit.  In order to
-hopefully prevent this from happening in the future, add additional
-comments which provide some instructions on how to resolve the
-BUILD_BUG_ON() failures.
-
-Fixes: 32a4f5ecd738 ("net: sched: introduce chain object to uapi")
-Cc: <stable@vger.kernel.org> # 4.19
-Acked-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Paul Moore <paul@paul-moore.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- security/selinux/nlmsgtab.c | 13 ++++++++++++-
- 1 file changed, 12 insertions(+), 1 deletion(-)
-
+diff --git a/scripts/unifdef.c b/scripts/unifdef.c
+index 7493c0ee51cc..db00e3e30a59 100644
+--- a/scripts/unifdef.c
++++ b/scripts/unifdef.c
+@@ -395,7 +395,7 @@ usage(void)
+  * When we have processed a group that starts off with a known-false
+  * #if/#elif sequence (which has therefore been deleted) followed by a
+  * #elif that we don't understand and therefore must keep, we edit the
+- * latter into a #if to keep the nesting correct. We use strncpy() to
++ * latter into a #if to keep the nesting correct. We use memcpy() to
+  * overwrite the 4 byte token "elif" with "if  " without a '\0' byte.
+  *
+  * When we find a true #elif in a group, the following block will
+@@ -450,7 +450,7 @@ static void Idrop (void) { Fdrop();  ignoreon(); }
+ static void Itrue (void) { Ftrue();  ignoreon(); }
+ static void Ifalse(void) { Ffalse(); ignoreon(); }
+ /* modify this line */
+-static void Mpass (void) { strncpy(keyword, "if  ", 4); Pelif(); }
++static void Mpass (void) { memcpy(keyword, "if  ", 4); Pelif(); }
+ static void Mtrue (void) { keywordedit("else");  state(IS_TRUE_MIDDLE); }
+ static void Melif (void) { keywordedit("endif"); state(IS_FALSE_TRAILER); }
+ static void Melse (void) { keywordedit("endif"); state(IS_FALSE_ELSE); }
 diff --git a/security/selinux/nlmsgtab.c b/security/selinux/nlmsgtab.c
 index 74b951f55608..9cec81209617 100644
 --- a/security/selinux/nlmsgtab.c
@@ -2337,1023 +1439,3 @@ index 74b951f55608..9cec81209617 100644
  		BUILD_BUG_ON(XFRM_MSG_MAX != XFRM_MSG_MAPPING);
  		err = nlmsg_perm(nlmsg_type, perm, nlmsg_xfrm_perms,
  				 sizeof(nlmsg_xfrm_perms));
--- 
-2.28.0
-
-
-From 2cb8d55be86cdebe94742d7e8bc53e243ec9ee90 Mon Sep 17 00:00:00 2001
-From: Lihong Yang <lihong.yang@intel.com>
-Date: Wed, 21 Nov 2018 09:15:37 -0800
-Subject: [PATCH 28/42] i40e: Fix deletion of MAC filters
-
-commit eab077aa84331afbda071a213925d4cdbca58941 upstream.
-
-In __i40e_del_filter function, the flag __I40E_MACVLAN_SYNC_PENDING for
-the PF state is wrongly set for the VSI. Deleting any of the MAC filters
-has caused the incorrect syncing for the PF. Fix it by setting this state
-flag to the intended PF.
-
-CC: stable <stable@vger.kernel.org>
-Signed-off-by: Lihong Yang <lihong.yang@intel.com>
-Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
-Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/intel/i40e/i40e_main.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/net/ethernet/intel/i40e/i40e_main.c b/drivers/net/ethernet/intel/i40e/i40e_main.c
-index 6eccfa82ca94..3c342700bf5f 100644
---- a/drivers/net/ethernet/intel/i40e/i40e_main.c
-+++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
-@@ -1409,7 +1409,7 @@ void __i40e_del_filter(struct i40e_vsi *vsi, struct i40e_mac_filter *f)
- 	}
- 
- 	vsi->flags |= I40E_VSI_FLAG_FILTER_CHANGED;
--	set_bit(__I40E_MACVLAN_SYNC_PENDING, vsi->state);
-+	set_bit(__I40E_MACVLAN_SYNC_PENDING, vsi->back->state);
- }
- 
- /**
--- 
-2.28.0
-
-
-From c47bb7af582af9824378396d9ef99e15ffdb5242 Mon Sep 17 00:00:00 2001
-From: Martin Wilck <mwilck@suse.com>
-Date: Mon, 12 Nov 2018 09:58:37 +0100
-Subject: [PATCH 29/42] scsi: lpfc: fix block guard enablement on SLI3 adapters
-
-commit dfb7513374c1f8e7cd595106fbdba3fd07ebaf30 upstream.
-
-Since f44ac12f1dcc, BG enablement is tracked with the LPFC_SLI3_BG_ENABLED
-bit, which is set in lpfc_get_cfgparam before lpfc_sli_config_sli_port() is
-called. The bit shouldn't be cleared before checking the feature.  Based on
-problem analysis by David Bond.
-
-Fixes: f44ac12f1dcc "scsi: lpfc: Memory allocation error during driver start-up on power8"
-Tested-by: David Bond <dbond@suse.com>
-Signed-off-by: Martin Wilck <mwilck@suse.com>
-Cc: stable@vger.kernel.org # 4.17.x
-Cc: stable@vger.kernel.org # 4.18.x
-Cc: stable@vger.kernel.org # 4.19.x
-Reviewed-by: Hannes Reinecke <hare@suse.com>
-Acked-by: James Smart <jsmart2021@gmail.com>
-Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/scsi/lpfc/lpfc_init.c | 6 +++++-
- drivers/scsi/lpfc/lpfc_sli.c  | 1 -
- 2 files changed, 5 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
-index f3cae733ae2d..9acb5b44ce4c 100644
---- a/drivers/scsi/lpfc/lpfc_init.c
-+++ b/drivers/scsi/lpfc/lpfc_init.c
-@@ -167,7 +167,11 @@ lpfc_config_port_prep(struct lpfc_hba *phba)
- 		       sizeof(phba->wwpn));
- 	}
- 
--	phba->sli3_options = 0x0;
-+	/*
-+	 * Clear all option bits except LPFC_SLI3_BG_ENABLED,
-+	 * which was already set in lpfc_get_cfgparam()
-+	 */
-+	phba->sli3_options &= (uint32_t)LPFC_SLI3_BG_ENABLED;
- 
- 	/* Setup and issue mailbox READ REV command */
- 	lpfc_read_rev(phba, pmb);
-diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
-index a95c823cd1a4..be2bac9355cd 100644
---- a/drivers/scsi/lpfc/lpfc_sli.c
-+++ b/drivers/scsi/lpfc/lpfc_sli.c
-@@ -4969,7 +4969,6 @@ lpfc_sli_config_port(struct lpfc_hba *phba, int sli_mode)
- 		phba->sli3_options &= ~(LPFC_SLI3_NPIV_ENABLED |
- 					LPFC_SLI3_HBQ_ENABLED |
- 					LPFC_SLI3_CRP_ENABLED |
--					LPFC_SLI3_BG_ENABLED |
- 					LPFC_SLI3_DSS_ENABLED);
- 		if (rc != MBX_SUCCESS) {
- 			lpfc_printf_log(phba, KERN_ERR, LOG_INIT,
--- 
-2.28.0
-
-
-From 58a99d3722fe1962cbdab96a18de315c04fbc2f3 Mon Sep 17 00:00:00 2001
-From: Cameron Gutman <aicommander@gmail.com>
-Date: Thu, 29 Nov 2018 10:09:33 -0800
-Subject: [PATCH 30/42] Input: xpad - quirk all PDP Xbox One gamepads
-
-commit a6754fae1e66e9a40fed406290d7ca3f2b4d227c upstream.
-
-Since we continue to find tons of new variants [0,1,2,3,4,5,6] that
-need the PDP quirk, let's just quirk all devices from PDP.
-
-[0]: https://github.com/paroj/xpad/pull/104
-[1]: https://github.com/paroj/xpad/pull/105
-[2]: https://github.com/paroj/xpad/pull/108
-[3]: https://github.com/paroj/xpad/pull/109
-[4]: https://github.com/paroj/xpad/pull/112
-[5]: https://github.com/paroj/xpad/pull/115
-[6]: https://github.com/paroj/xpad/pull/116
-
-Fixes: e5c9c6a885fa ("Input: xpad - add support for PDP Xbox One controllers")
-Cc: stable@vger.kernel.org
-Signed-off-by: Cameron Gutman <aicommander@gmail.com>
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/joystick/xpad.c | 16 ++++++----------
- 1 file changed, 6 insertions(+), 10 deletions(-)
-
-diff --git a/drivers/input/joystick/xpad.c b/drivers/input/joystick/xpad.c
-index d4b9db487b16..cfc8b94527b9 100644
---- a/drivers/input/joystick/xpad.c
-+++ b/drivers/input/joystick/xpad.c
-@@ -480,18 +480,18 @@ static const u8 xboxone_hori_init[] = {
- };
- 
- /*
-- * This packet is required for some of the PDP pads to start
-+ * This packet is required for most (all?) of the PDP pads to start
-  * sending input reports. These pads include: (0x0e6f:0x02ab),
-- * (0x0e6f:0x02a4).
-+ * (0x0e6f:0x02a4), (0x0e6f:0x02a6).
-  */
- static const u8 xboxone_pdp_init1[] = {
- 	0x0a, 0x20, 0x00, 0x03, 0x00, 0x01, 0x14
- };
- 
- /*
-- * This packet is required for some of the PDP pads to start
-+ * This packet is required for most (all?) of the PDP pads to start
-  * sending input reports. These pads include: (0x0e6f:0x02ab),
-- * (0x0e6f:0x02a4).
-+ * (0x0e6f:0x02a4), (0x0e6f:0x02a6).
-  */
- static const u8 xboxone_pdp_init2[] = {
- 	0x06, 0x20, 0x00, 0x02, 0x01, 0x00
-@@ -527,12 +527,8 @@ static const struct xboxone_init_packet xboxone_init_packets[] = {
- 	XBOXONE_INIT_PKT(0x0e6f, 0x0165, xboxone_hori_init),
- 	XBOXONE_INIT_PKT(0x0f0d, 0x0067, xboxone_hori_init),
- 	XBOXONE_INIT_PKT(0x0000, 0x0000, xboxone_fw2015_init),
--	XBOXONE_INIT_PKT(0x0e6f, 0x02ab, xboxone_pdp_init1),
--	XBOXONE_INIT_PKT(0x0e6f, 0x02ab, xboxone_pdp_init2),
--	XBOXONE_INIT_PKT(0x0e6f, 0x02a4, xboxone_pdp_init1),
--	XBOXONE_INIT_PKT(0x0e6f, 0x02a4, xboxone_pdp_init2),
--	XBOXONE_INIT_PKT(0x0e6f, 0x02a6, xboxone_pdp_init1),
--	XBOXONE_INIT_PKT(0x0e6f, 0x02a6, xboxone_pdp_init2),
-+	XBOXONE_INIT_PKT(0x0e6f, 0x0000, xboxone_pdp_init1),
-+	XBOXONE_INIT_PKT(0x0e6f, 0x0000, xboxone_pdp_init2),
- 	XBOXONE_INIT_PKT(0x24c6, 0x541a, xboxone_rumblebegin_init),
- 	XBOXONE_INIT_PKT(0x24c6, 0x542a, xboxone_rumblebegin_init),
- 	XBOXONE_INIT_PKT(0x24c6, 0x543a, xboxone_rumblebegin_init),
--- 
-2.28.0
-
-
-From 1673900500686a4588b3abbb342dbee7c119a2f8 Mon Sep 17 00:00:00 2001
-From: Lyude Paul <lyude@redhat.com>
-Date: Sat, 24 Nov 2018 23:28:10 -0800
-Subject: [PATCH 31/42] Input: synaptics - add PNP ID for ThinkPad P50 to SMBus
-
-commit 9df39bedbf292680655c6a947c77d6562c693d4a upstream.
-
-Noticed the other day the trackpoint felt different on my P50, then
-realized it was because rmi4 wasn't loading for this machine
-automatically. Suspend/resume, hibernate, and everything else seem to
-work perfectly fine on here.
-
-Signed-off-by: Lyude Paul <lyude@redhat.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/mouse/synaptics.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/input/mouse/synaptics.c b/drivers/input/mouse/synaptics.c
-index 5e85f3cca867..c42813d50591 100644
---- a/drivers/input/mouse/synaptics.c
-+++ b/drivers/input/mouse/synaptics.c
-@@ -170,6 +170,7 @@ static const char * const smbus_pnp_ids[] = {
- 	"LEN0048", /* X1 Carbon 3 */
- 	"LEN0046", /* X250 */
- 	"LEN004a", /* W541 */
-+	"LEN005b", /* P50 */
- 	"LEN0071", /* T480 */
- 	"LEN0072", /* X1 Carbon Gen 5 (2017) - Elan/ALPS trackpoint */
- 	"LEN0073", /* X1 Carbon G5 (Elantech) */
--- 
-2.28.0
-
-
-From 25e78d0557e185a73ab29ac31cb916ace843b451 Mon Sep 17 00:00:00 2001
-From: Christian Hoff <christian_hoff@gmx.net>
-Date: Mon, 12 Nov 2018 11:11:29 -0800
-Subject: [PATCH 32/42] Input: matrix_keypad - check for errors from
- of_get_named_gpio()
-
-commit d55bda1b3e7c5a87f10da54fdda866a9a9cef30b upstream.
-
-"of_get_named_gpio()" returns a negative error value if it fails
-and drivers should check for this. This missing check was now
-added to the matrix_keypad driver.
-
-In my case "of_get_named_gpio()" returned -EPROBE_DEFER because
-the referenced GPIOs belong to an I/O expander, which was not yet
-probed at the point in time when the matrix_keypad driver was
-loading. Because the driver did not check for errors from the
-"of_get_named_gpio()" routine, it was assuming that "-EPROBE_DEFER"
-is actually a GPIO number and continued as usual, which led to further
-errors like this later on:
-
-WARNING: CPU: 3 PID: 167 at drivers/gpio/gpiolib.c:114
-gpio_to_desc+0xc8/0xd0
-invalid GPIO -517
-
-Note that the "GPIO number" -517 in the error message above is
-actually "-EPROBE_DEFER".
-
-As part of the patch a misleading error message "no platform data defined"
-was also removed. This does not lead to information loss because the other
-error paths in matrix_keypad_parse_dt() already print an error.
-
-Signed-off-by: Christian Hoff <christian_hoff@gmx.net>
-Suggested-by: Sebastian Reichel <sre@kernel.org>
-Reviewed-by: Sebastian Reichel <sre@kernel.org>
-Cc: stable@vger.kernel.org
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/keyboard/matrix_keypad.c | 23 ++++++++++++++---------
- 1 file changed, 14 insertions(+), 9 deletions(-)
-
-diff --git a/drivers/input/keyboard/matrix_keypad.c b/drivers/input/keyboard/matrix_keypad.c
-index f51ae09596ef..403452ef00e6 100644
---- a/drivers/input/keyboard/matrix_keypad.c
-+++ b/drivers/input/keyboard/matrix_keypad.c
-@@ -407,7 +407,7 @@ matrix_keypad_parse_dt(struct device *dev)
- 	struct matrix_keypad_platform_data *pdata;
- 	struct device_node *np = dev->of_node;
- 	unsigned int *gpios;
--	int i, nrow, ncol;
-+	int ret, i, nrow, ncol;
- 
- 	if (!np) {
- 		dev_err(dev, "device lacks DT data\n");
-@@ -452,12 +452,19 @@ matrix_keypad_parse_dt(struct device *dev)
- 		return ERR_PTR(-ENOMEM);
- 	}
- 
--	for (i = 0; i < pdata->num_row_gpios; i++)
--		gpios[i] = of_get_named_gpio(np, "row-gpios", i);
-+	for (i = 0; i < nrow; i++) {
-+		ret = of_get_named_gpio(np, "row-gpios", i);
-+		if (ret < 0)
-+			return ERR_PTR(ret);
-+		gpios[i] = ret;
-+	}
- 
--	for (i = 0; i < pdata->num_col_gpios; i++)
--		gpios[pdata->num_row_gpios + i] =
--			of_get_named_gpio(np, "col-gpios", i);
-+	for (i = 0; i < ncol; i++) {
-+		ret = of_get_named_gpio(np, "col-gpios", i);
-+		if (ret < 0)
-+			return ERR_PTR(ret);
-+		gpios[nrow + i] = ret;
-+	}
- 
- 	pdata->row_gpios = gpios;
- 	pdata->col_gpios = &gpios[pdata->num_row_gpios];
-@@ -484,10 +491,8 @@ static int matrix_keypad_probe(struct platform_device *pdev)
- 	pdata = dev_get_platdata(&pdev->dev);
- 	if (!pdata) {
- 		pdata = matrix_keypad_parse_dt(&pdev->dev);
--		if (IS_ERR(pdata)) {
--			dev_err(&pdev->dev, "no platform data defined\n");
-+		if (IS_ERR(pdata))
- 			return PTR_ERR(pdata);
--		}
- 	} else if (!pdata->keymap_data) {
- 		dev_err(&pdev->dev, "no keymap data defined\n");
- 		return -EINVAL;
--- 
-2.28.0
-
-
-From 918cd7d1dfac5e838023985f5c8a9c5b63c16010 Mon Sep 17 00:00:00 2001
-From: Brian Norris <briannorris@chromium.org>
-Date: Mon, 12 Nov 2018 11:23:39 -0800
-Subject: [PATCH 33/42] Input: cros_ec_keyb - fix button/switch capability
- reports
-
-commit ac5722c1643a2fb75224c79b578214956d34f989 upstream.
-
-The cros_ec_keyb_bs array lists buttons and switches together, expecting
-that its users will match the appropriate type and bit fields. But
-cros_ec_keyb_register_bs() only checks the 'bit' field, which causes
-misreported input capabilities in some cases. For example, tablets
-(e.g., Scarlet -- a.k.a. Acer Chromebook Tab 10) were reporting a SW_LID
-capability, because EC_MKBP_POWER_BUTTON and EC_MKBP_LID_OPEN happen to
-share the same bit.
-
-(This has comedic effect on a tablet, in which a power-management daemon
-then thinks this "lid" is closed, and so puts the system to sleep as
-soon as it boots!)
-
-To fix this, check both the 'ev_type' and 'bit' fields before reporting
-the capability.
-
-Tested with a lid (Kevin / Samsung Chromebook Plus) and without a lid
-(Scarlet / Acer Chromebook Tab 10).
-
-This error got introduced when porting the feature from the downstream
-Chromium OS kernel to be upstreamed.
-
-Fixes: cdd7950e7aa4 ("input: cros_ec_keyb: Add non-matrix buttons and switches")
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Brian Norris <briannorris@chromium.org>
-Reviewed-by: Heiko Stuebner <heiko@sntech.de>
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/keyboard/cros_ec_keyb.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/input/keyboard/cros_ec_keyb.c b/drivers/input/keyboard/cros_ec_keyb.c
-index 81be6f781f0b..d56001181598 100644
---- a/drivers/input/keyboard/cros_ec_keyb.c
-+++ b/drivers/input/keyboard/cros_ec_keyb.c
-@@ -493,7 +493,8 @@ static int cros_ec_keyb_register_bs(struct cros_ec_keyb *ckdev)
- 	for (i = 0; i < ARRAY_SIZE(cros_ec_keyb_bs); i++) {
- 		const struct cros_ec_bs_map *map = &cros_ec_keyb_bs[i];
- 
--		if (buttons & BIT(map->bit))
-+		if ((map->ev_type == EV_KEY && (buttons & BIT(map->bit))) ||
-+		    (map->ev_type == EV_SW && (switches & BIT(map->bit))))
- 			input_set_capability(idev, map->ev_type, map->code);
- 	}
- 
--- 
-2.28.0
-
-
-From 08a7e486a19d5dab0c8786d2eecc7e0708e484d8 Mon Sep 17 00:00:00 2001
-From: Patrick Gaskin <patrick@pgaskin.net>
-Date: Mon, 12 Nov 2018 11:12:24 -0800
-Subject: [PATCH 34/42] Input: elan_i2c - add ELAN0620 to the ACPI table
-
-commit 3ed64da3b790be7c63601e8ca6341b7dff74a660 upstream.
-
-Add ELAN0620 to the ACPI table to support the elan touchpad in
-the Lenovo IdeaPad 130-15IKB.
-
-Signed-off-by: Patrick Gaskin <patrick@pgaskin.net>
-Cc: stable@vger.kernel.org
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/mouse/elan_i2c_core.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/input/mouse/elan_i2c_core.c b/drivers/input/mouse/elan_i2c_core.c
-index b0f9d19b3410..99227807a584 100644
---- a/drivers/input/mouse/elan_i2c_core.c
-+++ b/drivers/input/mouse/elan_i2c_core.c
-@@ -1348,6 +1348,7 @@ static const struct acpi_device_id elan_acpi_id[] = {
- 	{ "ELAN0618", 0 },
- 	{ "ELAN061C", 0 },
- 	{ "ELAN061D", 0 },
-+	{ "ELAN0620", 0 },
- 	{ "ELAN0622", 0 },
- 	{ "ELAN1000", 0 },
- 	{ }
--- 
-2.28.0
-
-
-From 77dd91caddfee19b1447bac8060c0bda63709c60 Mon Sep 17 00:00:00 2001
-From: Noah Westervelt <nwestervelt@outlook.com>
-Date: Thu, 29 Nov 2018 10:10:35 -0800
-Subject: [PATCH 35/42] Input: elan_i2c - add ACPI ID for Lenovo IdeaPad
- 330-15ARR
-
-commit ad33429cd02565c28404bb16ae7a4c2bdfda6626 upstream.
-
-Add ELAN061E to the ACPI table to support Elan touchpad found in Lenovo
-IdeaPad 330-15ARR.
-
-Signed-off-by: Noah Westervelt <nwestervelt@outlook.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/mouse/elan_i2c_core.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/input/mouse/elan_i2c_core.c b/drivers/input/mouse/elan_i2c_core.c
-index 99227807a584..68f45ab9ac20 100644
---- a/drivers/input/mouse/elan_i2c_core.c
-+++ b/drivers/input/mouse/elan_i2c_core.c
-@@ -1348,6 +1348,7 @@ static const struct acpi_device_id elan_acpi_id[] = {
- 	{ "ELAN0618", 0 },
- 	{ "ELAN061C", 0 },
- 	{ "ELAN061D", 0 },
-+	{ "ELAN061E", 0 },
- 	{ "ELAN0620", 0 },
- 	{ "ELAN0622", 0 },
- 	{ "ELAN1000", 0 },
--- 
-2.28.0
-
-
-From 280d652e0dd2f20dafe81e592ee5243fa9ed0b03 Mon Sep 17 00:00:00 2001
-From: Adam Wong <adam@adamwong.me>
-Date: Thu, 29 Nov 2018 10:04:35 -0800
-Subject: [PATCH 36/42] Input: elan_i2c - add support for ELAN0621 touchpad
-
-commit bf87ade0dd7f8cf19dac4d3161d5e86abe0c062b upstream.
-
-Added the ability to detect the ELAN0621 touchpad found in some Lenovo
-laptops.
-
-Signed-off-by: Adam Wong <adam@adamwong.me>
-Cc: stable@vger.kernel.org
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/mouse/elan_i2c_core.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/input/mouse/elan_i2c_core.c b/drivers/input/mouse/elan_i2c_core.c
-index 68f45ab9ac20..a94b6494e71a 100644
---- a/drivers/input/mouse/elan_i2c_core.c
-+++ b/drivers/input/mouse/elan_i2c_core.c
-@@ -1350,6 +1350,7 @@ static const struct acpi_device_id elan_acpi_id[] = {
- 	{ "ELAN061D", 0 },
- 	{ "ELAN061E", 0 },
- 	{ "ELAN0620", 0 },
-+	{ "ELAN0621", 0 },
- 	{ "ELAN0622", 0 },
- 	{ "ELAN1000", 0 },
- 	{ }
--- 
-2.28.0
-
-
-From b0234f15d2e25e014347bd43869b460b2228e72f Mon Sep 17 00:00:00 2001
-From: Qu Wenruo <wqu@suse.com>
-Date: Fri, 23 Nov 2018 09:06:36 +0800
-Subject: [PATCH 37/42] btrfs: tree-checker: Don't check max block group size
- as current max chunk size limit is unreliable
-
-commit 10950929e994c5ecee149ff0873388d3c98f12b5 upstream.
-
-[BUG]
-A completely valid btrfs will refuse to mount, with error message like:
-  BTRFS critical (device sdb2): corrupt leaf: root=2 block=239681536 slot=172 \
-    bg_start=12018974720 bg_len=10888413184, invalid block group size, \
-    have 10888413184 expect (0, 10737418240]
-
-This has been reported several times as the 4.19 kernel is now being
-used. The filesystem refuses to mount, but is otherwise ok and booting
-4.18 is a workaround.
-
-Btrfs check returns no error, and all kernels used on this fs is later
-than 2011, which should all have the 10G size limit commit.
-
-[CAUSE]
-For a 12 devices btrfs, we could allocate a chunk larger than 10G due to
-stripe stripe bump up.
-
-__btrfs_alloc_chunk()
-|- max_stripe_size = 1G
-|- max_chunk_size = 10G
-|- data_stripe = 11
-|- if (1G * 11 > 10G) {
-       stripe_size = 976128930;
-       stripe_size = round_up(976128930, SZ_16M) = 989855744
-
-However the final stripe_size (989855744) * 11 = 10888413184, which is
-still larger than 10G.
-
-[FIX]
-For the comprehensive check, we need to do the full check at chunk read
-time, and rely on bg <-> chunk mapping to do the check.
-
-We could just skip the length check for now.
-
-Fixes: fce466eab7ac ("btrfs: tree-checker: Verify block_group_item")
-Cc: stable@vger.kernel.org # v4.19+
-Reported-by: Wang Yugui <wangyugui@e16-tech.com>
-Signed-off-by: Qu Wenruo <wqu@suse.com>
-Reviewed-by: David Sterba <dsterba@suse.com>
-Signed-off-by: David Sterba <dsterba@suse.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/btrfs/tree-checker.c | 8 +++-----
- 1 file changed, 3 insertions(+), 5 deletions(-)
-
-diff --git a/fs/btrfs/tree-checker.c b/fs/btrfs/tree-checker.c
-index d385778b628c..3ec712cba58e 100644
---- a/fs/btrfs/tree-checker.c
-+++ b/fs/btrfs/tree-checker.c
-@@ -389,13 +389,11 @@ static int check_block_group_item(struct btrfs_fs_info *fs_info,
- 
- 	/*
- 	 * Here we don't really care about alignment since extent allocator can
--	 * handle it.  We care more about the size, as if one block group is
--	 * larger than maximum size, it's must be some obvious corruption.
-+	 * handle it.  We care more about the size.
- 	 */
--	if (key->offset > BTRFS_MAX_DATA_CHUNK_SIZE || key->offset == 0) {
-+	if (key->offset == 0) {
- 		block_group_err(fs_info, leaf, slot,
--			"invalid block group size, have %llu expect (0, %llu]",
--				key->offset, BTRFS_MAX_DATA_CHUNK_SIZE);
-+				"invalid block group size 0");
- 		return -EUCLEAN;
- 	}
- 
--- 
-2.28.0
-
-
-From 41e0254d32bd3f1d74db66d02ee57ab9dce3e474 Mon Sep 17 00:00:00 2001
-From: Kevin Hilman <khilman@baylibre.com>
-Date: Fri, 30 Nov 2018 15:51:56 +0300
-Subject: [PATCH 38/42] ARC: change defconfig defaults to ARCv2
-
-commit b7cc40c32a8bfa6f2581a71747f6a7d491fe43ba upstream.
-
-Change the default defconfig (used with 'make defconfig') to the ARCv2
-nsim_hs_defconfig, and also switch the default Kconfig ISA selection to
-ARCv2.
-
-This allows several default defconfigs (e.g. make defconfig, make
-allnoconfig, make tinyconfig) to all work with ARCv2 by default.
-
-Note since we change default architecture from ARCompact to ARCv2
-it's required to explicitly mention architecture type in ARCompact
-defconfigs otherwise ARCv2 will be implied and binaries will be
-generated for ARCv2.
-
-Cc: <stable@vger.kernel.org> # 4.4.x
-Signed-off-by: Kevin Hilman <khilman@baylibre.com>
-Signed-off-by: Alexey Brodkin <abrodkin@synopsys.com>
-Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arc/Kconfig                    | 2 +-
- arch/arc/Makefile                   | 2 +-
- arch/arc/configs/axs101_defconfig   | 1 +
- arch/arc/configs/nps_defconfig      | 1 +
- arch/arc/configs/nsim_700_defconfig | 1 +
- arch/arc/configs/nsimosci_defconfig | 1 +
- arch/arc/configs/tb10x_defconfig    | 1 +
- 7 files changed, 7 insertions(+), 2 deletions(-)
-
-diff --git a/arch/arc/Kconfig b/arch/arc/Kconfig
-index a045f3086047..a90c4f126050 100644
---- a/arch/arc/Kconfig
-+++ b/arch/arc/Kconfig
-@@ -111,7 +111,7 @@ endmenu
- 
- choice
- 	prompt "ARC Instruction Set"
--	default ISA_ARCOMPACT
-+	default ISA_ARCV2
- 
- config ISA_ARCOMPACT
- 	bool "ARCompact ISA"
-diff --git a/arch/arc/Makefile b/arch/arc/Makefile
-index 644815c0516e..16e6cc22e25c 100644
---- a/arch/arc/Makefile
-+++ b/arch/arc/Makefile
-@@ -6,7 +6,7 @@
- # published by the Free Software Foundation.
- #
- 
--KBUILD_DEFCONFIG := nsim_700_defconfig
-+KBUILD_DEFCONFIG := nsim_hs_defconfig
- 
- cflags-y	+= -fno-common -pipe -fno-builtin -mmedium-calls -D__linux__
- cflags-$(CONFIG_ISA_ARCOMPACT)	+= -mA7
-diff --git a/arch/arc/configs/axs101_defconfig b/arch/arc/configs/axs101_defconfig
-index 41bc08be6a3b..1bc84525a327 100644
---- a/arch/arc/configs/axs101_defconfig
-+++ b/arch/arc/configs/axs101_defconfig
-@@ -14,6 +14,7 @@ CONFIG_PERF_EVENTS=y
- # CONFIG_VM_EVENT_COUNTERS is not set
- # CONFIG_SLUB_DEBUG is not set
- # CONFIG_COMPAT_BRK is not set
-+CONFIG_ISA_ARCOMPACT=y
- CONFIG_MODULES=y
- CONFIG_MODULE_FORCE_LOAD=y
- CONFIG_MODULE_UNLOAD=y
-diff --git a/arch/arc/configs/nps_defconfig b/arch/arc/configs/nps_defconfig
-index 31ba224bbfb4..8721be01ab50 100644
---- a/arch/arc/configs/nps_defconfig
-+++ b/arch/arc/configs/nps_defconfig
-@@ -15,6 +15,7 @@ CONFIG_SYSCTL_SYSCALL=y
- CONFIG_EMBEDDED=y
- CONFIG_PERF_EVENTS=y
- # CONFIG_COMPAT_BRK is not set
-+CONFIG_ISA_ARCOMPACT=y
- CONFIG_KPROBES=y
- CONFIG_MODULES=y
- CONFIG_MODULE_FORCE_LOAD=y
-diff --git a/arch/arc/configs/nsim_700_defconfig b/arch/arc/configs/nsim_700_defconfig
-index 8e0b8b134cd9..219c2a65294b 100644
---- a/arch/arc/configs/nsim_700_defconfig
-+++ b/arch/arc/configs/nsim_700_defconfig
-@@ -15,6 +15,7 @@ CONFIG_EMBEDDED=y
- CONFIG_PERF_EVENTS=y
- # CONFIG_SLUB_DEBUG is not set
- # CONFIG_COMPAT_BRK is not set
-+CONFIG_ISA_ARCOMPACT=y
- CONFIG_KPROBES=y
- CONFIG_MODULES=y
- # CONFIG_LBDAF is not set
-diff --git a/arch/arc/configs/nsimosci_defconfig b/arch/arc/configs/nsimosci_defconfig
-index f14eeff7d308..a883cf5ac8b0 100644
---- a/arch/arc/configs/nsimosci_defconfig
-+++ b/arch/arc/configs/nsimosci_defconfig
-@@ -15,6 +15,7 @@ CONFIG_EMBEDDED=y
- CONFIG_PERF_EVENTS=y
- # CONFIG_SLUB_DEBUG is not set
- # CONFIG_COMPAT_BRK is not set
-+CONFIG_ISA_ARCOMPACT=y
- CONFIG_KPROBES=y
- CONFIG_MODULES=y
- # CONFIG_LBDAF is not set
-diff --git a/arch/arc/configs/tb10x_defconfig b/arch/arc/configs/tb10x_defconfig
-index a7f65313f84a..e71ade3cf9c8 100644
---- a/arch/arc/configs/tb10x_defconfig
-+++ b/arch/arc/configs/tb10x_defconfig
-@@ -19,6 +19,7 @@ CONFIG_KALLSYMS_ALL=y
- # CONFIG_AIO is not set
- CONFIG_EMBEDDED=y
- # CONFIG_COMPAT_BRK is not set
-+CONFIG_ISA_ARCOMPACT=y
- CONFIG_SLAB=y
- CONFIG_MODULES=y
- CONFIG_MODULE_FORCE_LOAD=y
--- 
-2.28.0
-
-
-From 4e84cccacb1291fedd2518a7e074c3152705fd77 Mon Sep 17 00:00:00 2001
-From: Alexey Brodkin <abrodkin@synopsys.com>
-Date: Tue, 20 Nov 2018 13:30:19 +0300
-Subject: [PATCH 39/42] arc: [devboards] Add support of NFSv3 ACL
-
-commit 6b04114f6fae5e84d33404c2970b1949c032546e upstream.
-
-By default NFSv3 doesn't support ACL (Access Control Lists)
-which might be quite convenient to have so that
-mounted NFS behaves exactly as any other local file-system.
-
-In particular missing support of ACL makes umask useless.
-This among other thigs fixes Glibc's "nptl/tst-umask1".
-
-Signed-off-by: Alexey Brodkin <abrodkin@synopsys.com>
-Cc: Cupertino Miranda <cmiranda@synopsys.com>
-Cc: stable@vger.kernel.org	#4.14+
-Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arc/configs/axs101_defconfig          | 1 +
- arch/arc/configs/axs103_defconfig          | 1 +
- arch/arc/configs/axs103_smp_defconfig      | 1 +
- arch/arc/configs/hsdk_defconfig            | 1 +
- arch/arc/configs/nps_defconfig             | 1 +
- arch/arc/configs/nsimosci_defconfig        | 1 +
- arch/arc/configs/nsimosci_hs_defconfig     | 1 +
- arch/arc/configs/nsimosci_hs_smp_defconfig | 1 +
- arch/arc/configs/vdk_hs38_defconfig        | 1 +
- arch/arc/configs/vdk_hs38_smp_defconfig    | 1 +
- 10 files changed, 10 insertions(+)
-
-diff --git a/arch/arc/configs/axs101_defconfig b/arch/arc/configs/axs101_defconfig
-index 1bc84525a327..020d4493edfd 100644
---- a/arch/arc/configs/axs101_defconfig
-+++ b/arch/arc/configs/axs101_defconfig
-@@ -96,6 +96,7 @@ CONFIG_VFAT_FS=y
- CONFIG_NTFS_FS=y
- CONFIG_TMPFS=y
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- CONFIG_NLS_CODEPAGE_437=y
- CONFIG_NLS_ISO8859_1=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
-diff --git a/arch/arc/configs/axs103_defconfig b/arch/arc/configs/axs103_defconfig
-index 1e1c4a8011b5..666314fffc60 100644
---- a/arch/arc/configs/axs103_defconfig
-+++ b/arch/arc/configs/axs103_defconfig
-@@ -94,6 +94,7 @@ CONFIG_VFAT_FS=y
- CONFIG_NTFS_FS=y
- CONFIG_TMPFS=y
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- CONFIG_NLS_CODEPAGE_437=y
- CONFIG_NLS_ISO8859_1=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
-diff --git a/arch/arc/configs/axs103_smp_defconfig b/arch/arc/configs/axs103_smp_defconfig
-index 6b0c0cfd5c30..429832b8560b 100644
---- a/arch/arc/configs/axs103_smp_defconfig
-+++ b/arch/arc/configs/axs103_smp_defconfig
-@@ -97,6 +97,7 @@ CONFIG_VFAT_FS=y
- CONFIG_NTFS_FS=y
- CONFIG_TMPFS=y
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- CONFIG_NLS_CODEPAGE_437=y
- CONFIG_NLS_ISO8859_1=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
-diff --git a/arch/arc/configs/hsdk_defconfig b/arch/arc/configs/hsdk_defconfig
-index 1dec2b4bc5e6..2a1d2cbfee1a 100644
---- a/arch/arc/configs/hsdk_defconfig
-+++ b/arch/arc/configs/hsdk_defconfig
-@@ -65,6 +65,7 @@ CONFIG_EXT3_FS=y
- CONFIG_VFAT_FS=y
- CONFIG_TMPFS=y
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- CONFIG_NLS_CODEPAGE_437=y
- CONFIG_NLS_ISO8859_1=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
-diff --git a/arch/arc/configs/nps_defconfig b/arch/arc/configs/nps_defconfig
-index 8721be01ab50..6e84060e7c90 100644
---- a/arch/arc/configs/nps_defconfig
-+++ b/arch/arc/configs/nps_defconfig
-@@ -74,6 +74,7 @@ CONFIG_PROC_KCORE=y
- CONFIG_TMPFS=y
- # CONFIG_MISC_FILESYSTEMS is not set
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- CONFIG_ROOT_NFS=y
- CONFIG_DEBUG_INFO=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
-diff --git a/arch/arc/configs/nsimosci_defconfig b/arch/arc/configs/nsimosci_defconfig
-index a883cf5ac8b0..35dfc6491a09 100644
---- a/arch/arc/configs/nsimosci_defconfig
-+++ b/arch/arc/configs/nsimosci_defconfig
-@@ -67,5 +67,6 @@ CONFIG_EXT2_FS_XATTR=y
- CONFIG_TMPFS=y
- # CONFIG_MISC_FILESYSTEMS is not set
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
- # CONFIG_ENABLE_MUST_CHECK is not set
-diff --git a/arch/arc/configs/nsimosci_hs_defconfig b/arch/arc/configs/nsimosci_hs_defconfig
-index 025298a48305..1638e5bc9672 100644
---- a/arch/arc/configs/nsimosci_hs_defconfig
-+++ b/arch/arc/configs/nsimosci_hs_defconfig
-@@ -65,5 +65,6 @@ CONFIG_EXT2_FS_XATTR=y
- CONFIG_TMPFS=y
- # CONFIG_MISC_FILESYSTEMS is not set
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
- # CONFIG_ENABLE_MUST_CHECK is not set
-diff --git a/arch/arc/configs/nsimosci_hs_smp_defconfig b/arch/arc/configs/nsimosci_hs_smp_defconfig
-index df7b77b13b82..11cfbdb0f441 100644
---- a/arch/arc/configs/nsimosci_hs_smp_defconfig
-+++ b/arch/arc/configs/nsimosci_hs_smp_defconfig
-@@ -76,6 +76,7 @@ CONFIG_EXT2_FS_XATTR=y
- CONFIG_TMPFS=y
- # CONFIG_MISC_FILESYSTEMS is not set
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
- # CONFIG_ENABLE_MUST_CHECK is not set
- CONFIG_FTRACE=y
-diff --git a/arch/arc/configs/vdk_hs38_defconfig b/arch/arc/configs/vdk_hs38_defconfig
-index db47c3541f15..1e59a2e9c602 100644
---- a/arch/arc/configs/vdk_hs38_defconfig
-+++ b/arch/arc/configs/vdk_hs38_defconfig
-@@ -85,6 +85,7 @@ CONFIG_NTFS_FS=y
- CONFIG_TMPFS=y
- CONFIG_JFFS2_FS=y
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- CONFIG_NLS_CODEPAGE_437=y
- CONFIG_NLS_ISO8859_1=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
-diff --git a/arch/arc/configs/vdk_hs38_smp_defconfig b/arch/arc/configs/vdk_hs38_smp_defconfig
-index a8ac5e917d9a..b5c3f6c54b03 100644
---- a/arch/arc/configs/vdk_hs38_smp_defconfig
-+++ b/arch/arc/configs/vdk_hs38_smp_defconfig
-@@ -90,6 +90,7 @@ CONFIG_NTFS_FS=y
- CONFIG_TMPFS=y
- CONFIG_JFFS2_FS=y
- CONFIG_NFS_FS=y
-+CONFIG_NFS_V3_ACL=y
- CONFIG_NLS_CODEPAGE_437=y
- CONFIG_NLS_ISO8859_1=y
- # CONFIG_ENABLE_WARN_DEPRECATED is not set
--- 
-2.28.0
-
-
-From 6235c229fea4e5c5fb35002a5ee1ae2dc65d3198 Mon Sep 17 00:00:00 2001
-From: Guoqing Jiang <gqjiang@suse.com>
-Date: Fri, 19 Oct 2018 12:08:22 +0800
-Subject: [PATCH 40/42] tipc: use destination length for copy string
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 29e270fc32192e7729057963ae7120663856c93e upstream.
-
-Got below warning with gcc 8.2 compiler.
-
-net/tipc/topsrv.c: In function ‘tipc_topsrv_start’:
-net/tipc/topsrv.c:660:2: warning: ‘strncpy’ specified bound depends on the length of the source argument [-Wstringop-overflow=]
-  strncpy(srv->name, name, strlen(name) + 1);
-  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-net/tipc/topsrv.c:660:27: note: length computed here
-  strncpy(srv->name, name, strlen(name) + 1);
-                           ^~~~~~~~~~~~
-So change it to correct length and use strscpy.
-
-Signed-off-by: Guoqing Jiang <gqjiang@suse.com>
-Acked-by: Ying Xue <ying.xue@windriver.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/tipc/topsrv.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/net/tipc/topsrv.c b/net/tipc/topsrv.c
-index 2627b5d812e9..b84c0059214f 100644
---- a/net/tipc/topsrv.c
-+++ b/net/tipc/topsrv.c
-@@ -657,7 +657,7 @@ int tipc_topsrv_start(struct net *net)
- 	srv->max_rcvbuf_size = sizeof(struct tipc_subscr);
- 	INIT_WORK(&srv->awork, tipc_topsrv_accept);
- 
--	strncpy(srv->name, name, strlen(name) + 1);
-+	strscpy(srv->name, name, sizeof(srv->name));
- 	tn->topsrv = srv;
- 	atomic_set(&tn->subscription_count, 0);
- 
--- 
-2.28.0
-
-
-From 55cbeea76e769b12cd0f1340132d32781f73a3dc Mon Sep 17 00:00:00 2001
-From: Jens Axboe <axboe@kernel.dk>
-Date: Thu, 6 Dec 2018 22:17:44 -0700
-Subject: [PATCH 41/42] blk-mq: punt failed direct issue to dispatch list
-
-commit c616cbee97aed4bc6178f148a7240206dcdb85a6 upstream.
-
-After the direct dispatch corruption fix, we permanently disallow direct
-dispatch of non read/write requests. This works fine off the normal IO
-path, as they will be retried like any other failed direct dispatch
-request. But for the blk_insert_cloned_request() that only DM uses to
-bypass the bottom level scheduler, we always first attempt direct
-dispatch. For some types of requests, that's now a permanent failure,
-and no amount of retrying will make that succeed. This results in a
-livelock.
-
-Instead of making special cases for what we can direct issue, and now
-having to deal with DM solving the livelock while still retaining a BUSY
-condition feedback loop, always just add a request that has been through
-->queue_rq() to the hardware queue dispatch list. These are safe to use
-as no merging can take place there. Additionally, if requests do have
-prepped data from drivers, we aren't dependent on them not sharing space
-in the request structure to safely add them to the IO scheduler lists.
-
-This basically reverts ffe81d45322c and is based on a patch from Ming,
-but with the list insert case covered as well.
-
-Fixes: ffe81d45322c ("blk-mq: fix corruption with direct issue")
-Cc: stable@vger.kernel.org
-Suggested-by: Ming Lei <ming.lei@redhat.com>
-Reported-by: Bart Van Assche <bvanassche@acm.org>
-Tested-by: Ming Lei <ming.lei@redhat.com>
-Acked-by: Mike Snitzer <snitzer@redhat.com>
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- block/blk-mq.c | 33 +++++----------------------------
- 1 file changed, 5 insertions(+), 28 deletions(-)
-
-diff --git a/block/blk-mq.c b/block/blk-mq.c
-index d020fffbbcc6..23a53b67cf0d 100644
---- a/block/blk-mq.c
-+++ b/block/blk-mq.c
-@@ -1698,15 +1698,6 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
- 		break;
- 	case BLK_STS_RESOURCE:
- 	case BLK_STS_DEV_RESOURCE:
--		/*
--		 * If direct dispatch fails, we cannot allow any merging on
--		 * this IO. Drivers (like SCSI) may have set up permanent state
--		 * for this request, like SG tables and mappings, and if we
--		 * merge to it later on then we'll still only do IO to the
--		 * original part.
--		 */
--		rq->cmd_flags |= REQ_NOMERGE;
--
- 		blk_mq_update_dispatch_busy(hctx, true);
- 		__blk_mq_requeue_request(rq);
- 		break;
-@@ -1719,18 +1710,6 @@ static blk_status_t __blk_mq_issue_directly(struct blk_mq_hw_ctx *hctx,
- 	return ret;
- }
- 
--/*
-- * Don't allow direct dispatch of anything but regular reads/writes,
-- * as some of the other commands can potentially share request space
-- * with data we need for the IO scheduler. If we attempt a direct dispatch
-- * on those and fail, we can't safely add it to the scheduler afterwards
-- * without potentially overwriting data that the driver has already written.
-- */
--static bool blk_rq_can_direct_dispatch(struct request *rq)
--{
--	return req_op(rq) == REQ_OP_READ || req_op(rq) == REQ_OP_WRITE;
--}
--
- static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
- 						struct request *rq,
- 						blk_qc_t *cookie,
-@@ -1752,7 +1731,7 @@ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
- 		goto insert;
- 	}
- 
--	if (!blk_rq_can_direct_dispatch(rq) || (q->elevator && !bypass_insert))
-+	if (q->elevator && !bypass_insert)
- 		goto insert;
- 
- 	if (!blk_mq_get_dispatch_budget(hctx))
-@@ -1768,7 +1747,7 @@ static blk_status_t __blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
- 	if (bypass_insert)
- 		return BLK_STS_RESOURCE;
- 
--	blk_mq_sched_insert_request(rq, false, run_queue, false);
-+	blk_mq_request_bypass_insert(rq, run_queue);
- 	return BLK_STS_OK;
- }
- 
-@@ -1784,7 +1763,7 @@ static void blk_mq_try_issue_directly(struct blk_mq_hw_ctx *hctx,
- 
- 	ret = __blk_mq_try_issue_directly(hctx, rq, cookie, false);
- 	if (ret == BLK_STS_RESOURCE || ret == BLK_STS_DEV_RESOURCE)
--		blk_mq_sched_insert_request(rq, false, true, false);
-+		blk_mq_request_bypass_insert(rq, true);
- 	else if (ret != BLK_STS_OK)
- 		blk_mq_end_request(rq, ret);
- 
-@@ -1814,15 +1793,13 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
- 		struct request *rq = list_first_entry(list, struct request,
- 				queuelist);
- 
--		if (!blk_rq_can_direct_dispatch(rq))
--			break;
--
- 		list_del_init(&rq->queuelist);
- 		ret = blk_mq_request_issue_directly(rq);
- 		if (ret != BLK_STS_OK) {
- 			if (ret == BLK_STS_RESOURCE ||
- 					ret == BLK_STS_DEV_RESOURCE) {
--				list_add(&rq->queuelist, list);
-+				blk_mq_request_bypass_insert(rq,
-+							list_empty(list));
- 				break;
- 			}
- 			blk_mq_end_request(rq, ret);
--- 
-2.28.0
-
-
-From 178574b66509c9ff7df4ad26c84a8884567e93b4 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sat, 8 Dec 2018 12:59:10 +0100
-Subject: [PATCH 42/42] Linux 4.19.8
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index d2b4efcfb388..34bc4c752c49 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- # SPDX-License-Identifier: GPL-2.0
- VERSION = 4
- PATCHLEVEL = 19
--SUBLEVEL = 7
-+SUBLEVEL = 8
- EXTRAVERSION =
- NAME = "People's Front"
- 
--- 
-2.28.0
-

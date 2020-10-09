@@ -1,502 +1,280 @@
-From ab18409cf05f8e3d20ae3e5347f431947ecc397c Mon Sep 17 00:00:00 2001
-From: Reinette Chatre <reinette.chatre@intel.com>
-Date: Wed, 19 Sep 2018 10:29:06 -0700
-Subject: [PATCH 01/45] perf/core: Add sanity check to deal with pinned event
- failure
-
-commit befb1b3c2703897c5b8ffb0044dc5d0e5f27c5d7 upstream.
-
-It is possible that a failure can occur during the scheduling of a
-pinned event. The initial portion of perf_event_read_local() contains
-the various error checks an event should pass before it can be
-considered valid. Ensure that the potential scheduling failure
-of a pinned event is checked for and have a credible error.
-
-Suggested-by: Peter Zijlstra <peterz@infradead.org>
-Signed-off-by: Reinette Chatre <reinette.chatre@intel.com>
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
-Cc: fenghua.yu@intel.com
-Cc: tony.luck@intel.com
-Cc: acme@kernel.org
-Cc: gavin.hindman@intel.com
-Cc: jithu.joseph@intel.com
-Cc: dave.hansen@intel.com
-Cc: hpa@zytor.com
-Cc: stable@vger.kernel.org
-Link: https://lkml.kernel.org/r/6486385d1f30336e9973b24c8c65f5079543d3d3.1537377064.git.reinette.chatre@intel.com
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/events/core.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/kernel/events/core.c b/kernel/events/core.c
-index 812ebf1cbb87..4dbce29a9313 100644
---- a/kernel/events/core.c
-+++ b/kernel/events/core.c
-@@ -3757,6 +3757,12 @@ int perf_event_read_local(struct perf_event *event, u64 *value)
+diff --git a/Makefile b/Makefile
+index 7fc373c011c0..332dd011b3b9 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 14
+-SUBLEVEL = 75
++SUBLEVEL = 76
+ EXTRAVERSION =
+ NAME = Petit Gorille
+ 
+diff --git a/arch/arc/kernel/process.c b/arch/arc/kernel/process.c
+index 4674541eba3f..8ce6e7235915 100644
+--- a/arch/arc/kernel/process.c
++++ b/arch/arc/kernel/process.c
+@@ -241,6 +241,26 @@ int copy_thread(unsigned long clone_flags,
+ 		task_thread_info(current)->thr_ptr;
+ 	}
+ 
++
++	/*
++	 * setup usermode thread pointer #1:
++	 * when child is picked by scheduler, __switch_to() uses @c_callee to
++	 * populate usermode callee regs: this works (despite being in a kernel
++	 * function) since special return path for child @ret_from_fork()
++	 * ensures those regs are not clobbered all the way to RTIE to usermode
++	 */
++	c_callee->r25 = task_thread_info(p)->thr_ptr;
++
++#ifdef CONFIG_ARC_CURR_IN_REG
++	/*
++	 * setup usermode thread pointer #2:
++	 * however for this special use of r25 in kernel, __switch_to() sets
++	 * r25 for kernel needs and only in the final return path is usermode
++	 * r25 setup, from pt_regs->user_r25. So set that up as well
++	 */
++	c_regs->user_r25 = c_callee->r25;
++#endif
++
+ 	return 0;
+ }
+ 
+diff --git a/arch/powerpc/include/asm/setup.h b/arch/powerpc/include/asm/setup.h
+index bbcdf929be54..a5e919e34c42 100644
+--- a/arch/powerpc/include/asm/setup.h
++++ b/arch/powerpc/include/asm/setup.h
+@@ -9,6 +9,7 @@ extern void ppc_printk_progress(char *s, unsigned short hex);
+ 
+ extern unsigned int rtas_data;
+ extern unsigned long long memory_limit;
++extern bool init_mem_is_free;
+ extern unsigned long klimit;
+ extern void *zalloc_maybe_bootmem(size_t size, gfp_t mask);
+ 
+diff --git a/arch/powerpc/lib/code-patching.c b/arch/powerpc/lib/code-patching.c
+index 096d4e4d31e6..882c750dc519 100644
+--- a/arch/powerpc/lib/code-patching.c
++++ b/arch/powerpc/lib/code-patching.c
+@@ -22,20 +22,28 @@
+ #include <asm/page.h>
+ #include <asm/code-patching.h>
+ #include <asm/setup.h>
++#include <asm/sections.h>
+ 
+-static int __patch_instruction(unsigned int *addr, unsigned int instr)
++static int __patch_instruction(unsigned int *exec_addr, unsigned int instr,
++			       unsigned int *patch_addr)
+ {
+ 	int err;
+ 
+-	__put_user_size(instr, addr, 4, err);
++	__put_user_size(instr, patch_addr, 4, err);
+ 	if (err)
+ 		return err;
+ 
+-	asm ("dcbst 0, %0; sync; icbi 0,%0; sync; isync" :: "r" (addr));
++	asm ("dcbst 0, %0; sync; icbi 0,%1; sync; isync" :: "r" (patch_addr),
++							    "r" (exec_addr));
+ 
+ 	return 0;
+ }
+ 
++static int raw_patch_instruction(unsigned int *addr, unsigned int instr)
++{
++	return __patch_instruction(addr, instr, addr);
++}
++
+ #ifdef CONFIG_STRICT_KERNEL_RWX
+ static DEFINE_PER_CPU(struct vm_struct *, text_poke_area);
+ 
+@@ -135,10 +143,10 @@ static inline int unmap_patch_area(unsigned long addr)
+ 	return 0;
+ }
+ 
+-int patch_instruction(unsigned int *addr, unsigned int instr)
++static int do_patch_instruction(unsigned int *addr, unsigned int instr)
+ {
+ 	int err;
+-	unsigned int *dest = NULL;
++	unsigned int *patch_addr = NULL;
+ 	unsigned long flags;
+ 	unsigned long text_poke_addr;
+ 	unsigned long kaddr = (unsigned long)addr;
+@@ -149,7 +157,7 @@ int patch_instruction(unsigned int *addr, unsigned int instr)
+ 	 * to allow patching. We just do the plain old patching
+ 	 */
+ 	if (!this_cpu_read(*PTRRELOC(&text_poke_area)))
+-		return __patch_instruction(addr, instr);
++		return raw_patch_instruction(addr, instr);
+ 
+ 	local_irq_save(flags);
+ 
+@@ -159,17 +167,10 @@ int patch_instruction(unsigned int *addr, unsigned int instr)
  		goto out;
  	}
  
-+	/* If this is a pinned event it must be running on this CPU */
-+	if (event->attr.pinned && event->oncpu != smp_processor_id()) {
-+		ret = -EBUSY;
-+		goto out;
-+	}
-+
- 	/*
- 	 * If the event is currently on this CPU, its either a per-task event,
- 	 * or local to this CPU. Furthermore it means its ACTIVE (otherwise
--- 
-2.28.0
-
-
-From 5f4f5b1f4491627f83d6b1bd2ac7b7c5b87e5f0e Mon Sep 17 00:00:00 2001
-From: Mike Kravetz <mike.kravetz@oracle.com>
-Date: Fri, 5 Oct 2018 15:51:29 -0700
-Subject: [PATCH 02/45] mm: migration: fix migration of huge PMD shared pages
-
-commit 017b1660df89f5fb4bfe66c34e35f7d2031100c7 upstream.
-
-The page migration code employs try_to_unmap() to try and unmap the source
-page.  This is accomplished by using rmap_walk to find all vmas where the
-page is mapped.  This search stops when page mapcount is zero.  For shared
-PMD huge pages, the page map count is always 1 no matter the number of
-mappings.  Shared mappings are tracked via the reference count of the PMD
-page.  Therefore, try_to_unmap stops prematurely and does not completely
-unmap all mappings of the source page.
-
-This problem can result is data corruption as writes to the original
-source page can happen after contents of the page are copied to the target
-page.  Hence, data is lost.
-
-This problem was originally seen as DB corruption of shared global areas
-after a huge page was soft offlined due to ECC memory errors.  DB
-developers noticed they could reproduce the issue by (hotplug) offlining
-memory used to back huge pages.  A simple testcase can reproduce the
-problem by creating a shared PMD mapping (note that this must be at least
-PUD_SIZE in size and PUD_SIZE aligned (1GB on x86)), and using
-migrate_pages() to migrate process pages between nodes while continually
-writing to the huge pages being migrated.
-
-To fix, have the try_to_unmap_one routine check for huge PMD sharing by
-calling huge_pmd_unshare for hugetlbfs huge pages.  If it is a shared
-mapping it will be 'unshared' which removes the page table entry and drops
-the reference on the PMD page.  After this, flush caches and TLB.
-
-mmu notifiers are called before locking page tables, but we can not be
-sure of PMD sharing until page tables are locked.  Therefore, check for
-the possibility of PMD sharing before locking so that notifiers can
-prepare for the worst possible case.
-
-Link: http://lkml.kernel.org/r/20180823205917.16297-2-mike.kravetz@oracle.com
-[mike.kravetz@oracle.com: make _range_in_vma() a static inline]
-  Link: http://lkml.kernel.org/r/6063f215-a5c8-2f0c-465a-2c515ddc952d@oracle.com
-Fixes: 39dde65c9940 ("shared page table for hugetlb page")
-Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
-Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
-Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
-Acked-by: Michal Hocko <mhocko@suse.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Davidlohr Bueso <dave@stgolabs.net>
-Cc: Jerome Glisse <jglisse@redhat.com>
-Cc: Mike Kravetz <mike.kravetz@oracle.com>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/hugetlb.h | 14 ++++++++++++++
- include/linux/mm.h      |  6 ++++++
- mm/hugetlb.c            | 37 ++++++++++++++++++++++++++++++++++--
- mm/rmap.c               | 42 ++++++++++++++++++++++++++++++++++++++---
- 4 files changed, 94 insertions(+), 5 deletions(-)
-
-diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
-index 82a25880714a..7aa2de25c09c 100644
---- a/include/linux/hugetlb.h
-+++ b/include/linux/hugetlb.h
-@@ -140,6 +140,8 @@ pte_t *huge_pte_alloc(struct mm_struct *mm,
- pte_t *huge_pte_offset(struct mm_struct *mm,
- 		       unsigned long addr, unsigned long sz);
- int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep);
-+void adjust_range_if_pmd_sharing_possible(struct vm_area_struct *vma,
-+				unsigned long *start, unsigned long *end);
- struct page *follow_huge_addr(struct mm_struct *mm, unsigned long address,
- 			      int write);
- struct page *follow_huge_pd(struct vm_area_struct *vma,
-@@ -169,6 +171,18 @@ static inline unsigned long hugetlb_total_pages(void)
- 	return 0;
- }
+-	dest = (unsigned int *)(text_poke_addr) +
++	patch_addr = (unsigned int *)(text_poke_addr) +
+ 			((kaddr & ~PAGE_MASK) / sizeof(unsigned int));
  
-+static inline int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr,
-+					pte_t *ptep)
-+{
-+	return 0;
-+}
-+
-+static inline void adjust_range_if_pmd_sharing_possible(
-+				struct vm_area_struct *vma,
-+				unsigned long *start, unsigned long *end)
-+{
-+}
-+
- #define follow_hugetlb_page(m,v,p,vs,a,b,i,w,n)	({ BUG(); 0; })
- #define follow_huge_addr(mm, addr, write)	ERR_PTR(-EINVAL)
- #define copy_hugetlb_page_range(src, dst, vma)	({ BUG(); 0; })
-diff --git a/include/linux/mm.h b/include/linux/mm.h
-index a26cf767407e..58f2263de4de 100644
---- a/include/linux/mm.h
-+++ b/include/linux/mm.h
-@@ -2322,6 +2322,12 @@ static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
- 	return vma;
- }
+-	/*
+-	 * We use __put_user_size so that we can handle faults while
+-	 * writing to dest and return err to handle faults gracefully
+-	 */
+-	__put_user_size(instr, dest, 4, err);
+-	if (!err)
+-		asm ("dcbst 0, %0; sync; icbi 0,%0; icbi 0,%1; sync; isync"
+-			::"r" (dest), "r"(addr));
++	__patch_instruction(addr, instr, patch_addr);
  
-+static inline bool range_in_vma(struct vm_area_struct *vma,
-+				unsigned long start, unsigned long end)
-+{
-+	return (vma && vma->vm_start <= start && end <= vma->vm_end);
-+}
-+
- #ifdef CONFIG_MMU
- pgprot_t vm_get_page_prot(unsigned long vm_flags);
- void vma_set_page_prot(struct vm_area_struct *vma);
-diff --git a/mm/hugetlb.c b/mm/hugetlb.c
-index dfd2947e046e..9801dc0250e2 100644
---- a/mm/hugetlb.c
-+++ b/mm/hugetlb.c
-@@ -4517,12 +4517,40 @@ static bool vma_shareable(struct vm_area_struct *vma, unsigned long addr)
- 	/*
- 	 * check on proper vm_flags and page table alignment
- 	 */
--	if (vma->vm_flags & VM_MAYSHARE &&
--	    vma->vm_start <= base && end <= vma->vm_end)
-+	if (vma->vm_flags & VM_MAYSHARE && range_in_vma(vma, base, end))
- 		return true;
- 	return false;
+ 	err = unmap_patch_area(text_poke_addr);
+ 	if (err)
+@@ -182,12 +183,22 @@ out:
  }
+ #else /* !CONFIG_STRICT_KERNEL_RWX */
  
-+/*
-+ * Determine if start,end range within vma could be mapped by shared pmd.
-+ * If yes, adjust start and end to cover range associated with possible
-+ * shared pmd mappings.
-+ */
-+void adjust_range_if_pmd_sharing_possible(struct vm_area_struct *vma,
-+				unsigned long *start, unsigned long *end)
-+{
-+	unsigned long check_addr = *start;
-+
-+	if (!(vma->vm_flags & VM_MAYSHARE))
-+		return;
-+
-+	for (check_addr = *start; check_addr < *end; check_addr += PUD_SIZE) {
-+		unsigned long a_start = check_addr & PUD_MASK;
-+		unsigned long a_end = a_start + PUD_SIZE;
-+
-+		/*
-+		 * If sharing is possible, adjust start/end if necessary.
-+		 */
-+		if (range_in_vma(vma, a_start, a_end)) {
-+			if (a_start < *start)
-+				*start = a_start;
-+			if (a_end > *end)
-+				*end = a_end;
-+		}
-+	}
-+}
-+
- /*
-  * Search for a shareable pmd page for hugetlb. In any case calls pmd_alloc()
-  * and returns the corresponding pte. While this is not necessary for the
-@@ -4620,6 +4648,11 @@ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
+-int patch_instruction(unsigned int *addr, unsigned int instr)
++static int do_patch_instruction(unsigned int *addr, unsigned int instr)
  {
- 	return 0;
+-	return __patch_instruction(addr, instr);
++	return raw_patch_instruction(addr, instr);
  }
+ 
+ #endif /* CONFIG_STRICT_KERNEL_RWX */
 +
-+void adjust_range_if_pmd_sharing_possible(struct vm_area_struct *vma,
-+				unsigned long *start, unsigned long *end)
++int patch_instruction(unsigned int *addr, unsigned int instr)
 +{
-+}
- #define want_pmd_share()	(0)
- #endif /* CONFIG_ARCH_WANT_HUGE_PMD_SHARE */
- 
-diff --git a/mm/rmap.c b/mm/rmap.c
-index 97edcf44d88c..8bd2ddd8febd 100644
---- a/mm/rmap.c
-+++ b/mm/rmap.c
-@@ -1358,11 +1358,21 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
- 	}
- 
- 	/*
--	 * We have to assume the worse case ie pmd for invalidation. Note that
--	 * the page can not be free in this function as call of try_to_unmap()
--	 * must hold a reference on the page.
-+	 * For THP, we have to assume the worse case ie pmd for invalidation.
-+	 * For hugetlb, it could be much worse if we need to do pud
-+	 * invalidation in the case of pmd sharing.
-+	 *
-+	 * Note that the page can not be free in this function as call of
-+	 * try_to_unmap() must hold a reference on the page.
- 	 */
- 	end = min(vma->vm_end, start + (PAGE_SIZE << compound_order(page)));
-+	if (PageHuge(page)) {
-+		/*
-+		 * If sharing is possible, start and end will be adjusted
-+		 * accordingly.
-+		 */
-+		adjust_range_if_pmd_sharing_possible(vma, &start, &end);
++	/* Make sure we aren't patching a freed init section */
++	if (init_mem_is_free && init_section_contains(addr, 4)) {
++		pr_debug("Skipping init section patching addr: 0x%px\n", addr);
++		return 0;
 +	}
- 	mmu_notifier_invalidate_range_start(vma->vm_mm, start, end);
++	return do_patch_instruction(addr, instr);
++}
+ NOKPROBE_SYMBOL(patch_instruction);
  
- 	while (page_vma_mapped_walk(&pvmw)) {
-@@ -1408,6 +1418,32 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
- 		subpage = page - page_to_pfn(page) + pte_pfn(*pvmw.pte);
- 		address = pvmw.address;
+ int patch_branch(unsigned int *addr, unsigned long target, int flags)
+diff --git a/arch/powerpc/mm/mem.c b/arch/powerpc/mm/mem.c
+index 9c2f83331e5b..30bf13b72e5e 100644
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@ -63,6 +63,7 @@
+ #endif
  
-+		if (PageHuge(page)) {
-+			if (huge_pmd_unshare(mm, &address, pvmw.pte)) {
-+				/*
-+				 * huge_pmd_unshare unmapped an entire PMD
-+				 * page.  There is no way of knowing exactly
-+				 * which PMDs may be cached for this mm, so
-+				 * we must flush them all.  start/end were
-+				 * already adjusted above to cover this range.
-+				 */
-+				flush_cache_range(vma, start, end);
-+				flush_tlb_range(vma, start, end);
-+				mmu_notifier_invalidate_range(mm, start, end);
-+
-+				/*
-+				 * The ref count of the PMD page was dropped
-+				 * which is part of the way map counting
-+				 * is done for shared PMDs.  Return 'true'
-+				 * here.  When there is no other sharing,
-+				 * huge_pmd_unshare returns false and we will
-+				 * unmap the actual page and drop map count
-+				 * to zero.
-+				 */
-+				page_vma_mapped_walk_done(&pvmw);
-+				break;
-+			}
-+		}
+ unsigned long long memory_limit;
++bool init_mem_is_free;
  
- 		if (IS_ENABLED(CONFIG_MIGRATION) &&
- 		    (flags & TTU_MIGRATION) &&
--- 
-2.28.0
-
-
-From a2e0493f99e6a65753ec32c39b17c0d1b370f9de Mon Sep 17 00:00:00 2001
-From: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
-Date: Fri, 5 Oct 2018 15:51:41 -0700
-Subject: [PATCH 03/45] mm, thp: fix mlocking THP page with migration enabled
-
-commit e125fe405abedc1dc8a5b2229b80ee91c1434015 upstream.
-
-A transparent huge page is represented by a single entry on an LRU list.
-Therefore, we can only make unevictable an entire compound page, not
-individual subpages.
-
-If a user tries to mlock() part of a huge page, we want the rest of the
-page to be reclaimable.
-
-We handle this by keeping PTE-mapped huge pages on normal LRU lists: the
-PMD on border of VM_LOCKED VMA will be split into PTE table.
-
-Introduction of THP migration breaks[1] the rules around mlocking THP
-pages.  If we had a single PMD mapping of the page in mlocked VMA, the
-page will get mlocked, regardless of PTE mappings of the page.
-
-For tmpfs/shmem it's easy to fix by checking PageDoubleMap() in
-remove_migration_pmd().
-
-Anon THP pages can only be shared between processes via fork().  Mlocked
-page can only be shared if parent mlocked it before forking, otherwise CoW
-will be triggered on mlock().
-
-For Anon-THP, we can fix the issue by munlocking the page on removing PTE
-migration entry for the page.  PTEs for the page will always come after
-mlocked PMD: rmap walks VMAs from oldest to newest.
-
-Test-case:
-
-	#include <unistd.h>
-	#include <sys/mman.h>
-	#include <sys/wait.h>
-	#include <linux/mempolicy.h>
-	#include <numaif.h>
-
-	int main(void)
-	{
-	        unsigned long nodemask = 4;
-	        void *addr;
-
-		addr = mmap((void *)0x20000000UL, 2UL << 20, PROT_READ | PROT_WRITE,
-			MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
-
-	        if (fork()) {
-			wait(NULL);
-			return 0;
-	        }
-
-	        mlock(addr, 4UL << 10);
-	        mbind(addr, 2UL << 20, MPOL_PREFERRED | MPOL_F_RELATIVE_NODES,
-	                &nodemask, 4, MPOL_MF_MOVE);
-
-	        return 0;
-	}
-
-[1] https://lkml.kernel.org/r/CAOMGZ=G52R-30rZvhGxEbkTw7rLLwBGadVYeo--iizcD3upL3A@mail.gmail.com
-
-Link: http://lkml.kernel.org/r/20180917133816.43995-1-kirill.shutemov@linux.intel.com
-Fixes: 616b8371539a ("mm: thp: enable thp migration in generic path")
-Signed-off-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
-Reported-by: Vegard Nossum <vegard.nossum@oracle.com>
-Reviewed-by: Zi Yan <zi.yan@cs.rutgers.edu>
-Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
-Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: Andrea Arcangeli <aarcange@redhat.com>
-Cc: <stable@vger.kernel.org>	[4.14+]
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/huge_memory.c | 2 +-
- mm/migrate.c     | 3 +++
- 2 files changed, 4 insertions(+), 1 deletion(-)
-
-diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index 255469f78217..174612f8339c 100644
---- a/mm/huge_memory.c
-+++ b/mm/huge_memory.c
-@@ -2886,7 +2886,7 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
- 	flush_cache_range(vma, mmun_start, mmun_start + HPAGE_PMD_SIZE);
- 	page_add_anon_rmap(new, vma, mmun_start, true);
- 	set_pmd_at(mm, mmun_start, pvmw->pmd, pmde);
--	if (vma->vm_flags & VM_LOCKED)
-+	if ((vma->vm_flags & VM_LOCKED) && !PageDoubleMap(new))
- 		mlock_vma_page(new);
- 	update_mmu_cache_pmd(vma, address, pvmw->pmd);
+ #ifdef CONFIG_HIGHMEM
+ pte_t *kmap_pte;
+@@ -405,6 +406,7 @@ void free_initmem(void)
+ {
+ 	ppc_md.progress = ppc_printk_progress;
+ 	mark_initmem_nx();
++	init_mem_is_free = true;
+ 	free_initmem_default(POISON_FREE_INITMEM);
  }
-diff --git a/mm/migrate.c b/mm/migrate.c
-index 1236449b4777..cbb025239071 100644
---- a/mm/migrate.c
-+++ b/mm/migrate.c
-@@ -274,6 +274,9 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
- 		if (vma->vm_flags & VM_LOCKED && !PageTransCompound(new))
- 			mlock_vma_page(new);
  
-+		if (PageTransHuge(page) && PageMlocked(page))
-+			clear_page_mlock(page);
+diff --git a/arch/x86/entry/vdso/Makefile b/arch/x86/entry/vdso/Makefile
+index b545bf9d2328..0a550dc5c525 100644
+--- a/arch/x86/entry/vdso/Makefile
++++ b/arch/x86/entry/vdso/Makefile
+@@ -74,7 +74,13 @@ $(obj)/vdso-image-%.c: $(obj)/vdso%.so.dbg $(obj)/vdso%.so $(obj)/vdso2c FORCE
+ CFL := $(PROFILING) -mcmodel=small -fPIC -O2 -fasynchronous-unwind-tables -m64 \
+        $(filter -g%,$(KBUILD_CFLAGS)) $(call cc-option, -fno-stack-protector) \
+        -fno-omit-frame-pointer -foptimize-sibling-calls \
+-       -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO $(RETPOLINE_VDSO_CFLAGS)
++       -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO
 +
- 		/* No need to invalidate - it was non-present before */
- 		update_mmu_cache(vma, pvmw.address, pvmw.pte);
- 	}
--- 
-2.28.0
-
-
-From 5178716b55c4d209b3fb624633086371e482a185 Mon Sep 17 00:00:00 2001
-From: Jann Horn <jannh@google.com>
-Date: Fri, 5 Oct 2018 15:52:07 -0700
-Subject: [PATCH 04/45] mm/vmstat.c: skip NR_TLB_REMOTE_FLUSH* properly
-
-commit 58bc4c34d249bf1bc50730a9a209139347cfacfe upstream.
-
-5dd0b16cdaff ("mm/vmstat: Make NR_TLB_REMOTE_FLUSH_RECEIVED available even
-on UP") made the availability of the NR_TLB_REMOTE_FLUSH* counters inside
-the kernel unconditional to reduce #ifdef soup, but (either to avoid
-showing dummy zero counters to userspace, or because that code was missed)
-didn't update the vmstat_array, meaning that all following counters would
-be shown with incorrect values.
-
-This only affects kernel builds with
-CONFIG_VM_EVENT_COUNTERS=y && CONFIG_DEBUG_TLBFLUSH=y && CONFIG_SMP=n.
-
-Link: http://lkml.kernel.org/r/20181001143138.95119-2-jannh@google.com
-Fixes: 5dd0b16cdaff ("mm/vmstat: Make NR_TLB_REMOTE_FLUSH_RECEIVED available even on UP")
-Signed-off-by: Jann Horn <jannh@google.com>
-Reviewed-by: Kees Cook <keescook@chromium.org>
-Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
-Acked-by: Michal Hocko <mhocko@suse.com>
-Acked-by: Roman Gushchin <guro@fb.com>
-Cc: Davidlohr Bueso <dave@stgolabs.net>
-Cc: Oleg Nesterov <oleg@redhat.com>
-Cc: Christoph Lameter <clameter@sgi.com>
-Cc: Kemi Wang <kemi.wang@intel.com>
-Cc: Andy Lutomirski <luto@kernel.org>
-Cc: Ingo Molnar <mingo@kernel.org>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/vmstat.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/mm/vmstat.c b/mm/vmstat.c
-index 4bb13e72ac97..2bdc962b2dfe 100644
---- a/mm/vmstat.c
-+++ b/mm/vmstat.c
-@@ -1203,6 +1203,9 @@ const char * const vmstat_text[] = {
- #ifdef CONFIG_SMP
- 	"nr_tlb_remote_flush",
- 	"nr_tlb_remote_flush_received",
-+#else
-+	"", /* nr_tlb_remote_flush */
-+	"", /* nr_tlb_remote_flush_received */
- #endif /* CONFIG_SMP */
- 	"nr_tlb_local_flush_all",
- 	"nr_tlb_local_flush_one",
--- 
-2.28.0
-
-
-From 87a9d1cc2e8f0a442ed1f219d36446398c5e24df Mon Sep 17 00:00:00 2001
-From: Sean Christopherson <sean.j.christopherson@intel.com>
-Date: Tue, 25 Sep 2018 13:20:00 -0700
-Subject: [PATCH 05/45] KVM: x86: fix L1TF's MMIO GFN calculation
-
-commit daa07cbc9ae3da2d61b7ce900c0b9107d134f2c1 upstream.
-
-One defense against L1TF in KVM is to always set the upper five bits
-of the *legal* physical address in the SPTEs for non-present and
-reserved SPTEs, e.g. MMIO SPTEs.  In the MMIO case, the GFN of the
-MMIO SPTE may overlap with the upper five bits that are being usurped
-to defend against L1TF.  To preserve the GFN, the bits of the GFN that
-overlap with the repurposed bits are shifted left into the reserved
-bits, i.e. the GFN in the SPTE will be split into high and low parts.
-When retrieving the GFN from the MMIO SPTE, e.g. to check for an MMIO
-access, get_mmio_spte_gfn() unshifts the affected bits and restores
-the original GFN for comparison.  Unfortunately, get_mmio_spte_gfn()
-neglects to mask off the reserved bits in the SPTE that were used to
-store the upper chunk of the GFN.  As a result, KVM fails to detect
-MMIO accesses whose GPA overlaps the repurprosed bits, which in turn
-causes guest panics and hangs.
-
-Fix the bug by generating a mask that covers the lower chunk of the
-GFN, i.e. the bits that aren't shifted by the L1TF mitigation.  The
-alternative approach would be to explicitly zero the five reserved
-bits that are used to store the upper chunk of the GFN, but that
-requires additional run-time computation and makes an already-ugly
-bit of code even more inscrutable.
-
-I considered adding a WARN_ON_ONCE(low_phys_bits-1 <= PAGE_SHIFT) to
-warn if GENMASK_ULL() generated a nonsensical value, but that seemed
-silly since that would mean a system that supports VMX has less than
-18 bits of physical address space...
-
-Reported-by: Sakari Ailus <sakari.ailus@iki.fi>
-Fixes: d9b47449c1a1 ("kvm: x86: Set highest physical address bits in non-present/reserved SPTEs")
-Cc: Junaid Shahid <junaids@google.com>
-Cc: Jim Mattson <jmattson@google.com>
-Cc: stable@vger.kernel.org
-Reviewed-by: Junaid Shahid <junaids@google.com>
-Tested-by: Sakari Ailus <sakari.ailus@linux.intel.com>
-Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/kvm/mmu.c | 24 ++++++++++++++++++++----
- 1 file changed, 20 insertions(+), 4 deletions(-)
-
++ifdef CONFIG_RETPOLINE
++ifneq ($(RETPOLINE_VDSO_CFLAGS),)
++  CFL += $(RETPOLINE_VDSO_CFLAGS)
++endif
++endif
+ 
+ $(vobjs): KBUILD_CFLAGS := $(filter-out $(GCC_PLUGINS_CFLAGS) $(RETPOLINE_CFLAGS),$(KBUILD_CFLAGS)) $(CFL)
+ 
+@@ -153,7 +159,13 @@ KBUILD_CFLAGS_32 += $(call cc-option, -fno-stack-protector)
+ KBUILD_CFLAGS_32 += $(call cc-option, -foptimize-sibling-calls)
+ KBUILD_CFLAGS_32 += -fno-omit-frame-pointer
+ KBUILD_CFLAGS_32 += -DDISABLE_BRANCH_PROFILING
+-KBUILD_CFLAGS_32 += $(RETPOLINE_VDSO_CFLAGS)
++
++ifdef CONFIG_RETPOLINE
++ifneq ($(RETPOLINE_VDSO_CFLAGS),)
++  KBUILD_CFLAGS_32 += $(RETPOLINE_VDSO_CFLAGS)
++endif
++endif
++
+ $(obj)/vdso32.so.dbg: KBUILD_CFLAGS = $(KBUILD_CFLAGS_32)
+ 
+ $(obj)/vdso32.so.dbg: FORCE \
+diff --git a/arch/x86/entry/vdso/vclock_gettime.c b/arch/x86/entry/vdso/vclock_gettime.c
+index fa8dbfcf7ed3..9c35dc0a9d64 100644
+--- a/arch/x86/entry/vdso/vclock_gettime.c
++++ b/arch/x86/entry/vdso/vclock_gettime.c
+@@ -43,8 +43,9 @@ extern u8 hvclock_page
+ notrace static long vdso_fallback_gettime(long clock, struct timespec *ts)
+ {
+ 	long ret;
+-	asm("syscall" : "=a" (ret) :
+-	    "0" (__NR_clock_gettime), "D" (clock), "S" (ts) : "memory");
++	asm ("syscall" : "=a" (ret), "=m" (*ts) :
++	     "0" (__NR_clock_gettime), "D" (clock), "S" (ts) :
++	     "memory", "rcx", "r11");
+ 	return ret;
+ }
+ 
+@@ -52,8 +53,9 @@ notrace static long vdso_fallback_gtod(struct timeval *tv, struct timezone *tz)
+ {
+ 	long ret;
+ 
+-	asm("syscall" : "=a" (ret) :
+-	    "0" (__NR_gettimeofday), "D" (tv), "S" (tz) : "memory");
++	asm ("syscall" : "=a" (ret), "=m" (*tv), "=m" (*tz) :
++	     "0" (__NR_gettimeofday), "D" (tv), "S" (tz) :
++	     "memory", "rcx", "r11");
+ 	return ret;
+ }
+ 
+@@ -64,13 +66,13 @@ notrace static long vdso_fallback_gettime(long clock, struct timespec *ts)
+ {
+ 	long ret;
+ 
+-	asm(
++	asm (
+ 		"mov %%ebx, %%edx \n"
+-		"mov %2, %%ebx \n"
++		"mov %[clock], %%ebx \n"
+ 		"call __kernel_vsyscall \n"
+ 		"mov %%edx, %%ebx \n"
+-		: "=a" (ret)
+-		: "0" (__NR_clock_gettime), "g" (clock), "c" (ts)
++		: "=a" (ret), "=m" (*ts)
++		: "0" (__NR_clock_gettime), [clock] "g" (clock), "c" (ts)
+ 		: "memory", "edx");
+ 	return ret;
+ }
+@@ -79,13 +81,13 @@ notrace static long vdso_fallback_gtod(struct timeval *tv, struct timezone *tz)
+ {
+ 	long ret;
+ 
+-	asm(
++	asm (
+ 		"mov %%ebx, %%edx \n"
+-		"mov %2, %%ebx \n"
++		"mov %[tv], %%ebx \n"
+ 		"call __kernel_vsyscall \n"
+ 		"mov %%edx, %%ebx \n"
+-		: "=a" (ret)
+-		: "0" (__NR_gettimeofday), "g" (tv), "c" (tz)
++		: "=a" (ret), "=m" (*tv), "=m" (*tz)
++		: "0" (__NR_gettimeofday), [tv] "g" (tv), "c" (tz)
+ 		: "memory", "edx");
+ 	return ret;
+ }
 diff --git a/arch/x86/kvm/mmu.c b/arch/x86/kvm/mmu.c
 index 1dfb808abd23..d755e0d44ac1 100644
 --- a/arch/x86/kvm/mmu.c
@@ -558,32 +336,6 @@ index 1dfb808abd23..d755e0d44ac1 100644
  }
  
  static int is_cpuid_PSE36(void)
--- 
-2.28.0
-
-
-From 8e2e2192eb35eb24eb99f120b78eed0b104092b2 Mon Sep 17 00:00:00 2001
-From: Ilya Dryomov <idryomov@gmail.com>
-Date: Wed, 26 Sep 2018 14:35:50 +0200
-Subject: [PATCH 06/45] blk-mq: I/O and timer unplugs are inverted in blktrace
-
-commit 587562d0c7cd6861f4f90a2eb811cccb1a376f5f upstream.
-
-trace_block_unplug() takes true for explicit unplugs and false for
-implicit unplugs.  schedule() unplugs are implicit and should be
-reported as timer unplugs.  While correct in the legacy code, this has
-been inverted in blk-mq since 4.11.
-
-Cc: stable@vger.kernel.org
-Fixes: bd166ef183c2 ("blk-mq-sched: add framework for MQ capable IO schedulers")
-Reviewed-by: Omar Sandoval <osandov@fb.com>
-Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- block/blk-mq.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
 diff --git a/block/blk-mq.c b/block/blk-mq.c
 index 49979c095f31..eac444804736 100644
 --- a/block/blk-mq.c
@@ -606,34 +358,30 @@ index 49979c095f31..eac444804736 100644
  		blk_mq_sched_insert_requests(this_q, this_ctx, &ctx_list,
  						from_schedule);
  	}
--- 
-2.28.0
-
-
-From 887361696fb9e2c5b99e39c8d0dbacbe46ff92f9 Mon Sep 17 00:00:00 2001
-From: Alexandre Belloni <alexandre.belloni@bootlin.com>
-Date: Wed, 25 Apr 2018 12:14:39 +0200
-Subject: [PATCH 07/45] clocksource/drivers/timer-atmel-pit: Properly handle
- error cases
-
-commit 52bf4a900d9cede3eb14982d0f2c5e6db6d97cc3 upstream.
-
-The smatch utility reports a possible leak:
-
-smatch warnings:
-drivers/clocksource/timer-atmel-pit.c:183 at91sam926x_pit_dt_init() warn: possible memory leak of 'data'
-
-Ensure data is freed before exiting with an error.
-
-Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
-Signed-off-by: Alexandre Belloni <alexandre.belloni@bootlin.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Daniel Lezcano <daniel.lezcano@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/clocksource/timer-atmel-pit.c | 20 ++++++++++++++------
- 1 file changed, 14 insertions(+), 6 deletions(-)
-
+diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
+index 770b1539a083..d16b40cd26cc 100644
+--- a/drivers/base/power/main.c
++++ b/drivers/base/power/main.c
+@@ -1462,8 +1462,10 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
+ 
+ 	dpm_wait_for_subordinate(dev, async);
+ 
+-	if (async_error)
++	if (async_error) {
++		dev->power.direct_complete = false;
+ 		goto Complete;
++	}
+ 
+ 	/*
+ 	 * If a device configured to wake up the system from sleep states
+@@ -1475,6 +1477,7 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
+ 		pm_wakeup_event(dev, 0);
+ 
+ 	if (pm_wakeup_pending()) {
++		dev->power.direct_complete = false;
+ 		async_error = -EBUSY;
+ 		goto Complete;
+ 	}
 diff --git a/drivers/clocksource/timer-atmel-pit.c b/drivers/clocksource/timer-atmel-pit.c
 index ec8a4376f74f..2fab18fae4fc 100644
 --- a/drivers/clocksource/timer-atmel-pit.c
@@ -702,2397 +450,6 @@ index ec8a4376f74f..2fab18fae4fc 100644
  }
  TIMER_OF_DECLARE(at91sam926x_pit, "atmel,at91sam9260-pit",
  		       at91sam926x_pit_dt_init);
--- 
-2.28.0
-
-
-From f66d89483bb301bd7a73ccc96204f1026b15151f Mon Sep 17 00:00:00 2001
-From: Tomi Valkeinen <tomi.valkeinen@ti.com>
-Date: Wed, 26 Sep 2018 18:11:22 +0200
-Subject: [PATCH 08/45] fbdev/omapfb: fix omapfb_memory_read infoleak
-
-commit 1bafcbf59fed92af58955024452f45430d3898c5 upstream.
-
-OMAPFB_MEMORY_READ ioctl reads pixels from the LCD's memory and copies
-them to a userspace buffer. The code has two issues:
-
-- The user provided width and height could be large enough to overflow
-  the calculations
-- The copy_to_user() can copy uninitialized memory to the userspace,
-  which might contain sensitive kernel information.
-
-Fix these by limiting the width & height parameters, and only copying
-the amount of data that we actually received from the LCD.
-
-Signed-off-by: Tomi Valkeinen <tomi.valkeinen@ti.com>
-Reported-by: Jann Horn <jannh@google.com>
-Cc: stable@vger.kernel.org
-Cc: security@kernel.org
-Cc: Will Deacon <will.deacon@arm.com>
-Cc: Jann Horn <jannh@google.com>
-Cc: Tony Lindgren <tony@atomide.com>
-Signed-off-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c | 5 ++++-
- 1 file changed, 4 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c b/drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c
-index ef69273074ba..a3edb20ea4c3 100644
---- a/drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c
-+++ b/drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c
-@@ -496,6 +496,9 @@ static int omapfb_memory_read(struct fb_info *fbi,
- 	if (!access_ok(VERIFY_WRITE, mr->buffer, mr->buffer_size))
- 		return -EFAULT;
- 
-+	if (mr->w > 4096 || mr->h > 4096)
-+		return -EINVAL;
-+
- 	if (mr->w * mr->h * 3 > mr->buffer_size)
- 		return -EINVAL;
- 
-@@ -509,7 +512,7 @@ static int omapfb_memory_read(struct fb_info *fbi,
- 			mr->x, mr->y, mr->w, mr->h);
- 
- 	if (r > 0) {
--		if (copy_to_user(mr->buffer, buf, mr->buffer_size))
-+		if (copy_to_user(mr->buffer, buf, r))
- 			r = -EFAULT;
- 	}
- 
--- 
-2.28.0
-
-
-From 309a1c5cfc598c162dfc951fac040554164056e4 Mon Sep 17 00:00:00 2001
-From: Jan Beulich <JBeulich@suse.com>
-Date: Tue, 25 Sep 2018 02:12:30 -0600
-Subject: [PATCH 09/45] xen-netback: fix input validation in
- xenvif_set_hash_mapping()
-
-commit 780e83c259fc33e8959fed8dfdad17e378d72b62 upstream.
-
-Both len and off are frontend specified values, so we need to make
-sure there's no overflow when adding the two for the bounds check. We
-also want to avoid undefined behavior and hence use off to index into
-->hash.mapping[] only after bounds checking. This at the same time
-allows to take care of not applying off twice for the bounds checking
-against vif->num_queues.
-
-It is also insufficient to bounds check copy_op.len, as this is len
-truncated to 16 bits.
-
-This is XSA-270 / CVE-2018-15471.
-
-Reported-by: Felix Wilhelm <fwilhelm@google.com>
-Signed-off-by: Jan Beulich <jbeulich@suse.com>
-Reviewed-by: Paul Durrant <paul.durrant@citrix.com>
-Tested-by: Paul Durrant <paul.durrant@citrix.com>
-Cc: stable@vger.kernel.org [4.7 onwards]
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/xen-netback/hash.c | 12 +++++++-----
- 1 file changed, 7 insertions(+), 5 deletions(-)
-
-diff --git a/drivers/net/xen-netback/hash.c b/drivers/net/xen-netback/hash.c
-index 3c4c58b9fe76..3b6fb5b3bdb2 100644
---- a/drivers/net/xen-netback/hash.c
-+++ b/drivers/net/xen-netback/hash.c
-@@ -332,20 +332,22 @@ u32 xenvif_set_hash_mapping_size(struct xenvif *vif, u32 size)
- u32 xenvif_set_hash_mapping(struct xenvif *vif, u32 gref, u32 len,
- 			    u32 off)
- {
--	u32 *mapping = &vif->hash.mapping[off];
-+	u32 *mapping = vif->hash.mapping;
- 	struct gnttab_copy copy_op = {
- 		.source.u.ref = gref,
- 		.source.domid = vif->domid,
--		.dest.u.gmfn = virt_to_gfn(mapping),
- 		.dest.domid = DOMID_SELF,
--		.dest.offset = xen_offset_in_page(mapping),
--		.len = len * sizeof(u32),
-+		.len = len * sizeof(*mapping),
- 		.flags = GNTCOPY_source_gref
- 	};
- 
--	if ((off + len > vif->hash.size) || copy_op.len > XEN_PAGE_SIZE)
-+	if ((off + len < off) || (off + len > vif->hash.size) ||
-+	    len > XEN_PAGE_SIZE / sizeof(*mapping))
- 		return XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
- 
-+	copy_op.dest.u.gmfn = virt_to_gfn(mapping + off);
-+	copy_op.dest.offset = xen_offset_in_page(mapping + off);
-+
- 	while (len-- != 0)
- 		if (mapping[off++] >= vif->num_queues)
- 			return XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
--- 
-2.28.0
-
-
-From 0c0dd182adae698ae108566e1300c498305d5aeb Mon Sep 17 00:00:00 2001
-From: Rex Zhu <Rex.Zhu@amd.com>
-Date: Thu, 27 Sep 2018 20:48:39 +0800
-Subject: [PATCH 10/45] drm/amdgpu: Fix vce work queue was not cancelled when
- suspend
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 61ea6f5831974ebd1a57baffd7cc30600a2e26fc upstream.
-
-The vce cancel_delayed_work_sync never be called.
-driver call the function in error path.
-
-This caused the A+A suspend hang when runtime pm enebled.
-As we will visit the smu in the idle queue. this will cause
-smu hang because the dgpu has been suspend, and the dgpu also
-will be waked up. As the smu has been hang, so the dgpu resume
-will failed.
-
-Reviewed-by: Christian König <christian.koenig@amd.com>
-Reviewed-by: Feifei Xu <Feifei.Xu@amd.com>
-Signed-off-by: Rex Zhu <Rex.Zhu@amd.com>
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c | 3 ++-
- drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c | 4 ++--
- 2 files changed, 4 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
-index 9fc3d387eae3..fb36425e21ff 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
-@@ -231,6 +231,8 @@ int amdgpu_vce_suspend(struct amdgpu_device *adev)
- {
- 	int i;
- 
-+	cancel_delayed_work_sync(&adev->vce.idle_work);
-+
- 	if (adev->vce.vcpu_bo == NULL)
- 		return 0;
- 
-@@ -241,7 +243,6 @@ int amdgpu_vce_suspend(struct amdgpu_device *adev)
- 	if (i == AMDGPU_MAX_VCE_HANDLES)
- 		return 0;
- 
--	cancel_delayed_work_sync(&adev->vce.idle_work);
- 	/* TODO: suspending running encoding sessions isn't supported */
- 	return -EINVAL;
- }
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
-index 1612d8aa6ad6..fca1b10628a6 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
-@@ -155,11 +155,11 @@ int amdgpu_vcn_suspend(struct amdgpu_device *adev)
- 	unsigned size;
- 	void *ptr;
- 
-+	cancel_delayed_work_sync(&adev->vcn.idle_work);
-+
- 	if (adev->vcn.vcpu_bo == NULL)
- 		return 0;
- 
--	cancel_delayed_work_sync(&adev->vcn.idle_work);
--
- 	size = amdgpu_bo_size(adev->vcn.vcpu_bo);
- 	ptr = adev->vcn.cpu_addr;
- 
--- 
-2.28.0
-
-
-From 71a0556255de125b7e3fc0dc6171fb31fab2b9ad Mon Sep 17 00:00:00 2001
-From: Jason Ekstrand <jason@jlekstrand.net>
-Date: Wed, 26 Sep 2018 02:17:03 -0500
-Subject: [PATCH 11/45] drm/syncobj: Don't leak fences when WAIT_FOR_SUBMIT is
- set
-
-commit 337fe9f5c1e7de1f391c6a692531379d2aa2ee11 upstream.
-
-We attempt to get fences earlier in the hopes that everything will
-already have fences and no callbacks will be needed.  If we do succeed
-in getting a fence, getting one a second time will result in a duplicate
-ref with no unref.  This is causing memory leaks in Vulkan applications
-that create a lot of fences; playing for a few hours can, apparently,
-bring down the system.
-
-Cc: stable@vger.kernel.org
-Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=107899
-Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
-Signed-off-by: Jason Ekstrand <jason@jlekstrand.net>
-Signed-off-by: Sean Paul <seanpaul@chromium.org>
-Link: https://patchwork.freedesktop.org/patch/msgid/20180926071703.15257-1-jason.ekstrand@intel.com
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/drm_syncobj.c | 5 +++++
- 1 file changed, 5 insertions(+)
-
-diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
-index 7bcf5702c91c..889c95d4feec 100644
---- a/drivers/gpu/drm/drm_syncobj.c
-+++ b/drivers/gpu/drm/drm_syncobj.c
-@@ -96,6 +96,8 @@ static int drm_syncobj_fence_get_or_add_callback(struct drm_syncobj *syncobj,
- {
- 	int ret;
- 
-+	WARN_ON(*fence);
-+
- 	*fence = drm_syncobj_fence_get(syncobj);
- 	if (*fence)
- 		return 1;
-@@ -656,6 +658,9 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
- 
- 	if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) {
- 		for (i = 0; i < count; ++i) {
-+			if (entries[i].fence)
-+				continue;
-+
- 			drm_syncobj_fence_get_or_add_callback(syncobjs[i],
- 							      &entries[i].fence,
- 							      &entries[i].syncobj_cb,
--- 
-2.28.0
-
-
-From 30500cc74a365c2fc90dc9b6d9611bbbc1304af9 Mon Sep 17 00:00:00 2001
-From: Andy Lutomirski <luto@kernel.org>
-Date: Mon, 1 Oct 2018 12:52:15 -0700
-Subject: [PATCH 12/45] x86/vdso: Fix asm constraints on vDSO syscall fallbacks
-
-commit 715bd9d12f84d8f5cc8ad21d888f9bc304a8eb0b upstream.
-
-The syscall fallbacks in the vDSO have incorrect asm constraints.
-They are not marked as writing to their outputs -- instead, they are
-marked as clobbering "memory", which is useless.  In particular, gcc
-is smart enough to know that the timespec parameter hasn't escaped,
-so a memory clobber doesn't clobber it.  And passing a pointer as an
-asm *input* does not tell gcc that the pointed-to value is changed.
-
-Add in the fact that the asm instructions weren't volatile, and gcc
-was free to omit them entirely unless their sole output (the return
-value) is used.  Which it is (phew!), but that stops happening with
-some upcoming patches.
-
-As a trivial example, the following code:
-
-void test_fallback(struct timespec *ts)
-{
-	vdso_fallback_gettime(CLOCK_MONOTONIC, ts);
-}
-
-compiles to:
-
-00000000000000c0 <test_fallback>:
-  c0:   c3                      retq
-
-To add insult to injury, the RCX and R11 clobbers on 64-bit
-builds were missing.
-
-The "memory" clobber is also unnecessary -- no ordering with respect to
-other memory operations is needed, but that's going to be fixed in a
-separate not-for-stable patch.
-
-Fixes: 2aae950b21e4 ("x86_64: Add vDSO for x86-64 with gettimeofday/clock_gettime/getcpu")
-Signed-off-by: Andy Lutomirski <luto@kernel.org>
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Cc: stable@vger.kernel.org
-Link: https://lkml.kernel.org/r/2c0231690551989d2fafa60ed0e7b5cc8b403908.1538422295.git.luto@kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/entry/vdso/vclock_gettime.c | 18 ++++++++++--------
- 1 file changed, 10 insertions(+), 8 deletions(-)
-
-diff --git a/arch/x86/entry/vdso/vclock_gettime.c b/arch/x86/entry/vdso/vclock_gettime.c
-index fa8dbfcf7ed3..94a301c412fc 100644
---- a/arch/x86/entry/vdso/vclock_gettime.c
-+++ b/arch/x86/entry/vdso/vclock_gettime.c
-@@ -43,8 +43,9 @@ extern u8 hvclock_page
- notrace static long vdso_fallback_gettime(long clock, struct timespec *ts)
- {
- 	long ret;
--	asm("syscall" : "=a" (ret) :
--	    "0" (__NR_clock_gettime), "D" (clock), "S" (ts) : "memory");
-+	asm ("syscall" : "=a" (ret), "=m" (*ts) :
-+	     "0" (__NR_clock_gettime), "D" (clock), "S" (ts) :
-+	     "memory", "rcx", "r11");
- 	return ret;
- }
- 
-@@ -52,8 +53,9 @@ notrace static long vdso_fallback_gtod(struct timeval *tv, struct timezone *tz)
- {
- 	long ret;
- 
--	asm("syscall" : "=a" (ret) :
--	    "0" (__NR_gettimeofday), "D" (tv), "S" (tz) : "memory");
-+	asm ("syscall" : "=a" (ret), "=m" (*tv), "=m" (*tz) :
-+	     "0" (__NR_gettimeofday), "D" (tv), "S" (tz) :
-+	     "memory", "rcx", "r11");
- 	return ret;
- }
- 
-@@ -64,12 +66,12 @@ notrace static long vdso_fallback_gettime(long clock, struct timespec *ts)
- {
- 	long ret;
- 
--	asm(
-+	asm (
- 		"mov %%ebx, %%edx \n"
- 		"mov %2, %%ebx \n"
- 		"call __kernel_vsyscall \n"
- 		"mov %%edx, %%ebx \n"
--		: "=a" (ret)
-+		: "=a" (ret), "=m" (*ts)
- 		: "0" (__NR_clock_gettime), "g" (clock), "c" (ts)
- 		: "memory", "edx");
- 	return ret;
-@@ -79,12 +81,12 @@ notrace static long vdso_fallback_gtod(struct timeval *tv, struct timezone *tz)
- {
- 	long ret;
- 
--	asm(
-+	asm (
- 		"mov %%ebx, %%edx \n"
- 		"mov %2, %%ebx \n"
- 		"call __kernel_vsyscall \n"
- 		"mov %%edx, %%ebx \n"
--		: "=a" (ret)
-+		: "=a" (ret), "=m" (*tv), "=m" (*tz)
- 		: "0" (__NR_gettimeofday), "g" (tv), "c" (tz)
- 		: "memory", "edx");
- 	return ret;
--- 
-2.28.0
-
-
-From 64ff5747e2af415348ca3dd9221ef542ad07fdb9 Mon Sep 17 00:00:00 2001
-From: Andy Lutomirski <luto@kernel.org>
-Date: Mon, 1 Oct 2018 12:52:16 -0700
-Subject: [PATCH 13/45] selftests/x86: Add clock_gettime() tests to test_vdso
-
-commit 7c03e7035ac1cf2a6165754e4f3a49c2f1977838 upstream.
-
-Now that the vDSO implementation of clock_gettime() is getting
-reworked, add a selftest for it.  This tests that its output is
-consistent with the syscall version.
-
-This is marked for stable to serve as a test for commit
-
-  715bd9d12f84 ("x86/vdso: Fix asm constraints on vDSO syscall fallbacks")
-
-Signed-off-by: Andy Lutomirski <luto@kernel.org>
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Cc: stable@vger.kernel.org
-Link: https://lkml.kernel.org/r/082399674de2619b2befd8c0dde49b260605b126.1538422295.git.luto@kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/testing/selftests/x86/test_vdso.c | 99 +++++++++++++++++++++++++
- 1 file changed, 99 insertions(+)
-
-diff --git a/tools/testing/selftests/x86/test_vdso.c b/tools/testing/selftests/x86/test_vdso.c
-index 235259011704..49f7294fb382 100644
---- a/tools/testing/selftests/x86/test_vdso.c
-+++ b/tools/testing/selftests/x86/test_vdso.c
-@@ -17,6 +17,7 @@
- #include <errno.h>
- #include <sched.h>
- #include <stdbool.h>
-+#include <limits.h>
- 
- #ifndef SYS_getcpu
- # ifdef __x86_64__
-@@ -31,6 +32,10 @@
- 
- int nerrs = 0;
- 
-+typedef int (*vgettime_t)(clockid_t, struct timespec *);
-+
-+vgettime_t vdso_clock_gettime;
-+
- typedef long (*getcpu_t)(unsigned *, unsigned *, void *);
- 
- getcpu_t vgetcpu;
-@@ -95,6 +100,10 @@ static void fill_function_pointers()
- 		printf("Warning: failed to find getcpu in vDSO\n");
- 
- 	vgetcpu = (getcpu_t) vsyscall_getcpu();
-+
-+	vdso_clock_gettime = (vgettime_t)dlsym(vdso, "__vdso_clock_gettime");
-+	if (!vdso_clock_gettime)
-+		printf("Warning: failed to find clock_gettime in vDSO\n");
- }
- 
- static long sys_getcpu(unsigned * cpu, unsigned * node,
-@@ -103,6 +112,11 @@ static long sys_getcpu(unsigned * cpu, unsigned * node,
- 	return syscall(__NR_getcpu, cpu, node, cache);
- }
- 
-+static inline int sys_clock_gettime(clockid_t id, struct timespec *ts)
-+{
-+	return syscall(__NR_clock_gettime, id, ts);
-+}
-+
- static void test_getcpu(void)
- {
- 	printf("[RUN]\tTesting getcpu...\n");
-@@ -155,10 +169,95 @@ static void test_getcpu(void)
- 	}
- }
- 
-+static bool ts_leq(const struct timespec *a, const struct timespec *b)
-+{
-+	if (a->tv_sec != b->tv_sec)
-+		return a->tv_sec < b->tv_sec;
-+	else
-+		return a->tv_nsec <= b->tv_nsec;
-+}
-+
-+static char const * const clocknames[] = {
-+	[0] = "CLOCK_REALTIME",
-+	[1] = "CLOCK_MONOTONIC",
-+	[2] = "CLOCK_PROCESS_CPUTIME_ID",
-+	[3] = "CLOCK_THREAD_CPUTIME_ID",
-+	[4] = "CLOCK_MONOTONIC_RAW",
-+	[5] = "CLOCK_REALTIME_COARSE",
-+	[6] = "CLOCK_MONOTONIC_COARSE",
-+	[7] = "CLOCK_BOOTTIME",
-+	[8] = "CLOCK_REALTIME_ALARM",
-+	[9] = "CLOCK_BOOTTIME_ALARM",
-+	[10] = "CLOCK_SGI_CYCLE",
-+	[11] = "CLOCK_TAI",
-+};
-+
-+static void test_one_clock_gettime(int clock, const char *name)
-+{
-+	struct timespec start, vdso, end;
-+	int vdso_ret, end_ret;
-+
-+	printf("[RUN]\tTesting clock_gettime for clock %s (%d)...\n", name, clock);
-+
-+	if (sys_clock_gettime(clock, &start) < 0) {
-+		if (errno == EINVAL) {
-+			vdso_ret = vdso_clock_gettime(clock, &vdso);
-+			if (vdso_ret == -EINVAL) {
-+				printf("[OK]\tNo such clock.\n");
-+			} else {
-+				printf("[FAIL]\tNo such clock, but __vdso_clock_gettime returned %d\n", vdso_ret);
-+				nerrs++;
-+			}
-+		} else {
-+			printf("[WARN]\t clock_gettime(%d) syscall returned error %d\n", clock, errno);
-+		}
-+		return;
-+	}
-+
-+	vdso_ret = vdso_clock_gettime(clock, &vdso);
-+	end_ret = sys_clock_gettime(clock, &end);
-+
-+	if (vdso_ret != 0 || end_ret != 0) {
-+		printf("[FAIL]\tvDSO returned %d, syscall errno=%d\n",
-+		       vdso_ret, errno);
-+		nerrs++;
-+		return;
-+	}
-+
-+	printf("\t%llu.%09ld %llu.%09ld %llu.%09ld\n",
-+	       (unsigned long long)start.tv_sec, start.tv_nsec,
-+	       (unsigned long long)vdso.tv_sec, vdso.tv_nsec,
-+	       (unsigned long long)end.tv_sec, end.tv_nsec);
-+
-+	if (!ts_leq(&start, &vdso) || !ts_leq(&vdso, &end)) {
-+		printf("[FAIL]\tTimes are out of sequence\n");
-+		nerrs++;
-+	}
-+}
-+
-+static void test_clock_gettime(void)
-+{
-+	for (int clock = 0; clock < sizeof(clocknames) / sizeof(clocknames[0]);
-+	     clock++) {
-+		test_one_clock_gettime(clock, clocknames[clock]);
-+	}
-+
-+	/* Also test some invalid clock ids */
-+	test_one_clock_gettime(-1, "invalid");
-+	test_one_clock_gettime(INT_MIN, "invalid");
-+	test_one_clock_gettime(INT_MAX, "invalid");
-+}
-+
- int main(int argc, char **argv)
- {
- 	fill_function_pointers();
- 
-+	test_clock_gettime();
-+
-+	/*
-+	 * Test getcpu() last so that, if something goes wrong setting affinity,
-+	 * we still run the other tests.
-+	 */
- 	test_getcpu();
- 
- 	return nerrs ? 1 : 0;
--- 
-2.28.0
-
-
-From 1194e838b87953e1e4923da585a0e0226d8aecea Mon Sep 17 00:00:00 2001
-From: Andy Lutomirski <luto@kernel.org>
-Date: Tue, 2 Oct 2018 21:26:50 -0700
-Subject: [PATCH 14/45] x86/vdso: Only enable vDSO retpolines when enabled and
- supported
-
-commit 4f166564014aba65ad6f15b612f6711fd0f117ee upstream.
-
-When I fixed the vDSO build to use inline retpolines, I messed up
-the Makefile logic and made it unconditional.  It should have
-depended on CONFIG_RETPOLINE and on the availability of compiler
-support.  This broke the build on some older compilers.
-
-Reported-by: nikola.ciprich@linuxbox.cz
-Signed-off-by: Andy Lutomirski <luto@kernel.org>
-Cc: Borislav Petkov <bp@alien8.de>
-Cc: David Woodhouse <dwmw2@infradead.org>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Matt Rickard <matt@softrans.com.au>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: jason.vas.dias@gmail.com
-Cc: stable@vger.kernel.org
-Fixes: 2e549b2ee0e3 ("x86/vdso: Fix vDSO build if a retpoline is emitted")
-Link: http://lkml.kernel.org/r/08a1f29f2c238dd1f493945e702a521f8a5aa3ae.1538540801.git.luto@kernel.org
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/entry/vdso/Makefile | 16 ++++++++++++++--
- 1 file changed, 14 insertions(+), 2 deletions(-)
-
-diff --git a/arch/x86/entry/vdso/Makefile b/arch/x86/entry/vdso/Makefile
-index b545bf9d2328..0a550dc5c525 100644
---- a/arch/x86/entry/vdso/Makefile
-+++ b/arch/x86/entry/vdso/Makefile
-@@ -74,7 +74,13 @@ $(obj)/vdso-image-%.c: $(obj)/vdso%.so.dbg $(obj)/vdso%.so $(obj)/vdso2c FORCE
- CFL := $(PROFILING) -mcmodel=small -fPIC -O2 -fasynchronous-unwind-tables -m64 \
-        $(filter -g%,$(KBUILD_CFLAGS)) $(call cc-option, -fno-stack-protector) \
-        -fno-omit-frame-pointer -foptimize-sibling-calls \
--       -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO $(RETPOLINE_VDSO_CFLAGS)
-+       -DDISABLE_BRANCH_PROFILING -DBUILD_VDSO
-+
-+ifdef CONFIG_RETPOLINE
-+ifneq ($(RETPOLINE_VDSO_CFLAGS),)
-+  CFL += $(RETPOLINE_VDSO_CFLAGS)
-+endif
-+endif
- 
- $(vobjs): KBUILD_CFLAGS := $(filter-out $(GCC_PLUGINS_CFLAGS) $(RETPOLINE_CFLAGS),$(KBUILD_CFLAGS)) $(CFL)
- 
-@@ -153,7 +159,13 @@ KBUILD_CFLAGS_32 += $(call cc-option, -fno-stack-protector)
- KBUILD_CFLAGS_32 += $(call cc-option, -foptimize-sibling-calls)
- KBUILD_CFLAGS_32 += -fno-omit-frame-pointer
- KBUILD_CFLAGS_32 += -DDISABLE_BRANCH_PROFILING
--KBUILD_CFLAGS_32 += $(RETPOLINE_VDSO_CFLAGS)
-+
-+ifdef CONFIG_RETPOLINE
-+ifneq ($(RETPOLINE_VDSO_CFLAGS),)
-+  KBUILD_CFLAGS_32 += $(RETPOLINE_VDSO_CFLAGS)
-+endif
-+endif
-+
- $(obj)/vdso32.so.dbg: KBUILD_CFLAGS = $(KBUILD_CFLAGS_32)
- 
- $(obj)/vdso32.so.dbg: FORCE \
--- 
-2.28.0
-
-
-From 25bc6e80f9d6434511a09cb4a41c655b154486d9 Mon Sep 17 00:00:00 2001
-From: Andy Lutomirski <luto@kernel.org>
-Date: Wed, 3 Oct 2018 16:23:49 -0700
-Subject: [PATCH 15/45] x86/vdso: Fix vDSO syscall fallback asm constraint
- regression
-
-commit 02e425668f5c9deb42787d10001a3b605993ad15 upstream.
-
-When I added the missing memory outputs, I failed to update the
-index of the first argument (ebx) on 32-bit builds, which broke the
-fallbacks.  Somehow I must have screwed up my testing or gotten
-lucky.
-
-Add another test to cover gettimeofday() as well.
-
-Signed-off-by: Andy Lutomirski <luto@kernel.org>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: stable@vger.kernel.org
-Fixes: 715bd9d12f84 ("x86/vdso: Fix asm constraints on vDSO syscall fallbacks")
-Link: http://lkml.kernel.org/r/21bd45ab04b6d838278fa5bebfa9163eceffa13c.1538608971.git.luto@kernel.org
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/entry/vdso/vclock_gettime.c    |  8 +--
- tools/testing/selftests/x86/test_vdso.c | 73 +++++++++++++++++++++++++
- 2 files changed, 77 insertions(+), 4 deletions(-)
-
-diff --git a/arch/x86/entry/vdso/vclock_gettime.c b/arch/x86/entry/vdso/vclock_gettime.c
-index 94a301c412fc..9c35dc0a9d64 100644
---- a/arch/x86/entry/vdso/vclock_gettime.c
-+++ b/arch/x86/entry/vdso/vclock_gettime.c
-@@ -68,11 +68,11 @@ notrace static long vdso_fallback_gettime(long clock, struct timespec *ts)
- 
- 	asm (
- 		"mov %%ebx, %%edx \n"
--		"mov %2, %%ebx \n"
-+		"mov %[clock], %%ebx \n"
- 		"call __kernel_vsyscall \n"
- 		"mov %%edx, %%ebx \n"
- 		: "=a" (ret), "=m" (*ts)
--		: "0" (__NR_clock_gettime), "g" (clock), "c" (ts)
-+		: "0" (__NR_clock_gettime), [clock] "g" (clock), "c" (ts)
- 		: "memory", "edx");
- 	return ret;
- }
-@@ -83,11 +83,11 @@ notrace static long vdso_fallback_gtod(struct timeval *tv, struct timezone *tz)
- 
- 	asm (
- 		"mov %%ebx, %%edx \n"
--		"mov %2, %%ebx \n"
-+		"mov %[tv], %%ebx \n"
- 		"call __kernel_vsyscall \n"
- 		"mov %%edx, %%ebx \n"
- 		: "=a" (ret), "=m" (*tv), "=m" (*tz)
--		: "0" (__NR_gettimeofday), "g" (tv), "c" (tz)
-+		: "0" (__NR_gettimeofday), [tv] "g" (tv), "c" (tz)
- 		: "memory", "edx");
- 	return ret;
- }
-diff --git a/tools/testing/selftests/x86/test_vdso.c b/tools/testing/selftests/x86/test_vdso.c
-index 49f7294fb382..35edd61d1663 100644
---- a/tools/testing/selftests/x86/test_vdso.c
-+++ b/tools/testing/selftests/x86/test_vdso.c
-@@ -36,6 +36,10 @@ typedef int (*vgettime_t)(clockid_t, struct timespec *);
- 
- vgettime_t vdso_clock_gettime;
- 
-+typedef long (*vgtod_t)(struct timeval *tv, struct timezone *tz);
-+
-+vgtod_t vdso_gettimeofday;
-+
- typedef long (*getcpu_t)(unsigned *, unsigned *, void *);
- 
- getcpu_t vgetcpu;
-@@ -104,6 +108,11 @@ static void fill_function_pointers()
- 	vdso_clock_gettime = (vgettime_t)dlsym(vdso, "__vdso_clock_gettime");
- 	if (!vdso_clock_gettime)
- 		printf("Warning: failed to find clock_gettime in vDSO\n");
-+
-+	vdso_gettimeofday = (vgtod_t)dlsym(vdso, "__vdso_gettimeofday");
-+	if (!vdso_gettimeofday)
-+		printf("Warning: failed to find gettimeofday in vDSO\n");
-+
- }
- 
- static long sys_getcpu(unsigned * cpu, unsigned * node,
-@@ -117,6 +126,11 @@ static inline int sys_clock_gettime(clockid_t id, struct timespec *ts)
- 	return syscall(__NR_clock_gettime, id, ts);
- }
- 
-+static inline int sys_gettimeofday(struct timeval *tv, struct timezone *tz)
-+{
-+	return syscall(__NR_gettimeofday, tv, tz);
-+}
-+
- static void test_getcpu(void)
- {
- 	printf("[RUN]\tTesting getcpu...\n");
-@@ -177,6 +191,14 @@ static bool ts_leq(const struct timespec *a, const struct timespec *b)
- 		return a->tv_nsec <= b->tv_nsec;
- }
- 
-+static bool tv_leq(const struct timeval *a, const struct timeval *b)
-+{
-+	if (a->tv_sec != b->tv_sec)
-+		return a->tv_sec < b->tv_sec;
-+	else
-+		return a->tv_usec <= b->tv_usec;
-+}
-+
- static char const * const clocknames[] = {
- 	[0] = "CLOCK_REALTIME",
- 	[1] = "CLOCK_MONOTONIC",
-@@ -248,11 +270,62 @@ static void test_clock_gettime(void)
- 	test_one_clock_gettime(INT_MAX, "invalid");
- }
- 
-+static void test_gettimeofday(void)
-+{
-+	struct timeval start, vdso, end;
-+	struct timezone sys_tz, vdso_tz;
-+	int vdso_ret, end_ret;
-+
-+	if (!vdso_gettimeofday)
-+		return;
-+
-+	printf("[RUN]\tTesting gettimeofday...\n");
-+
-+	if (sys_gettimeofday(&start, &sys_tz) < 0) {
-+		printf("[FAIL]\tsys_gettimeofday failed (%d)\n", errno);
-+		nerrs++;
-+		return;
-+	}
-+
-+	vdso_ret = vdso_gettimeofday(&vdso, &vdso_tz);
-+	end_ret = sys_gettimeofday(&end, NULL);
-+
-+	if (vdso_ret != 0 || end_ret != 0) {
-+		printf("[FAIL]\tvDSO returned %d, syscall errno=%d\n",
-+		       vdso_ret, errno);
-+		nerrs++;
-+		return;
-+	}
-+
-+	printf("\t%llu.%06ld %llu.%06ld %llu.%06ld\n",
-+	       (unsigned long long)start.tv_sec, start.tv_usec,
-+	       (unsigned long long)vdso.tv_sec, vdso.tv_usec,
-+	       (unsigned long long)end.tv_sec, end.tv_usec);
-+
-+	if (!tv_leq(&start, &vdso) || !tv_leq(&vdso, &end)) {
-+		printf("[FAIL]\tTimes are out of sequence\n");
-+		nerrs++;
-+	}
-+
-+	if (sys_tz.tz_minuteswest == vdso_tz.tz_minuteswest &&
-+	    sys_tz.tz_dsttime == vdso_tz.tz_dsttime) {
-+		printf("[OK]\ttimezones match: minuteswest=%d, dsttime=%d\n",
-+		       sys_tz.tz_minuteswest, sys_tz.tz_dsttime);
-+	} else {
-+		printf("[FAIL]\ttimezones do not match\n");
-+		nerrs++;
-+	}
-+
-+	/* And make sure that passing NULL for tz doesn't crash. */
-+	vdso_gettimeofday(&vdso, NULL);
-+}
-+
- int main(int argc, char **argv)
- {
- 	fill_function_pointers();
- 
- 	test_clock_gettime();
-+	test_gettimeofday();
- 
- 	/*
- 	 * Test getcpu() last so that, if something goes wrong setting affinity,
--- 
-2.28.0
-
-
-From 8ebd65583375726670cbecfb47913a41f0a1d0a1 Mon Sep 17 00:00:00 2001
-From: Daniel Drake <drake@endlessm.com>
-Date: Thu, 27 Sep 2018 15:47:33 -0500
-Subject: [PATCH 16/45] PCI: Reprogram bridge prefetch registers on resume
-
-commit 083874549fdfefa629dfa752785e20427dde1511 upstream.
-
-On 38+ Intel-based ASUS products, the NVIDIA GPU becomes unusable after S3
-suspend/resume.  The affected products include multiple generations of
-NVIDIA GPUs and Intel SoCs.  After resume, nouveau logs many errors such
-as:
-
-  fifo: fault 00 [READ] at 0000005555555000 engine 00 [GR] client 04
-        [HUB/FE] reason 4a [] on channel -1 [007fa91000 unknown]
-  DRM: failed to idle channel 0 [DRM]
-
-Similarly, the NVIDIA proprietary driver also fails after resume (black
-screen, 100% CPU usage in Xorg process).  We shipped a sample to NVIDIA for
-diagnosis, and their response indicated that it's a problem with the parent
-PCI bridge (on the Intel SoC), not the GPU.
-
-Runtime suspend/resume works fine, only S3 suspend is affected.
-
-We found a workaround: on resume, rewrite the Intel PCI bridge
-'Prefetchable Base Upper 32 Bits' register (PCI_PREF_BASE_UPPER32).  In the
-cases that I checked, this register has value 0 and we just have to rewrite
-that value.
-
-Linux already saves and restores PCI config space during suspend/resume,
-but this register was being skipped because upon resume, it already has
-value 0 (the correct, pre-suspend value).
-
-Intel appear to have previously acknowledged this behaviour and the
-requirement to rewrite this register:
-https://bugzilla.kernel.org/show_bug.cgi?id=116851#c23
-
-Based on that, rewrite the prefetch register values even when that appears
-unnecessary.
-
-We have confirmed this solution on all the affected models we have in-hands
-(X542UQ, UX533FD, X530UN, V272UN).
-
-Additionally, this solves an issue where r8169 MSI-X interrupts were broken
-after S3 suspend/resume on ASUS X441UAR.  This issue was recently worked
-around in commit 7bb05b85bc2d ("r8169: don't use MSI-X on RTL8106e").  It
-also fixes the same issue on RTL6186evl/8111evl on an Aimfor-tech laptop
-that we had not yet patched.  I suspect it will also fix the issue that was
-worked around in commit 7c53a722459c ("r8169: don't use MSI-X on
-RTL8168g").
-
-Thomas Martitz reports that this change also solves an issue where the AMD
-Radeon Polaris 10 GPU on the HP Zbook 14u G5 is unresponsive after S3
-suspend/resume.
-
-Link: https://bugzilla.kernel.org/show_bug.cgi?id=201069
-Signed-off-by: Daniel Drake <drake@endlessm.com>
-Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
-Reviewed-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
-Reviewed-By: Peter Wu <peter@lekensteyn.nl>
-CC: stable@vger.kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/pci/pci.c | 27 +++++++++++++++++++--------
- 1 file changed, 19 insertions(+), 8 deletions(-)
-
-diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
-index 22924629e64a..1af30c881566 100644
---- a/drivers/pci/pci.c
-+++ b/drivers/pci/pci.c
-@@ -1112,12 +1112,12 @@ int pci_save_state(struct pci_dev *dev)
- EXPORT_SYMBOL(pci_save_state);
- 
- static void pci_restore_config_dword(struct pci_dev *pdev, int offset,
--				     u32 saved_val, int retry)
-+				     u32 saved_val, int retry, bool force)
- {
- 	u32 val;
- 
- 	pci_read_config_dword(pdev, offset, &val);
--	if (val == saved_val)
-+	if (!force && val == saved_val)
- 		return;
- 
- 	for (;;) {
-@@ -1136,25 +1136,36 @@ static void pci_restore_config_dword(struct pci_dev *pdev, int offset,
- }
- 
- static void pci_restore_config_space_range(struct pci_dev *pdev,
--					   int start, int end, int retry)
-+					   int start, int end, int retry,
-+					   bool force)
- {
- 	int index;
- 
- 	for (index = end; index >= start; index--)
- 		pci_restore_config_dword(pdev, 4 * index,
- 					 pdev->saved_config_space[index],
--					 retry);
-+					 retry, force);
- }
- 
- static void pci_restore_config_space(struct pci_dev *pdev)
- {
- 	if (pdev->hdr_type == PCI_HEADER_TYPE_NORMAL) {
--		pci_restore_config_space_range(pdev, 10, 15, 0);
-+		pci_restore_config_space_range(pdev, 10, 15, 0, false);
- 		/* Restore BARs before the command register. */
--		pci_restore_config_space_range(pdev, 4, 9, 10);
--		pci_restore_config_space_range(pdev, 0, 3, 0);
-+		pci_restore_config_space_range(pdev, 4, 9, 10, false);
-+		pci_restore_config_space_range(pdev, 0, 3, 0, false);
-+	} else if (pdev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
-+		pci_restore_config_space_range(pdev, 12, 15, 0, false);
-+
-+		/*
-+		 * Force rewriting of prefetch registers to avoid S3 resume
-+		 * issues on Intel PCI bridges that occur when these
-+		 * registers are not explicitly written.
-+		 */
-+		pci_restore_config_space_range(pdev, 9, 11, 0, true);
-+		pci_restore_config_space_range(pdev, 0, 8, 0, false);
- 	} else {
--		pci_restore_config_space_range(pdev, 0, 15, 0);
-+		pci_restore_config_space_range(pdev, 0, 15, 0, false);
- 	}
- }
- 
--- 
-2.28.0
-
-
-From 9047696cb3f8d7cbe80592d231841699fd0246f2 Mon Sep 17 00:00:00 2001
-From: Felix Fietkau <nbd@nbd.name>
-Date: Sat, 29 Sep 2018 16:01:58 +0200
-Subject: [PATCH 17/45] mac80211: fix setting IEEE80211_KEY_FLAG_RX_MGMT for AP
- mode keys
-
-commit 211710ca74adf790b46ab3867fcce8047b573cd1 upstream.
-
-key->sta is only valid after ieee80211_key_link, which is called later
-in this function. Because of that, the IEEE80211_KEY_FLAG_RX_MGMT is
-never set when management frame protection is enabled.
-
-Fixes: e548c49e6dc6b ("mac80211: add key flag for management keys")
-Cc: stable@vger.kernel.org
-Signed-off-by: Felix Fietkau <nbd@nbd.name>
-Signed-off-by: Johannes Berg <johannes.berg@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/mac80211/cfg.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
-index b456b882a6ea..63558335e41e 100644
---- a/net/mac80211/cfg.c
-+++ b/net/mac80211/cfg.c
-@@ -426,7 +426,7 @@ static int ieee80211_add_key(struct wiphy *wiphy, struct net_device *dev,
- 	case NL80211_IFTYPE_AP:
- 	case NL80211_IFTYPE_AP_VLAN:
- 		/* Keys without a station are used for TX only */
--		if (key->sta && test_sta_flag(key->sta, WLAN_STA_MFP))
-+		if (sta && test_sta_flag(sta, WLAN_STA_MFP))
- 			key->conf.flags |= IEEE80211_KEY_FLAG_RX_MGMT;
- 		break;
- 	case NL80211_IFTYPE_ADHOC:
--- 
-2.28.0
-
-
-From 1364055c96c5359bfe74637e41ba673956ac9c93 Mon Sep 17 00:00:00 2001
-From: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
-Date: Thu, 4 Oct 2018 11:08:12 +0200
-Subject: [PATCH 18/45] PM / core: Clear the direct_complete flag on errors
-
-commit 69e445ab8b66a9f30519842ef18be555d3ee9b51 upstream.
-
-If __device_suspend() runs asynchronously (in which case the device
-passed to it is in dpm_suspended_list at that point) and it returns
-early on an error or pending wakeup, and the power.direct_complete
-flag has been set for the device already, the subsequent
-device_resume() will be confused by that and it will call
-pm_runtime_enable() incorrectly, as runtime PM has not been
-disabled for the device by __device_suspend().
-
-To avoid that, clear power.direct_complete if __device_suspend()
-is not going to disable runtime PM for the device before returning.
-
-Fixes: aae4518b3124 (PM / sleep: Mechanism to avoid resuming runtime-suspended devices unnecessarily)
-Reported-by: Al Cooper <alcooperx@gmail.com>
-Tested-by: Al Cooper <alcooperx@gmail.com>
-Reviewed-by: Ulf Hansson <ulf.hansson@linaro.org>
-Cc: 3.16+ <stable@vger.kernel.org> # 3.16+
-Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/base/power/main.c | 5 ++++-
- 1 file changed, 4 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/base/power/main.c b/drivers/base/power/main.c
-index 770b1539a083..d16b40cd26cc 100644
---- a/drivers/base/power/main.c
-+++ b/drivers/base/power/main.c
-@@ -1462,8 +1462,10 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
- 
- 	dpm_wait_for_subordinate(dev, async);
- 
--	if (async_error)
-+	if (async_error) {
-+		dev->power.direct_complete = false;
- 		goto Complete;
-+	}
- 
- 	/*
- 	 * If a device configured to wake up the system from sleep states
-@@ -1475,6 +1477,7 @@ static int __device_suspend(struct device *dev, pm_message_t state, bool async)
- 		pm_wakeup_event(dev, 0);
- 
- 	if (pm_wakeup_pending()) {
-+		dev->power.direct_complete = false;
- 		async_error = -EBUSY;
- 		goto Complete;
- 	}
--- 
-2.28.0
-
-
-From f11a6abfdb4181fb713758c13ac2a1605c16db40 Mon Sep 17 00:00:00 2001
-From: Joe Thornber <ejt@redhat.com>
-Date: Mon, 24 Sep 2018 16:19:30 -0400
-Subject: [PATCH 19/45] dm cache metadata: ignore hints array being too small
- during resize
-
-commit 4561ffca88c546f96367f94b8f1e4715a9c62314 upstream.
-
-Commit fd2fa9541 ("dm cache metadata: save in-core policy_hint_size to
-on-disk superblock") enabled previously written policy hints to be
-used after a cache is reactivated.  But in doing so the cache
-metadata's hint array was left exposed to out of bounds access because
-on resize the metadata's on-disk hint array wasn't ever extended.
-
-Fix this by ignoring that there are no on-disk hints associated with the
-newly added cache blocks.  An expanded on-disk hint array is later
-rewritten upon the next clean shutdown of the cache.
-
-Fixes: fd2fa9541 ("dm cache metadata: save in-core policy_hint_size to on-disk superblock")
-Cc: stable@vger.kernel.org
-Signed-off-by: Joe Thornber <ejt@redhat.com>
-Signed-off-by: Mike Snitzer <snitzer@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/md/dm-cache-metadata.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/md/dm-cache-metadata.c b/drivers/md/dm-cache-metadata.c
-index 0a5a45f3ec5f..7f1c64c4ad24 100644
---- a/drivers/md/dm-cache-metadata.c
-+++ b/drivers/md/dm-cache-metadata.c
-@@ -1454,8 +1454,8 @@ static int __load_mappings(struct dm_cache_metadata *cmd,
- 		if (hints_valid) {
- 			r = dm_array_cursor_next(&cmd->hint_cursor);
- 			if (r) {
--				DMERR("dm_array_cursor_next for hint failed");
--				goto out;
-+				dm_array_cursor_end(&cmd->hint_cursor);
-+				hints_valid = false;
- 			}
- 		}
- 
--- 
-2.28.0
-
-
-From ec6ae632e04bd35f436051917cf17db9ec2ebe49 Mon Sep 17 00:00:00 2001
-From: Mike Snitzer <snitzer@redhat.com>
-Date: Tue, 25 Sep 2018 20:56:02 -0400
-Subject: [PATCH 20/45] dm cache: fix resize crash if user doesn't reload cache
- table
-
-commit 5d07384a666d4b2f781dc056bfeec2c27fbdf383 upstream.
-
-A reload of the cache's DM table is needed during resize because
-otherwise a crash will occur when attempting to access smq policy
-entries associated with the portion of the cache that was recently
-extended.
-
-The reason is cache-size based data structures in the policy will not be
-resized, the only way to safely extend the cache is to allow for a
-proper cache policy initialization that occurs when the cache table is
-loaded.  For example the smq policy's space_init(), init_allocator(),
-calc_hotspot_params() must be sized based on the extended cache size.
-
-The fix for this is to disallow cache resizes of this pattern:
-1) suspend "cache" target's device
-2) resize the fast device used for the cache
-3) resume "cache" target's device
-
-Instead, the last step must be a full reload of the cache's DM table.
-
-Fixes: 66a636356 ("dm cache: add stochastic-multi-queue (smq) policy")
-Cc: stable@vger.kernel.org
-Signed-off-by: Mike Snitzer <snitzer@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/md/dm-cache-target.c | 9 +++++++--
- 1 file changed, 7 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/md/dm-cache-target.c b/drivers/md/dm-cache-target.c
-index a4b7c2698096..e2ea57d5376e 100644
---- a/drivers/md/dm-cache-target.c
-+++ b/drivers/md/dm-cache-target.c
-@@ -3097,8 +3097,13 @@ static dm_cblock_t get_cache_dev_size(struct cache *cache)
- 
- static bool can_resize(struct cache *cache, dm_cblock_t new_size)
- {
--	if (from_cblock(new_size) > from_cblock(cache->cache_size))
--		return true;
-+	if (from_cblock(new_size) > from_cblock(cache->cache_size)) {
-+		if (cache->sized) {
-+			DMERR("%s: unable to extend cache due to missing cache table reload",
-+			      cache_device_name(cache));
-+			return false;
-+		}
-+	}
- 
- 	/*
- 	 * We can't drop a dirty block when shrinking the cache.
--- 
-2.28.0
-
-
-From c096f5c4a8bc80efe6c45ed364fd1ac81e2c363a Mon Sep 17 00:00:00 2001
-From: Mathias Nyman <mathias.nyman@linux.intel.com>
-Date: Mon, 1 Oct 2018 18:36:07 +0300
-Subject: [PATCH 21/45] xhci: Add missing CAS workaround for Intel Sunrise
- Point xHCI
-
-commit ffe84e01bb1b38c7eb9c6b6da127a6c136d251df upstream.
-
-The workaround for missing CAS bit is also needed for xHC on Intel
-sunrisepoint PCH. For more details see:
-
-Intel 100/c230 series PCH specification update Doc #332692-006 Errata #8
-
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/host/xhci-pci.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
-index 838d37e79fa2..9218f506f8e3 100644
---- a/drivers/usb/host/xhci-pci.c
-+++ b/drivers/usb/host/xhci-pci.c
-@@ -196,6 +196,8 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
- 	}
- 	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
- 	    (pdev->device == PCI_DEVICE_ID_INTEL_CHERRYVIEW_XHCI ||
-+	     pdev->device == PCI_DEVICE_ID_INTEL_SUNRISEPOINT_LP_XHCI ||
-+	     pdev->device == PCI_DEVICE_ID_INTEL_SUNRISEPOINT_H_XHCI ||
- 	     pdev->device == PCI_DEVICE_ID_INTEL_APL_XHCI ||
- 	     pdev->device == PCI_DEVICE_ID_INTEL_DNV_XHCI))
- 		xhci->quirks |= XHCI_MISSING_CAS;
--- 
-2.28.0
-
-
-From 35123e64a1682cf3e938458aa786d0b8736474b8 Mon Sep 17 00:00:00 2001
-From: Chunfeng Yun <chunfeng.yun@mediatek.com>
-Date: Mon, 1 Oct 2018 18:36:08 +0300
-Subject: [PATCH 22/45] usb: xhci-mtk: resume USB3 roothub first
-
-commit 555df5820e733cded7eb8d0bf78b2a791be51d75 upstream.
-
-Give USB3 devices a better chance to enumerate at USB3 speeds if
-they are connected to a suspended host.
-Porting from "671ffdff5b13 xhci: resume USB 3 roothub first"
-
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Chunfeng Yun <chunfeng.yun@mediatek.com>
-Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/host/xhci-mtk.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/usb/host/xhci-mtk.c b/drivers/usb/host/xhci-mtk.c
-index 8fb60657ed4f..510d28a9d190 100644
---- a/drivers/usb/host/xhci-mtk.c
-+++ b/drivers/usb/host/xhci-mtk.c
-@@ -780,10 +780,10 @@ static int __maybe_unused xhci_mtk_resume(struct device *dev)
- 	xhci_mtk_host_enable(mtk);
- 
- 	xhci_dbg(xhci, "%s: restart port polling\n", __func__);
--	set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
--	usb_hcd_poll_rh_status(hcd);
- 	set_bit(HCD_FLAG_POLL_RH, &xhci->shared_hcd->flags);
- 	usb_hcd_poll_rh_status(xhci->shared_hcd);
-+	set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
-+	usb_hcd_poll_rh_status(hcd);
- 	return 0;
- }
- 
--- 
-2.28.0
-
-
-From 821c42e7d5ea3efc332ca1b466052a7c89f72a3b Mon Sep 17 00:00:00 2001
-From: Johan Hovold <johan@kernel.org>
-Date: Mon, 24 Sep 2018 15:28:10 +0200
-Subject: [PATCH 23/45] USB: serial: simple: add Motorola Tetra MTP6550 id
-
-commit f5fad711c06e652f90f581fc7c2caee327c33d31 upstream.
-
-Add device-id for the Motorola Tetra radio MTP6550.
-
-Bus 001 Device 004: ID 0cad:9012 Motorola CGISS
-Device Descriptor:
-  bLength                18
-  bDescriptorType         1
-  bcdUSB               2.00
-  bDeviceClass            0 (Defined at Interface level)
-  bDeviceSubClass         0
-  bDeviceProtocol         0
-  bMaxPacketSize0        64
-  idVendor           0x0cad Motorola CGISS
-  idProduct          0x9012
-  bcdDevice           24.16
-  iManufacturer           1 Motorola Solutions, Inc.
-  iProduct                2 TETRA PEI interface
-  iSerial                 0
-  bNumConfigurations      1
-  Configuration Descriptor:
-    bLength                 9
-    bDescriptorType         2
-    wTotalLength           55
-    bNumInterfaces          2
-    bConfigurationValue     1
-    iConfiguration          3 Generic Serial config
-    bmAttributes         0x80
-      (Bus Powered)
-    MaxPower              500mA
-    Interface Descriptor:
-      bLength                 9
-      bDescriptorType         4
-      bInterfaceNumber        0
-      bAlternateSetting       0
-      bNumEndpoints           2
-      bInterfaceClass       255 Vendor Specific Class
-      bInterfaceSubClass      0
-      bInterfaceProtocol      0
-      iInterface              0
-      Endpoint Descriptor:
-        bLength                 7
-        bDescriptorType         5
-        bEndpointAddress     0x81  EP 1 IN
-        bmAttributes            2
-          Transfer Type            Bulk
-          Synch Type               None
-          Usage Type               Data
-        wMaxPacketSize     0x0200  1x 512 bytes
-        bInterval               0
-      Endpoint Descriptor:
-        bLength                 7
-        bDescriptorType         5
-        bEndpointAddress     0x01  EP 1 OUT
-        bmAttributes            2
-          Transfer Type            Bulk
-          Synch Type               None
-          Usage Type               Data
-        wMaxPacketSize     0x0200  1x 512 bytes
-    Interface Descriptor:
-      bLength                 9
-      bDescriptorType         4
-      bInterfaceNumber        1
-      bAlternateSetting       0
-      bNumEndpoints           2
-      bInterfaceClass       255 Vendor Specific Class
-      bInterfaceSubClass      0
-      bInterfaceProtocol      0
-      iInterface              0
-      Endpoint Descriptor:
-        bLength                 7
-        bDescriptorType         5
-        bEndpointAddress     0x82  EP 2 IN
-        bmAttributes            2
-          Transfer Type            Bulk
-          Synch Type               None
-          Usage Type               Data
-        wMaxPacketSize     0x0200  1x 512 bytes
-        bInterval               0
-      Endpoint Descriptor:
-        bLength                 7
-        bDescriptorType         5
-        bEndpointAddress     0x02  EP 2 OUT
-        bmAttributes            2
-          Transfer Type            Bulk
-          Synch Type               None
-          Usage Type               Data
-        wMaxPacketSize     0x0200  1x 512 bytes
-        bInterval               0
-Device Qualifier (for other device speed):
-  bLength                10
-  bDescriptorType         6
-  bcdUSB               2.00
-  bDeviceClass            0 (Defined at Interface level)
-  bDeviceSubClass         0
-  bDeviceProtocol         0
-  bMaxPacketSize0        64
-  bNumConfigurations      1
-Device Status:     0x0000
-  (Bus Powered)
-
-Reported-by: Hans Hult <hanshult35@gmail.com>
-Cc: stable <stable@vger.kernel.org>
-Signed-off-by: Johan Hovold <johan@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/serial/usb-serial-simple.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/usb/serial/usb-serial-simple.c b/drivers/usb/serial/usb-serial-simple.c
-index 2674da40d9cd..6d6acf2c07c3 100644
---- a/drivers/usb/serial/usb-serial-simple.c
-+++ b/drivers/usb/serial/usb-serial-simple.c
-@@ -87,7 +87,8 @@ DEVICE(moto_modem, MOTO_IDS);
- 
- /* Motorola Tetra driver */
- #define MOTOROLA_TETRA_IDS()			\
--	{ USB_DEVICE(0x0cad, 0x9011) }	/* Motorola Solutions TETRA PEI */
-+	{ USB_DEVICE(0x0cad, 0x9011) },	/* Motorola Solutions TETRA PEI */ \
-+	{ USB_DEVICE(0x0cad, 0x9012) }	/* MTP6550 */
- DEVICE(motorola_tetra, MOTOROLA_TETRA_IDS);
- 
- /* Novatel Wireless GPS driver */
--- 
-2.28.0
-
-
-From c92e73b11ed11baf38942fbbdbeb1f5adab81e94 Mon Sep 17 00:00:00 2001
-From: Romain Izard <romain.izard.pro@gmail.com>
-Date: Thu, 20 Sep 2018 16:49:04 +0200
-Subject: [PATCH 24/45] usb: cdc_acm: Do not leak URB buffers
-
-commit f2924d4b16ae138c2de6a0e73f526fb638330858 upstream.
-
-When the ACM TTY port is disconnected, the URBs it uses must be killed, and
-then the buffers must be freed. Unfortunately a previous refactor removed
-the code freeing the buffers because it looked extremely similar to the
-code killing the URBs.
-
-As a result, there were many new leaks for each plug/unplug cycle of a
-CDC-ACM device, that were detected by kmemleak.
-
-Restore the missing code, and the memory leak is removed.
-
-Fixes: ba8c931ded8d ("cdc-acm: refactor killing urbs")
-Signed-off-by: Romain Izard <romain.izard.pro@gmail.com>
-Acked-by: Oliver Neukum <oneukum@suse.com>
-Cc: stable <stable@vger.kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/class/cdc-acm.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
-index feaa0d8f830a..9f6f402470ac 100644
---- a/drivers/usb/class/cdc-acm.c
-+++ b/drivers/usb/class/cdc-acm.c
-@@ -1527,6 +1527,7 @@ static void acm_disconnect(struct usb_interface *intf)
- {
- 	struct acm *acm = usb_get_intfdata(intf);
- 	struct tty_struct *tty;
-+	int i;
- 
- 	/* sibling interface is already cleaning up */
- 	if (!acm)
-@@ -1557,6 +1558,11 @@ static void acm_disconnect(struct usb_interface *intf)
- 
- 	tty_unregister_device(acm_tty_driver, acm->minor);
- 
-+	usb_free_urb(acm->ctrlurb);
-+	for (i = 0; i < ACM_NW; i++)
-+		usb_free_urb(acm->wb[i].urb);
-+	for (i = 0; i < acm->rx_buflimit; i++)
-+		usb_free_urb(acm->read_urbs[i]);
- 	acm_write_buffers_free(acm);
- 	usb_free_coherent(acm->dev, acm->ctrlsize, acm->ctrl_buffer, acm->ctrl_dma);
- 	acm_read_buffers_free(acm);
--- 
-2.28.0
-
-
-From 171f90d4ae841e2205fb706b49f266d40207d0bb Mon Sep 17 00:00:00 2001
-From: Dmitry Safonov <dima@arista.com>
-Date: Tue, 18 Sep 2018 00:52:52 +0100
-Subject: [PATCH 25/45] tty: Drop tty->count on tty_reopen() failure
-
-commit fe32416790093b31364c08395727de17ec96ace1 upstream.
-
-In case of tty_ldisc_reinit() failure, tty->count should be decremented
-back, otherwise we will never release_tty().
-Tetsuo reported that it fixes noisy warnings on tty release like:
-  pts pts4033: tty_release: tty->count(10529) != (#fd's(7) + #kopen's(0))
-
-Fixes: commit 892d1fa7eaae ("tty: Destroy ldisc instance on hangup")
-
-Cc: stable@vger.kernel.org # v4.6+
-Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Cc: Jiri Slaby <jslaby@suse.com>
-Reviewed-by: Jiri Slaby <jslaby@suse.cz>
-Tested-by: Jiri Slaby <jslaby@suse.com>
-Tested-by: Mark Rutland <mark.rutland@arm.com>
-Tested-by: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
-Signed-off-by: Dmitry Safonov <dima@arista.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/tty/tty_io.c | 11 ++++++++---
- 1 file changed, 8 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
-index 562d31073f9a..8d65b2f9ee80 100644
---- a/drivers/tty/tty_io.c
-+++ b/drivers/tty/tty_io.c
-@@ -1254,6 +1254,7 @@ static void tty_driver_remove_tty(struct tty_driver *driver, struct tty_struct *
- static int tty_reopen(struct tty_struct *tty)
- {
- 	struct tty_driver *driver = tty->driver;
-+	int retval;
- 
- 	if (driver->type == TTY_DRIVER_TYPE_PTY &&
- 	    driver->subtype == PTY_TYPE_MASTER)
-@@ -1267,10 +1268,14 @@ static int tty_reopen(struct tty_struct *tty)
- 
- 	tty->count++;
- 
--	if (!tty->ldisc)
--		return tty_ldisc_reinit(tty, tty->termios.c_line);
-+	if (tty->ldisc)
-+		return 0;
- 
--	return 0;
-+	retval = tty_ldisc_reinit(tty, tty->termios.c_line);
-+	if (retval)
-+		tty->count--;
-+
-+	return retval;
- }
- 
- /**
--- 
-2.28.0
-
-
-From 79f87e09bcb282f08301bccb2edbc2981bb819d5 Mon Sep 17 00:00:00 2001
-From: Guenter Roeck <linux@roeck-us.net>
-Date: Tue, 25 Sep 2018 21:06:24 -0700
-Subject: [PATCH 26/45] of: unittest: Disable interrupt node tests for old
- world MAC systems
-
-commit 8894891446c9380709451b99ab45c5c53adfd2fc upstream.
-
-On systems with OF_IMAP_OLDWORLD_MAC set in of_irq_workarounds, the
-devicetree interrupt parsing code is different, causing unit tests of
-devicetree interrupt nodes to fail. Due to a bug in unittest code, which
-tries to dereference an uninitialized pointer, this results in a crash.
-
-OF: /testcase-data/phandle-tests/consumer-a: arguments longer than property
-Unable to handle kernel paging request for data at address 0x00bc616e
-Faulting instruction address: 0xc08e9468
-Oops: Kernel access of bad area, sig: 11 [#1]
-BE PREEMPT PowerMac
-Modules linked in:
-CPU: 0 PID: 1 Comm: swapper Not tainted 4.14.72-rc1-yocto-standard+ #1
-task: cf8e0000 task.stack: cf8da000
-NIP:  c08e9468 LR: c08ea5bc CTR: c08ea5ac
-REGS: cf8dbb50 TRAP: 0300   Not tainted  (4.14.72-rc1-yocto-standard+)
-MSR:  00001032 <ME,IR,DR,RI>  CR: 82004044  XER: 00000000
-DAR: 00bc616e DSISR: 40000000
-GPR00: c08ea5bc cf8dbc00 cf8e0000 c13ca517 c13ca517 c13ca8a0 00000066 00000002
-GPR08: 00000063 00bc614e c0b05865 000affff 82004048 00000000 c00047f0 00000000
-GPR16: c0a80000 c0a9cc34 c13ca517 c0ad1134 05ffffff 000affff c0b05860 c0abeef8
-GPR24: cecec278 cecec278 c0a8c4d0 c0a885e0 c13ca8a0 05ffffff c13ca8a0 c13ca517
-
-NIP [c08e9468] device_node_gen_full_name+0x30/0x15c
-LR [c08ea5bc] device_node_string+0x190/0x3c8
-Call Trace:
-[cf8dbc00] [c007f670] trace_hardirqs_on_caller+0x118/0x1fc (unreliable)
-[cf8dbc40] [c08ea5bc] device_node_string+0x190/0x3c8
-[cf8dbcb0] [c08eb794] pointer+0x25c/0x4d0
-[cf8dbd00] [c08ebcbc] vsnprintf+0x2b4/0x5ec
-[cf8dbd60] [c08ec00c] vscnprintf+0x18/0x48
-[cf8dbd70] [c008e268] vprintk_store+0x4c/0x22c
-[cf8dbda0] [c008ecac] vprintk_emit+0x94/0x130
-[cf8dbdd0] [c008ff54] printk+0x5c/0x6c
-[cf8dbe10] [c0b8ddd4] of_unittest+0x2220/0x26f8
-[cf8dbea0] [c0004434] do_one_initcall+0x4c/0x184
-[cf8dbf00] [c0b4534c] kernel_init_freeable+0x13c/0x1d8
-[cf8dbf30] [c0004814] kernel_init+0x24/0x118
-[cf8dbf40] [c0013398] ret_from_kernel_thread+0x5c/0x64
-
-The problem was observed when running a qemu test for the g3beige machine
-with devicetree unittests enabled.
-
-Disable interrupt node tests on affected systems to avoid both false
-unittest failures and the crash.
-
-With this patch in place, unittest on the affected system passes with
-the following message.
-
-	dt-test ### end of unittest - 144 passed, 0 failed
-
-Fixes: 53a42093d96ef ("of: Add device tree selftests")
-Signed-off-by: Guenter Roeck <linux@roeck-us.net>
-Reviewed-by: Frank Rowand <frank.rowand@sony.com>
-Signed-off-by: Rob Herring <robh@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/of/unittest.c | 26 ++++++++++++++++++--------
- 1 file changed, 18 insertions(+), 8 deletions(-)
-
-diff --git a/drivers/of/unittest.c b/drivers/of/unittest.c
-index 985a85f281a8..7c6aff761800 100644
---- a/drivers/of/unittest.c
-+++ b/drivers/of/unittest.c
-@@ -614,6 +614,9 @@ static void __init of_unittest_parse_interrupts(void)
- 	struct of_phandle_args args;
- 	int i, rc;
- 
-+	if (of_irq_workarounds & OF_IMAP_OLDWORLD_MAC)
-+		return;
-+
- 	np = of_find_node_by_path("/testcase-data/interrupts/interrupts0");
- 	if (!np) {
- 		pr_err("missing testcase data\n");
-@@ -688,6 +691,9 @@ static void __init of_unittest_parse_interrupts_extended(void)
- 	struct of_phandle_args args;
- 	int i, rc;
- 
-+	if (of_irq_workarounds & OF_IMAP_OLDWORLD_MAC)
-+		return;
-+
- 	np = of_find_node_by_path("/testcase-data/interrupts/interrupts-extended0");
- 	if (!np) {
- 		pr_err("missing testcase data\n");
-@@ -844,15 +850,19 @@ static void __init of_unittest_platform_populate(void)
- 	pdev = of_find_device_by_node(np);
- 	unittest(pdev, "device 1 creation failed\n");
- 
--	irq = platform_get_irq(pdev, 0);
--	unittest(irq == -EPROBE_DEFER, "device deferred probe failed - %d\n", irq);
-+	if (!(of_irq_workarounds & OF_IMAP_OLDWORLD_MAC)) {
-+		irq = platform_get_irq(pdev, 0);
-+		unittest(irq == -EPROBE_DEFER,
-+			 "device deferred probe failed - %d\n", irq);
- 
--	/* Test that a parsing failure does not return -EPROBE_DEFER */
--	np = of_find_node_by_path("/testcase-data/testcase-device2");
--	pdev = of_find_device_by_node(np);
--	unittest(pdev, "device 2 creation failed\n");
--	irq = platform_get_irq(pdev, 0);
--	unittest(irq < 0 && irq != -EPROBE_DEFER, "device parsing error failed - %d\n", irq);
-+		/* Test that a parsing failure does not return -EPROBE_DEFER */
-+		np = of_find_node_by_path("/testcase-data/testcase-device2");
-+		pdev = of_find_device_by_node(np);
-+		unittest(pdev, "device 2 creation failed\n");
-+		irq = platform_get_irq(pdev, 0);
-+		unittest(irq < 0 && irq != -EPROBE_DEFER,
-+			 "device parsing error failed - %d\n", irq);
-+	}
- 
- 	np = of_find_node_by_path("/testcase-data/platform-tests");
- 	unittest(np, "No testcase data in device tree\n");
--- 
-2.28.0
-
-
-From ec727693a9ef20da5829c8c68ae0fa4520a3fba6 Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Wed, 14 Mar 2018 10:34:11 -0300
-Subject: [PATCH 27/45] perf annotate: Use asprintf when formatting objdump
- command line
-
-commit 6810158d526e483868e519befff407b91e76b3db upstream.
-
-We were using a local buffer with an arbitrary size, that would have to
-get increased to avoid truncation as warned by gcc 8:
-
-  util/annotate.c: In function 'symbol__disassemble':
-  util/annotate.c:1488:4: error: '%s' directive output may be truncated writing up to 4095 bytes into a region of size between 3966 and 8086 [-Werror=format-truncation=]
-      "%s %s%s --start-address=0x%016" PRIx64
-      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  util/annotate.c:1498:20:
-      symfs_filename, symfs_filename);
-                      ~~~~~~~~~~~~~~
-  util/annotate.c:1490:50: note: format string is defined here
-      " -l -d %s %s -C \"%s\" 2>/dev/null|grep -v \"%s:\"|expand",
-                                                  ^~
-  In file included from /usr/include/stdio.h:861,
-                   from util/color.h:5,
-                   from util/sort.h:8,
-                   from util/annotate.c:14:
-  /usr/include/bits/stdio2.h:67:10: note: '__builtin___snprintf_chk' output 116 or more bytes (assuming 8331) into a destination of size 8192
-     return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
-            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-          __bos (__s), __fmt, __va_arg_pack ());
-          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-So switch to asprintf, that will make sure enough space is available.
-
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jin Yao <yao.jin@linux.intel.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Wang Nan <wangnan0@huawei.com>
-Link: https://lkml.kernel.org/n/tip-qagoy2dmbjpc9gdnaj0r3mml@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Cc: Ignat Korchagin <ignat@cloudflare.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/annotate.c | 17 ++++++++++++-----
- 1 file changed, 12 insertions(+), 5 deletions(-)
-
-diff --git a/tools/perf/util/annotate.c b/tools/perf/util/annotate.c
-index dac76ac117c1..398d4cc2f0e4 100644
---- a/tools/perf/util/annotate.c
-+++ b/tools/perf/util/annotate.c
-@@ -1432,7 +1432,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
- 			struct arch **parch, char *cpuid)
- {
- 	struct dso *dso = map->dso;
--	char command[PATH_MAX * 2];
-+	char *command;
- 	struct arch *arch = NULL;
- 	FILE *file;
- 	char symfs_filename[PATH_MAX];
-@@ -1496,7 +1496,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
- 		strcpy(symfs_filename, tmp);
- 	}
- 
--	snprintf(command, sizeof(command),
-+	err = asprintf(&command,
- 		 "%s %s%s --start-address=0x%016" PRIx64
- 		 " --stop-address=0x%016" PRIx64
- 		 " -l -d %s %s -C \"%s\" 2>/dev/null|grep -v \"%s:\"|expand",
-@@ -1509,12 +1509,17 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
- 		 symbol_conf.annotate_src ? "-S" : "",
- 		 symfs_filename, symfs_filename);
- 
-+	if (err < 0) {
-+		pr_err("Failure allocating memory for the command to run\n");
-+		goto out_remove_tmp;
-+	}
-+
- 	pr_debug("Executing: %s\n", command);
- 
- 	err = -1;
- 	if (pipe(stdout_fd) < 0) {
- 		pr_err("Failure creating the pipe to run %s\n", command);
--		goto out_remove_tmp;
-+		goto out_free_command;
- 	}
- 
- 	pid = fork();
-@@ -1541,7 +1546,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
- 		 * If we were using debug info should retry with
- 		 * original binary.
- 		 */
--		goto out_remove_tmp;
-+		goto out_free_command;
- 	}
- 
- 	nline = 0;
-@@ -1570,6 +1575,8 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
- 
- 	fclose(file);
- 	err = 0;
-+out_free_command:
-+	free(command);
- out_remove_tmp:
- 	close(stdout_fd[0]);
- 
-@@ -1583,7 +1590,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
- 
- out_close_stdout:
- 	close(stdout_fd[1]);
--	goto out_remove_tmp;
-+	goto out_free_command;
- }
- 
- static void insert_source_line(struct rb_root *root, struct source_line *src_line)
--- 
-2.28.0
-
-
-From 327400b3a7082eea72890cc6d008dd4b48ad0355 Mon Sep 17 00:00:00 2001
-From: Jiri Olsa <jolsa@kernel.org>
-Date: Mon, 19 Mar 2018 09:29:02 +0100
-Subject: [PATCH 28/45] perf tools: Fix python extension build for gcc 8
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit b7a313d84e853049062011d78cb04b6decd12f5c upstream.
-
-The gcc 8 compiler won't compile the python extension code with the
-following errors (one example):
-
-  python.c:830:15: error: cast between incompatible  function types from              \
-  ‘PyObject * (*)(struct pyrf_evsel *, PyObject *, PyObject *)’                       \
-  uct _object * (*)(struct pyrf_evsel *, struct _object *, struct _object *)’} to     \
-  ‘PyObject * (*)(PyObject *, PyObject *)’ {aka ‘struct _object * (*)(struct _objeuct \
-  _object *)’} [-Werror=cast-function-type]
-     .ml_meth  = (PyCFunction)pyrf_evsel__open,
-
-The problem with the PyMethodDef::ml_meth callback is that its type is
-determined based on the PyMethodDef::ml_flags value, which we set as
-METH_VARARGS | METH_KEYWORDS.
-
-That indicates that the callback is expecting an extra PyObject* arg, and is
-actually PyCFunctionWithKeywords type, but the base PyMethodDef::ml_meth type
-stays PyCFunction.
-
-Previous gccs did not find this, gcc8 now does. Fixing this by silencing this
-warning for python.c build.
-
-Commiter notes:
-
-Do not do that for CC=clang, as it breaks the build in some clang
-versions, like the ones in fedora up to fedora27:
-
-  fedora:25:error: unknown warning option '-Wno-cast-function-type'; did you mean '-Wno-bad-function-cast'? [-Werror,-Wunknown-warning-option]
-  fedora:26:error: unknown warning option '-Wno-cast-function-type'; did you mean '-Wno-bad-function-cast'? [-Werror,-Wunknown-warning-option]
-  fedora:27:error: unknown warning option '-Wno-cast-function-type'; did you mean '-Wno-bad-function-cast'? [-Werror,-Wunknown-warning-option]
-  #
-
-those have:
-
-  clang version 3.9.1 (tags/RELEASE_391/final)
-
-The one in rawhide accepts that:
-
-  clang version 6.0.0 (tags/RELEASE_600/final)
-
-Signed-off-by: Jiri Olsa <jolsa@kernel.org>
-Tested-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Josh Poimboeuf <jpoimboe@redhat.com>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Sergey Senozhatsky <sergey.senozhatsky.work@gmail.com>
-Link: http://lkml.kernel.org/r/20180319082902.4518-2-jolsa@kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Cc: Ignat Korchagin <ignat@cloudflare.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/setup.py | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/tools/perf/util/setup.py b/tools/perf/util/setup.py
-index af415febbc46..da4df7fd43a2 100644
---- a/tools/perf/util/setup.py
-+++ b/tools/perf/util/setup.py
-@@ -28,6 +28,8 @@ class install_lib(_install_lib):
- cflags = getenv('CFLAGS', '').split()
- # switch off several checks (need to be at the end of cflags list)
- cflags += ['-fno-strict-aliasing', '-Wno-write-strings', '-Wno-unused-parameter' ]
-+if cc != "clang":
-+    cflags += ['-Wno-cast-function-type' ]
- 
- src_perf  = getenv('srctree') + '/tools/perf'
- build_lib = getenv('PYTHON_EXTBUILD_LIB')
--- 
-2.28.0
-
-
-From 8146256b7dcdb1e98a1f6435501ca76396c42f20 Mon Sep 17 00:00:00 2001
-From: Carl Huang <cjhuang@codeaurora.org>
-Date: Mon, 5 Mar 2018 14:44:02 +0800
-Subject: [PATCH 29/45] ath10k: fix use-after-free in
- ath10k_wmi_cmd_send_nowait
-
-commit 9ef0f58ed7b4a55da4a64641d538e0d9e46579ac upstream.
-
-The skb may be freed in tx completion context before
-trace_ath10k_wmi_cmd is called. This can be easily captured when
-KASAN(Kernel Address Sanitizer) is enabled. The fix is to move
-trace_ath10k_wmi_cmd before the send operation. As the ret has no
-meaning in trace_ath10k_wmi_cmd then, so remove this parameter too.
-
-Signed-off-by: Carl Huang <cjhuang@codeaurora.org>
-Tested-by: Brian Norris <briannorris@chromium.org>
-Reviewed-by: Brian Norris <briannorris@chromium.org>
-Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
-Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/ath/ath10k/trace.h | 12 ++++--------
- drivers/net/wireless/ath/ath10k/wmi.c   |  2 +-
- 2 files changed, 5 insertions(+), 9 deletions(-)
-
-diff --git a/drivers/net/wireless/ath/ath10k/trace.h b/drivers/net/wireless/ath/ath10k/trace.h
-index e0d00cef0bd8..5b974bb76e6c 100644
---- a/drivers/net/wireless/ath/ath10k/trace.h
-+++ b/drivers/net/wireless/ath/ath10k/trace.h
-@@ -152,10 +152,9 @@ TRACE_EVENT(ath10k_log_dbg_dump,
- );
- 
- TRACE_EVENT(ath10k_wmi_cmd,
--	TP_PROTO(struct ath10k *ar, int id, const void *buf, size_t buf_len,
--		 int ret),
-+	TP_PROTO(struct ath10k *ar, int id, const void *buf, size_t buf_len),
- 
--	TP_ARGS(ar, id, buf, buf_len, ret),
-+	TP_ARGS(ar, id, buf, buf_len),
- 
- 	TP_STRUCT__entry(
- 		__string(device, dev_name(ar->dev))
-@@ -163,7 +162,6 @@ TRACE_EVENT(ath10k_wmi_cmd,
- 		__field(unsigned int, id)
- 		__field(size_t, buf_len)
- 		__dynamic_array(u8, buf, buf_len)
--		__field(int, ret)
- 	),
- 
- 	TP_fast_assign(
-@@ -171,17 +169,15 @@ TRACE_EVENT(ath10k_wmi_cmd,
- 		__assign_str(driver, dev_driver_string(ar->dev));
- 		__entry->id = id;
- 		__entry->buf_len = buf_len;
--		__entry->ret = ret;
- 		memcpy(__get_dynamic_array(buf), buf, buf_len);
- 	),
- 
- 	TP_printk(
--		"%s %s id %d len %zu ret %d",
-+		"%s %s id %d len %zu",
- 		__get_str(driver),
- 		__get_str(device),
- 		__entry->id,
--		__entry->buf_len,
--		__entry->ret
-+		__entry->buf_len
- 	)
- );
- 
-diff --git a/drivers/net/wireless/ath/ath10k/wmi.c b/drivers/net/wireless/ath/ath10k/wmi.c
-index 38a97086708b..2ab5311659ea 100644
---- a/drivers/net/wireless/ath/ath10k/wmi.c
-+++ b/drivers/net/wireless/ath/ath10k/wmi.c
-@@ -1741,8 +1741,8 @@ int ath10k_wmi_cmd_send_nowait(struct ath10k *ar, struct sk_buff *skb,
- 	cmd_hdr->cmd_id = __cpu_to_le32(cmd);
- 
- 	memset(skb_cb, 0, sizeof(*skb_cb));
-+	trace_ath10k_wmi_cmd(ar, cmd_id, skb->data, skb->len);
- 	ret = ath10k_htc_send(&ar->htc, ar->wmi.eid, skb);
--	trace_ath10k_wmi_cmd(ar, cmd_id, skb->data, skb->len, ret);
- 
- 	if (ret)
- 		goto err_pull;
--- 
-2.28.0
-
-
-From 1b2ad48a85c4011f2cb620fa96fd50645bd11263 Mon Sep 17 00:00:00 2001
-From: Yu Wang <yyuwang@codeaurora.org>
-Date: Tue, 30 Jan 2018 14:06:08 +0200
-Subject: [PATCH 30/45] ath10k: fix kernel panic issue during pci probe
-
-commit 50e79e25250bf928369996277e85b00536b380c7 upstream.
-
-If device gone during chip reset, ar->normal_mode_fw.board is not
-initialized, but ath10k_debug_print_hwfw_info() will try to access its
-member, which will cause 'kernel NULL pointer' issue. This was found
-using a faulty device (pci link went down sometimes) in a random
-insmod/rmmod/other-op test.
-To fix it, check ar->normal_mode_fw.board before accessing the member.
-
-pci 0000:02:00.0: BAR 0: assigned [mem 0xf7400000-0xf75fffff 64bit]
-ath10k_pci 0000:02:00.0: enabling device (0000 -> 0002)
-ath10k_pci 0000:02:00.0: pci irq msi oper_irq_mode 2 irq_mode 0 reset_mode 0
-ath10k_pci 0000:02:00.0: failed to read device register, device is gone
-ath10k_pci 0000:02:00.0: failed to wait for target init: -5
-ath10k_pci 0000:02:00.0: failed to warm reset: -5
-ath10k_pci 0000:02:00.0: firmware crashed during chip reset
-ath10k_pci 0000:02:00.0: firmware crashed! (uuid 5d018951-b8e1-404a-8fde-923078b4423a)
-ath10k_pci 0000:02:00.0: (null) target 0x00000000 chip_id 0x00340aff sub 0000:0000
-ath10k_pci 0000:02:00.0: kconfig debug 1 debugfs 1 tracing 1 dfs 1 testmode 1
-ath10k_pci 0000:02:00.0: firmware ver  api 0 features  crc32 00000000
-...
-BUG: unable to handle kernel NULL pointer dereference at 00000004
-...
-Call Trace:
- [<fb4e7882>] ath10k_print_driver_info+0x12/0x20 [ath10k_core]
- [<fb62b7dd>] ath10k_pci_fw_crashed_dump+0x6d/0x4d0 [ath10k_pci]
- [<fb629f07>] ? ath10k_pci_sleep.part.19+0x57/0xc0 [ath10k_pci]
- [<fb62c8ee>] ath10k_pci_hif_power_up+0x14e/0x1b0 [ath10k_pci]
- [<c10477fb>] ? do_page_fault+0xb/0x10
- [<fb4eb934>] ath10k_core_register_work+0x24/0x840 [ath10k_core]
- [<c18a00d8>] ? netlbl_unlhsh_remove+0x178/0x410
- [<c10477f0>] ? __do_page_fault+0x480/0x480
- [<c1068e44>] process_one_work+0x114/0x3e0
- [<c1069d07>] worker_thread+0x37/0x4a0
- [<c106e294>] kthread+0xa4/0xc0
- [<c1069cd0>] ? create_worker+0x180/0x180
- [<c106e1f0>] ? kthread_park+0x50/0x50
- [<c18ab4f7>] ret_from_fork+0x1b/0x28
- Code: 78 80 b8 50 09 00 00 00 75 5d 8d 75 94 c7 44 24 08 aa d7 52 fb c7 44 24 04 64 00 00 00
- 89 34 24 e8 82 52 e2 c5 8b 83 dc 08 00 00 <8b> 50 04 8b 08 31 c0 e8 20 57 e3 c5 89 44 24 10 8b 83 58 09 00
- EIP: [<fb4e7754>]-
- ath10k_debug_print_board_info+0x34/0xb0 [ath10k_core]
- SS:ESP 0068:f4921d90
- CR2: 0000000000000004
-
-Signed-off-by: Yu Wang <yyuwang@codeaurora.org>
-Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
-[AmitP: Minor rebasing for 4.14.y and 4.9.y]
-Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/ath/ath10k/debug.c | 12 ++++++++++--
- 1 file changed, 10 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/net/wireless/ath/ath10k/debug.c b/drivers/net/wireless/ath/ath10k/debug.c
-index df514507d3f1..22003895f854 100644
---- a/drivers/net/wireless/ath/ath10k/debug.c
-+++ b/drivers/net/wireless/ath/ath10k/debug.c
-@@ -1,6 +1,7 @@
- /*
-  * Copyright (c) 2005-2011 Atheros Communications Inc.
-  * Copyright (c) 2011-2013 Qualcomm Atheros, Inc.
-+ * Copyright (c) 2018, The Linux Foundation. All rights reserved.
-  *
-  * Permission to use, copy, modify, and/or distribute this software for any
-  * purpose with or without fee is hereby granted, provided that the above
-@@ -163,6 +164,8 @@ void ath10k_debug_print_hwfw_info(struct ath10k *ar)
- void ath10k_debug_print_board_info(struct ath10k *ar)
- {
- 	char boardinfo[100];
-+	const struct firmware *board;
-+	u32 crc;
- 
- 	if (ar->id.bmi_ids_valid)
- 		scnprintf(boardinfo, sizeof(boardinfo), "%d:%d",
-@@ -170,11 +173,16 @@ void ath10k_debug_print_board_info(struct ath10k *ar)
- 	else
- 		scnprintf(boardinfo, sizeof(boardinfo), "N/A");
- 
-+	board = ar->normal_mode_fw.board;
-+	if (!IS_ERR_OR_NULL(board))
-+		crc = crc32_le(0, board->data, board->size);
-+	else
-+		crc = 0;
-+
- 	ath10k_info(ar, "board_file api %d bmi_id %s crc32 %08x",
- 		    ar->bd_api,
- 		    boardinfo,
--		    crc32_le(0, ar->normal_mode_fw.board->data,
--			     ar->normal_mode_fw.board->size));
-+		    crc);
- }
- 
- void ath10k_debug_print_boot_info(struct ath10k *ar)
--- 
-2.28.0
-
-
-From 0f6e2f4e06be4da35c1b9e52d638218bafa91e25 Mon Sep 17 00:00:00 2001
-From: James Smart <jsmart2021@gmail.com>
-Date: Tue, 13 Mar 2018 09:48:07 -0700
-Subject: [PATCH 31/45] nvme_fc: fix ctrl create failures racing with workq
- items
-
-commit cf25809bec2c7df4b45df5b2196845d9a4a3c89b upstream.
-
-If there are errors during initial controller create, the transport
-will teardown the partially initialized controller struct and free
-the ctlr memory.  Trouble is - most of those errors can occur due
-to asynchronous events happening such io timeouts and subsystem
-connectivity failures. Those failures invoke async workq items to
-reset the controller and attempt reconnect.  Those may be in progress
-as the main thread frees the ctrl memory, resulting in NULL ptr oops.
-
-Prevent this from happening by having the main ctrl failure thread
-changing state to DELETING followed by synchronously cancelling any
-pending queued work item. The change of state will prevent the
-scheduling of resets or reconnect events.
-
-Signed-off-by: James Smart <james.smart@broadcom.com>
-Signed-off-by: Keith Busch <keith.busch@intel.com>
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/nvme/host/fc.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
-index 7deb7b5d8683..058d542647dd 100644
---- a/drivers/nvme/host/fc.c
-+++ b/drivers/nvme/host/fc.c
-@@ -2868,6 +2868,10 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
- 	}
- 
- 	if (ret) {
-+		nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_DELETING);
-+		cancel_work_sync(&ctrl->ctrl.reset_work);
-+		cancel_delayed_work_sync(&ctrl->connect_work);
-+
- 		/* couldn't schedule retry - fail out */
- 		dev_err(ctrl->ctrl.device,
- 			"NVME-FC{%d}: Connect retry failed\n", ctrl->cnum);
--- 
-2.28.0
-
-
-From 4e43fbc8ef2598cfea7704f6e496db70fe86e6d1 Mon Sep 17 00:00:00 2001
-From: Christophe Leroy <christophe.leroy@c-s.fr>
-Date: Fri, 24 Nov 2017 08:31:07 +0100
-Subject: [PATCH 32/45] powerpc/lib/code-patching: refactor patch_instruction()
-
-commit 8cf4c05712f04a405f0dacebcca8f042b391694a upstream.
-
-patch_instruction() uses almost the same sequence as
-__patch_instruction()
-
-This patch refactor it so that patch_instruction() uses
-__patch_instruction() instead of duplicating code.
-
-Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
-Acked-by: Balbir Singh <bsingharora@gmail.com>
-Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/lib/code-patching.c | 30 +++++++++++++++---------------
- 1 file changed, 15 insertions(+), 15 deletions(-)
-
-diff --git a/arch/powerpc/lib/code-patching.c b/arch/powerpc/lib/code-patching.c
-index 096d4e4d31e6..e1c58937281f 100644
---- a/arch/powerpc/lib/code-patching.c
-+++ b/arch/powerpc/lib/code-patching.c
-@@ -23,19 +23,26 @@
- #include <asm/code-patching.h>
- #include <asm/setup.h>
- 
--static int __patch_instruction(unsigned int *addr, unsigned int instr)
-+static int __patch_instruction(unsigned int *exec_addr, unsigned int instr,
-+			       unsigned int *patch_addr)
- {
- 	int err;
- 
--	__put_user_size(instr, addr, 4, err);
-+	__put_user_size(instr, patch_addr, 4, err);
- 	if (err)
- 		return err;
- 
--	asm ("dcbst 0, %0; sync; icbi 0,%0; sync; isync" :: "r" (addr));
-+	asm ("dcbst 0, %0; sync; icbi 0,%1; sync; isync" :: "r" (patch_addr),
-+							    "r" (exec_addr));
- 
- 	return 0;
- }
- 
-+static int raw_patch_instruction(unsigned int *addr, unsigned int instr)
-+{
-+	return __patch_instruction(addr, instr, addr);
-+}
-+
- #ifdef CONFIG_STRICT_KERNEL_RWX
- static DEFINE_PER_CPU(struct vm_struct *, text_poke_area);
- 
-@@ -138,7 +145,7 @@ static inline int unmap_patch_area(unsigned long addr)
- int patch_instruction(unsigned int *addr, unsigned int instr)
- {
- 	int err;
--	unsigned int *dest = NULL;
-+	unsigned int *patch_addr = NULL;
- 	unsigned long flags;
- 	unsigned long text_poke_addr;
- 	unsigned long kaddr = (unsigned long)addr;
-@@ -149,7 +156,7 @@ int patch_instruction(unsigned int *addr, unsigned int instr)
- 	 * to allow patching. We just do the plain old patching
- 	 */
- 	if (!this_cpu_read(*PTRRELOC(&text_poke_area)))
--		return __patch_instruction(addr, instr);
-+		return raw_patch_instruction(addr, instr);
- 
- 	local_irq_save(flags);
- 
-@@ -159,17 +166,10 @@ int patch_instruction(unsigned int *addr, unsigned int instr)
- 		goto out;
- 	}
- 
--	dest = (unsigned int *)(text_poke_addr) +
-+	patch_addr = (unsigned int *)(text_poke_addr) +
- 			((kaddr & ~PAGE_MASK) / sizeof(unsigned int));
- 
--	/*
--	 * We use __put_user_size so that we can handle faults while
--	 * writing to dest and return err to handle faults gracefully
--	 */
--	__put_user_size(instr, dest, 4, err);
--	if (!err)
--		asm ("dcbst 0, %0; sync; icbi 0,%0; icbi 0,%1; sync; isync"
--			::"r" (dest), "r"(addr));
-+	__patch_instruction(addr, instr, patch_addr);
- 
- 	err = unmap_patch_area(text_poke_addr);
- 	if (err)
-@@ -184,7 +184,7 @@ int patch_instruction(unsigned int *addr, unsigned int instr)
- 
- int patch_instruction(unsigned int *addr, unsigned int instr)
- {
--	return __patch_instruction(addr, instr);
-+	return raw_patch_instruction(addr, instr);
- }
- 
- #endif /* CONFIG_STRICT_KERNEL_RWX */
--- 
-2.28.0
-
-
-From 609fbeddb24c4035d24fc32d82dc08b30ae3dfc0 Mon Sep 17 00:00:00 2001
-From: Michael Neuling <mikey@neuling.org>
-Date: Fri, 14 Sep 2018 11:14:11 +1000
-Subject: [PATCH 33/45] powerpc: Avoid code patching freed init sections
-
-commit 51c3c62b58b357e8d35e4cc32f7b4ec907426fe3 upstream.
-
-This stops us from doing code patching in init sections after they've
-been freed.
-
-In this chain:
-  kvm_guest_init() ->
-    kvm_use_magic_page() ->
-      fault_in_pages_readable() ->
-	 __get_user() ->
-	   __get_user_nocheck() ->
-	     barrier_nospec();
-
-We have a code patching location at barrier_nospec() and
-kvm_guest_init() is an init function. This whole chain gets inlined,
-so when we free the init section (hence kvm_guest_init()), this code
-goes away and hence should no longer be patched.
-
-We seen this as userspace memory corruption when using a memory
-checker while doing partition migration testing on powervm (this
-starts the code patching post migration via
-/sys/kernel/mobility/migration). In theory, it could also happen when
-using /sys/kernel/debug/powerpc/barrier_nospec.
-
-Cc: stable@vger.kernel.org # 4.13+
-Signed-off-by: Michael Neuling <mikey@neuling.org>
-Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
-Reviewed-by: Christophe Leroy <christophe.leroy@c-s.fr>
-Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/include/asm/setup.h | 1 +
- arch/powerpc/lib/code-patching.c | 7 +++++++
- arch/powerpc/mm/mem.c            | 2 ++
- 3 files changed, 10 insertions(+)
-
-diff --git a/arch/powerpc/include/asm/setup.h b/arch/powerpc/include/asm/setup.h
-index bbcdf929be54..a5e919e34c42 100644
---- a/arch/powerpc/include/asm/setup.h
-+++ b/arch/powerpc/include/asm/setup.h
-@@ -9,6 +9,7 @@ extern void ppc_printk_progress(char *s, unsigned short hex);
- 
- extern unsigned int rtas_data;
- extern unsigned long long memory_limit;
-+extern bool init_mem_is_free;
- extern unsigned long klimit;
- extern void *zalloc_maybe_bootmem(size_t size, gfp_t mask);
- 
-diff --git a/arch/powerpc/lib/code-patching.c b/arch/powerpc/lib/code-patching.c
-index e1c58937281f..0054b0be8985 100644
---- a/arch/powerpc/lib/code-patching.c
-+++ b/arch/powerpc/lib/code-patching.c
-@@ -22,12 +22,19 @@
- #include <asm/page.h>
- #include <asm/code-patching.h>
- #include <asm/setup.h>
-+#include <asm/sections.h>
- 
- static int __patch_instruction(unsigned int *exec_addr, unsigned int instr,
- 			       unsigned int *patch_addr)
- {
- 	int err;
- 
-+	/* Make sure we aren't patching a freed init section */
-+	if (init_mem_is_free && init_section_contains(exec_addr, 4)) {
-+		pr_debug("Skipping init section patching addr: 0x%px\n", exec_addr);
-+		return 0;
-+	}
-+
- 	__put_user_size(instr, patch_addr, 4, err);
- 	if (err)
- 		return err;
-diff --git a/arch/powerpc/mm/mem.c b/arch/powerpc/mm/mem.c
-index 9c2f83331e5b..30bf13b72e5e 100644
---- a/arch/powerpc/mm/mem.c
-+++ b/arch/powerpc/mm/mem.c
-@@ -63,6 +63,7 @@
- #endif
- 
- unsigned long long memory_limit;
-+bool init_mem_is_free;
- 
- #ifdef CONFIG_HIGHMEM
- pte_t *kmap_pte;
-@@ -405,6 +406,7 @@ void free_initmem(void)
- {
- 	ppc_md.progress = ppc_printk_progress;
- 	mark_initmem_nx();
-+	init_mem_is_free = true;
- 	free_initmem_default(POISON_FREE_INITMEM);
- }
- 
--- 
-2.28.0
-
-
-From af1a8101794dfea897290e057f61086dabfe6c91 Mon Sep 17 00:00:00 2001
-From: Christophe Leroy <christophe.leroy@c-s.fr>
-Date: Mon, 1 Oct 2018 12:21:10 +0000
-Subject: [PATCH 34/45] powerpc/lib: fix book3s/32 boot failure due to code
- patching
-
-commit b45ba4a51cde29b2939365ef0c07ad34c8321789 upstream.
-
-Commit 51c3c62b58b3 ("powerpc: Avoid code patching freed init
-sections") accesses 'init_mem_is_free' flag too early, before the
-kernel is relocated. This provokes early boot failure (before the
-console is active).
-
-As it is not necessary to do this verification that early, this
-patch moves the test into patch_instruction() instead of
-__patch_instruction().
-
-This modification also has the advantage of avoiding unnecessary
-remappings.
-
-Fixes: 51c3c62b58b3 ("powerpc: Avoid code patching freed init sections")
-Cc: stable@vger.kernel.org # 4.13+
-Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
-Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/lib/code-patching.c | 20 ++++++++++++--------
- 1 file changed, 12 insertions(+), 8 deletions(-)
-
-diff --git a/arch/powerpc/lib/code-patching.c b/arch/powerpc/lib/code-patching.c
-index 0054b0be8985..882c750dc519 100644
---- a/arch/powerpc/lib/code-patching.c
-+++ b/arch/powerpc/lib/code-patching.c
-@@ -29,12 +29,6 @@ static int __patch_instruction(unsigned int *exec_addr, unsigned int instr,
- {
- 	int err;
- 
--	/* Make sure we aren't patching a freed init section */
--	if (init_mem_is_free && init_section_contains(exec_addr, 4)) {
--		pr_debug("Skipping init section patching addr: 0x%px\n", exec_addr);
--		return 0;
--	}
--
- 	__put_user_size(instr, patch_addr, 4, err);
- 	if (err)
- 		return err;
-@@ -149,7 +143,7 @@ static inline int unmap_patch_area(unsigned long addr)
- 	return 0;
- }
- 
--int patch_instruction(unsigned int *addr, unsigned int instr)
-+static int do_patch_instruction(unsigned int *addr, unsigned int instr)
- {
- 	int err;
- 	unsigned int *patch_addr = NULL;
-@@ -189,12 +183,22 @@ int patch_instruction(unsigned int *addr, unsigned int instr)
- }
- #else /* !CONFIG_STRICT_KERNEL_RWX */
- 
--int patch_instruction(unsigned int *addr, unsigned int instr)
-+static int do_patch_instruction(unsigned int *addr, unsigned int instr)
- {
- 	return raw_patch_instruction(addr, instr);
- }
- 
- #endif /* CONFIG_STRICT_KERNEL_RWX */
-+
-+int patch_instruction(unsigned int *addr, unsigned int instr)
-+{
-+	/* Make sure we aren't patching a freed init section */
-+	if (init_mem_is_free && init_section_contains(addr, 4)) {
-+		pr_debug("Skipping init section patching addr: 0x%px\n", addr);
-+		return 0;
-+	}
-+	return do_patch_instruction(addr, instr);
-+}
- NOKPROBE_SYMBOL(patch_instruction);
- 
- int patch_branch(unsigned int *addr, unsigned long target, int flags)
--- 
-2.28.0
-
-
-From b5dcd4ab8e6c1368048002b8f648a434c4bacae6 Mon Sep 17 00:00:00 2001
-From: Vineet Gupta <vgupta@synopsys.com>
-Date: Fri, 5 Oct 2018 12:48:48 -0700
-Subject: [PATCH 35/45] ARC: clone syscall to setp r25 as thread pointer
-
-commit c58a584f05e35d1d4342923cd7aac07d9c3d3d16 upstream.
-
-Per ARC TLS ABI, r25 is designated TP (thread pointer register).
-However so far kernel didn't do any special treatment, like setting up
-usermode r25, even for CLONE_SETTLS. We instead relied on libc runtime
-to do this, in say clone libc wrapper [1]. This was deliberate to keep
-kernel ABI agnostic (userspace could potentially change TP, specially
-for different ARC ISA say ARCompact vs. ARCv2 with different spare
-registers etc)
-
-However userspace setting up r25, after clone syscall opens a race, if
-child is not scheduled and gets a signal instead. It starts off in
-userspace not in clone but in a signal handler and anything TP sepcific
-there such as pthread_self() fails which showed up with uClibc
-testsuite nptl/tst-kill6 [2]
-
-Fix this by having kernel populate r25 to TP value. So this locks in
-ABI, but it was not going to change anyways, and fwiw is same for both
-ARCompact (arc700 core) and ARCvs (HS3x cores)
-
-[1] https://cgit.uclibc-ng.org/cgi/cgit/uclibc-ng.git/tree/libc/sysdeps/linux/arc/clone.S
-[2] https://github.com/wbx-github/uclibc-ng-test/blob/master/test/nptl/tst-kill6.c
-
-Fixes: ARC STAR 9001378481
-Cc: stable@vger.kernel.org
-Reported-by: Nikita Sobolev <sobolev@synopsys.com>
-Signed-off-by: Vineet Gupta <vgupta@synopsys.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arc/kernel/process.c | 20 ++++++++++++++++++++
- 1 file changed, 20 insertions(+)
-
-diff --git a/arch/arc/kernel/process.c b/arch/arc/kernel/process.c
-index 4674541eba3f..8ce6e7235915 100644
---- a/arch/arc/kernel/process.c
-+++ b/arch/arc/kernel/process.c
-@@ -241,6 +241,26 @@ int copy_thread(unsigned long clone_flags,
- 		task_thread_info(current)->thr_ptr;
- 	}
- 
-+
-+	/*
-+	 * setup usermode thread pointer #1:
-+	 * when child is picked by scheduler, __switch_to() uses @c_callee to
-+	 * populate usermode callee regs: this works (despite being in a kernel
-+	 * function) since special return path for child @ret_from_fork()
-+	 * ensures those regs are not clobbered all the way to RTIE to usermode
-+	 */
-+	c_callee->r25 = task_thread_info(p)->thr_ptr;
-+
-+#ifdef CONFIG_ARC_CURR_IN_REG
-+	/*
-+	 * setup usermode thread pointer #2:
-+	 * however for this special use of r25 in kernel, __switch_to() sets
-+	 * r25 for kernel needs and only in the final return path is usermode
-+	 * r25 setup, from pt_regs->user_r25. So set that up as well
-+	 */
-+	c_regs->user_r25 = c_callee->r25;
-+#endif
-+
- 	return 0;
- }
- 
--- 
-2.28.0
-
-
-From 75fc05a20f5fa0b4e1ccfbf14130c3842adcdbe5 Mon Sep 17 00:00:00 2001
-From: Harsh Jain <harsh@chelsio.com>
-Date: Wed, 19 Sep 2018 22:42:16 +0530
-Subject: [PATCH 36/45] crypto: chelsio - Fix memory corruption in DMA Mapped
- buffers.
-
-commit add92a817e60e308a419693413a38d9d1e663aff upstream.
-
-Update PCI Id in "cpl_rx_phys_dsgl" header. In case pci_chan_id and
-tx_chan_id are not derived from same queue, H/W can send request
-completion indication before completing DMA Transfer.
-
-Herbert, It would be good if fix can be merge to stable tree.
-For 4.14 kernel, It requires some update to avoid mege conficts.
-
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Harsh Jain <harsh@chelsio.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/crypto/chelsio/chcr_algo.c   | 41 ++++++++++++++++++----------
- drivers/crypto/chelsio/chcr_crypto.h |  2 ++
- 2 files changed, 29 insertions(+), 14 deletions(-)
-
 diff --git a/drivers/crypto/chelsio/chcr_algo.c b/drivers/crypto/chelsio/chcr_algo.c
 index 0e8160701833..bb7b59fc5c08 100644
 --- a/drivers/crypto/chelsio/chcr_algo.c
@@ -3225,225 +582,567 @@ index 30af1ee17b87..e039d9aeb651 100644
  	struct __crypto_ctx crypto_ctx[0];
  };
  
--- 
-2.28.0
-
-
-From dfe96e30b5a5cbd4b6a4806ea7f0f779cc4ee015 Mon Sep 17 00:00:00 2001
-From: Jiri Olsa <jolsa@kernel.org>
-Date: Wed, 6 Dec 2017 18:45:35 +0100
-Subject: [PATCH 37/45] perf utils: Move is_directory() to path.h
-
-commit 06c3f2aa9fc68e7f3fe3d83e7569d2a2801d9f99 upstream.
-
-So that it can be used more widely, like in the next patch, when it will
-be used to fix a bug in 'perf test' handling of dirent.d_type ==
-DT_UNKNOWN.
-
-Signed-off-by: Jiri Olsa <jolsa@kernel.org>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Michael Petlan <mpetlan@redhat.com>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Link: http://lkml.kernel.org/r/20171206174535.25380-1-jolsa@kernel.org
-[ Split from a larger patch, removed needless includes in path.h ]
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Cc: Ignat Korchagin <ignat@cloudflare.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/builtin-script.c | 14 +-------------
- tools/perf/util/path.c      | 14 ++++++++++++++
- tools/perf/util/path.h      |  3 +++
- 3 files changed, 18 insertions(+), 13 deletions(-)
-
-diff --git a/tools/perf/builtin-script.c b/tools/perf/builtin-script.c
-index 615fdc63452e..e37653b0f2d0 100644
---- a/tools/perf/builtin-script.c
-+++ b/tools/perf/builtin-script.c
-@@ -25,6 +25,7 @@
- #include "util/string2.h"
- #include "util/thread-stack.h"
- #include "util/time-utils.h"
-+#include "util/path.h"
- #include "print_binary.h"
- #include <linux/bitmap.h>
- #include <linux/kernel.h>
-@@ -2129,19 +2130,6 @@ static int parse_output_fields(const struct option *opt __maybe_unused,
- 	return rc;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+index 9fc3d387eae3..fb36425e21ff 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vce.c
+@@ -231,6 +231,8 @@ int amdgpu_vce_suspend(struct amdgpu_device *adev)
+ {
+ 	int i;
+ 
++	cancel_delayed_work_sync(&adev->vce.idle_work);
++
+ 	if (adev->vce.vcpu_bo == NULL)
+ 		return 0;
+ 
+@@ -241,7 +243,6 @@ int amdgpu_vce_suspend(struct amdgpu_device *adev)
+ 	if (i == AMDGPU_MAX_VCE_HANDLES)
+ 		return 0;
+ 
+-	cancel_delayed_work_sync(&adev->vce.idle_work);
+ 	/* TODO: suspending running encoding sessions isn't supported */
+ 	return -EINVAL;
+ }
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+index 1612d8aa6ad6..fca1b10628a6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_vcn.c
+@@ -155,11 +155,11 @@ int amdgpu_vcn_suspend(struct amdgpu_device *adev)
+ 	unsigned size;
+ 	void *ptr;
+ 
++	cancel_delayed_work_sync(&adev->vcn.idle_work);
++
+ 	if (adev->vcn.vcpu_bo == NULL)
+ 		return 0;
+ 
+-	cancel_delayed_work_sync(&adev->vcn.idle_work);
+-
+ 	size = amdgpu_bo_size(adev->vcn.vcpu_bo);
+ 	ptr = adev->vcn.cpu_addr;
+ 
+diff --git a/drivers/gpu/drm/drm_syncobj.c b/drivers/gpu/drm/drm_syncobj.c
+index 7bcf5702c91c..889c95d4feec 100644
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -96,6 +96,8 @@ static int drm_syncobj_fence_get_or_add_callback(struct drm_syncobj *syncobj,
+ {
+ 	int ret;
+ 
++	WARN_ON(*fence);
++
+ 	*fence = drm_syncobj_fence_get(syncobj);
+ 	if (*fence)
+ 		return 1;
+@@ -656,6 +658,9 @@ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
+ 
+ 	if (flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT) {
+ 		for (i = 0; i < count; ++i) {
++			if (entries[i].fence)
++				continue;
++
+ 			drm_syncobj_fence_get_or_add_callback(syncobjs[i],
+ 							      &entries[i].fence,
+ 							      &entries[i].syncobj_cb,
+diff --git a/drivers/infiniband/core/ucma.c b/drivers/infiniband/core/ucma.c
+index 16423d7ab599..17144a781aeb 100644
+--- a/drivers/infiniband/core/ucma.c
++++ b/drivers/infiniband/core/ucma.c
+@@ -1742,6 +1742,8 @@ static int ucma_close(struct inode *inode, struct file *filp)
+ 		mutex_lock(&mut);
+ 		if (!ctx->closing) {
+ 			mutex_unlock(&mut);
++			ucma_put_ctx(ctx);
++			wait_for_completion(&ctx->comp);
+ 			/* rdma_destroy_id ensures that no event handlers are
+ 			 * inflight for that id before releasing it.
+ 			 */
+diff --git a/drivers/md/dm-cache-metadata.c b/drivers/md/dm-cache-metadata.c
+index 0a5a45f3ec5f..7f1c64c4ad24 100644
+--- a/drivers/md/dm-cache-metadata.c
++++ b/drivers/md/dm-cache-metadata.c
+@@ -1454,8 +1454,8 @@ static int __load_mappings(struct dm_cache_metadata *cmd,
+ 		if (hints_valid) {
+ 			r = dm_array_cursor_next(&cmd->hint_cursor);
+ 			if (r) {
+-				DMERR("dm_array_cursor_next for hint failed");
+-				goto out;
++				dm_array_cursor_end(&cmd->hint_cursor);
++				hints_valid = false;
+ 			}
+ 		}
+ 
+diff --git a/drivers/md/dm-cache-target.c b/drivers/md/dm-cache-target.c
+index a4b7c2698096..e2ea57d5376e 100644
+--- a/drivers/md/dm-cache-target.c
++++ b/drivers/md/dm-cache-target.c
+@@ -3097,8 +3097,13 @@ static dm_cblock_t get_cache_dev_size(struct cache *cache)
+ 
+ static bool can_resize(struct cache *cache, dm_cblock_t new_size)
+ {
+-	if (from_cblock(new_size) > from_cblock(cache->cache_size))
+-		return true;
++	if (from_cblock(new_size) > from_cblock(cache->cache_size)) {
++		if (cache->sized) {
++			DMERR("%s: unable to extend cache due to missing cache table reload",
++			      cache_device_name(cache));
++			return false;
++		}
++	}
+ 
+ 	/*
+ 	 * We can't drop a dirty block when shrinking the cache.
+diff --git a/drivers/net/wireless/ath/ath10k/debug.c b/drivers/net/wireless/ath/ath10k/debug.c
+index df514507d3f1..22003895f854 100644
+--- a/drivers/net/wireless/ath/ath10k/debug.c
++++ b/drivers/net/wireless/ath/ath10k/debug.c
+@@ -1,6 +1,7 @@
+ /*
+  * Copyright (c) 2005-2011 Atheros Communications Inc.
+  * Copyright (c) 2011-2013 Qualcomm Atheros, Inc.
++ * Copyright (c) 2018, The Linux Foundation. All rights reserved.
+  *
+  * Permission to use, copy, modify, and/or distribute this software for any
+  * purpose with or without fee is hereby granted, provided that the above
+@@ -163,6 +164,8 @@ void ath10k_debug_print_hwfw_info(struct ath10k *ar)
+ void ath10k_debug_print_board_info(struct ath10k *ar)
+ {
+ 	char boardinfo[100];
++	const struct firmware *board;
++	u32 crc;
+ 
+ 	if (ar->id.bmi_ids_valid)
+ 		scnprintf(boardinfo, sizeof(boardinfo), "%d:%d",
+@@ -170,11 +173,16 @@ void ath10k_debug_print_board_info(struct ath10k *ar)
+ 	else
+ 		scnprintf(boardinfo, sizeof(boardinfo), "N/A");
+ 
++	board = ar->normal_mode_fw.board;
++	if (!IS_ERR_OR_NULL(board))
++		crc = crc32_le(0, board->data, board->size);
++	else
++		crc = 0;
++
+ 	ath10k_info(ar, "board_file api %d bmi_id %s crc32 %08x",
+ 		    ar->bd_api,
+ 		    boardinfo,
+-		    crc32_le(0, ar->normal_mode_fw.board->data,
+-			     ar->normal_mode_fw.board->size));
++		    crc);
  }
  
--/* Helper function for filesystems that return a dent->d_type DT_UNKNOWN */
--static int is_directory(const char *base_path, const struct dirent *dent)
--{
--	char path[PATH_MAX];
--	struct stat st;
--
--	sprintf(path, "%s/%s", base_path, dent->d_name);
--	if (stat(path, &st))
--		return 0;
--
--	return S_ISDIR(st.st_mode);
--}
--
- #define for_each_lang(scripts_path, scripts_dir, lang_dirent)		\
- 	while ((lang_dirent = readdir(scripts_dir)) != NULL)		\
- 		if ((lang_dirent->d_type == DT_DIR ||			\
-diff --git a/tools/perf/util/path.c b/tools/perf/util/path.c
-index 933f5c6bffb4..ca56ba2dd3da 100644
---- a/tools/perf/util/path.c
-+++ b/tools/perf/util/path.c
-@@ -18,6 +18,7 @@
- #include <stdio.h>
- #include <sys/types.h>
- #include <sys/stat.h>
-+#include <dirent.h>
- #include <unistd.h>
+ void ath10k_debug_print_boot_info(struct ath10k *ar)
+diff --git a/drivers/net/wireless/ath/ath10k/trace.h b/drivers/net/wireless/ath/ath10k/trace.h
+index e0d00cef0bd8..5b974bb76e6c 100644
+--- a/drivers/net/wireless/ath/ath10k/trace.h
++++ b/drivers/net/wireless/ath/ath10k/trace.h
+@@ -152,10 +152,9 @@ TRACE_EVENT(ath10k_log_dbg_dump,
+ );
  
- static char bad_path[] = "/bad-path/";
-@@ -77,3 +78,16 @@ bool is_regular_file(const char *file)
+ TRACE_EVENT(ath10k_wmi_cmd,
+-	TP_PROTO(struct ath10k *ar, int id, const void *buf, size_t buf_len,
+-		 int ret),
++	TP_PROTO(struct ath10k *ar, int id, const void *buf, size_t buf_len),
  
- 	return S_ISREG(st.st_mode);
+-	TP_ARGS(ar, id, buf, buf_len, ret),
++	TP_ARGS(ar, id, buf, buf_len),
+ 
+ 	TP_STRUCT__entry(
+ 		__string(device, dev_name(ar->dev))
+@@ -163,7 +162,6 @@ TRACE_EVENT(ath10k_wmi_cmd,
+ 		__field(unsigned int, id)
+ 		__field(size_t, buf_len)
+ 		__dynamic_array(u8, buf, buf_len)
+-		__field(int, ret)
+ 	),
+ 
+ 	TP_fast_assign(
+@@ -171,17 +169,15 @@ TRACE_EVENT(ath10k_wmi_cmd,
+ 		__assign_str(driver, dev_driver_string(ar->dev));
+ 		__entry->id = id;
+ 		__entry->buf_len = buf_len;
+-		__entry->ret = ret;
+ 		memcpy(__get_dynamic_array(buf), buf, buf_len);
+ 	),
+ 
+ 	TP_printk(
+-		"%s %s id %d len %zu ret %d",
++		"%s %s id %d len %zu",
+ 		__get_str(driver),
+ 		__get_str(device),
+ 		__entry->id,
+-		__entry->buf_len,
+-		__entry->ret
++		__entry->buf_len
+ 	)
+ );
+ 
+diff --git a/drivers/net/wireless/ath/ath10k/wmi-tlv.c b/drivers/net/wireless/ath/ath10k/wmi-tlv.c
+index baec856af90f..b54001e97ced 100644
+--- a/drivers/net/wireless/ath/ath10k/wmi-tlv.c
++++ b/drivers/net/wireless/ath/ath10k/wmi-tlv.c
+@@ -1486,10 +1486,10 @@ ath10k_wmi_tlv_op_gen_start_scan(struct ath10k *ar,
+ 	bssid_len = arg->n_bssids * sizeof(struct wmi_mac_addr);
+ 	ie_len = roundup(arg->ie_len, 4);
+ 	len = (sizeof(*tlv) + sizeof(*cmd)) +
+-	      (arg->n_channels ? sizeof(*tlv) + chan_len : 0) +
+-	      (arg->n_ssids ? sizeof(*tlv) + ssid_len : 0) +
+-	      (arg->n_bssids ? sizeof(*tlv) + bssid_len : 0) +
+-	      (arg->ie_len ? sizeof(*tlv) + ie_len : 0);
++	      sizeof(*tlv) + chan_len +
++	      sizeof(*tlv) + ssid_len +
++	      sizeof(*tlv) + bssid_len +
++	      sizeof(*tlv) + ie_len;
+ 
+ 	skb = ath10k_wmi_alloc_skb(ar, len);
+ 	if (!skb)
+diff --git a/drivers/net/wireless/ath/ath10k/wmi.c b/drivers/net/wireless/ath/ath10k/wmi.c
+index 38a97086708b..2ab5311659ea 100644
+--- a/drivers/net/wireless/ath/ath10k/wmi.c
++++ b/drivers/net/wireless/ath/ath10k/wmi.c
+@@ -1741,8 +1741,8 @@ int ath10k_wmi_cmd_send_nowait(struct ath10k *ar, struct sk_buff *skb,
+ 	cmd_hdr->cmd_id = __cpu_to_le32(cmd);
+ 
+ 	memset(skb_cb, 0, sizeof(*skb_cb));
++	trace_ath10k_wmi_cmd(ar, cmd_id, skb->data, skb->len);
+ 	ret = ath10k_htc_send(&ar->htc, ar->wmi.eid, skb);
+-	trace_ath10k_wmi_cmd(ar, cmd_id, skb->data, skb->len, ret);
+ 
+ 	if (ret)
+ 		goto err_pull;
+diff --git a/drivers/net/xen-netback/hash.c b/drivers/net/xen-netback/hash.c
+index 3c4c58b9fe76..3b6fb5b3bdb2 100644
+--- a/drivers/net/xen-netback/hash.c
++++ b/drivers/net/xen-netback/hash.c
+@@ -332,20 +332,22 @@ u32 xenvif_set_hash_mapping_size(struct xenvif *vif, u32 size)
+ u32 xenvif_set_hash_mapping(struct xenvif *vif, u32 gref, u32 len,
+ 			    u32 off)
+ {
+-	u32 *mapping = &vif->hash.mapping[off];
++	u32 *mapping = vif->hash.mapping;
+ 	struct gnttab_copy copy_op = {
+ 		.source.u.ref = gref,
+ 		.source.domid = vif->domid,
+-		.dest.u.gmfn = virt_to_gfn(mapping),
+ 		.dest.domid = DOMID_SELF,
+-		.dest.offset = xen_offset_in_page(mapping),
+-		.len = len * sizeof(u32),
++		.len = len * sizeof(*mapping),
+ 		.flags = GNTCOPY_source_gref
+ 	};
+ 
+-	if ((off + len > vif->hash.size) || copy_op.len > XEN_PAGE_SIZE)
++	if ((off + len < off) || (off + len > vif->hash.size) ||
++	    len > XEN_PAGE_SIZE / sizeof(*mapping))
+ 		return XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
+ 
++	copy_op.dest.u.gmfn = virt_to_gfn(mapping + off);
++	copy_op.dest.offset = xen_offset_in_page(mapping + off);
++
+ 	while (len-- != 0)
+ 		if (mapping[off++] >= vif->num_queues)
+ 			return XEN_NETIF_CTRL_STATUS_INVALID_PARAMETER;
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index 7deb7b5d8683..058d542647dd 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2868,6 +2868,10 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 	}
+ 
+ 	if (ret) {
++		nvme_change_ctrl_state(&ctrl->ctrl, NVME_CTRL_DELETING);
++		cancel_work_sync(&ctrl->ctrl.reset_work);
++		cancel_delayed_work_sync(&ctrl->connect_work);
++
+ 		/* couldn't schedule retry - fail out */
+ 		dev_err(ctrl->ctrl.device,
+ 			"NVME-FC{%d}: Connect retry failed\n", ctrl->cnum);
+diff --git a/drivers/of/unittest.c b/drivers/of/unittest.c
+index 985a85f281a8..7c6aff761800 100644
+--- a/drivers/of/unittest.c
++++ b/drivers/of/unittest.c
+@@ -614,6 +614,9 @@ static void __init of_unittest_parse_interrupts(void)
+ 	struct of_phandle_args args;
+ 	int i, rc;
+ 
++	if (of_irq_workarounds & OF_IMAP_OLDWORLD_MAC)
++		return;
++
+ 	np = of_find_node_by_path("/testcase-data/interrupts/interrupts0");
+ 	if (!np) {
+ 		pr_err("missing testcase data\n");
+@@ -688,6 +691,9 @@ static void __init of_unittest_parse_interrupts_extended(void)
+ 	struct of_phandle_args args;
+ 	int i, rc;
+ 
++	if (of_irq_workarounds & OF_IMAP_OLDWORLD_MAC)
++		return;
++
+ 	np = of_find_node_by_path("/testcase-data/interrupts/interrupts-extended0");
+ 	if (!np) {
+ 		pr_err("missing testcase data\n");
+@@ -844,15 +850,19 @@ static void __init of_unittest_platform_populate(void)
+ 	pdev = of_find_device_by_node(np);
+ 	unittest(pdev, "device 1 creation failed\n");
+ 
+-	irq = platform_get_irq(pdev, 0);
+-	unittest(irq == -EPROBE_DEFER, "device deferred probe failed - %d\n", irq);
++	if (!(of_irq_workarounds & OF_IMAP_OLDWORLD_MAC)) {
++		irq = platform_get_irq(pdev, 0);
++		unittest(irq == -EPROBE_DEFER,
++			 "device deferred probe failed - %d\n", irq);
+ 
+-	/* Test that a parsing failure does not return -EPROBE_DEFER */
+-	np = of_find_node_by_path("/testcase-data/testcase-device2");
+-	pdev = of_find_device_by_node(np);
+-	unittest(pdev, "device 2 creation failed\n");
+-	irq = platform_get_irq(pdev, 0);
+-	unittest(irq < 0 && irq != -EPROBE_DEFER, "device parsing error failed - %d\n", irq);
++		/* Test that a parsing failure does not return -EPROBE_DEFER */
++		np = of_find_node_by_path("/testcase-data/testcase-device2");
++		pdev = of_find_device_by_node(np);
++		unittest(pdev, "device 2 creation failed\n");
++		irq = platform_get_irq(pdev, 0);
++		unittest(irq < 0 && irq != -EPROBE_DEFER,
++			 "device parsing error failed - %d\n", irq);
++	}
+ 
+ 	np = of_find_node_by_path("/testcase-data/platform-tests");
+ 	unittest(np, "No testcase data in device tree\n");
+diff --git a/drivers/pci/pci.c b/drivers/pci/pci.c
+index 22924629e64a..1af30c881566 100644
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@ -1112,12 +1112,12 @@ int pci_save_state(struct pci_dev *dev)
+ EXPORT_SYMBOL(pci_save_state);
+ 
+ static void pci_restore_config_dword(struct pci_dev *pdev, int offset,
+-				     u32 saved_val, int retry)
++				     u32 saved_val, int retry, bool force)
+ {
+ 	u32 val;
+ 
+ 	pci_read_config_dword(pdev, offset, &val);
+-	if (val == saved_val)
++	if (!force && val == saved_val)
+ 		return;
+ 
+ 	for (;;) {
+@@ -1136,25 +1136,36 @@ static void pci_restore_config_dword(struct pci_dev *pdev, int offset,
  }
-+
-+/* Helper function for filesystems that return a dent->d_type DT_UNKNOWN */
-+bool is_directory(const char *base_path, const struct dirent *dent)
-+{
-+	char path[PATH_MAX];
-+	struct stat st;
-+
-+	sprintf(path, "%s/%s", base_path, dent->d_name);
-+	if (stat(path, &st))
-+		return false;
-+
-+	return S_ISDIR(st.st_mode);
-+}
-diff --git a/tools/perf/util/path.h b/tools/perf/util/path.h
-index 14a254ada7eb..f014f905df50 100644
---- a/tools/perf/util/path.h
-+++ b/tools/perf/util/path.h
-@@ -2,9 +2,12 @@
- #ifndef _PERF_PATH_H
- #define _PERF_PATH_H
  
-+struct dirent;
+ static void pci_restore_config_space_range(struct pci_dev *pdev,
+-					   int start, int end, int retry)
++					   int start, int end, int retry,
++					   bool force)
+ {
+ 	int index;
+ 
+ 	for (index = end; index >= start; index--)
+ 		pci_restore_config_dword(pdev, 4 * index,
+ 					 pdev->saved_config_space[index],
+-					 retry);
++					 retry, force);
+ }
+ 
+ static void pci_restore_config_space(struct pci_dev *pdev)
+ {
+ 	if (pdev->hdr_type == PCI_HEADER_TYPE_NORMAL) {
+-		pci_restore_config_space_range(pdev, 10, 15, 0);
++		pci_restore_config_space_range(pdev, 10, 15, 0, false);
+ 		/* Restore BARs before the command register. */
+-		pci_restore_config_space_range(pdev, 4, 9, 10);
+-		pci_restore_config_space_range(pdev, 0, 3, 0);
++		pci_restore_config_space_range(pdev, 4, 9, 10, false);
++		pci_restore_config_space_range(pdev, 0, 3, 0, false);
++	} else if (pdev->hdr_type == PCI_HEADER_TYPE_BRIDGE) {
++		pci_restore_config_space_range(pdev, 12, 15, 0, false);
 +
- int path__join(char *bf, size_t size, const char *path1, const char *path2);
- int path__join3(char *bf, size_t size, const char *path1, const char *path2, const char *path3);
++		/*
++		 * Force rewriting of prefetch registers to avoid S3 resume
++		 * issues on Intel PCI bridges that occur when these
++		 * registers are not explicitly written.
++		 */
++		pci_restore_config_space_range(pdev, 9, 11, 0, true);
++		pci_restore_config_space_range(pdev, 0, 8, 0, false);
+ 	} else {
+-		pci_restore_config_space_range(pdev, 0, 15, 0);
++		pci_restore_config_space_range(pdev, 0, 15, 0, false);
+ 	}
+ }
  
- bool is_regular_file(const char *file);
-+bool is_directory(const char *base_path, const struct dirent *dent);
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index 562d31073f9a..8d65b2f9ee80 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -1254,6 +1254,7 @@ static void tty_driver_remove_tty(struct tty_driver *driver, struct tty_struct *
+ static int tty_reopen(struct tty_struct *tty)
+ {
+ 	struct tty_driver *driver = tty->driver;
++	int retval;
  
- #endif /* _PERF_PATH_H */
--- 
-2.28.0
-
-
-From 3a7a9fb68c97ed1891fdd3843947e1d68e0252e8 Mon Sep 17 00:00:00 2001
-From: Chao Yu <yuchao0@huawei.com>
-Date: Thu, 2 Aug 2018 22:59:12 +0800
-Subject: [PATCH 38/45] f2fs: fix invalid memory access
-
-commit d3f07c049dab1a3f1740f476afd3d5e5b738c21c upstream.
-
-syzbot found the following crash on:
-
-HEAD commit:    d9bd94c0bcaa Add linux-next specific files for 20180801
-git tree:       linux-next
-console output: https://syzkaller.appspot.com/x/log.txt?x=1001189c400000
-kernel config:  https://syzkaller.appspot.com/x/.config?x=cc8964ea4d04518c
-dashboard link: https://syzkaller.appspot.com/bug?extid=c966a82db0b14aa37e81
-compiler:       gcc (GCC) 8.0.1 20180413 (experimental)
-
-Unfortunately, I don't have any reproducer for this crash yet.
-
-IMPORTANT: if you fix the bug, please add the following tag to the commit:
-Reported-by: syzbot+c966a82db0b14aa37e81@syzkaller.appspotmail.com
-
-loop7: rw=12288, want=8200, limit=20
-netlink: 65342 bytes leftover after parsing attributes in process `syz-executor4'.
-openvswitch: netlink: Message has 8 unknown bytes.
-kasan: CONFIG_KASAN_INLINE enabled
-kasan: GPF could be caused by NULL-ptr deref or user memory access
-general protection fault: 0000 [#1] SMP KASAN
-CPU: 1 PID: 7615 Comm: syz-executor7 Not tainted 4.18.0-rc7-next-20180801+ #29
-Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
-RIP: 0010:__read_once_size include/linux/compiler.h:188 [inline]
-RIP: 0010:compound_head include/linux/page-flags.h:142 [inline]
-RIP: 0010:PageLocked include/linux/page-flags.h:272 [inline]
-RIP: 0010:f2fs_put_page fs/f2fs/f2fs.h:2011 [inline]
-RIP: 0010:validate_checkpoint+0x66d/0xec0 fs/f2fs/checkpoint.c:835
-Code: e8 58 05 7f fe 4c 8d 6b 80 4d 8d 74 24 08 48 b8 00 00 00 00 00 fc ff df 4c 89 ea 48 c1 ea 03 c6 04 02 00 4c 89 f2 48 c1 ea 03 <80> 3c 02 00 0f 85 f4 06 00 00 4c 89 ea 4d 8b 7c 24 08 48 b8 00 00
-RSP: 0018:ffff8801937cebe8 EFLAGS: 00010246
-RAX: dffffc0000000000 RBX: ffff8801937cef30 RCX: ffffc90006035000
-RDX: 0000000000000000 RSI: ffffffff82fd9658 RDI: 0000000000000005
-RBP: ffff8801937cef58 R08: ffff8801ab254700 R09: fffff94000d9e026
-R10: fffff94000d9e026 R11: ffffea0006cf0137 R12: fffffffffffffffb
-R13: ffff8801937ceeb0 R14: 0000000000000003 R15: ffff880193419b40
-FS:  00007f36a61d5700(0000) GS:ffff8801db100000(0000) knlGS:0000000000000000
-CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-CR2: 00007fc04ff93000 CR3: 00000001d0562000 CR4: 00000000001426e0
-DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
-DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
-Call Trace:
- f2fs_get_valid_checkpoint+0x436/0x1ec0 fs/f2fs/checkpoint.c:860
- f2fs_fill_super+0x2d42/0x8110 fs/f2fs/super.c:2883
- mount_bdev+0x314/0x3e0 fs/super.c:1344
- f2fs_mount+0x3c/0x50 fs/f2fs/super.c:3133
- legacy_get_tree+0x131/0x460 fs/fs_context.c:729
- vfs_get_tree+0x1cb/0x5c0 fs/super.c:1743
- do_new_mount fs/namespace.c:2603 [inline]
- do_mount+0x6f2/0x1e20 fs/namespace.c:2927
- ksys_mount+0x12d/0x140 fs/namespace.c:3143
- __do_sys_mount fs/namespace.c:3157 [inline]
- __se_sys_mount fs/namespace.c:3154 [inline]
- __x64_sys_mount+0xbe/0x150 fs/namespace.c:3154
- do_syscall_64+0x1b9/0x820 arch/x86/entry/common.c:290
- entry_SYSCALL_64_after_hwframe+0x49/0xbe
-RIP: 0033:0x45943a
-Code: b8 a6 00 00 00 0f 05 48 3d 01 f0 ff ff 0f 83 bd 8a fb ff c3 66 2e 0f 1f 84 00 00 00 00 00 66 90 49 89 ca b8 a5 00 00 00 0f 05 <48> 3d 01 f0 ff ff 0f 83 9a 8a fb ff c3 66 0f 1f 84 00 00 00 00 00
-RSP: 002b:00007f36a61d4a88 EFLAGS: 00000206 ORIG_RAX: 00000000000000a5
-RAX: ffffffffffffffda RBX: 00007f36a61d4b30 RCX: 000000000045943a
-RDX: 00007f36a61d4ad0 RSI: 0000000020000100 RDI: 00007f36a61d4af0
-RBP: 0000000020000100 R08: 00007f36a61d4b30 R09: 00007f36a61d4ad0
-R10: 0000000000000000 R11: 0000000000000206 R12: 0000000000000013
-R13: 0000000000000000 R14: 00000000004c8ea0 R15: 0000000000000000
-Modules linked in:
-Dumping ftrace buffer:
-   (ftrace buffer empty)
----[ end trace bd8550c129352286 ]---
-RIP: 0010:__read_once_size include/linux/compiler.h:188 [inline]
-RIP: 0010:compound_head include/linux/page-flags.h:142 [inline]
-RIP: 0010:PageLocked include/linux/page-flags.h:272 [inline]
-RIP: 0010:f2fs_put_page fs/f2fs/f2fs.h:2011 [inline]
-RIP: 0010:validate_checkpoint+0x66d/0xec0 fs/f2fs/checkpoint.c:835
-Code: e8 58 05 7f fe 4c 8d 6b 80 4d 8d 74 24 08 48 b8 00 00 00 00 00 fc ff df 4c 89 ea 48 c1 ea 03 c6 04 02 00 4c 89 f2 48 c1 ea 03 <80> 3c 02 00 0f 85 f4 06 00 00 4c 89 ea 4d 8b 7c 24 08 48 b8 00 00
-RSP: 0018:ffff8801937cebe8 EFLAGS: 00010246
-RAX: dffffc0000000000 RBX: ffff8801937cef30 RCX: ffffc90006035000
-RDX: 0000000000000000 RSI: ffffffff82fd9658 RDI: 0000000000000005
-netlink: 65342 bytes leftover after parsing attributes in process `syz-executor4'.
-RBP: ffff8801937cef58 R08: ffff8801ab254700 R09: fffff94000d9e026
-openvswitch: netlink: Message has 8 unknown bytes.
-R10: fffff94000d9e026 R11: ffffea0006cf0137 R12: fffffffffffffffb
-R13: ffff8801937ceeb0 R14: 0000000000000003 R15: ffff880193419b40
-FS:  00007f36a61d5700(0000) GS:ffff8801db100000(0000) knlGS:0000000000000000
-CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-CR2: 00007fc04ff93000 CR3: 00000001d0562000 CR4: 00000000001426e0
-DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
-DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
-
-In validate_checkpoint(), if we failed to call get_checkpoint_version(), we
-will pass returned invalid page pointer into f2fs_put_page, cause accessing
-invalid memory, this patch tries to handle error path correctly to fix this
-issue.
-
-Signed-off-by: Chao Yu <yuchao0@huawei.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-
-Signed-off-by: Jaegeuk Kim <jaegeuk@kernel.org>
----
- fs/f2fs/checkpoint.c | 9 +++++----
- 1 file changed, 5 insertions(+), 4 deletions(-)
-
+ 	if (driver->type == TTY_DRIVER_TYPE_PTY &&
+ 	    driver->subtype == PTY_TYPE_MASTER)
+@@ -1267,10 +1268,14 @@ static int tty_reopen(struct tty_struct *tty)
+ 
+ 	tty->count++;
+ 
+-	if (!tty->ldisc)
+-		return tty_ldisc_reinit(tty, tty->termios.c_line);
++	if (tty->ldisc)
++		return 0;
+ 
+-	return 0;
++	retval = tty_ldisc_reinit(tty, tty->termios.c_line);
++	if (retval)
++		tty->count--;
++
++	return retval;
+ }
+ 
+ /**
+diff --git a/drivers/usb/class/cdc-acm.c b/drivers/usb/class/cdc-acm.c
+index feaa0d8f830a..9f6f402470ac 100644
+--- a/drivers/usb/class/cdc-acm.c
++++ b/drivers/usb/class/cdc-acm.c
+@@ -1527,6 +1527,7 @@ static void acm_disconnect(struct usb_interface *intf)
+ {
+ 	struct acm *acm = usb_get_intfdata(intf);
+ 	struct tty_struct *tty;
++	int i;
+ 
+ 	/* sibling interface is already cleaning up */
+ 	if (!acm)
+@@ -1557,6 +1558,11 @@ static void acm_disconnect(struct usb_interface *intf)
+ 
+ 	tty_unregister_device(acm_tty_driver, acm->minor);
+ 
++	usb_free_urb(acm->ctrlurb);
++	for (i = 0; i < ACM_NW; i++)
++		usb_free_urb(acm->wb[i].urb);
++	for (i = 0; i < acm->rx_buflimit; i++)
++		usb_free_urb(acm->read_urbs[i]);
+ 	acm_write_buffers_free(acm);
+ 	usb_free_coherent(acm->dev, acm->ctrlsize, acm->ctrl_buffer, acm->ctrl_dma);
+ 	acm_read_buffers_free(acm);
+diff --git a/drivers/usb/host/xhci-mtk.c b/drivers/usb/host/xhci-mtk.c
+index 8fb60657ed4f..510d28a9d190 100644
+--- a/drivers/usb/host/xhci-mtk.c
++++ b/drivers/usb/host/xhci-mtk.c
+@@ -780,10 +780,10 @@ static int __maybe_unused xhci_mtk_resume(struct device *dev)
+ 	xhci_mtk_host_enable(mtk);
+ 
+ 	xhci_dbg(xhci, "%s: restart port polling\n", __func__);
+-	set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
+-	usb_hcd_poll_rh_status(hcd);
+ 	set_bit(HCD_FLAG_POLL_RH, &xhci->shared_hcd->flags);
+ 	usb_hcd_poll_rh_status(xhci->shared_hcd);
++	set_bit(HCD_FLAG_POLL_RH, &hcd->flags);
++	usb_hcd_poll_rh_status(hcd);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/usb/host/xhci-pci.c b/drivers/usb/host/xhci-pci.c
+index 838d37e79fa2..9218f506f8e3 100644
+--- a/drivers/usb/host/xhci-pci.c
++++ b/drivers/usb/host/xhci-pci.c
+@@ -196,6 +196,8 @@ static void xhci_pci_quirks(struct device *dev, struct xhci_hcd *xhci)
+ 	}
+ 	if (pdev->vendor == PCI_VENDOR_ID_INTEL &&
+ 	    (pdev->device == PCI_DEVICE_ID_INTEL_CHERRYVIEW_XHCI ||
++	     pdev->device == PCI_DEVICE_ID_INTEL_SUNRISEPOINT_LP_XHCI ||
++	     pdev->device == PCI_DEVICE_ID_INTEL_SUNRISEPOINT_H_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_APL_XHCI ||
+ 	     pdev->device == PCI_DEVICE_ID_INTEL_DNV_XHCI))
+ 		xhci->quirks |= XHCI_MISSING_CAS;
+diff --git a/drivers/usb/serial/usb-serial-simple.c b/drivers/usb/serial/usb-serial-simple.c
+index 2674da40d9cd..6d6acf2c07c3 100644
+--- a/drivers/usb/serial/usb-serial-simple.c
++++ b/drivers/usb/serial/usb-serial-simple.c
+@@ -87,7 +87,8 @@ DEVICE(moto_modem, MOTO_IDS);
+ 
+ /* Motorola Tetra driver */
+ #define MOTOROLA_TETRA_IDS()			\
+-	{ USB_DEVICE(0x0cad, 0x9011) }	/* Motorola Solutions TETRA PEI */
++	{ USB_DEVICE(0x0cad, 0x9011) },	/* Motorola Solutions TETRA PEI */ \
++	{ USB_DEVICE(0x0cad, 0x9012) }	/* MTP6550 */
+ DEVICE(motorola_tetra, MOTOROLA_TETRA_IDS);
+ 
+ /* Novatel Wireless GPS driver */
+diff --git a/drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c b/drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c
+index ef69273074ba..a3edb20ea4c3 100644
+--- a/drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c
++++ b/drivers/video/fbdev/omap2/omapfb/omapfb-ioctl.c
+@@ -496,6 +496,9 @@ static int omapfb_memory_read(struct fb_info *fbi,
+ 	if (!access_ok(VERIFY_WRITE, mr->buffer, mr->buffer_size))
+ 		return -EFAULT;
+ 
++	if (mr->w > 4096 || mr->h > 4096)
++		return -EINVAL;
++
+ 	if (mr->w * mr->h * 3 > mr->buffer_size)
+ 		return -EINVAL;
+ 
+@@ -509,7 +512,7 @@ static int omapfb_memory_read(struct fb_info *fbi,
+ 			mr->x, mr->y, mr->w, mr->h);
+ 
+ 	if (r > 0) {
+-		if (copy_to_user(mr->buffer, buf, mr->buffer_size))
++		if (copy_to_user(mr->buffer, buf, r))
+ 			r = -EFAULT;
+ 	}
+ 
+diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
+index 36c9fbf70d44..d9873aa014a6 100644
+--- a/drivers/virtio/virtio_balloon.c
++++ b/drivers/virtio/virtio_balloon.c
+@@ -143,16 +143,17 @@ static void set_page_pfns(struct virtio_balloon *vb,
+ 
+ static unsigned fill_balloon(struct virtio_balloon *vb, size_t num)
+ {
+-	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info;
+ 	unsigned num_allocated_pages;
++	unsigned num_pfns;
++	struct page *page;
++	LIST_HEAD(pages);
+ 
+ 	/* We can only do one array worth at a time. */
+ 	num = min(num, ARRAY_SIZE(vb->pfns));
+ 
+-	mutex_lock(&vb->balloon_lock);
+-	for (vb->num_pfns = 0; vb->num_pfns < num;
+-	     vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
+-		struct page *page = balloon_page_enqueue(vb_dev_info);
++	for (num_pfns = 0; num_pfns < num;
++	     num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
++		struct page *page = balloon_page_alloc();
+ 
+ 		if (!page) {
+ 			dev_info_ratelimited(&vb->vdev->dev,
+@@ -162,11 +163,23 @@ static unsigned fill_balloon(struct virtio_balloon *vb, size_t num)
+ 			msleep(200);
+ 			break;
+ 		}
++
++		balloon_page_push(&pages, page);
++	}
++
++	mutex_lock(&vb->balloon_lock);
++
++	vb->num_pfns = 0;
++
++	while ((page = balloon_page_pop(&pages))) {
++		balloon_page_enqueue(&vb->vb_dev_info, page);
++
+ 		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
+ 		vb->num_pages += VIRTIO_BALLOON_PAGES_PER_PAGE;
+ 		if (!virtio_has_feature(vb->vdev,
+ 					VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
+ 			adjust_managed_page_count(page, -1);
++		vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE;
+ 	}
+ 
+ 	num_allocated_pages = vb->num_pfns;
 diff --git a/fs/f2fs/checkpoint.c b/fs/f2fs/checkpoint.c
 index c282e21f5b5e..41fce930f44c 100644
 --- a/fs/f2fs/checkpoint.c
@@ -3492,97 +1191,6 @@ index c282e21f5b5e..41fce930f44c 100644
  	f2fs_put_page(cp_page_1, 1);
  	return NULL;
  }
--- 
-2.28.0
-
-
-From 5656b735418363abdeda50027c627fb9542336f6 Mon Sep 17 00:00:00 2001
-From: Cong Wang <xiyou.wangcong@gmail.com>
-Date: Wed, 12 Sep 2018 16:27:44 -0700
-Subject: [PATCH 39/45] ucma: fix a use-after-free in ucma_resolve_ip()
-
-commit 5fe23f262e0548ca7f19fb79f89059a60d087d22 upstream.
-
-There is a race condition between ucma_close() and ucma_resolve_ip():
-
-CPU0				CPU1
-ucma_resolve_ip():		ucma_close():
-
-ctx = ucma_get_ctx(file, cmd.id);
-
-        list_for_each_entry_safe(ctx, tmp, &file->ctx_list, list) {
-                mutex_lock(&mut);
-                idr_remove(&ctx_idr, ctx->id);
-                mutex_unlock(&mut);
-		...
-                mutex_lock(&mut);
-                if (!ctx->closing) {
-                        mutex_unlock(&mut);
-                        rdma_destroy_id(ctx->cm_id);
-		...
-                ucma_free_ctx(ctx);
-
-ret = rdma_resolve_addr();
-ucma_put_ctx(ctx);
-
-Before idr_remove(), ucma_get_ctx() could still find the ctx
-and after rdma_destroy_id(), rdma_resolve_addr() may still
-access id_priv pointer. Also, ucma_put_ctx() may use ctx after
-ucma_free_ctx() too.
-
-ucma_close() should call ucma_put_ctx() too which tests the
-refcnt and waits for the last one releasing it. The similar
-pattern is already used by ucma_destroy_id().
-
-Reported-and-tested-by: syzbot+da2591e115d57a9cbb8b@syzkaller.appspotmail.com
-Reported-by: syzbot+cfe3c1e8ef634ba8964b@syzkaller.appspotmail.com
-Cc: Jason Gunthorpe <jgg@mellanox.com>
-Cc: Doug Ledford <dledford@redhat.com>
-Cc: Leon Romanovsky <leon@kernel.org>
-Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
-Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
-Signed-off-by: Doug Ledford <dledford@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/core/ucma.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/drivers/infiniband/core/ucma.c b/drivers/infiniband/core/ucma.c
-index 16423d7ab599..17144a781aeb 100644
---- a/drivers/infiniband/core/ucma.c
-+++ b/drivers/infiniband/core/ucma.c
-@@ -1742,6 +1742,8 @@ static int ucma_close(struct inode *inode, struct file *filp)
- 		mutex_lock(&mut);
- 		if (!ctx->closing) {
- 			mutex_unlock(&mut);
-+			ucma_put_ctx(ctx);
-+			wait_for_completion(&ctx->comp);
- 			/* rdma_destroy_id ensures that no event handlers are
- 			 * inflight for that id before releasing it.
- 			 */
--- 
-2.28.0
-
-
-From 4c925efc22301608ffef444dc45cc07adc931bd3 Mon Sep 17 00:00:00 2001
-From: Richard Weinberger <richard@nod.at>
-Date: Mon, 3 Sep 2018 23:06:23 +0200
-Subject: [PATCH 40/45] ubifs: Check for name being NULL while mounting
-
-commit 37f31b6ca4311b94d985fb398a72e5399ad57925 upstream.
-
-The requested device name can be NULL or an empty string.
-Check for that and refuse to continue. UBIFS has to do this manually
-since we cannot use mount_bdev(), which checks for this condition.
-
-Fixes: 1e51764a3c2ac ("UBIFS: add new flash file system")
-Reported-by: syzbot+38bd0f7865e5c6379280@syzkaller.appspotmail.com
-Signed-off-by: Richard Weinberger <richard@nod.at>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ubifs/super.c | 3 +++
- 1 file changed, 3 insertions(+)
-
 diff --git a/fs/ubifs/super.c b/fs/ubifs/super.c
 index e1cd3dcf5a03..ad827cf642fe 100644
 --- a/fs/ubifs/super.c
@@ -3597,38 +1205,362 @@ index e1cd3dcf5a03..ad827cf642fe 100644
  	/* First, try to open using the device node path method */
  	ubi = ubi_open_volume_path(name, mode);
  	if (!IS_ERR(ubi))
--- 
-2.28.0
-
-
-From 251bc1f44c33a8707d9bd0a1eef459224ab5da99 Mon Sep 17 00:00:00 2001
-From: Ka-Cheong Poon <ka-cheong.poon@oracle.com>
-Date: Mon, 30 Jul 2018 22:48:41 -0700
-Subject: [PATCH 41/45] rds: rds_ib_recv_alloc_cache() should call
- alloc_percpu_gfp() instead
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit f394ad28feffbeebab77c8bf9a203bd49b957c9a upstream.
-
-Currently, rds_ib_conn_alloc() calls rds_ib_recv_alloc_caches()
-without passing along the gfp_t flag.  But rds_ib_recv_alloc_caches()
-and rds_ib_recv_alloc_cache() should take a gfp_t parameter so that
-rds_ib_recv_alloc_cache() can call alloc_percpu_gfp() using the
-correct flag instead of calling alloc_percpu().
-
-Signed-off-by: Ka-Cheong Poon <ka-cheong.poon@oracle.com>
-Acked-by: Santosh Shilimkar <santosh.shilimkar@oracle.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Cc: Håkon Bugge <haakon.bugge@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/rds/ib.h      |  2 +-
- net/rds/ib_cm.c   |  2 +-
- net/rds/ib_recv.c | 10 +++++-----
- 3 files changed, 7 insertions(+), 7 deletions(-)
-
+diff --git a/include/linux/balloon_compaction.h b/include/linux/balloon_compaction.h
+index fbbe6da40fed..53051f3d8f25 100644
+--- a/include/linux/balloon_compaction.h
++++ b/include/linux/balloon_compaction.h
+@@ -50,6 +50,7 @@
+ #include <linux/gfp.h>
+ #include <linux/err.h>
+ #include <linux/fs.h>
++#include <linux/list.h>
+ 
+ /*
+  * Balloon device information descriptor.
+@@ -67,7 +68,9 @@ struct balloon_dev_info {
+ 	struct inode *inode;
+ };
+ 
+-extern struct page *balloon_page_enqueue(struct balloon_dev_info *b_dev_info);
++extern struct page *balloon_page_alloc(void);
++extern void balloon_page_enqueue(struct balloon_dev_info *b_dev_info,
++				 struct page *page);
+ extern struct page *balloon_page_dequeue(struct balloon_dev_info *b_dev_info);
+ 
+ static inline void balloon_devinfo_init(struct balloon_dev_info *balloon)
+@@ -193,4 +196,34 @@ static inline gfp_t balloon_mapping_gfp_mask(void)
+ }
+ 
+ #endif /* CONFIG_BALLOON_COMPACTION */
++
++/*
++ * balloon_page_push - insert a page into a page list.
++ * @head : pointer to list
++ * @page : page to be added
++ *
++ * Caller must ensure the page is private and protect the list.
++ */
++static inline void balloon_page_push(struct list_head *pages, struct page *page)
++{
++	list_add(&page->lru, pages);
++}
++
++/*
++ * balloon_page_pop - remove a page from a page list.
++ * @head : pointer to list
++ * @page : page to be added
++ *
++ * Caller must ensure the page is private and protect the list.
++ */
++static inline struct page *balloon_page_pop(struct list_head *pages)
++{
++	struct page *page = list_first_entry_or_null(pages, struct page, lru);
++
++	if (!page)
++		return NULL;
++
++	list_del(&page->lru);
++	return page;
++}
+ #endif /* _LINUX_BALLOON_COMPACTION_H */
+diff --git a/include/linux/hugetlb.h b/include/linux/hugetlb.h
+index 82a25880714a..7aa2de25c09c 100644
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@ -140,6 +140,8 @@ pte_t *huge_pte_alloc(struct mm_struct *mm,
+ pte_t *huge_pte_offset(struct mm_struct *mm,
+ 		       unsigned long addr, unsigned long sz);
+ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep);
++void adjust_range_if_pmd_sharing_possible(struct vm_area_struct *vma,
++				unsigned long *start, unsigned long *end);
+ struct page *follow_huge_addr(struct mm_struct *mm, unsigned long address,
+ 			      int write);
+ struct page *follow_huge_pd(struct vm_area_struct *vma,
+@@ -169,6 +171,18 @@ static inline unsigned long hugetlb_total_pages(void)
+ 	return 0;
+ }
+ 
++static inline int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr,
++					pte_t *ptep)
++{
++	return 0;
++}
++
++static inline void adjust_range_if_pmd_sharing_possible(
++				struct vm_area_struct *vma,
++				unsigned long *start, unsigned long *end)
++{
++}
++
+ #define follow_hugetlb_page(m,v,p,vs,a,b,i,w,n)	({ BUG(); 0; })
+ #define follow_huge_addr(mm, addr, write)	ERR_PTR(-EINVAL)
+ #define copy_hugetlb_page_range(src, dst, vma)	({ BUG(); 0; })
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index a26cf767407e..58f2263de4de 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -2322,6 +2322,12 @@ static inline struct vm_area_struct *find_exact_vma(struct mm_struct *mm,
+ 	return vma;
+ }
+ 
++static inline bool range_in_vma(struct vm_area_struct *vma,
++				unsigned long start, unsigned long end)
++{
++	return (vma && vma->vm_start <= start && end <= vma->vm_end);
++}
++
+ #ifdef CONFIG_MMU
+ pgprot_t vm_get_page_prot(unsigned long vm_flags);
+ void vma_set_page_prot(struct vm_area_struct *vma);
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 812ebf1cbb87..4dbce29a9313 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -3757,6 +3757,12 @@ int perf_event_read_local(struct perf_event *event, u64 *value)
+ 		goto out;
+ 	}
+ 
++	/* If this is a pinned event it must be running on this CPU */
++	if (event->attr.pinned && event->oncpu != smp_processor_id()) {
++		ret = -EBUSY;
++		goto out;
++	}
++
+ 	/*
+ 	 * If the event is currently on this CPU, its either a per-task event,
+ 	 * or local to this CPU. Furthermore it means its ACTIVE (otherwise
+diff --git a/mm/balloon_compaction.c b/mm/balloon_compaction.c
+index 68d28924ba79..ef858d547e2d 100644
+--- a/mm/balloon_compaction.c
++++ b/mm/balloon_compaction.c
+@@ -10,23 +10,38 @@
+ #include <linux/export.h>
+ #include <linux/balloon_compaction.h>
+ 
++/*
++ * balloon_page_alloc - allocates a new page for insertion into the balloon
++ *			  page list.
++ *
++ * Driver must call it to properly allocate a new enlisted balloon page.
++ * Driver must call balloon_page_enqueue before definitively removing it from
++ * the guest system.  This function returns the page address for the recently
++ * allocated page or NULL in the case we fail to allocate a new page this turn.
++ */
++struct page *balloon_page_alloc(void)
++{
++	struct page *page = alloc_page(balloon_mapping_gfp_mask() |
++				       __GFP_NOMEMALLOC | __GFP_NORETRY);
++	return page;
++}
++EXPORT_SYMBOL_GPL(balloon_page_alloc);
++
+ /*
+  * balloon_page_enqueue - allocates a new page and inserts it into the balloon
+  *			  page list.
+  * @b_dev_info: balloon device descriptor where we will insert a new page to
++ * @page: new page to enqueue - allocated using balloon_page_alloc.
+  *
+- * Driver must call it to properly allocate a new enlisted balloon page
++ * Driver must call it to properly enqueue a new allocated balloon page
+  * before definitively removing it from the guest system.
+  * This function returns the page address for the recently enqueued page or
+  * NULL in the case we fail to allocate a new page this turn.
+  */
+-struct page *balloon_page_enqueue(struct balloon_dev_info *b_dev_info)
++void balloon_page_enqueue(struct balloon_dev_info *b_dev_info,
++			  struct page *page)
+ {
+ 	unsigned long flags;
+-	struct page *page = alloc_page(balloon_mapping_gfp_mask() |
+-				       __GFP_NOMEMALLOC | __GFP_NORETRY);
+-	if (!page)
+-		return NULL;
+ 
+ 	/*
+ 	 * Block others from accessing the 'page' when we get around to
+@@ -39,7 +54,6 @@ struct page *balloon_page_enqueue(struct balloon_dev_info *b_dev_info)
+ 	__count_vm_event(BALLOON_INFLATE);
+ 	spin_unlock_irqrestore(&b_dev_info->pages_lock, flags);
+ 	unlock_page(page);
+-	return page;
+ }
+ EXPORT_SYMBOL_GPL(balloon_page_enqueue);
+ 
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 255469f78217..174612f8339c 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2886,7 +2886,7 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
+ 	flush_cache_range(vma, mmun_start, mmun_start + HPAGE_PMD_SIZE);
+ 	page_add_anon_rmap(new, vma, mmun_start, true);
+ 	set_pmd_at(mm, mmun_start, pvmw->pmd, pmde);
+-	if (vma->vm_flags & VM_LOCKED)
++	if ((vma->vm_flags & VM_LOCKED) && !PageDoubleMap(new))
+ 		mlock_vma_page(new);
+ 	update_mmu_cache_pmd(vma, address, pvmw->pmd);
+ }
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index dfd2947e046e..9801dc0250e2 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -4517,12 +4517,40 @@ static bool vma_shareable(struct vm_area_struct *vma, unsigned long addr)
+ 	/*
+ 	 * check on proper vm_flags and page table alignment
+ 	 */
+-	if (vma->vm_flags & VM_MAYSHARE &&
+-	    vma->vm_start <= base && end <= vma->vm_end)
++	if (vma->vm_flags & VM_MAYSHARE && range_in_vma(vma, base, end))
+ 		return true;
+ 	return false;
+ }
+ 
++/*
++ * Determine if start,end range within vma could be mapped by shared pmd.
++ * If yes, adjust start and end to cover range associated with possible
++ * shared pmd mappings.
++ */
++void adjust_range_if_pmd_sharing_possible(struct vm_area_struct *vma,
++				unsigned long *start, unsigned long *end)
++{
++	unsigned long check_addr = *start;
++
++	if (!(vma->vm_flags & VM_MAYSHARE))
++		return;
++
++	for (check_addr = *start; check_addr < *end; check_addr += PUD_SIZE) {
++		unsigned long a_start = check_addr & PUD_MASK;
++		unsigned long a_end = a_start + PUD_SIZE;
++
++		/*
++		 * If sharing is possible, adjust start/end if necessary.
++		 */
++		if (range_in_vma(vma, a_start, a_end)) {
++			if (a_start < *start)
++				*start = a_start;
++			if (a_end > *end)
++				*end = a_end;
++		}
++	}
++}
++
+ /*
+  * Search for a shareable pmd page for hugetlb. In any case calls pmd_alloc()
+  * and returns the corresponding pte. While this is not necessary for the
+@@ -4620,6 +4648,11 @@ int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
+ {
+ 	return 0;
+ }
++
++void adjust_range_if_pmd_sharing_possible(struct vm_area_struct *vma,
++				unsigned long *start, unsigned long *end)
++{
++}
+ #define want_pmd_share()	(0)
+ #endif /* CONFIG_ARCH_WANT_HUGE_PMD_SHARE */
+ 
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 1236449b4777..cbb025239071 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -274,6 +274,9 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
+ 		if (vma->vm_flags & VM_LOCKED && !PageTransCompound(new))
+ 			mlock_vma_page(new);
+ 
++		if (PageTransHuge(page) && PageMlocked(page))
++			clear_page_mlock(page);
++
+ 		/* No need to invalidate - it was non-present before */
+ 		update_mmu_cache(vma, pvmw.address, pvmw.pte);
+ 	}
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 97edcf44d88c..8bd2ddd8febd 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1358,11 +1358,21 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 	}
+ 
+ 	/*
+-	 * We have to assume the worse case ie pmd for invalidation. Note that
+-	 * the page can not be free in this function as call of try_to_unmap()
+-	 * must hold a reference on the page.
++	 * For THP, we have to assume the worse case ie pmd for invalidation.
++	 * For hugetlb, it could be much worse if we need to do pud
++	 * invalidation in the case of pmd sharing.
++	 *
++	 * Note that the page can not be free in this function as call of
++	 * try_to_unmap() must hold a reference on the page.
+ 	 */
+ 	end = min(vma->vm_end, start + (PAGE_SIZE << compound_order(page)));
++	if (PageHuge(page)) {
++		/*
++		 * If sharing is possible, start and end will be adjusted
++		 * accordingly.
++		 */
++		adjust_range_if_pmd_sharing_possible(vma, &start, &end);
++	}
+ 	mmu_notifier_invalidate_range_start(vma->vm_mm, start, end);
+ 
+ 	while (page_vma_mapped_walk(&pvmw)) {
+@@ -1408,6 +1418,32 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 		subpage = page - page_to_pfn(page) + pte_pfn(*pvmw.pte);
+ 		address = pvmw.address;
+ 
++		if (PageHuge(page)) {
++			if (huge_pmd_unshare(mm, &address, pvmw.pte)) {
++				/*
++				 * huge_pmd_unshare unmapped an entire PMD
++				 * page.  There is no way of knowing exactly
++				 * which PMDs may be cached for this mm, so
++				 * we must flush them all.  start/end were
++				 * already adjusted above to cover this range.
++				 */
++				flush_cache_range(vma, start, end);
++				flush_tlb_range(vma, start, end);
++				mmu_notifier_invalidate_range(mm, start, end);
++
++				/*
++				 * The ref count of the PMD page was dropped
++				 * which is part of the way map counting
++				 * is done for shared PMDs.  Return 'true'
++				 * here.  When there is no other sharing,
++				 * huge_pmd_unshare returns false and we will
++				 * unmap the actual page and drop map count
++				 * to zero.
++				 */
++				page_vma_mapped_walk_done(&pvmw);
++				break;
++			}
++		}
+ 
+ 		if (IS_ENABLED(CONFIG_MIGRATION) &&
+ 		    (flags & TTU_MIGRATION) &&
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 4bb13e72ac97..2bdc962b2dfe 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1203,6 +1203,9 @@ const char * const vmstat_text[] = {
+ #ifdef CONFIG_SMP
+ 	"nr_tlb_remote_flush",
+ 	"nr_tlb_remote_flush_received",
++#else
++	"", /* nr_tlb_remote_flush */
++	"", /* nr_tlb_remote_flush_received */
+ #endif /* CONFIG_SMP */
+ 	"nr_tlb_local_flush_all",
+ 	"nr_tlb_local_flush_one",
+diff --git a/net/mac80211/cfg.c b/net/mac80211/cfg.c
+index b456b882a6ea..63558335e41e 100644
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -426,7 +426,7 @@ static int ieee80211_add_key(struct wiphy *wiphy, struct net_device *dev,
+ 	case NL80211_IFTYPE_AP:
+ 	case NL80211_IFTYPE_AP_VLAN:
+ 		/* Keys without a station are used for TX only */
+-		if (key->sta && test_sta_flag(key->sta, WLAN_STA_MFP))
++		if (sta && test_sta_flag(sta, WLAN_STA_MFP))
+ 			key->conf.flags |= IEEE80211_KEY_FLAG_RX_MGMT;
+ 		break;
+ 	case NL80211_IFTYPE_ADHOC:
 diff --git a/net/rds/ib.h b/net/rds/ib.h
 index 86a8578d95b8..7db93f7f5c61 100644
 --- a/net/rds/ib.h
@@ -3691,368 +1623,377 @@ index b4e421aa9727..918d2e676b9b 100644
  		if (ret)
  			free_percpu(ic->i_cache_incs.percpu);
  	}
--- 
-2.28.0
-
-
-From 7f42eada5e3fd87ed15efba117e1c792a9fbdd0a Mon Sep 17 00:00:00 2001
-From: "Michael S. Tsirkin" <mst@redhat.com>
-Date: Fri, 13 Oct 2017 16:11:48 +0300
-Subject: [PATCH 42/45] virtio_balloon: fix deadlock on OOM
-
-commit c7cdff0e864713a089d7cb3a2b1136ba9a54881a upstream.
-
-fill_balloon doing memory allocations under balloon_lock
-can cause a deadlock when leak_balloon is called from
-virtballoon_oom_notify and tries to take same lock.
-
-To fix, split page allocation and enqueue and do allocations outside the lock.
-
-Here's a detailed analysis of the deadlock by Tetsuo Handa:
-
-In leak_balloon(), mutex_lock(&vb->balloon_lock) is called in order to
-serialize against fill_balloon(). But in fill_balloon(),
-alloc_page(GFP_HIGHUSER[_MOVABLE] | __GFP_NOMEMALLOC | __GFP_NORETRY) is
-called with vb->balloon_lock mutex held. Since GFP_HIGHUSER[_MOVABLE]
-implies __GFP_DIRECT_RECLAIM | __GFP_IO | __GFP_FS, despite __GFP_NORETRY
-is specified, this allocation attempt might indirectly depend on somebody
-else's __GFP_DIRECT_RECLAIM memory allocation. And such indirect
-__GFP_DIRECT_RECLAIM memory allocation might call leak_balloon() via
-virtballoon_oom_notify() via blocking_notifier_call_chain() callback via
-out_of_memory() when it reached __alloc_pages_may_oom() and held oom_lock
-mutex. Since vb->balloon_lock mutex is already held by fill_balloon(), it
-will cause OOM lockup.
-
-  Thread1                                       Thread2
-    fill_balloon()
-      takes a balloon_lock
-      balloon_page_enqueue()
-        alloc_page(GFP_HIGHUSER_MOVABLE)
-          direct reclaim (__GFP_FS context)       takes a fs lock
-            waits for that fs lock                  alloc_page(GFP_NOFS)
-                                                      __alloc_pages_may_oom()
-                                                        takes the oom_lock
-                                                        out_of_memory()
-                                                          blocking_notifier_call_chain()
-                                                            leak_balloon()
-                                                              tries to take that balloon_lock and deadlocks
-
-Reported-by: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
-Cc: Michal Hocko <mhocko@suse.com>
-Cc: Wei Wang <wei.w.wang@intel.com>
-Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
-Signed-off-by: Sudip Mukherjee <sudipm.mukherjee@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/virtio/virtio_balloon.c    | 24 +++++++++++++++-----
- include/linux/balloon_compaction.h | 35 +++++++++++++++++++++++++++++-
- mm/balloon_compaction.c            | 28 ++++++++++++++++++------
- 3 files changed, 74 insertions(+), 13 deletions(-)
-
-diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
-index 36c9fbf70d44..43fcd17a738e 100644
---- a/drivers/virtio/virtio_balloon.c
-+++ b/drivers/virtio/virtio_balloon.c
-@@ -143,16 +143,17 @@ static void set_page_pfns(struct virtio_balloon *vb,
- 
- static unsigned fill_balloon(struct virtio_balloon *vb, size_t num)
- {
--	struct balloon_dev_info *vb_dev_info = &vb->vb_dev_info;
- 	unsigned num_allocated_pages;
-+	unsigned num_pfns;
-+	struct page *page;
-+	LIST_HEAD(pages);
- 
- 	/* We can only do one array worth at a time. */
- 	num = min(num, ARRAY_SIZE(vb->pfns));
- 
--	mutex_lock(&vb->balloon_lock);
--	for (vb->num_pfns = 0; vb->num_pfns < num;
--	     vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
--		struct page *page = balloon_page_enqueue(vb_dev_info);
-+	for (num_pfns = 0; num_pfns < num;
-+	     num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE) {
-+		struct page *page = balloon_page_alloc();
- 
- 		if (!page) {
- 			dev_info_ratelimited(&vb->vdev->dev,
-@@ -162,6 +163,19 @@ static unsigned fill_balloon(struct virtio_balloon *vb, size_t num)
- 			msleep(200);
- 			break;
- 		}
-+
-+		balloon_page_push(&pages, page);
-+	}
-+
-+	mutex_lock(&vb->balloon_lock);
-+
-+	vb->num_pfns = 0;
-+
-+	while ((page = balloon_page_pop(&pages))) {
-+		balloon_page_enqueue(&vb->vb_dev_info, page);
-+
-+		vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE;
-+
- 		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
- 		vb->num_pages += VIRTIO_BALLOON_PAGES_PER_PAGE;
- 		if (!virtio_has_feature(vb->vdev,
-diff --git a/include/linux/balloon_compaction.h b/include/linux/balloon_compaction.h
-index fbbe6da40fed..53051f3d8f25 100644
---- a/include/linux/balloon_compaction.h
-+++ b/include/linux/balloon_compaction.h
-@@ -50,6 +50,7 @@
- #include <linux/gfp.h>
- #include <linux/err.h>
- #include <linux/fs.h>
-+#include <linux/list.h>
- 
- /*
-  * Balloon device information descriptor.
-@@ -67,7 +68,9 @@ struct balloon_dev_info {
- 	struct inode *inode;
- };
- 
--extern struct page *balloon_page_enqueue(struct balloon_dev_info *b_dev_info);
-+extern struct page *balloon_page_alloc(void);
-+extern void balloon_page_enqueue(struct balloon_dev_info *b_dev_info,
-+				 struct page *page);
- extern struct page *balloon_page_dequeue(struct balloon_dev_info *b_dev_info);
- 
- static inline void balloon_devinfo_init(struct balloon_dev_info *balloon)
-@@ -193,4 +196,34 @@ static inline gfp_t balloon_mapping_gfp_mask(void)
+diff --git a/tools/perf/builtin-script.c b/tools/perf/builtin-script.c
+index 615fdc63452e..e37653b0f2d0 100644
+--- a/tools/perf/builtin-script.c
++++ b/tools/perf/builtin-script.c
+@@ -25,6 +25,7 @@
+ #include "util/string2.h"
+ #include "util/thread-stack.h"
+ #include "util/time-utils.h"
++#include "util/path.h"
+ #include "print_binary.h"
+ #include <linux/bitmap.h>
+ #include <linux/kernel.h>
+@@ -2129,19 +2130,6 @@ out:
+ 	return rc;
  }
  
- #endif /* CONFIG_BALLOON_COMPACTION */
-+
-+/*
-+ * balloon_page_push - insert a page into a page list.
-+ * @head : pointer to list
-+ * @page : page to be added
-+ *
-+ * Caller must ensure the page is private and protect the list.
-+ */
-+static inline void balloon_page_push(struct list_head *pages, struct page *page)
-+{
-+	list_add(&page->lru, pages);
-+}
-+
-+/*
-+ * balloon_page_pop - remove a page from a page list.
-+ * @head : pointer to list
-+ * @page : page to be added
-+ *
-+ * Caller must ensure the page is private and protect the list.
-+ */
-+static inline struct page *balloon_page_pop(struct list_head *pages)
-+{
-+	struct page *page = list_first_entry_or_null(pages, struct page, lru);
-+
-+	if (!page)
-+		return NULL;
-+
-+	list_del(&page->lru);
-+	return page;
-+}
- #endif /* _LINUX_BALLOON_COMPACTION_H */
-diff --git a/mm/balloon_compaction.c b/mm/balloon_compaction.c
-index 68d28924ba79..ef858d547e2d 100644
---- a/mm/balloon_compaction.c
-+++ b/mm/balloon_compaction.c
-@@ -10,23 +10,38 @@
- #include <linux/export.h>
- #include <linux/balloon_compaction.h>
- 
-+/*
-+ * balloon_page_alloc - allocates a new page for insertion into the balloon
-+ *			  page list.
-+ *
-+ * Driver must call it to properly allocate a new enlisted balloon page.
-+ * Driver must call balloon_page_enqueue before definitively removing it from
-+ * the guest system.  This function returns the page address for the recently
-+ * allocated page or NULL in the case we fail to allocate a new page this turn.
-+ */
-+struct page *balloon_page_alloc(void)
-+{
-+	struct page *page = alloc_page(balloon_mapping_gfp_mask() |
-+				       __GFP_NOMEMALLOC | __GFP_NORETRY);
-+	return page;
-+}
-+EXPORT_SYMBOL_GPL(balloon_page_alloc);
-+
- /*
-  * balloon_page_enqueue - allocates a new page and inserts it into the balloon
-  *			  page list.
-  * @b_dev_info: balloon device descriptor where we will insert a new page to
-+ * @page: new page to enqueue - allocated using balloon_page_alloc.
-  *
-- * Driver must call it to properly allocate a new enlisted balloon page
-+ * Driver must call it to properly enqueue a new allocated balloon page
-  * before definitively removing it from the guest system.
-  * This function returns the page address for the recently enqueued page or
-  * NULL in the case we fail to allocate a new page this turn.
-  */
--struct page *balloon_page_enqueue(struct balloon_dev_info *b_dev_info)
-+void balloon_page_enqueue(struct balloon_dev_info *b_dev_info,
-+			  struct page *page)
- {
- 	unsigned long flags;
--	struct page *page = alloc_page(balloon_mapping_gfp_mask() |
--				       __GFP_NOMEMALLOC | __GFP_NORETRY);
--	if (!page)
--		return NULL;
- 
- 	/*
- 	 * Block others from accessing the 'page' when we get around to
-@@ -39,7 +54,6 @@ struct page *balloon_page_enqueue(struct balloon_dev_info *b_dev_info)
- 	__count_vm_event(BALLOON_INFLATE);
- 	spin_unlock_irqrestore(&b_dev_info->pages_lock, flags);
- 	unlock_page(page);
--	return page;
- }
- EXPORT_SYMBOL_GPL(balloon_page_enqueue);
- 
--- 
-2.28.0
-
-
-From 711b942ae3beb9c39912271eb12e685ac5d1b7aa Mon Sep 17 00:00:00 2001
-From: Jan Stancek <jstancek@redhat.com>
-Date: Fri, 1 Dec 2017 10:50:28 +0100
-Subject: [PATCH 43/45] virtio_balloon: fix increment of vb->num_pfns in
- fill_balloon()
-
-commit d9e427f6ab8142d6868eb719e6a7851aafea56b6 upstream.
-
-commit c7cdff0e8647 ("virtio_balloon: fix deadlock on OOM")
-changed code to increment vb->num_pfns before call to
-set_page_pfns(), which used to happen only after.
-
-This patch fixes boot hang for me on ppc64le KVM guests.
-
-Fixes: c7cdff0e8647 ("virtio_balloon: fix deadlock on OOM")
-Cc: Michael S. Tsirkin <mst@redhat.com>
-Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
-Cc: Michal Hocko <mhocko@suse.com>
-Cc: Wei Wang <wei.w.wang@intel.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Jan Stancek <jstancek@redhat.com>
-Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
-Signed-off-by: Sudip Mukherjee <sudipm.mukherjee@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/virtio/virtio_balloon.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
-diff --git a/drivers/virtio/virtio_balloon.c b/drivers/virtio/virtio_balloon.c
-index 43fcd17a738e..d9873aa014a6 100644
---- a/drivers/virtio/virtio_balloon.c
-+++ b/drivers/virtio/virtio_balloon.c
-@@ -174,13 +174,12 @@ static unsigned fill_balloon(struct virtio_balloon *vb, size_t num)
- 	while ((page = balloon_page_pop(&pages))) {
- 		balloon_page_enqueue(&vb->vb_dev_info, page);
- 
--		vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE;
+-/* Helper function for filesystems that return a dent->d_type DT_UNKNOWN */
+-static int is_directory(const char *base_path, const struct dirent *dent)
+-{
+-	char path[PATH_MAX];
+-	struct stat st;
 -
- 		set_page_pfns(vb, vb->pfns + vb->num_pfns, page);
- 		vb->num_pages += VIRTIO_BALLOON_PAGES_PER_PAGE;
- 		if (!virtio_has_feature(vb->vdev,
- 					VIRTIO_BALLOON_F_DEFLATE_ON_OOM))
- 			adjust_managed_page_count(page, -1);
-+		vb->num_pfns += VIRTIO_BALLOON_PAGES_PER_PAGE;
+-	sprintf(path, "%s/%s", base_path, dent->d_name);
+-	if (stat(path, &st))
+-		return 0;
+-
+-	return S_ISDIR(st.st_mode);
+-}
+-
+ #define for_each_lang(scripts_path, scripts_dir, lang_dirent)		\
+ 	while ((lang_dirent = readdir(scripts_dir)) != NULL)		\
+ 		if ((lang_dirent->d_type == DT_DIR ||			\
+diff --git a/tools/perf/util/annotate.c b/tools/perf/util/annotate.c
+index dac76ac117c1..398d4cc2f0e4 100644
+--- a/tools/perf/util/annotate.c
++++ b/tools/perf/util/annotate.c
+@@ -1432,7 +1432,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
+ 			struct arch **parch, char *cpuid)
+ {
+ 	struct dso *dso = map->dso;
+-	char command[PATH_MAX * 2];
++	char *command;
+ 	struct arch *arch = NULL;
+ 	FILE *file;
+ 	char symfs_filename[PATH_MAX];
+@@ -1496,7 +1496,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
+ 		strcpy(symfs_filename, tmp);
  	}
  
- 	num_allocated_pages = vb->num_pfns;
--- 
-2.28.0
-
-
-From c03f0ab15f3bbe5806e30616a16e016ca624468d Mon Sep 17 00:00:00 2001
-From: Zhi Chen <zhichen@codeaurora.org>
-Date: Mon, 18 Jun 2018 17:00:39 +0300
-Subject: [PATCH 44/45] ath10k: fix scan crash due to incorrect length
- calculation
-
-commit c8291988806407e02a01b4b15b4504eafbcc04e0 upstream.
-
-Length of WMI scan message was not calculated correctly. The allocated
-buffer was smaller than what we expected. So WMI message corrupted
-skb_info, which is at the end of skb->data. This fix takes TLV header
-into account even if the element is zero-length.
-
-Crash log:
-  [49.629986] Unhandled kernel unaligned access[#1]:
-  [49.634932] CPU: 0 PID: 1176 Comm: logd Not tainted 4.4.60 #180
-  [49.641040] task: 83051460 ti: 8329c000 task.ti: 8329c000
-  [49.646608] $ 0   : 00000000 00000001 80984a80 00000000
-  [49.652038] $ 4   : 45259e89 8046d484 8046df30 8024ba70
-  [49.657468] $ 8   : 00000000 804cc4c0 00000001 20306320
-  [49.662898] $12   : 33322037 000110f2 00000000 31203930
-  [49.668327] $16   : 82792b40 80984a80 00000001 804207fc
-  [49.673757] $20   : 00000000 0000012c 00000040 80470000
-  [49.679186] $24   : 00000000 8024af7c
-  [49.684617] $28   : 8329c000 8329db88 00000001 802c58d0
-  [49.690046] Hi    : 00000000
-  [49.693022] Lo    : 453c0000
-  [49.696013] epc   : 800efae4 put_page+0x0/0x58
-  [49.700615] ra    : 802c58d0 skb_release_data+0x148/0x1d4
-  [49.706184] Status: 1000fc03 KERNEL EXL IE
-  [49.710531] Cause : 00800010 (ExcCode 04)
-  [49.714669] BadVA : 45259e89
-  [49.717644] PrId  : 00019374 (MIPS 24Kc)
-
-Signed-off-by: Zhi Chen <zhichen@codeaurora.org>
-Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
-Cc: Brian Norris <briannorris@chromium.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/ath/ath10k/wmi-tlv.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/net/wireless/ath/ath10k/wmi-tlv.c b/drivers/net/wireless/ath/ath10k/wmi-tlv.c
-index baec856af90f..b54001e97ced 100644
---- a/drivers/net/wireless/ath/ath10k/wmi-tlv.c
-+++ b/drivers/net/wireless/ath/ath10k/wmi-tlv.c
-@@ -1486,10 +1486,10 @@ ath10k_wmi_tlv_op_gen_start_scan(struct ath10k *ar,
- 	bssid_len = arg->n_bssids * sizeof(struct wmi_mac_addr);
- 	ie_len = roundup(arg->ie_len, 4);
- 	len = (sizeof(*tlv) + sizeof(*cmd)) +
--	      (arg->n_channels ? sizeof(*tlv) + chan_len : 0) +
--	      (arg->n_ssids ? sizeof(*tlv) + ssid_len : 0) +
--	      (arg->n_bssids ? sizeof(*tlv) + bssid_len : 0) +
--	      (arg->ie_len ? sizeof(*tlv) + ie_len : 0);
-+	      sizeof(*tlv) + chan_len +
-+	      sizeof(*tlv) + ssid_len +
-+	      sizeof(*tlv) + bssid_len +
-+	      sizeof(*tlv) + ie_len;
+-	snprintf(command, sizeof(command),
++	err = asprintf(&command,
+ 		 "%s %s%s --start-address=0x%016" PRIx64
+ 		 " --stop-address=0x%016" PRIx64
+ 		 " -l -d %s %s -C \"%s\" 2>/dev/null|grep -v \"%s:\"|expand",
+@@ -1509,12 +1509,17 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
+ 		 symbol_conf.annotate_src ? "-S" : "",
+ 		 symfs_filename, symfs_filename);
  
- 	skb = ath10k_wmi_alloc_skb(ar, len);
- 	if (!skb)
--- 
-2.28.0
-
-
-From 0b46ce3e3423aee80d28d296e1806176cdcec7ad Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sat, 13 Oct 2018 09:27:30 +0200
-Subject: [PATCH 45/45] Linux 4.14.76
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 7fc373c011c0..332dd011b3b9 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- # SPDX-License-Identifier: GPL-2.0
- VERSION = 4
- PATCHLEVEL = 14
--SUBLEVEL = 75
-+SUBLEVEL = 76
- EXTRAVERSION =
- NAME = Petit Gorille
++	if (err < 0) {
++		pr_err("Failure allocating memory for the command to run\n");
++		goto out_remove_tmp;
++	}
++
+ 	pr_debug("Executing: %s\n", command);
  
--- 
-2.28.0
-
+ 	err = -1;
+ 	if (pipe(stdout_fd) < 0) {
+ 		pr_err("Failure creating the pipe to run %s\n", command);
+-		goto out_remove_tmp;
++		goto out_free_command;
+ 	}
+ 
+ 	pid = fork();
+@@ -1541,7 +1546,7 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
+ 		 * If we were using debug info should retry with
+ 		 * original binary.
+ 		 */
+-		goto out_remove_tmp;
++		goto out_free_command;
+ 	}
+ 
+ 	nline = 0;
+@@ -1570,6 +1575,8 @@ int symbol__disassemble(struct symbol *sym, struct map *map,
+ 
+ 	fclose(file);
+ 	err = 0;
++out_free_command:
++	free(command);
+ out_remove_tmp:
+ 	close(stdout_fd[0]);
+ 
+@@ -1583,7 +1590,7 @@ out:
+ 
+ out_close_stdout:
+ 	close(stdout_fd[1]);
+-	goto out_remove_tmp;
++	goto out_free_command;
+ }
+ 
+ static void insert_source_line(struct rb_root *root, struct source_line *src_line)
+diff --git a/tools/perf/util/path.c b/tools/perf/util/path.c
+index 933f5c6bffb4..ca56ba2dd3da 100644
+--- a/tools/perf/util/path.c
++++ b/tools/perf/util/path.c
+@@ -18,6 +18,7 @@
+ #include <stdio.h>
+ #include <sys/types.h>
+ #include <sys/stat.h>
++#include <dirent.h>
+ #include <unistd.h>
+ 
+ static char bad_path[] = "/bad-path/";
+@@ -77,3 +78,16 @@ bool is_regular_file(const char *file)
+ 
+ 	return S_ISREG(st.st_mode);
+ }
++
++/* Helper function for filesystems that return a dent->d_type DT_UNKNOWN */
++bool is_directory(const char *base_path, const struct dirent *dent)
++{
++	char path[PATH_MAX];
++	struct stat st;
++
++	sprintf(path, "%s/%s", base_path, dent->d_name);
++	if (stat(path, &st))
++		return false;
++
++	return S_ISDIR(st.st_mode);
++}
+diff --git a/tools/perf/util/path.h b/tools/perf/util/path.h
+index 14a254ada7eb..f014f905df50 100644
+--- a/tools/perf/util/path.h
++++ b/tools/perf/util/path.h
+@@ -2,9 +2,12 @@
+ #ifndef _PERF_PATH_H
+ #define _PERF_PATH_H
+ 
++struct dirent;
++
+ int path__join(char *bf, size_t size, const char *path1, const char *path2);
+ int path__join3(char *bf, size_t size, const char *path1, const char *path2, const char *path3);
+ 
+ bool is_regular_file(const char *file);
++bool is_directory(const char *base_path, const struct dirent *dent);
+ 
+ #endif /* _PERF_PATH_H */
+diff --git a/tools/perf/util/setup.py b/tools/perf/util/setup.py
+index af415febbc46..da4df7fd43a2 100644
+--- a/tools/perf/util/setup.py
++++ b/tools/perf/util/setup.py
+@@ -28,6 +28,8 @@ class install_lib(_install_lib):
+ cflags = getenv('CFLAGS', '').split()
+ # switch off several checks (need to be at the end of cflags list)
+ cflags += ['-fno-strict-aliasing', '-Wno-write-strings', '-Wno-unused-parameter' ]
++if cc != "clang":
++    cflags += ['-Wno-cast-function-type' ]
+ 
+ src_perf  = getenv('srctree') + '/tools/perf'
+ build_lib = getenv('PYTHON_EXTBUILD_LIB')
+diff --git a/tools/testing/selftests/x86/test_vdso.c b/tools/testing/selftests/x86/test_vdso.c
+index 235259011704..35edd61d1663 100644
+--- a/tools/testing/selftests/x86/test_vdso.c
++++ b/tools/testing/selftests/x86/test_vdso.c
+@@ -17,6 +17,7 @@
+ #include <errno.h>
+ #include <sched.h>
+ #include <stdbool.h>
++#include <limits.h>
+ 
+ #ifndef SYS_getcpu
+ # ifdef __x86_64__
+@@ -31,6 +32,14 @@
+ 
+ int nerrs = 0;
+ 
++typedef int (*vgettime_t)(clockid_t, struct timespec *);
++
++vgettime_t vdso_clock_gettime;
++
++typedef long (*vgtod_t)(struct timeval *tv, struct timezone *tz);
++
++vgtod_t vdso_gettimeofday;
++
+ typedef long (*getcpu_t)(unsigned *, unsigned *, void *);
+ 
+ getcpu_t vgetcpu;
+@@ -95,6 +104,15 @@ static void fill_function_pointers()
+ 		printf("Warning: failed to find getcpu in vDSO\n");
+ 
+ 	vgetcpu = (getcpu_t) vsyscall_getcpu();
++
++	vdso_clock_gettime = (vgettime_t)dlsym(vdso, "__vdso_clock_gettime");
++	if (!vdso_clock_gettime)
++		printf("Warning: failed to find clock_gettime in vDSO\n");
++
++	vdso_gettimeofday = (vgtod_t)dlsym(vdso, "__vdso_gettimeofday");
++	if (!vdso_gettimeofday)
++		printf("Warning: failed to find gettimeofday in vDSO\n");
++
+ }
+ 
+ static long sys_getcpu(unsigned * cpu, unsigned * node,
+@@ -103,6 +121,16 @@ static long sys_getcpu(unsigned * cpu, unsigned * node,
+ 	return syscall(__NR_getcpu, cpu, node, cache);
+ }
+ 
++static inline int sys_clock_gettime(clockid_t id, struct timespec *ts)
++{
++	return syscall(__NR_clock_gettime, id, ts);
++}
++
++static inline int sys_gettimeofday(struct timeval *tv, struct timezone *tz)
++{
++	return syscall(__NR_gettimeofday, tv, tz);
++}
++
+ static void test_getcpu(void)
+ {
+ 	printf("[RUN]\tTesting getcpu...\n");
+@@ -155,10 +183,154 @@ static void test_getcpu(void)
+ 	}
+ }
+ 
++static bool ts_leq(const struct timespec *a, const struct timespec *b)
++{
++	if (a->tv_sec != b->tv_sec)
++		return a->tv_sec < b->tv_sec;
++	else
++		return a->tv_nsec <= b->tv_nsec;
++}
++
++static bool tv_leq(const struct timeval *a, const struct timeval *b)
++{
++	if (a->tv_sec != b->tv_sec)
++		return a->tv_sec < b->tv_sec;
++	else
++		return a->tv_usec <= b->tv_usec;
++}
++
++static char const * const clocknames[] = {
++	[0] = "CLOCK_REALTIME",
++	[1] = "CLOCK_MONOTONIC",
++	[2] = "CLOCK_PROCESS_CPUTIME_ID",
++	[3] = "CLOCK_THREAD_CPUTIME_ID",
++	[4] = "CLOCK_MONOTONIC_RAW",
++	[5] = "CLOCK_REALTIME_COARSE",
++	[6] = "CLOCK_MONOTONIC_COARSE",
++	[7] = "CLOCK_BOOTTIME",
++	[8] = "CLOCK_REALTIME_ALARM",
++	[9] = "CLOCK_BOOTTIME_ALARM",
++	[10] = "CLOCK_SGI_CYCLE",
++	[11] = "CLOCK_TAI",
++};
++
++static void test_one_clock_gettime(int clock, const char *name)
++{
++	struct timespec start, vdso, end;
++	int vdso_ret, end_ret;
++
++	printf("[RUN]\tTesting clock_gettime for clock %s (%d)...\n", name, clock);
++
++	if (sys_clock_gettime(clock, &start) < 0) {
++		if (errno == EINVAL) {
++			vdso_ret = vdso_clock_gettime(clock, &vdso);
++			if (vdso_ret == -EINVAL) {
++				printf("[OK]\tNo such clock.\n");
++			} else {
++				printf("[FAIL]\tNo such clock, but __vdso_clock_gettime returned %d\n", vdso_ret);
++				nerrs++;
++			}
++		} else {
++			printf("[WARN]\t clock_gettime(%d) syscall returned error %d\n", clock, errno);
++		}
++		return;
++	}
++
++	vdso_ret = vdso_clock_gettime(clock, &vdso);
++	end_ret = sys_clock_gettime(clock, &end);
++
++	if (vdso_ret != 0 || end_ret != 0) {
++		printf("[FAIL]\tvDSO returned %d, syscall errno=%d\n",
++		       vdso_ret, errno);
++		nerrs++;
++		return;
++	}
++
++	printf("\t%llu.%09ld %llu.%09ld %llu.%09ld\n",
++	       (unsigned long long)start.tv_sec, start.tv_nsec,
++	       (unsigned long long)vdso.tv_sec, vdso.tv_nsec,
++	       (unsigned long long)end.tv_sec, end.tv_nsec);
++
++	if (!ts_leq(&start, &vdso) || !ts_leq(&vdso, &end)) {
++		printf("[FAIL]\tTimes are out of sequence\n");
++		nerrs++;
++	}
++}
++
++static void test_clock_gettime(void)
++{
++	for (int clock = 0; clock < sizeof(clocknames) / sizeof(clocknames[0]);
++	     clock++) {
++		test_one_clock_gettime(clock, clocknames[clock]);
++	}
++
++	/* Also test some invalid clock ids */
++	test_one_clock_gettime(-1, "invalid");
++	test_one_clock_gettime(INT_MIN, "invalid");
++	test_one_clock_gettime(INT_MAX, "invalid");
++}
++
++static void test_gettimeofday(void)
++{
++	struct timeval start, vdso, end;
++	struct timezone sys_tz, vdso_tz;
++	int vdso_ret, end_ret;
++
++	if (!vdso_gettimeofday)
++		return;
++
++	printf("[RUN]\tTesting gettimeofday...\n");
++
++	if (sys_gettimeofday(&start, &sys_tz) < 0) {
++		printf("[FAIL]\tsys_gettimeofday failed (%d)\n", errno);
++		nerrs++;
++		return;
++	}
++
++	vdso_ret = vdso_gettimeofday(&vdso, &vdso_tz);
++	end_ret = sys_gettimeofday(&end, NULL);
++
++	if (vdso_ret != 0 || end_ret != 0) {
++		printf("[FAIL]\tvDSO returned %d, syscall errno=%d\n",
++		       vdso_ret, errno);
++		nerrs++;
++		return;
++	}
++
++	printf("\t%llu.%06ld %llu.%06ld %llu.%06ld\n",
++	       (unsigned long long)start.tv_sec, start.tv_usec,
++	       (unsigned long long)vdso.tv_sec, vdso.tv_usec,
++	       (unsigned long long)end.tv_sec, end.tv_usec);
++
++	if (!tv_leq(&start, &vdso) || !tv_leq(&vdso, &end)) {
++		printf("[FAIL]\tTimes are out of sequence\n");
++		nerrs++;
++	}
++
++	if (sys_tz.tz_minuteswest == vdso_tz.tz_minuteswest &&
++	    sys_tz.tz_dsttime == vdso_tz.tz_dsttime) {
++		printf("[OK]\ttimezones match: minuteswest=%d, dsttime=%d\n",
++		       sys_tz.tz_minuteswest, sys_tz.tz_dsttime);
++	} else {
++		printf("[FAIL]\ttimezones do not match\n");
++		nerrs++;
++	}
++
++	/* And make sure that passing NULL for tz doesn't crash. */
++	vdso_gettimeofday(&vdso, NULL);
++}
++
+ int main(int argc, char **argv)
+ {
+ 	fill_function_pointers();
+ 
++	test_clock_gettime();
++	test_gettimeofday();
++
++	/*
++	 * Test getcpu() last so that, if something goes wrong setting affinity,
++	 * we still run the other tests.
++	 */
+ 	test_getcpu();
+ 
+ 	return nerrs ? 1 : 0;

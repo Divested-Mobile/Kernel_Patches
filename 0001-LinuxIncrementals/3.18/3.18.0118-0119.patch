@@ -1,608 +1,3 @@
-From 38b901473177ece7e8c34eaa551b76b49774c4bc Mon Sep 17 00:00:00 2001
-From: Juergen Gross <jgross@suse.com>
-Date: Thu, 9 Aug 2018 16:42:16 +0200
-Subject: [PATCH 01/16] xen/netfront: don't cache skb_shinfo()
-
-commit d472b3a6cf63cd31cae1ed61930f07e6cd6671b5 upstream.
-
-skb_shinfo() can change when calling __pskb_pull_tail(): Don't cache
-its return value.
-
-Cc: stable@vger.kernel.org
-Signed-off-by: Juergen Gross <jgross@suse.com>
-Reviewed-by: Wei Liu <wei.liu2@citrix.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/xen-netfront.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/net/xen-netfront.c b/drivers/net/xen-netfront.c
-index 584d035ec0dd..b780c059cc03 100644
---- a/drivers/net/xen-netfront.c
-+++ b/drivers/net/xen-netfront.c
-@@ -903,7 +903,6 @@ static RING_IDX xennet_fill_frags(struct netfront_queue *queue,
- 				  struct sk_buff *skb,
- 				  struct sk_buff_head *list)
- {
--	struct skb_shared_info *shinfo = skb_shinfo(skb);
- 	RING_IDX cons = queue->rx.rsp_cons;
- 	struct sk_buff *nskb;
- 
-@@ -912,15 +911,16 @@ static RING_IDX xennet_fill_frags(struct netfront_queue *queue,
- 			RING_GET_RESPONSE(&queue->rx, ++cons);
- 		skb_frag_t *nfrag = &skb_shinfo(nskb)->frags[0];
- 
--		if (shinfo->nr_frags == MAX_SKB_FRAGS) {
-+		if (skb_shinfo(skb)->nr_frags == MAX_SKB_FRAGS) {
- 			unsigned int pull_to = NETFRONT_SKB_CB(skb)->pull_to;
- 
- 			BUG_ON(pull_to <= skb_headlen(skb));
- 			__pskb_pull_tail(skb, pull_to - skb_headlen(skb));
- 		}
--		BUG_ON(shinfo->nr_frags >= MAX_SKB_FRAGS);
-+		BUG_ON(skb_shinfo(skb)->nr_frags >= MAX_SKB_FRAGS);
- 
--		skb_add_rx_frag(skb, shinfo->nr_frags, skb_frag_page(nfrag),
-+		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
-+				skb_frag_page(nfrag),
- 				rx->offset, rx->status, PAGE_SIZE);
- 
- 		skb_shinfo(nskb)->nr_frags = 0;
--- 
-2.28.0
-
-
-From 7f48b39f2437fc159b818aac85ffef35521e5709 Mon Sep 17 00:00:00 2001
-From: Al Viro <viro@zeniv.linux.org.uk>
-Date: Mon, 6 Aug 2018 09:03:58 -0400
-Subject: [PATCH 02/16] root dentries need RCU-delayed freeing
-
-commit 90bad5e05bcdb0308cfa3d3a60f5c0b9c8e2efb3 upstream.
-
-Since mountpoint crossing can happen without leaving lazy mode,
-root dentries do need the same protection against having their
-memory freed without RCU delay as everything else in the tree.
-
-It's partially hidden by RCU delay between detaching from the
-mount tree and dropping the vfsmount reference, but the starting
-point of pathwalk can be on an already detached mount, in which
-case umount-caused RCU delay has already passed by the time the
-lazy pathwalk grabs rcu_read_lock().  If the starting point
-happens to be at the root of that vfsmount *and* that vfsmount
-covers the entire filesystem, we get trouble.
-
-Fixes: 48a066e72d97 ("RCU'd vsfmounts")
-Cc: stable@vger.kernel.org
-Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/dcache.c | 6 ++++--
- 1 file changed, 4 insertions(+), 2 deletions(-)
-
-diff --git a/fs/dcache.c b/fs/dcache.c
-index a34d4019f465..5977fc3f4705 100644
---- a/fs/dcache.c
-+++ b/fs/dcache.c
-@@ -1848,10 +1848,12 @@ struct dentry *d_make_root(struct inode *root_inode)
- 		static const struct qstr name = QSTR_INIT("/", 1);
- 
- 		res = __d_alloc(root_inode->i_sb, &name);
--		if (res)
-+		if (res) {
-+			res->d_flags |= DCACHE_RCUACCESS;
- 			d_instantiate(res, root_inode);
--		else
-+		} else {
- 			iput(root_inode);
-+		}
- 	}
- 	return res;
- }
--- 
-2.28.0
-
-
-From 6f4d6842ea3716b8b9bc8f470ea217670b03d8bc Mon Sep 17 00:00:00 2001
-From: Al Viro <viro@zeniv.linux.org.uk>
-Date: Thu, 9 Aug 2018 17:21:17 -0400
-Subject: [PATCH 03/16] fix mntput/mntput race
-
-commit 9ea0a46ca2c318fcc449c1e6b62a7230a17888f1 upstream.
-
-mntput_no_expire() does the calculation of total refcount under mount_lock;
-unfortunately, the decrement (as well as all increments) are done outside
-of it, leading to false positives in the "are we dropping the last reference"
-test.  Consider the following situation:
-	* mnt is a lazy-umounted mount, kept alive by two opened files.  One
-of those files gets closed.  Total refcount of mnt is 2.  On CPU 42
-mntput(mnt) (called from __fput()) drops one reference, decrementing component
-	* After it has looked at component #0, the process on CPU 0 does
-mntget(), incrementing component #0, gets preempted and gets to run again -
-on CPU 69.  There it does mntput(), which drops the reference (component #69)
-and proceeds to spin on mount_lock.
-	* On CPU 42 our first mntput() finishes counting.  It observes the
-decrement of component #69, but not the increment of component #0.  As the
-result, the total it gets is not 1 as it should've been - it's 0.  At which
-point we decide that vfsmount needs to be killed and proceed to free it and
-shut the filesystem down.  However, there's still another opened file
-on that filesystem, with reference to (now freed) vfsmount, etc. and we are
-screwed.
-
-It's not a wide race, but it can be reproduced with artificial slowdown of
-the mnt_get_count() loop, and it should be easier to hit on SMP KVM setups.
-
-Fix consists of moving the refcount decrement under mount_lock; the tricky
-part is that we want (and can) keep the fast case (i.e. mount that still
-has non-NULL ->mnt_ns) entirely out of mount_lock.  All places that zero
-mnt->mnt_ns are dropping some reference to mnt and they call synchronize_rcu()
-before that mntput().  IOW, if mntput() observes (under rcu_read_lock())
-a non-NULL ->mnt_ns, it is guaranteed that there is another reference yet to
-be dropped.
-
-Reported-by: Jann Horn <jannh@google.com>
-Tested-by: Jann Horn <jannh@google.com>
-Fixes: 48a066e72d97 ("RCU'd vsfmounts")
-Cc: stable@vger.kernel.org
-Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/namespace.c | 14 ++++++++++++--
- 1 file changed, 12 insertions(+), 2 deletions(-)
-
-diff --git a/fs/namespace.c b/fs/namespace.c
-index ded3f1edd7f7..2472083e0487 100644
---- a/fs/namespace.c
-+++ b/fs/namespace.c
-@@ -1049,12 +1049,22 @@ static DECLARE_DELAYED_WORK(delayed_mntput_work, delayed_mntput);
- static void mntput_no_expire(struct mount *mnt)
- {
- 	rcu_read_lock();
--	mnt_add_count(mnt, -1);
--	if (likely(mnt->mnt_ns)) { /* shouldn't be the last one */
-+	if (likely(READ_ONCE(mnt->mnt_ns))) {
-+		/*
-+		 * Since we don't do lock_mount_hash() here,
-+		 * ->mnt_ns can change under us.  However, if it's
-+		 * non-NULL, then there's a reference that won't
-+		 * be dropped until after an RCU delay done after
-+		 * turning ->mnt_ns NULL.  So if we observe it
-+		 * non-NULL under rcu_read_lock(), the reference
-+		 * we are dropping is not the final one.
-+		 */
-+		mnt_add_count(mnt, -1);
- 		rcu_read_unlock();
- 		return;
- 	}
- 	lock_mount_hash();
-+	mnt_add_count(mnt, -1);
- 	if (mnt_get_count(mnt)) {
- 		rcu_read_unlock();
- 		unlock_mount_hash();
--- 
-2.28.0
-
-
-From 4111fe47e3fe2e30dceb3e15b2cf696eb94618b7 Mon Sep 17 00:00:00 2001
-From: Al Viro <viro@zeniv.linux.org.uk>
-Date: Thu, 9 Aug 2018 17:51:32 -0400
-Subject: [PATCH 04/16] fix __legitimize_mnt()/mntput() race
-
-commit 119e1ef80ecfe0d1deb6378d4ab41f5b71519de1 upstream.
-
-__legitimize_mnt() has two problems - one is that in case of success
-the check of mount_lock is not ordered wrt preceding increment of
-refcount, making it possible to have successful __legitimize_mnt()
-on one CPU just before the otherwise final mntpu() on another,
-with __legitimize_mnt() not seeing mntput() taking the lock and
-mntput() not seeing the increment done by __legitimize_mnt().
-Solved by a pair of barriers.
-
-Another is that failure of __legitimize_mnt() on the second
-read_seqretry() leaves us with reference that'll need to be
-dropped by caller; however, if that races with final mntput()
-we can end up with caller dropping rcu_read_lock() and doing
-mntput() to release that reference - with the first mntput()
-having freed the damn thing just as rcu_read_lock() had been
-dropped.  Solution: in "do mntput() yourself" failure case
-grab mount_lock, check if MNT_DOOMED has been set by racing
-final mntput() that has missed our increment and if it has -
-undo the increment and treat that as "failure, caller doesn't
-need to drop anything" case.
-
-It's not easy to hit - the final mntput() has to come right
-after the first read_seqretry() in __legitimize_mnt() *and*
-manage to miss the increment done by __legitimize_mnt() before
-the second read_seqretry() in there.  The things that are almost
-impossible to hit on bare hardware are not impossible on SMP
-KVM, though...
-
-Reported-by: Oleg Nesterov <oleg@redhat.com>
-Fixes: 48a066e72d97 ("RCU'd vsfmounts")
-Cc: stable@vger.kernel.org
-Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/namespace.c | 14 ++++++++++++++
- 1 file changed, 14 insertions(+)
-
-diff --git a/fs/namespace.c b/fs/namespace.c
-index 2472083e0487..df76ec5f22cb 100644
---- a/fs/namespace.c
-+++ b/fs/namespace.c
-@@ -590,12 +590,21 @@ bool legitimize_mnt(struct vfsmount *bastard, unsigned seq)
- 		return true;
- 	mnt = real_mount(bastard);
- 	mnt_add_count(mnt, 1);
-+	smp_mb();			// see mntput_no_expire()
- 	if (likely(!read_seqretry(&mount_lock, seq)))
- 		return true;
- 	if (bastard->mnt_flags & MNT_SYNC_UMOUNT) {
- 		mnt_add_count(mnt, -1);
- 		return false;
- 	}
-+	lock_mount_hash();
-+	if (unlikely(bastard->mnt_flags & MNT_DOOMED)) {
-+		mnt_add_count(mnt, -1);
-+		unlock_mount_hash();
-+		return true;
-+	}
-+	unlock_mount_hash();
-+
- 	rcu_read_unlock();
- 	mntput(bastard);
- 	rcu_read_lock();
-@@ -1064,6 +1073,11 @@ static void mntput_no_expire(struct mount *mnt)
- 		return;
- 	}
- 	lock_mount_hash();
-+	/*
-+	 * make sure that if __legitimize_mnt() has not seen us grab
-+	 * mount_lock, we'll see their refcount increment here.
-+	 */
-+	smp_mb();
- 	mnt_add_count(mnt, -1);
- 	if (mnt_get_count(mnt)) {
- 		rcu_read_unlock();
--- 
-2.28.0
-
-
-From af773a647f6cae37658a3e235b08a417960d36a8 Mon Sep 17 00:00:00 2001
-From: Oleksij Rempel <o.rempel@pengutronix.de>
-Date: Fri, 15 Jun 2018 09:41:29 +0200
-Subject: [PATCH 05/16] ARM: dts: imx6sx: fix irq for pcie bridge
-
-commit 1bcfe0564044be578841744faea1c2f46adc8178 upstream.
-
-Use the correct IRQ line for the MSI controller in the PCIe host
-controller. Apparently a different IRQ line is used compared to other
-i.MX6 variants. Without this change MSI IRQs aren't properly propagated
-to the upstream interrupt controller.
-
-Signed-off-by: Oleksij Rempel <o.rempel@pengutronix.de>
-Reviewed-by: Lucas Stach <l.stach@pengutronix.de>
-Fixes: b1d17f68e5c5 ("ARM: dts: imx: add initial imx6sx device tree source")
-Signed-off-by: Shawn Guo <shawnguo@kernel.org>
-Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/boot/dts/imx6sx.dtsi | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/arm/boot/dts/imx6sx.dtsi b/arch/arm/boot/dts/imx6sx.dtsi
-index f3e88c03b1e4..a7c011f1edde 100644
---- a/arch/arm/boot/dts/imx6sx.dtsi
-+++ b/arch/arm/boot/dts/imx6sx.dtsi
-@@ -1202,7 +1202,7 @@
- 				  /* non-prefetchable memory */
- 				  0x82000000 0 0x08000000 0x08000000 0 0x00f00000>;
- 			num-lanes = <1>;
--			interrupts = <GIC_SPI 123 IRQ_TYPE_LEVEL_HIGH>;
-+			interrupts = <GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>;
- 			clocks = <&clks IMX6SX_CLK_PCIE_REF_125M>,
- 				 <&clks IMX6SX_CLK_PCIE_AXI>,
- 				 <&clks IMX6SX_CLK_LVDS1_OUT>,
--- 
-2.28.0
-
-
-From 208255c7a3bfdb4e7a02d1aba8c4c68affd9027e Mon Sep 17 00:00:00 2001
-From: Masami Hiramatsu <mhiramat@kernel.org>
-Date: Sat, 28 Apr 2018 21:37:03 +0900
-Subject: [PATCH 06/16] kprobes/x86: Fix %p uses in error messages
-
-commit 0ea063306eecf300fcf06d2f5917474b580f666f upstream.
-
-Remove all %p uses in error messages in kprobes/x86.
-
-Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
-Cc: Ananth N Mavinakayanahalli <ananth@in.ibm.com>
-Cc: Anil S Keshavamurthy <anil.s.keshavamurthy@intel.com>
-Cc: Arnd Bergmann <arnd@arndb.de>
-Cc: David Howells <dhowells@redhat.com>
-Cc: David S . Miller <davem@davemloft.net>
-Cc: Heiko Carstens <heiko.carstens@de.ibm.com>
-Cc: Jon Medhurst <tixy@linaro.org>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: Thomas Richter <tmricht@linux.ibm.com>
-Cc: Tobin C . Harding <me@tobin.cc>
-Cc: Will Deacon <will.deacon@arm.com>
-Cc: acme@kernel.org
-Cc: akpm@linux-foundation.org
-Cc: brueckner@linux.vnet.ibm.com
-Cc: linux-arch@vger.kernel.org
-Cc: rostedt@goodmis.org
-Cc: schwidefsky@de.ibm.com
-Cc: stable@vger.kernel.org
-Link: https://lkml.kernel.org/lkml/152491902310.9916.13355297638917767319.stgit@devbox
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/kernel/kprobes/core.c | 4 +---
- 1 file changed, 1 insertion(+), 3 deletions(-)
-
-diff --git a/arch/x86/kernel/kprobes/core.c b/arch/x86/kernel/kprobes/core.c
-index 51947348fcb9..323d122267b2 100644
---- a/arch/x86/kernel/kprobes/core.c
-+++ b/arch/x86/kernel/kprobes/core.c
-@@ -365,7 +365,6 @@ int __copy_instruction(u8 *dest, u8 *src)
- 		newdisp = (u8 *) src + (s64) insn.displacement.value - (u8 *) dest;
- 		if ((s64) (s32) newdisp != newdisp) {
- 			pr_err("Kprobes error: new displacement does not fit into s32 (%llx)\n", newdisp);
--			pr_err("\tSrc: %p, Dest: %p, old disp: %x\n", src, dest, insn.displacement.value);
- 			return 0;
- 		}
- 		disp = (u8 *) dest + insn_offset_displacement(&insn);
-@@ -568,8 +567,7 @@ static int reenter_kprobe(struct kprobe *p, struct pt_regs *regs,
- 		 * Raise a BUG or we'll continue in an endless reentering loop
- 		 * and eventually a stack overflow.
- 		 */
--		printk(KERN_WARNING "Unrecoverable kprobe detected at %p.\n",
--		       p->addr);
-+		pr_err("Unrecoverable kprobe detected.\n");
- 		dump_kprobe(p);
- 		BUG();
- 	default:
--- 
-2.28.0
-
-
-From 84d2099e70072468af1f565853f8958d9e12e3fd Mon Sep 17 00:00:00 2001
-From: Erick Reyes <erickreyes@google.com>
-Date: Wed, 15 Aug 2018 17:55:48 -0700
-Subject: [PATCH 07/16] ALSA: info: Check for integer overflow in
- snd_info_entry_write()
-
-Commit 4adb7bcbcb69 ("ALSA: core: Use seq_file for text proc file
-reads") heavily refactored ALSA procfs and fixed the overflow as
-a side-effect, so this fix only applies to kernels < 4.2 and
-there is no upstream equivalent
-
-snd_info_entry_write() resizes the buffer with an unsigned long
-size argument that gets truncated because resize_info_buffer()
-takes the size parameter as an unsigned int. On 64-bit kernels,
-this causes the following copy_to_user() to write out-of-bounds
-if (pos + count) can't be represented by an unsigned int.
-
-Signed-off-by: Siqi Lin <siqilin@google.com>
-Signed-off-by: Erick Reyes <erickreyes@google.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/info.c | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
-diff --git a/sound/core/info.c b/sound/core/info.c
-index 9f404e965ea2..08832c973a53 100644
---- a/sound/core/info.c
-+++ b/sound/core/info.c
-@@ -253,6 +253,7 @@ static ssize_t snd_info_entry_write(struct file *file, const char __user *buffer
- 	struct snd_info_buffer *buf;
- 	ssize_t size = 0;
- 	loff_t pos;
-+	unsigned long realloc_size;
- 
- 	data = file->private_data;
- 	if (snd_BUG_ON(!data))
-@@ -261,7 +262,8 @@ static ssize_t snd_info_entry_write(struct file *file, const char __user *buffer
- 	pos = *offset;
- 	if (pos < 0 || (long) pos != pos || (ssize_t) count < 0)
- 		return -EIO;
--	if ((unsigned long) pos + (unsigned long) count < (unsigned long) pos)
-+	realloc_size = (unsigned long) pos + (unsigned long) count;
-+	if (realloc_size < (unsigned long) pos || realloc_size > UINT_MAX)
- 		return -EIO;
- 	switch (entry->content) {
- 	case SNDRV_INFO_CONTENT_TEXT:
--- 
-2.28.0
-
-
-From cdc103fb630478aa031c1b808a8e57bc734d2e36 Mon Sep 17 00:00:00 2001
-From: Andrey Ryabinin <a.ryabinin@samsung.com>
-Date: Wed, 10 Dec 2014 15:42:22 -0800
-Subject: [PATCH 08/16] mm: slub: fix format mismatches in slab_err() callers
-
-commit f6edde9cbe0634e4391b6e421a609ca3f57f6c38 upstream.
-
-Adding __printf(3, 4) to slab_err exposed following:
-
-  mm/slub.c: In function `check_slab':
-  mm/slub.c:852:4: warning: format `%u' expects argument of type `unsigned int', but argument 4 has type `const char *' [-Wformat=]
-      s->name, page->objects, maxobj);
-      ^
-  mm/slub.c:852:4: warning: too many arguments for format [-Wformat-extra-args]
-  mm/slub.c:857:4: warning: format `%u' expects argument of type `unsigned int', but argument 4 has type `const char *' [-Wformat=]
-      s->name, page->inuse, page->objects);
-      ^
-  mm/slub.c:857:4: warning: too many arguments for format [-Wformat-extra-args]
-
-  mm/slub.c: In function `on_freelist':
-  mm/slub.c:905:4: warning: format `%d' expects argument of type `int', but argument 5 has type `long unsigned int' [-Wformat=]
-      "should be %d", page->objects, max_objects);
-
-Fix first two warnings by removing redundant s->name.
-Fix the last by changing type of max_object from unsigned long to int.
-
-Signed-off-by: Andrey Ryabinin <a.ryabinin@samsung.com>
-Cc: Christoph Lameter <cl@linux.com>
-Cc: Pekka Enberg <penberg@kernel.org>
-Acked-by: David Rientjes <rientjes@google.com>
-Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/slub.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/mm/slub.c b/mm/slub.c
-index 70a9f027f963..b3e3c8f339a0 100644
---- a/mm/slub.c
-+++ b/mm/slub.c
-@@ -849,12 +849,12 @@ static int check_slab(struct kmem_cache *s, struct page *page)
- 	maxobj = order_objects(compound_order(page), s->size, s->reserved);
- 	if (page->objects > maxobj) {
- 		slab_err(s, page, "objects %u > max %u",
--			s->name, page->objects, maxobj);
-+			page->objects, maxobj);
- 		return 0;
- 	}
- 	if (page->inuse > page->objects) {
- 		slab_err(s, page, "inuse %u > max %u",
--			s->name, page->inuse, page->objects);
-+			page->inuse, page->objects);
- 		return 0;
- 	}
- 	/* Slab_pad_check fixes things up after itself */
-@@ -871,7 +871,7 @@ static int on_freelist(struct kmem_cache *s, struct page *page, void *search)
- 	int nr = 0;
- 	void *fp;
- 	void *object = NULL;
--	unsigned long max_objects;
-+	int max_objects;
- 
- 	fp = page->freelist;
- 	while (fp && nr <= page->objects) {
--- 
-2.28.0
-
-
-From 982ad049e60e54f5a1425123637b770ad3f65df6 Mon Sep 17 00:00:00 2001
-From: Liwei Song <liwei.song@windriver.com>
-Date: Tue, 13 Jun 2017 00:59:53 -0400
-Subject: [PATCH 09/16] i2c: ismt: fix wrong device address when unmap the data
- buffer
-
-commit 17e83549e199d89aace7788a9f11c108671eecf5 upstream.
-
-Fix the following kernel bug:
-
-kernel BUG at drivers/iommu/intel-iommu.c:3260!
-invalid opcode: 0000 [#5] PREEMPT SMP
-Hardware name: Intel Corp. Harcuvar/Server, BIOS HAVLCRB0.X64.0013.D39.1608311820 08/31/2016
-task: ffff880175389950 ti: ffff880176bec000 task.ti: ffff880176bec000
-RIP: 0010:[<ffffffff8150a83b>]  [<ffffffff8150a83b>] intel_unmap+0x25b/0x260
-RSP: 0018:ffff880176bef5e8  EFLAGS: 00010296
-RAX: 0000000000000024 RBX: ffff8800773c7c88 RCX: 000000000000ce04
-RDX: 0000000080000000 RSI: 0000000000000000 RDI: 0000000000000009
-RBP: ffff880176bef638 R08: 0000000000000010 R09: 0000000000000004
-R10: ffff880175389c78 R11: 0000000000000a4f R12: ffff8800773c7868
-R13: 00000000ffffac88 R14: ffff8800773c7818 R15: 0000000000000001
-FS:  00007fef21258700(0000) GS:ffff88017b5c0000(0000) knlGS:0000000000000000
-CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-CR2: 000000000066d6d8 CR3: 000000007118c000 CR4: 00000000003406e0
-Stack:
- 00000000ffffac88 ffffffff8199867f ffff880176bef5f8 ffff880100000030
- ffff880176bef668 ffff8800773c7c88 ffff880178288098 ffff8800772c0010
- ffff8800773c7818 0000000000000001 ffff880176bef648 ffffffff8150a86e
-Call Trace:
- [<ffffffff8199867f>] ? printk+0x46/0x48
- [<ffffffff8150a86e>] intel_unmap_page+0xe/0x10
- [<ffffffffa039d99b>] ismt_access+0x27b/0x8fa [i2c_ismt]
- [<ffffffff81554420>] ? __pm_runtime_suspend+0xa0/0xa0
- [<ffffffff815544a0>] ? pm_suspend_timer_fn+0x80/0x80
- [<ffffffff81554420>] ? __pm_runtime_suspend+0xa0/0xa0
- [<ffffffff815544a0>] ? pm_suspend_timer_fn+0x80/0x80
- [<ffffffff8143dfd0>] ? pci_bus_read_dev_vendor_id+0xf0/0xf0
- [<ffffffff8172b36c>] i2c_smbus_xfer+0xec/0x4b0
- [<ffffffff810aa4d5>] ? vprintk_emit+0x345/0x530
- [<ffffffffa038936b>] i2cdev_ioctl_smbus+0x12b/0x240 [i2c_dev]
- [<ffffffff810aa829>] ? vprintk_default+0x29/0x40
- [<ffffffffa0389b33>] i2cdev_ioctl+0x63/0x1ec [i2c_dev]
- [<ffffffff811b04c8>] do_vfs_ioctl+0x328/0x5d0
- [<ffffffff8119d8ec>] ? vfs_write+0x11c/0x190
- [<ffffffff8109d449>] ? rt_up_read+0x19/0x20
- [<ffffffff811b07f1>] SyS_ioctl+0x81/0xa0
- [<ffffffff819a351b>] system_call_fastpath+0x16/0x6e
-
-This happen When run "i2cdetect -y 0" detect SMBus iSMT adapter.
-
-After finished I2C block read/write, when unmap the data buffer,
-a wrong device address was pass to dma_unmap_single().
-
-To fix this, give dma_unmap_single() the "dev" parameter, just like
-what dma_map_single() does, then unmap can find the right devices.
-
-Fixes: 13f35ac14cd0 ("i2c: Adding support for Intel iSMT SMBus 2.0 host controller")
-Signed-off-by: Liwei Song <liwei.song@windriver.com>
-Reviewed-by: Andy Shevchenko <andy.shevchenko@gmail.com>
-Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/i2c/busses/i2c-ismt.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/i2c/busses/i2c-ismt.c b/drivers/i2c/busses/i2c-ismt.c
-index f771c6afbab5..beab499d182c 100644
---- a/drivers/i2c/busses/i2c-ismt.c
-+++ b/drivers/i2c/busses/i2c-ismt.c
-@@ -587,7 +587,7 @@ static int ismt_access(struct i2c_adapter *adap, u16 addr,
- 
- 	/* unmap the data buffer */
- 	if (dma_size != 0)
--		dma_unmap_single(&adap->dev, dma_addr, dma_size, dma_direction);
-+		dma_unmap_single(dev, dma_addr, dma_size, dma_direction);
- 
- 	if (unlikely(!ret)) {
- 		dev_err(dev, "completion wait timed out\n");
--- 
-2.28.0
-
-
-From cd635c1cb35b4d5491b137630c3bb62e3ae34969 Mon Sep 17 00:00:00 2001
-From: Randy Dunlap <rdunlap@infradead.org>
-Date: Sun, 1 Jul 2018 19:46:06 -0700
-Subject: [PATCH 10/16] kbuild: verify that $DEPMOD is installed
-
-commit 934193a654c1f4d0643ddbf4b2529b508cae926e upstream.
-
-Verify that 'depmod' ($DEPMOD) is installed.
-This is a partial revert of commit 620c231c7a7f
-("kbuild: do not check for ancient modutils tools").
-
-Also update Documentation/process/changes.rst to refer to
-kmod instead of module-init-tools.
-
-Fixes kernel bugzilla #198965:
-https://bugzilla.kernel.org/show_bug.cgi?id=198965
-
-Signed-off-by: Randy Dunlap <rdunlap@infradead.org>
-Cc: Lucas De Marchi <lucas.demarchi@profusion.mobi>
-Cc: Lucas De Marchi <lucas.de.marchi@gmail.com>
-Cc: Michal Marek <michal.lkml@markovi.net>
-Cc: Jessica Yu <jeyu@kernel.org>
-Cc: Chih-Wei Huang <cwhuang@linux.org.tw>
-Cc: stable@vger.kernel.org # any kernel since 2012
-Signed-off-by: Masahiro Yamada <yamada.masahiro@socionext.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- Documentation/Changes | 17 ++++++-----------
- scripts/depmod.sh     |  8 +++++++-
- 2 files changed, 13 insertions(+), 12 deletions(-)
-
 diff --git a/Documentation/Changes b/Documentation/Changes
 index 1de131bb49fb..9ad68f1819d3 100644
 --- a/Documentation/Changes
@@ -649,136 +44,255 @@ index 1de131bb49fb..9ad68f1819d3 100644
  Mkinitrd
  --------
  o  <https://code.launchpad.net/initrd-tools/main>
-diff --git a/scripts/depmod.sh b/scripts/depmod.sh
-index 122599b1c13b..ea1e96921e3b 100755
---- a/scripts/depmod.sh
-+++ b/scripts/depmod.sh
-@@ -10,10 +10,16 @@ DEPMOD=$1
- KERNELRELEASE=$2
- SYMBOL_PREFIX=$3
+diff --git a/Makefile b/Makefile
+index 5c3464b5bb1e..6f85cc732008 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 118
++SUBLEVEL = 119
+ EXTRAVERSION =
+ NAME = Diseased Newt
  
--if ! test -r System.map -a -x "$DEPMOD"; then
-+if ! test -r System.map ; then
- 	exit 0
- fi
+diff --git a/arch/arm/boot/dts/imx6sx.dtsi b/arch/arm/boot/dts/imx6sx.dtsi
+index f3e88c03b1e4..a7c011f1edde 100644
+--- a/arch/arm/boot/dts/imx6sx.dtsi
++++ b/arch/arm/boot/dts/imx6sx.dtsi
+@@ -1202,7 +1202,7 @@
+ 				  /* non-prefetchable memory */
+ 				  0x82000000 0 0x08000000 0x08000000 0 0x00f00000>;
+ 			num-lanes = <1>;
+-			interrupts = <GIC_SPI 123 IRQ_TYPE_LEVEL_HIGH>;
++			interrupts = <GIC_SPI 120 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&clks IMX6SX_CLK_PCIE_REF_125M>,
+ 				 <&clks IMX6SX_CLK_PCIE_AXI>,
+ 				 <&clks IMX6SX_CLK_LVDS1_OUT>,
+diff --git a/arch/x86/kernel/kprobes/core.c b/arch/x86/kernel/kprobes/core.c
+index 51947348fcb9..323d122267b2 100644
+--- a/arch/x86/kernel/kprobes/core.c
++++ b/arch/x86/kernel/kprobes/core.c
+@@ -365,7 +365,6 @@ int __copy_instruction(u8 *dest, u8 *src)
+ 		newdisp = (u8 *) src + (s64) insn.displacement.value - (u8 *) dest;
+ 		if ((s64) (s32) newdisp != newdisp) {
+ 			pr_err("Kprobes error: new displacement does not fit into s32 (%llx)\n", newdisp);
+-			pr_err("\tSrc: %p, Dest: %p, old disp: %x\n", src, dest, insn.displacement.value);
+ 			return 0;
+ 		}
+ 		disp = (u8 *) dest + insn_offset_displacement(&insn);
+@@ -568,8 +567,7 @@ static int reenter_kprobe(struct kprobe *p, struct pt_regs *regs,
+ 		 * Raise a BUG or we'll continue in an endless reentering loop
+ 		 * and eventually a stack overflow.
+ 		 */
+-		printk(KERN_WARNING "Unrecoverable kprobe detected at %p.\n",
+-		       p->addr);
++		pr_err("Unrecoverable kprobe detected.\n");
+ 		dump_kprobe(p);
+ 		BUG();
+ 	default:
+diff --git a/crypto/ablkcipher.c b/crypto/ablkcipher.c
+index 520729d898fe..5061d7ad33e4 100644
+--- a/crypto/ablkcipher.c
++++ b/crypto/ablkcipher.c
+@@ -72,11 +72,9 @@ static inline u8 *ablkcipher_get_spot(u8 *start, unsigned int len)
+ 	return max(start, end_page);
+ }
  
-+if [ -z $(command -v $DEPMOD) ]; then
-+	echo "'make modules_install' requires $DEPMOD. Please install it." >&2
-+	echo "This is probably in the kmod package." >&2
-+	exit 1
-+fi
-+
- # older versions of depmod don't support -P <symbol-prefix>
- # support was added in module-init-tools 3.13
- if test -n "$SYMBOL_PREFIX"; then
--- 
-2.28.0
-
-
-From b39ac2f453c56158c0945c0dc8685518760bd457 Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Mon, 18 Jun 2018 10:22:37 -0700
-Subject: [PATCH 11/16] crypto: vmac - require a block cipher with 128-bit
- block size
-
-commit 73bf20ef3df262026c3470241ae4ac8196943ffa upstream.
-
-The VMAC template assumes the block cipher has a 128-bit block size, but
-it failed to check for that.  Thus it was possible to instantiate it
-using a 64-bit block size cipher, e.g. "vmac(cast5)", causing
-uninitialized memory to be used.
-
-Add the needed check when instantiating the template.
-
-Fixes: f1939f7c5645 ("crypto: vmac - New hash algorithm for intel_txt support")
-Cc: <stable@vger.kernel.org> # v2.6.32+
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/vmac.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
+-static inline unsigned int ablkcipher_done_slow(struct ablkcipher_walk *walk,
+-						unsigned int bsize)
++static inline void ablkcipher_done_slow(struct ablkcipher_walk *walk,
++					unsigned int n)
+ {
+-	unsigned int n = bsize;
+-
+ 	for (;;) {
+ 		unsigned int len_this_page = scatterwalk_pagelen(&walk->out);
+ 
+@@ -88,17 +86,13 @@ static inline unsigned int ablkcipher_done_slow(struct ablkcipher_walk *walk,
+ 		n -= len_this_page;
+ 		scatterwalk_start(&walk->out, scatterwalk_sg_next(walk->out.sg));
+ 	}
+-
+-	return bsize;
+ }
+ 
+-static inline unsigned int ablkcipher_done_fast(struct ablkcipher_walk *walk,
+-						unsigned int n)
++static inline void ablkcipher_done_fast(struct ablkcipher_walk *walk,
++					unsigned int n)
+ {
+ 	scatterwalk_advance(&walk->in, n);
+ 	scatterwalk_advance(&walk->out, n);
+-
+-	return n;
+ }
+ 
+ static int ablkcipher_walk_next(struct ablkcipher_request *req,
+@@ -108,39 +102,40 @@ int ablkcipher_walk_done(struct ablkcipher_request *req,
+ 			 struct ablkcipher_walk *walk, int err)
+ {
+ 	struct crypto_tfm *tfm = req->base.tfm;
+-	unsigned int nbytes = 0;
++	unsigned int n; /* bytes processed */
++	bool more;
+ 
+-	if (likely(err >= 0)) {
+-		unsigned int n = walk->nbytes - err;
++	if (unlikely(err < 0))
++		goto finish;
+ 
+-		if (likely(!(walk->flags & ABLKCIPHER_WALK_SLOW)))
+-			n = ablkcipher_done_fast(walk, n);
+-		else if (WARN_ON(err)) {
+-			err = -EINVAL;
+-			goto err;
+-		} else
+-			n = ablkcipher_done_slow(walk, n);
++	n = walk->nbytes - err;
++	walk->total -= n;
++	more = (walk->total != 0);
+ 
+-		nbytes = walk->total - n;
+-		err = 0;
++	if (likely(!(walk->flags & ABLKCIPHER_WALK_SLOW))) {
++		ablkcipher_done_fast(walk, n);
++	} else {
++		if (WARN_ON(err)) {
++			/* unexpected case; didn't process all bytes */
++			err = -EINVAL;
++			goto finish;
++		}
++		ablkcipher_done_slow(walk, n);
+ 	}
+ 
+-	scatterwalk_done(&walk->in, 0, nbytes);
+-	scatterwalk_done(&walk->out, 1, nbytes);
+-
+-err:
+-	walk->total = nbytes;
+-	walk->nbytes = nbytes;
++	scatterwalk_done(&walk->in, 0, more);
++	scatterwalk_done(&walk->out, 1, more);
+ 
+-	if (nbytes) {
++	if (more) {
+ 		crypto_yield(req->base.flags);
+ 		return ablkcipher_walk_next(req, walk);
+ 	}
+-
++	err = 0;
++finish:
++	walk->nbytes = 0;
+ 	if (walk->iv != req->info)
+ 		memcpy(req->info, walk->iv, tfm->crt_ablkcipher.ivsize);
+ 	kfree(walk->iv_buffer);
+-
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(ablkcipher_walk_done);
+diff --git a/crypto/blkcipher.c b/crypto/blkcipher.c
+index f25799f351f7..5ebfdd0d4543 100644
+--- a/crypto/blkcipher.c
++++ b/crypto/blkcipher.c
+@@ -70,19 +70,18 @@ static inline u8 *blkcipher_get_spot(u8 *start, unsigned int len)
+ 	return max(start, end_page);
+ }
+ 
+-static inline unsigned int blkcipher_done_slow(struct blkcipher_walk *walk,
+-					       unsigned int bsize)
++static inline void blkcipher_done_slow(struct blkcipher_walk *walk,
++				       unsigned int bsize)
+ {
+ 	u8 *addr;
+ 
+ 	addr = (u8 *)ALIGN((unsigned long)walk->buffer, walk->alignmask + 1);
+ 	addr = blkcipher_get_spot(addr, bsize);
+ 	scatterwalk_copychunks(addr, &walk->out, bsize, 1);
+-	return bsize;
+ }
+ 
+-static inline unsigned int blkcipher_done_fast(struct blkcipher_walk *walk,
+-					       unsigned int n)
++static inline void blkcipher_done_fast(struct blkcipher_walk *walk,
++				       unsigned int n)
+ {
+ 	if (walk->flags & BLKCIPHER_WALK_COPY) {
+ 		blkcipher_map_dst(walk);
+@@ -96,49 +95,48 @@ static inline unsigned int blkcipher_done_fast(struct blkcipher_walk *walk,
+ 
+ 	scatterwalk_advance(&walk->in, n);
+ 	scatterwalk_advance(&walk->out, n);
+-
+-	return n;
+ }
+ 
+ int blkcipher_walk_done(struct blkcipher_desc *desc,
+ 			struct blkcipher_walk *walk, int err)
+ {
+-	unsigned int nbytes = 0;
++	unsigned int n; /* bytes processed */
++	bool more;
+ 
+-	if (likely(err >= 0)) {
+-		unsigned int n = walk->nbytes - err;
++	if (unlikely(err < 0))
++		goto finish;
+ 
+-		if (likely(!(walk->flags & BLKCIPHER_WALK_SLOW)))
+-			n = blkcipher_done_fast(walk, n);
+-		else if (WARN_ON(err)) {
+-			err = -EINVAL;
+-			goto err;
+-		} else
+-			n = blkcipher_done_slow(walk, n);
++	n = walk->nbytes - err;
++	walk->total -= n;
++	more = (walk->total != 0);
+ 
+-		nbytes = walk->total - n;
+-		err = 0;
++	if (likely(!(walk->flags & BLKCIPHER_WALK_SLOW))) {
++		blkcipher_done_fast(walk, n);
++	} else {
++		if (WARN_ON(err)) {
++			/* unexpected case; didn't process all bytes */
++			err = -EINVAL;
++			goto finish;
++		}
++		blkcipher_done_slow(walk, n);
+ 	}
+ 
+-	scatterwalk_done(&walk->in, 0, nbytes);
+-	scatterwalk_done(&walk->out, 1, nbytes);
+-
+-err:
+-	walk->total = nbytes;
+-	walk->nbytes = nbytes;
++	scatterwalk_done(&walk->in, 0, more);
++	scatterwalk_done(&walk->out, 1, more);
+ 
+-	if (nbytes) {
++	if (more) {
+ 		crypto_yield(desc->flags);
+ 		return blkcipher_walk_next(desc, walk);
+ 	}
+-
++	err = 0;
++finish:
++	walk->nbytes = 0;
+ 	if (walk->iv != desc->info)
+ 		memcpy(desc->info, walk->iv, walk->ivsize);
+ 	if (walk->buffer != walk->page)
+ 		kfree(walk->buffer);
+ 	if (walk->page)
+ 		free_page((unsigned long)walk->page);
+-
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(blkcipher_walk_done);
 diff --git a/crypto/vmac.c b/crypto/vmac.c
-index df76a816cfb2..3034454a3713 100644
---- a/crypto/vmac.c
-+++ b/crypto/vmac.c
-@@ -655,6 +655,10 @@ static int vmac_create(struct crypto_template *tmpl, struct rtattr **tb)
- 	if (IS_ERR(alg))
- 		return PTR_ERR(alg);
- 
-+	err = -EINVAL;
-+	if (alg->cra_blocksize != 16)
-+		goto out_put_alg;
-+
- 	inst = shash_alloc_instance("vmac", alg);
- 	err = PTR_ERR(inst);
- 	if (IS_ERR(inst))
--- 
-2.28.0
-
-
-From 58a60fc8e062fd61859c5aa7a0756d20517961b3 Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Mon, 18 Jun 2018 10:22:38 -0700
-Subject: [PATCH 12/16] crypto: vmac - separate tfm and request context
-
-commit bb29648102335586e9a66289a1d98a0cb392b6e5 upstream.
-
-syzbot reported a crash in vmac_final() when multiple threads
-concurrently use the same "vmac(aes)" transform through AF_ALG.  The bug
-is pretty fundamental: the VMAC template doesn't separate per-request
-state from per-tfm (per-key) state like the other hash algorithms do,
-but rather stores it all in the tfm context.  That's wrong.
-
-Also, vmac_final() incorrectly zeroes most of the state including the
-derived keys and cached pseudorandom pad.  Therefore, only the first
-VMAC invocation with a given key calculates the correct digest.
-
-Fix these bugs by splitting the per-tfm state from the per-request state
-and using the proper init/update/final sequencing for requests.
-
-Reproducer for the crash:
-
-    #include <linux/if_alg.h>
-    #include <sys/socket.h>
-    #include <unistd.h>
-
-    int main()
-    {
-            int fd;
-            struct sockaddr_alg addr = {
-                    .salg_type = "hash",
-                    .salg_name = "vmac(aes)",
-            };
-            char buf[256] = { 0 };
-
-            fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
-            bind(fd, (void *)&addr, sizeof(addr));
-            setsockopt(fd, SOL_ALG, ALG_SET_KEY, buf, 16);
-            fork();
-            fd = accept(fd, NULL, NULL);
-            for (;;)
-                    write(fd, buf, 256);
-    }
-
-The immediate cause of the crash is that vmac_ctx_t.partial_size exceeds
-VMAC_NHBYTES, causing vmac_final() to memset() a negative length.
-
-Reported-by: syzbot+264bca3a6e8d645550d3@syzkaller.appspotmail.com
-Fixes: f1939f7c5645 ("crypto: vmac - New hash algorithm for intel_txt support")
-Cc: <stable@vger.kernel.org> # v2.6.32+
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/vmac.c         | 408 +++++++++++++++++++-----------------------
- include/crypto/vmac.h |  63 -------
- 2 files changed, 181 insertions(+), 290 deletions(-)
- delete mode 100644 include/crypto/vmac.h
-
-diff --git a/crypto/vmac.c b/crypto/vmac.c
-index 3034454a3713..bb2fc787d615 100644
+index df76a816cfb2..bb2fc787d615 100644
 --- a/crypto/vmac.c
 +++ b/crypto/vmac.c
 @@ -1,6 +1,10 @@
@@ -1103,7 +617,9 @@ index 3034454a3713..bb2fc787d615 100644
 +static int vmac_init(struct shash_desc *desc)
  {
 -	struct vmac_ctx_t *ctx = crypto_shash_ctx(parent);
--
++	const struct vmac_tfm_ctx *tctx = crypto_shash_ctx(desc->tfm);
++	struct vmac_desc_ctx *dctx = shash_desc_ctx(desc);
+ 
 -	if (keylen != VMAC_KEY_LEN) {
 -		crypto_shash_set_flags(parent, CRYPTO_TFM_RES_BAD_KEY_LEN);
 -		return -EINVAL;
@@ -1111,9 +627,7 @@ index 3034454a3713..bb2fc787d615 100644
 -
 -	return vmac_set_key((u8 *)key, ctx);
 -}
-+	const struct vmac_tfm_ctx *tctx = crypto_shash_ctx(desc->tfm);
-+	struct vmac_desc_ctx *dctx = shash_desc_ctx(desc);
- 
+-
 -static int vmac_init(struct shash_desc *pdesc)
 -{
 +	dctx->partial_size = 0;
@@ -1286,7 +800,18 @@ index 3034454a3713..bb2fc787d615 100644
  }
  
  static int vmac_create(struct crypto_template *tmpl, struct rtattr **tb)
-@@ -674,11 +627,12 @@ static int vmac_create(struct crypto_template *tmpl, struct rtattr **tb)
+@@ -655,6 +608,10 @@ static int vmac_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	if (IS_ERR(alg))
+ 		return PTR_ERR(alg);
+ 
++	err = -EINVAL;
++	if (alg->cra_blocksize != 16)
++		goto out_put_alg;
++
+ 	inst = shash_alloc_instance("vmac", alg);
+ 	err = PTR_ERR(inst);
+ 	if (IS_ERR(inst))
+@@ -670,11 +627,12 @@ static int vmac_create(struct crypto_template *tmpl, struct rtattr **tb)
  	inst->alg.base.cra_blocksize = alg->cra_blocksize;
  	inst->alg.base.cra_alignmask = alg->cra_alignmask;
  
@@ -1301,6 +826,126 @@ index 3034454a3713..bb2fc787d615 100644
  	inst->alg.init = vmac_init;
  	inst->alg.update = vmac_update;
  	inst->alg.final = vmac_final;
+diff --git a/drivers/i2c/busses/i2c-ismt.c b/drivers/i2c/busses/i2c-ismt.c
+index f771c6afbab5..beab499d182c 100644
+--- a/drivers/i2c/busses/i2c-ismt.c
++++ b/drivers/i2c/busses/i2c-ismt.c
+@@ -587,7 +587,7 @@ static int ismt_access(struct i2c_adapter *adap, u16 addr,
+ 
+ 	/* unmap the data buffer */
+ 	if (dma_size != 0)
+-		dma_unmap_single(&adap->dev, dma_addr, dma_size, dma_direction);
++		dma_unmap_single(dev, dma_addr, dma_size, dma_direction);
+ 
+ 	if (unlikely(!ret)) {
+ 		dev_err(dev, "completion wait timed out\n");
+diff --git a/drivers/net/xen-netfront.c b/drivers/net/xen-netfront.c
+index 584d035ec0dd..b780c059cc03 100644
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@ -903,7 +903,6 @@ static RING_IDX xennet_fill_frags(struct netfront_queue *queue,
+ 				  struct sk_buff *skb,
+ 				  struct sk_buff_head *list)
+ {
+-	struct skb_shared_info *shinfo = skb_shinfo(skb);
+ 	RING_IDX cons = queue->rx.rsp_cons;
+ 	struct sk_buff *nskb;
+ 
+@@ -912,15 +911,16 @@ static RING_IDX xennet_fill_frags(struct netfront_queue *queue,
+ 			RING_GET_RESPONSE(&queue->rx, ++cons);
+ 		skb_frag_t *nfrag = &skb_shinfo(nskb)->frags[0];
+ 
+-		if (shinfo->nr_frags == MAX_SKB_FRAGS) {
++		if (skb_shinfo(skb)->nr_frags == MAX_SKB_FRAGS) {
+ 			unsigned int pull_to = NETFRONT_SKB_CB(skb)->pull_to;
+ 
+ 			BUG_ON(pull_to <= skb_headlen(skb));
+ 			__pskb_pull_tail(skb, pull_to - skb_headlen(skb));
+ 		}
+-		BUG_ON(shinfo->nr_frags >= MAX_SKB_FRAGS);
++		BUG_ON(skb_shinfo(skb)->nr_frags >= MAX_SKB_FRAGS);
+ 
+-		skb_add_rx_frag(skb, shinfo->nr_frags, skb_frag_page(nfrag),
++		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++				skb_frag_page(nfrag),
+ 				rx->offset, rx->status, PAGE_SIZE);
+ 
+ 		skb_shinfo(nskb)->nr_frags = 0;
+diff --git a/fs/dcache.c b/fs/dcache.c
+index a34d4019f465..5977fc3f4705 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -1848,10 +1848,12 @@ struct dentry *d_make_root(struct inode *root_inode)
+ 		static const struct qstr name = QSTR_INIT("/", 1);
+ 
+ 		res = __d_alloc(root_inode->i_sb, &name);
+-		if (res)
++		if (res) {
++			res->d_flags |= DCACHE_RCUACCESS;
+ 			d_instantiate(res, root_inode);
+-		else
++		} else {
+ 			iput(root_inode);
++		}
+ 	}
+ 	return res;
+ }
+diff --git a/fs/namespace.c b/fs/namespace.c
+index ded3f1edd7f7..df76ec5f22cb 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -590,12 +590,21 @@ bool legitimize_mnt(struct vfsmount *bastard, unsigned seq)
+ 		return true;
+ 	mnt = real_mount(bastard);
+ 	mnt_add_count(mnt, 1);
++	smp_mb();			// see mntput_no_expire()
+ 	if (likely(!read_seqretry(&mount_lock, seq)))
+ 		return true;
+ 	if (bastard->mnt_flags & MNT_SYNC_UMOUNT) {
+ 		mnt_add_count(mnt, -1);
+ 		return false;
+ 	}
++	lock_mount_hash();
++	if (unlikely(bastard->mnt_flags & MNT_DOOMED)) {
++		mnt_add_count(mnt, -1);
++		unlock_mount_hash();
++		return true;
++	}
++	unlock_mount_hash();
++
+ 	rcu_read_unlock();
+ 	mntput(bastard);
+ 	rcu_read_lock();
+@@ -1049,12 +1058,27 @@ static DECLARE_DELAYED_WORK(delayed_mntput_work, delayed_mntput);
+ static void mntput_no_expire(struct mount *mnt)
+ {
+ 	rcu_read_lock();
+-	mnt_add_count(mnt, -1);
+-	if (likely(mnt->mnt_ns)) { /* shouldn't be the last one */
++	if (likely(READ_ONCE(mnt->mnt_ns))) {
++		/*
++		 * Since we don't do lock_mount_hash() here,
++		 * ->mnt_ns can change under us.  However, if it's
++		 * non-NULL, then there's a reference that won't
++		 * be dropped until after an RCU delay done after
++		 * turning ->mnt_ns NULL.  So if we observe it
++		 * non-NULL under rcu_read_lock(), the reference
++		 * we are dropping is not the final one.
++		 */
++		mnt_add_count(mnt, -1);
+ 		rcu_read_unlock();
+ 		return;
+ 	}
+ 	lock_mount_hash();
++	/*
++	 * make sure that if __legitimize_mnt() has not seen us grab
++	 * mount_lock, we'll see their refcount increment here.
++	 */
++	smp_mb();
++	mnt_add_count(mnt, -1);
+ 	if (mnt_get_count(mnt)) {
+ 		rcu_read_unlock();
+ 		unlock_mount_hash();
 diff --git a/include/crypto/vmac.h b/include/crypto/vmac.h
 deleted file mode 100644
 index 6b700c7b2fe1..000000000000
@@ -1370,343 +1015,34 @@ index 6b700c7b2fe1..000000000000
 -};
 -
 -#endif /* __CRYPTO_VMAC_H */
--- 
-2.28.0
-
-
-From c34837deef0c7294e6a846c778df08ebbcefe0de Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Mon, 23 Jul 2018 10:54:57 -0700
-Subject: [PATCH 13/16] crypto: blkcipher - fix crash flushing dcache in error
- path
-
-commit 0868def3e4100591e7a1fdbf3eed1439cc8f7ca3 upstream.
-
-Like the skcipher_walk case:
-
-scatterwalk_done() is only meant to be called after a nonzero number of
-bytes have been processed, since scatterwalk_pagedone() will flush the
-dcache of the *previous* page.  But in the error case of
-blkcipher_walk_done(), e.g. if the input wasn't an integer number of
-blocks, scatterwalk_done() was actually called after advancing 0 bytes.
-This caused a crash ("BUG: unable to handle kernel paging request")
-during '!PageSlab(page)' on architectures like arm and arm64 that define
-ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE, provided that the input was
-page-aligned as in that case walk->offset == 0.
-
-Fix it by reorganizing blkcipher_walk_done() to skip the
-scatterwalk_advance() and scatterwalk_done() if an error has occurred.
-
-This bug was found by syzkaller fuzzing.
-
-Reproducer, assuming ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE:
-
-	#include <linux/if_alg.h>
-	#include <sys/socket.h>
-	#include <unistd.h>
-
-	int main()
-	{
-		struct sockaddr_alg addr = {
-			.salg_type = "skcipher",
-			.salg_name = "ecb(aes-generic)",
-		};
-		char buffer[4096] __attribute__((aligned(4096))) = { 0 };
-		int fd;
-
-		fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
-		bind(fd, (void *)&addr, sizeof(addr));
-		setsockopt(fd, SOL_ALG, ALG_SET_KEY, buffer, 16);
-		fd = accept(fd, NULL, NULL);
-		write(fd, buffer, 15);
-		read(fd, buffer, 15);
-	}
-
-Reported-by: Liu Chao <liuchao741@huawei.com>
-Fixes: 5cde0af2a982 ("[CRYPTO] cipher: Added block cipher type")
-Cc: <stable@vger.kernel.org> # v2.6.19+
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/blkcipher.c | 54 ++++++++++++++++++++++------------------------
- 1 file changed, 26 insertions(+), 28 deletions(-)
-
-diff --git a/crypto/blkcipher.c b/crypto/blkcipher.c
-index f25799f351f7..5ebfdd0d4543 100644
---- a/crypto/blkcipher.c
-+++ b/crypto/blkcipher.c
-@@ -70,19 +70,18 @@ static inline u8 *blkcipher_get_spot(u8 *start, unsigned int len)
- 	return max(start, end_page);
- }
- 
--static inline unsigned int blkcipher_done_slow(struct blkcipher_walk *walk,
--					       unsigned int bsize)
-+static inline void blkcipher_done_slow(struct blkcipher_walk *walk,
-+				       unsigned int bsize)
- {
- 	u8 *addr;
- 
- 	addr = (u8 *)ALIGN((unsigned long)walk->buffer, walk->alignmask + 1);
- 	addr = blkcipher_get_spot(addr, bsize);
- 	scatterwalk_copychunks(addr, &walk->out, bsize, 1);
--	return bsize;
- }
- 
--static inline unsigned int blkcipher_done_fast(struct blkcipher_walk *walk,
--					       unsigned int n)
-+static inline void blkcipher_done_fast(struct blkcipher_walk *walk,
-+				       unsigned int n)
- {
- 	if (walk->flags & BLKCIPHER_WALK_COPY) {
- 		blkcipher_map_dst(walk);
-@@ -96,49 +95,48 @@ static inline unsigned int blkcipher_done_fast(struct blkcipher_walk *walk,
- 
- 	scatterwalk_advance(&walk->in, n);
- 	scatterwalk_advance(&walk->out, n);
--
--	return n;
- }
- 
- int blkcipher_walk_done(struct blkcipher_desc *desc,
- 			struct blkcipher_walk *walk, int err)
- {
--	unsigned int nbytes = 0;
-+	unsigned int n; /* bytes processed */
-+	bool more;
- 
--	if (likely(err >= 0)) {
--		unsigned int n = walk->nbytes - err;
-+	if (unlikely(err < 0))
-+		goto finish;
- 
--		if (likely(!(walk->flags & BLKCIPHER_WALK_SLOW)))
--			n = blkcipher_done_fast(walk, n);
--		else if (WARN_ON(err)) {
--			err = -EINVAL;
--			goto err;
--		} else
--			n = blkcipher_done_slow(walk, n);
-+	n = walk->nbytes - err;
-+	walk->total -= n;
-+	more = (walk->total != 0);
- 
--		nbytes = walk->total - n;
--		err = 0;
-+	if (likely(!(walk->flags & BLKCIPHER_WALK_SLOW))) {
-+		blkcipher_done_fast(walk, n);
-+	} else {
-+		if (WARN_ON(err)) {
-+			/* unexpected case; didn't process all bytes */
-+			err = -EINVAL;
-+			goto finish;
-+		}
-+		blkcipher_done_slow(walk, n);
+diff --git a/mm/slub.c b/mm/slub.c
+index 70a9f027f963..b3e3c8f339a0 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -849,12 +849,12 @@ static int check_slab(struct kmem_cache *s, struct page *page)
+ 	maxobj = order_objects(compound_order(page), s->size, s->reserved);
+ 	if (page->objects > maxobj) {
+ 		slab_err(s, page, "objects %u > max %u",
+-			s->name, page->objects, maxobj);
++			page->objects, maxobj);
+ 		return 0;
  	}
- 
--	scatterwalk_done(&walk->in, 0, nbytes);
--	scatterwalk_done(&walk->out, 1, nbytes);
--
--err:
--	walk->total = nbytes;
--	walk->nbytes = nbytes;
-+	scatterwalk_done(&walk->in, 0, more);
-+	scatterwalk_done(&walk->out, 1, more);
- 
--	if (nbytes) {
-+	if (more) {
- 		crypto_yield(desc->flags);
- 		return blkcipher_walk_next(desc, walk);
+ 	if (page->inuse > page->objects) {
+ 		slab_err(s, page, "inuse %u > max %u",
+-			s->name, page->inuse, page->objects);
++			page->inuse, page->objects);
+ 		return 0;
  	}
--
-+	err = 0;
-+finish:
-+	walk->nbytes = 0;
- 	if (walk->iv != desc->info)
- 		memcpy(desc->info, walk->iv, walk->ivsize);
- 	if (walk->buffer != walk->page)
- 		kfree(walk->buffer);
- 	if (walk->page)
- 		free_page((unsigned long)walk->page);
--
- 	return err;
- }
- EXPORT_SYMBOL_GPL(blkcipher_walk_done);
--- 
-2.28.0
-
-
-From 4b55d18a7b09dae3af7d9b5b69e55b9a0edd5cd7 Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Mon, 23 Jul 2018 10:54:58 -0700
-Subject: [PATCH 14/16] crypto: ablkcipher - fix crash flushing dcache in error
- path
-
-commit 318abdfbe708aaaa652c79fb500e9bd60521f9dc upstream.
-
-Like the skcipher_walk and blkcipher_walk cases:
-
-scatterwalk_done() is only meant to be called after a nonzero number of
-bytes have been processed, since scatterwalk_pagedone() will flush the
-dcache of the *previous* page.  But in the error case of
-ablkcipher_walk_done(), e.g. if the input wasn't an integer number of
-blocks, scatterwalk_done() was actually called after advancing 0 bytes.
-This caused a crash ("BUG: unable to handle kernel paging request")
-during '!PageSlab(page)' on architectures like arm and arm64 that define
-ARCH_IMPLEMENTS_FLUSH_DCACHE_PAGE, provided that the input was
-page-aligned as in that case walk->offset == 0.
-
-Fix it by reorganizing ablkcipher_walk_done() to skip the
-scatterwalk_advance() and scatterwalk_done() if an error has occurred.
-
-Reported-by: Liu Chao <liuchao741@huawei.com>
-Fixes: bf06099db18a ("crypto: skcipher - Add ablkcipher_walk interfaces")
-Cc: <stable@vger.kernel.org> # v2.6.35+
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/ablkcipher.c | 57 +++++++++++++++++++++------------------------
- 1 file changed, 26 insertions(+), 31 deletions(-)
-
-diff --git a/crypto/ablkcipher.c b/crypto/ablkcipher.c
-index 520729d898fe..5061d7ad33e4 100644
---- a/crypto/ablkcipher.c
-+++ b/crypto/ablkcipher.c
-@@ -72,11 +72,9 @@ static inline u8 *ablkcipher_get_spot(u8 *start, unsigned int len)
- 	return max(start, end_page);
- }
+ 	/* Slab_pad_check fixes things up after itself */
+@@ -871,7 +871,7 @@ static int on_freelist(struct kmem_cache *s, struct page *page, void *search)
+ 	int nr = 0;
+ 	void *fp;
+ 	void *object = NULL;
+-	unsigned long max_objects;
++	int max_objects;
  
--static inline unsigned int ablkcipher_done_slow(struct ablkcipher_walk *walk,
--						unsigned int bsize)
-+static inline void ablkcipher_done_slow(struct ablkcipher_walk *walk,
-+					unsigned int n)
- {
--	unsigned int n = bsize;
--
- 	for (;;) {
- 		unsigned int len_this_page = scatterwalk_pagelen(&walk->out);
- 
-@@ -88,17 +86,13 @@ static inline unsigned int ablkcipher_done_slow(struct ablkcipher_walk *walk,
- 		n -= len_this_page;
- 		scatterwalk_start(&walk->out, scatterwalk_sg_next(walk->out.sg));
- 	}
--
--	return bsize;
- }
- 
--static inline unsigned int ablkcipher_done_fast(struct ablkcipher_walk *walk,
--						unsigned int n)
-+static inline void ablkcipher_done_fast(struct ablkcipher_walk *walk,
-+					unsigned int n)
- {
- 	scatterwalk_advance(&walk->in, n);
- 	scatterwalk_advance(&walk->out, n);
--
--	return n;
- }
- 
- static int ablkcipher_walk_next(struct ablkcipher_request *req,
-@@ -108,39 +102,40 @@ int ablkcipher_walk_done(struct ablkcipher_request *req,
- 			 struct ablkcipher_walk *walk, int err)
- {
- 	struct crypto_tfm *tfm = req->base.tfm;
--	unsigned int nbytes = 0;
-+	unsigned int n; /* bytes processed */
-+	bool more;
- 
--	if (likely(err >= 0)) {
--		unsigned int n = walk->nbytes - err;
-+	if (unlikely(err < 0))
-+		goto finish;
- 
--		if (likely(!(walk->flags & ABLKCIPHER_WALK_SLOW)))
--			n = ablkcipher_done_fast(walk, n);
--		else if (WARN_ON(err)) {
--			err = -EINVAL;
--			goto err;
--		} else
--			n = ablkcipher_done_slow(walk, n);
-+	n = walk->nbytes - err;
-+	walk->total -= n;
-+	more = (walk->total != 0);
- 
--		nbytes = walk->total - n;
--		err = 0;
-+	if (likely(!(walk->flags & ABLKCIPHER_WALK_SLOW))) {
-+		ablkcipher_done_fast(walk, n);
-+	} else {
-+		if (WARN_ON(err)) {
-+			/* unexpected case; didn't process all bytes */
-+			err = -EINVAL;
-+			goto finish;
-+		}
-+		ablkcipher_done_slow(walk, n);
- 	}
- 
--	scatterwalk_done(&walk->in, 0, nbytes);
--	scatterwalk_done(&walk->out, 1, nbytes);
--
--err:
--	walk->total = nbytes;
--	walk->nbytes = nbytes;
-+	scatterwalk_done(&walk->in, 0, more);
-+	scatterwalk_done(&walk->out, 1, more);
- 
--	if (nbytes) {
-+	if (more) {
- 		crypto_yield(req->base.flags);
- 		return ablkcipher_walk_next(req, walk);
- 	}
--
-+	err = 0;
-+finish:
-+	walk->nbytes = 0;
- 	if (walk->iv != req->info)
- 		memcpy(req->info, walk->iv, tfm->crt_ablkcipher.ivsize);
- 	kfree(walk->iv_buffer);
--
- 	return err;
- }
- EXPORT_SYMBOL_GPL(ablkcipher_walk_done);
--- 
-2.28.0
-
-
-From adfdcfe1c7cd5f163855b0d3ea5d3a75efddd576 Mon Sep 17 00:00:00 2001
-From: Mark Salyzyn <salyzyn@android.com>
-Date: Tue, 31 Jul 2018 15:02:13 -0700
-Subject: [PATCH 15/16] Bluetooth: hidp: buffer overflow in hidp_process_report
-
-commit 7992c18810e568b95c869b227137a2215702a805 upstream.
-
-CVE-2018-9363
-
-The buffer length is unsigned at all layers, but gets cast to int and
-checked in hidp_process_report and can lead to a buffer overflow.
-Switch len parameter to unsigned int to resolve issue.
-
-This affects 3.18 and newer kernels.
-
-Signed-off-by: Mark Salyzyn <salyzyn@android.com>
-Fixes: a4b1b5877b514b276f0f31efe02388a9c2836728 ("HID: Bluetooth: hidp: make sure input buffers are big enough")
-Cc: Marcel Holtmann <marcel@holtmann.org>
-Cc: Johan Hedberg <johan.hedberg@gmail.com>
-Cc: "David S. Miller" <davem@davemloft.net>
-Cc: Kees Cook <keescook@chromium.org>
-Cc: Benjamin Tissoires <benjamin.tissoires@redhat.com>
-Cc: linux-bluetooth@vger.kernel.org
-Cc: netdev@vger.kernel.org
-Cc: linux-kernel@vger.kernel.org
-Cc: security@kernel.org
-Cc: kernel-team@android.com
-Acked-by: Kees Cook <keescook@chromium.org>
-Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/bluetooth/hidp/core.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
+ 	fp = page->freelist;
+ 	while (fp && nr <= page->objects) {
 diff --git a/net/bluetooth/hidp/core.c b/net/bluetooth/hidp/core.c
 index 9f5273a0be7a..4f41b245ce5b 100644
 --- a/net/bluetooth/hidp/core.c
@@ -1722,31 +1058,47 @@ index 9f5273a0be7a..4f41b245ce5b 100644
  {
  	if (len > HID_MAX_BUFFER_SIZE)
  		len = HID_MAX_BUFFER_SIZE;
--- 
-2.28.0
-
-
-From 18e6ee0440a7ab853e4ca0f1403eeef1803ed970 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Fri, 17 Aug 2018 20:54:56 +0200
-Subject: [PATCH 16/16] Linux 3.18.119
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 5c3464b5bb1e..6f85cc732008 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 18
--SUBLEVEL = 118
-+SUBLEVEL = 119
- EXTRAVERSION =
- NAME = Diseased Newt
+diff --git a/scripts/depmod.sh b/scripts/depmod.sh
+index 122599b1c13b..ea1e96921e3b 100755
+--- a/scripts/depmod.sh
++++ b/scripts/depmod.sh
+@@ -10,10 +10,16 @@ DEPMOD=$1
+ KERNELRELEASE=$2
+ SYMBOL_PREFIX=$3
  
--- 
-2.28.0
-
+-if ! test -r System.map -a -x "$DEPMOD"; then
++if ! test -r System.map ; then
+ 	exit 0
+ fi
+ 
++if [ -z $(command -v $DEPMOD) ]; then
++	echo "'make modules_install' requires $DEPMOD. Please install it." >&2
++	echo "This is probably in the kmod package." >&2
++	exit 1
++fi
++
+ # older versions of depmod don't support -P <symbol-prefix>
+ # support was added in module-init-tools 3.13
+ if test -n "$SYMBOL_PREFIX"; then
+diff --git a/sound/core/info.c b/sound/core/info.c
+index 9f404e965ea2..08832c973a53 100644
+--- a/sound/core/info.c
++++ b/sound/core/info.c
+@@ -253,6 +253,7 @@ static ssize_t snd_info_entry_write(struct file *file, const char __user *buffer
+ 	struct snd_info_buffer *buf;
+ 	ssize_t size = 0;
+ 	loff_t pos;
++	unsigned long realloc_size;
+ 
+ 	data = file->private_data;
+ 	if (snd_BUG_ON(!data))
+@@ -261,7 +262,8 @@ static ssize_t snd_info_entry_write(struct file *file, const char __user *buffer
+ 	pos = *offset;
+ 	if (pos < 0 || (long) pos != pos || (ssize_t) count < 0)
+ 		return -EIO;
+-	if ((unsigned long) pos + (unsigned long) count < (unsigned long) pos)
++	realloc_size = (unsigned long) pos + (unsigned long) count;
++	if (realloc_size < (unsigned long) pos || realloc_size > UINT_MAX)
+ 		return -EIO;
+ 	switch (entry->content) {
+ 	case SNDRV_INFO_CONTENT_TEXT:

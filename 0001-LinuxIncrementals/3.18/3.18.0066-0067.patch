@@ -1,407 +1,17 @@
-From 5776984fafdc8b18fb6ddd8264e6cc274b8ef349 Mon Sep 17 00:00:00 2001
-From: Liping Zhang <zlpnobody@gmail.com>
-Date: Sat, 25 Mar 2017 16:35:29 +0800
-Subject: [PATCH 01/11] netfilter: nf_ct_ext: fix possible panic after
- nf_ct_extend_unregister
-
-commit 9c3f3794926a997b1cab6c42480ff300efa2d162 upstream.
-
-If one cpu is doing nf_ct_extend_unregister while another cpu is doing
-__nf_ct_ext_add_length, then we may hit BUG_ON(t == NULL). Moreover,
-there's no synchronize_rcu invocation after set nf_ct_ext_types[id] to
-NULL, so it's possible that we may access invalid pointer.
-
-But actually, most of the ct extends are built-in, so the problem listed
-above will not happen. However, there are two exceptions: NF_CT_EXT_NAT
-and NF_CT_EXT_SYNPROXY.
-
-For _EXT_NAT, the panic will not happen, since adding the nat extend and
-unregistering the nat extend are located in the same file(nf_nat_core.c),
-this means that after the nat module is removed, we cannot add the nat
-extend too.
-
-For _EXT_SYNPROXY, synproxy extend may be added by init_conntrack, while
-synproxy extend unregister will be done by synproxy_core_exit. So after
-nf_synproxy_core.ko is removed, we may still try to add the synproxy
-extend, then kernel panic may happen.
-
-I know it's very hard to reproduce this issue, but I can play a tricky
-game to make it happen very easily :)
-
-Step 1. Enable SYNPROXY for tcp dport 1234 at FORWARD hook:
-  # iptables -I FORWARD -p tcp --dport 1234 -j SYNPROXY
-Step 2. Queue the syn packet to the userspace at raw table OUTPUT hook.
-        Also note, in the userspace we only add a 20s' delay, then
-        reinject the syn packet to the kernel:
-  # iptables -t raw -I OUTPUT -p tcp --syn -j NFQUEUE --queue-num 1
-Step 3. Using "nc 2.2.2.2 1234" to connect the server.
-Step 4. Now remove the nf_synproxy_core.ko quickly:
-  # iptables -F FORWARD
-  # rmmod ipt_SYNPROXY
-  # rmmod nf_synproxy_core
-Step 5. After 20s' delay, the syn packet is reinjected to the kernel.
-
-Now you will see the panic like this:
-  kernel BUG at net/netfilter/nf_conntrack_extend.c:91!
-  Call Trace:
-   ? __nf_ct_ext_add_length+0x53/0x3c0 [nf_conntrack]
-   init_conntrack+0x12b/0x600 [nf_conntrack]
-   nf_conntrack_in+0x4cc/0x580 [nf_conntrack]
-   ipv4_conntrack_local+0x48/0x50 [nf_conntrack_ipv4]
-   nf_reinject+0x104/0x270
-   nfqnl_recv_verdict+0x3e1/0x5f9 [nfnetlink_queue]
-   ? nfqnl_recv_verdict+0x5/0x5f9 [nfnetlink_queue]
-   ? nla_parse+0xa0/0x100
-   nfnetlink_rcv_msg+0x175/0x6a9 [nfnetlink]
-   [...]
-
-One possible solution is to make NF_CT_EXT_SYNPROXY extend built-in, i.e.
-introduce nf_conntrack_synproxy.c and only do ct extend register and
-unregister in it, similar to nf_conntrack_timeout.c.
-
-But having such a obscure restriction of nf_ct_extend_unregister is not a
-good idea, so we should invoke synchronize_rcu after set nf_ct_ext_types
-to NULL, and check the NULL pointer when do __nf_ct_ext_add_length. Then
-it will be easier if we add new ct extend in the future.
-
-Last, we use kfree_rcu to free nf_ct_ext, so rcu_barrier() is unnecessary
-anymore, remove it too.
-
-Signed-off-by: Liping Zhang <zlpnobody@gmail.com>
-Acked-by: Florian Westphal <fw@strlen.de>
-Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
-Cc: Stefan Bader <stefan.bader@canonical.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/netfilter/nf_conntrack_extend.c | 13 ++++++++++---
- 1 file changed, 10 insertions(+), 3 deletions(-)
-
-diff --git a/net/netfilter/nf_conntrack_extend.c b/net/netfilter/nf_conntrack_extend.c
-index 1a9545965c0d..531ca55f1af6 100644
---- a/net/netfilter/nf_conntrack_extend.c
-+++ b/net/netfilter/nf_conntrack_extend.c
-@@ -53,7 +53,11 @@ nf_ct_ext_create(struct nf_ct_ext **ext, enum nf_ct_ext_id id,
+diff --git a/Makefile b/Makefile
+index 32c25e43e43c..7d6526eed64a 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 66
++SUBLEVEL = 67
+ EXTRAVERSION =
+ NAME = Diseased Newt
  
- 	rcu_read_lock();
- 	t = rcu_dereference(nf_ct_ext_types[id]);
--	BUG_ON(t == NULL);
-+	if (!t) {
-+		rcu_read_unlock();
-+		return NULL;
-+	}
-+
- 	off = ALIGN(sizeof(struct nf_ct_ext), t->align);
- 	len = off + t->len + var_alloc_len;
- 	alloc_size = t->alloc_size + var_alloc_len;
-@@ -88,7 +92,10 @@ void *__nf_ct_ext_add_length(struct nf_conn *ct, enum nf_ct_ext_id id,
- 
- 	rcu_read_lock();
- 	t = rcu_dereference(nf_ct_ext_types[id]);
--	BUG_ON(t == NULL);
-+	if (!t) {
-+		rcu_read_unlock();
-+		return NULL;
-+	}
- 
- 	newoff = ALIGN(old->len, t->align);
- 	newlen = newoff + t->len + var_alloc_len;
-@@ -186,6 +193,6 @@ void nf_ct_extend_unregister(struct nf_ct_ext_type *type)
- 	RCU_INIT_POINTER(nf_ct_ext_types[type->id], NULL);
- 	update_alloc_size(type);
- 	mutex_unlock(&nf_ct_ext_type_mutex);
--	rcu_barrier(); /* Wait for completion of call_rcu()'s */
-+	synchronize_rcu();
- }
- EXPORT_SYMBOL_GPL(nf_ct_extend_unregister);
--- 
-2.28.0
-
-
-From dc7a0acd79f45adfb48bef68a17c7ab0744a0b0f Mon Sep 17 00:00:00 2001
-From: Jan Kara <jack@suse.cz>
-Date: Tue, 15 Aug 2017 13:00:36 +0200
-Subject: [PATCH 02/11] audit: Fix use after free in audit_remove_watch_rule()
-
-commit d76036ab47eafa6ce52b69482e91ca3ba337d6d6 upstream.
-
-audit_remove_watch_rule() drops watch's reference to parent but then
-continues to work with it. That is not safe as parent can get freed once
-we drop our reference. The following is a trivial reproducer:
-
-mount -o loop image /mnt
-touch /mnt/file
-auditctl -w /mnt/file -p wax
-umount /mnt
-auditctl -D
-<crash in fsnotify_destroy_mark()>
-
-Grab our own reference in audit_remove_watch_rule() earlier to make sure
-mark does not get freed under us.
-
-Reported-by: Tony Jones <tonyj@suse.de>
-Signed-off-by: Jan Kara <jack@suse.cz>
-Tested-by: Tony Jones <tonyj@suse.de>
-Signed-off-by: Paul Moore <paul@paul-moore.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/audit_watch.c | 12 +++++++-----
- 1 file changed, 7 insertions(+), 5 deletions(-)
-
-diff --git a/kernel/audit_watch.c b/kernel/audit_watch.c
-index ad9c1682f616..d39e6e3f1e0a 100644
---- a/kernel/audit_watch.c
-+++ b/kernel/audit_watch.c
-@@ -455,13 +455,15 @@ void audit_remove_watch_rule(struct audit_krule *krule)
- 	list_del(&krule->rlist);
- 
- 	if (list_empty(&watch->rules)) {
-+		/*
-+		 * audit_remove_watch() drops our reference to 'parent' which
-+		 * can get freed. Grab our own reference to be safe.
-+		 */
-+		audit_get_parent(parent);
- 		audit_remove_watch(watch);
--
--		if (list_empty(&parent->watches)) {
--			audit_get_parent(parent);
-+		if (list_empty(&parent->watches))
- 			fsnotify_destroy_mark(&parent->mark, audit_watch_group);
--			audit_put_parent(parent);
--		}
-+		audit_put_parent(parent);
- 	}
- }
- 
--- 
-2.28.0
-
-
-From 014e673b0c563f497e0e71cfd65b7c75ad738732 Mon Sep 17 00:00:00 2001
-From: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
-Date: Sat, 12 Aug 2017 23:36:47 +0200
-Subject: [PATCH 03/11] parisc: pci memory bar assignment fails with 64bit
- kernels on dino/cujo
-
-commit 4098116039911e8870d84c975e2ec22dab65a909 upstream.
-
-For 64bit kernels the lmmio_space_offset of the host bridge window
-isn't set correctly on systems with dino/cujo PCI host bridges.
-This leads to not assigned memory bars and failing drivers, which
-need to use these bars.
-
-Signed-off-by: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
-Acked-by: Helge Deller <deller@gmx.de>
-Signed-off-by: Helge Deller <deller@gmx.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/parisc/dino.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/parisc/dino.c b/drivers/parisc/dino.c
-index 7b0ca1551d7b..005ea632ba53 100644
---- a/drivers/parisc/dino.c
-+++ b/drivers/parisc/dino.c
-@@ -954,7 +954,7 @@ static int __init dino_probe(struct parisc_device *dev)
- 
- 	dino_dev->hba.dev = dev;
- 	dino_dev->hba.base_addr = ioremap_nocache(hpa, 4096);
--	dino_dev->hba.lmmio_space_offset = 0;	/* CPU addrs == bus addrs */
-+	dino_dev->hba.lmmio_space_offset = PCI_F_EXTEND;
- 	spin_lock_init(&dino_dev->dinosaur_pen);
- 	dino_dev->hba.iommu = ccio_get_iommu(dev);
- 
--- 
-2.28.0
-
-
-From f1bfa63f2e683a0d18c8508694d5aff81afe8298 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Mon, 14 Aug 2017 14:35:50 +0200
-Subject: [PATCH 04/11] ALSA: usb-audio: Apply sample rate quirk to Sennheiser
- headset
-
-commit a8e800fe0f68bc28ce309914f47e432742b865ed upstream.
-
-A Senheisser headset requires the typical sample-rate quirk for
-avoiding spurious errors from inquiring the current sample rate like:
- usb 1-1: 2:1: cannot get freq at ep 0x4
- usb 1-1: 3:1: cannot get freq at ep 0x83
-
-The USB ID 1395:740a has to be added to the entries in
-snd_usb_get_sample_rate_quirk().
-
-Bugzilla: https://bugzilla.suse.com/show_bug.cgi?id=1052580
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/quirks.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
-index 5ace1fb54595..9fd1c7a68a3a 100644
---- a/sound/usb/quirks.c
-+++ b/sound/usb/quirks.c
-@@ -1127,6 +1127,7 @@ bool snd_usb_get_sample_rate_quirk(struct snd_usb_audio *chip)
- 	case USB_ID(0x04D8, 0xFEEA): /* Benchmark DAC1 Pre */
- 	case USB_ID(0x0556, 0x0014): /* Phoenix Audio TMX320VC */
- 	case USB_ID(0x074D, 0x3553): /* Outlaw RR2150 (Micronas UAC3553B) */
-+	case USB_ID(0x1395, 0x740a): /* Sennheiser DECT */
- 	case USB_ID(0x1901, 0x0191): /* GE B850V3 CP2114 audio interface */
- 	case USB_ID(0x1de7, 0x0013): /* Phoenix Audio MT202exe */
- 	case USB_ID(0x1de7, 0x0014): /* Phoenix Audio TMX320 */
--- 
-2.28.0
-
-
-From d5a76b2ba6871a875fdcd598548176ce3464aa30 Mon Sep 17 00:00:00 2001
-From: zhong jiang <zhongjiang@huawei.com>
-Date: Fri, 18 Aug 2017 15:16:24 -0700
-Subject: [PATCH 05/11] mm/mempolicy: fix use after free when calling
- get_mempolicy
-
-commit 73223e4e2e3867ebf033a5a8eb2e5df0158ccc99 upstream.
-
-I hit a use after free issue when executing trinity and repoduced it
-with KASAN enabled.  The related call trace is as follows.
-
-  BUG: KASan: use after free in SyS_get_mempolicy+0x3c8/0x960 at addr ffff8801f582d766
-  Read of size 2 by task syz-executor1/798
-
-  INFO: Allocated in mpol_new.part.2+0x74/0x160 age=3 cpu=1 pid=799
-     __slab_alloc+0x768/0x970
-     kmem_cache_alloc+0x2e7/0x450
-     mpol_new.part.2+0x74/0x160
-     mpol_new+0x66/0x80
-     SyS_mbind+0x267/0x9f0
-     system_call_fastpath+0x16/0x1b
-  INFO: Freed in __mpol_put+0x2b/0x40 age=4 cpu=1 pid=799
-     __slab_free+0x495/0x8e0
-     kmem_cache_free+0x2f3/0x4c0
-     __mpol_put+0x2b/0x40
-     SyS_mbind+0x383/0x9f0
-     system_call_fastpath+0x16/0x1b
-  INFO: Slab 0xffffea0009cb8dc0 objects=23 used=8 fp=0xffff8801f582de40 flags=0x200000000004080
-  INFO: Object 0xffff8801f582d760 @offset=5984 fp=0xffff8801f582d600
-
-  Bytes b4 ffff8801f582d750: ae 01 ff ff 00 00 00 00 5a 5a 5a 5a 5a 5a 5a 5a  ........ZZZZZZZZ
-  Object ffff8801f582d760: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b  kkkkkkkkkkkkkkkk
-  Object ffff8801f582d770: 6b 6b 6b 6b 6b 6b 6b a5                          kkkkkkk.
-  Redzone ffff8801f582d778: bb bb bb bb bb bb bb bb                          ........
-  Padding ffff8801f582d8b8: 5a 5a 5a 5a 5a 5a 5a 5a                          ZZZZZZZZ
-  Memory state around the buggy address:
-  ffff8801f582d600: fb fb fb fc fc fc fc fc fc fc fc fc fc fc fc fc
-  ffff8801f582d680: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
-  >ffff8801f582d700: fc fc fc fc fc fc fc fc fc fc fc fc fb fb fb fc
-
-!shared memory policy is not protected against parallel removal by other
-thread which is normally protected by the mmap_sem.  do_get_mempolicy,
-however, drops the lock midway while we can still access it later.
-
-Early premature up_read is a historical artifact from times when
-put_user was called in this path see https://lwn.net/Articles/124754/
-but that is gone since 8bccd85ffbaf ("[PATCH] Implement sys_* do_*
-layering in the memory policy layer.").  but when we have the the
-current mempolicy ref count model.  The issue was introduced
-accordingly.
-
-Fix the issue by removing the premature release.
-
-Link: http://lkml.kernel.org/r/1502950924-27521-1-git-send-email-zhongjiang@huawei.com
-Signed-off-by: zhong jiang <zhongjiang@huawei.com>
-Acked-by: Michal Hocko <mhocko@suse.com>
-Cc: Minchan Kim <minchan@kernel.org>
-Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: David Rientjes <rientjes@google.com>
-Cc: Mel Gorman <mgorman@techsingularity.net>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/mempolicy.c | 5 -----
- 1 file changed, 5 deletions(-)
-
-diff --git a/mm/mempolicy.c b/mm/mempolicy.c
-index 6a23ccc46f0f..d326955b4d05 100644
---- a/mm/mempolicy.c
-+++ b/mm/mempolicy.c
-@@ -944,11 +944,6 @@ static long do_get_mempolicy(int *policy, nodemask_t *nmask,
- 		*policy |= (pol->flags & MPOL_MODE_FLAGS);
- 	}
- 
--	if (vma) {
--		up_read(&current->mm->mmap_sem);
--		vma = NULL;
--	}
--
- 	err = 0;
- 	if (nmask) {
- 		if (mpol_store_user_nodemask(pol)) {
--- 
-2.28.0
-
-
-From ce76d8b8c727dea127099a7263f2ccd744b2aab0 Mon Sep 17 00:00:00 2001
-From: Boris Brezillon <boris.brezillon@free-electrons.com>
-Date: Tue, 4 Jul 2017 11:10:39 +0200
-Subject: [PATCH 06/11] irqchip/atmel-aic: Fix unbalanced of_node_put() in
- aic_common_irq_fixup()
-
-commit 469bcef53c546bb792aa66303933272991b7831d upstream.
-
-aic_common_irq_fixup() is calling twice of_node_put() on the same node
-thus leading to an unbalanced refcount on the root node.
-
-Signed-off-by: Boris Brezillon <boris.brezillon@free-electrons.com>
-Reported-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
-Fixes: b2f579b58e93 ("irqchip: atmel-aic: Add irq fixup infrastructure")
-Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/irqchip/irq-atmel-aic-common.c | 1 -
- 1 file changed, 1 deletion(-)
-
 diff --git a/drivers/irqchip/irq-atmel-aic-common.c b/drivers/irqchip/irq-atmel-aic-common.c
-index d84c742dd073..6df64112bd34 100644
---- a/drivers/irqchip/irq-atmel-aic-common.c
-+++ b/drivers/irqchip/irq-atmel-aic-common.c
-@@ -176,7 +176,6 @@ void __init aic_common_irq_fixup(const struct of_device_id *matches)
- 		return;
- 
- 	match = of_match_node(matches, root);
--	of_node_put(root);
- 
- 	if (match) {
- 		void (*fixup)(struct device_node *) = match->data;
--- 
-2.28.0
-
-
-From 165f22abe9eff817d9771dd94a1dfbe6f335d459 Mon Sep 17 00:00:00 2001
-From: Boris Brezillon <boris.brezillon@free-electrons.com>
-Date: Tue, 4 Jul 2017 11:10:40 +0200
-Subject: [PATCH 07/11] irqchip/atmel-aic: Fix unbalanced refcount in
- aic_common_rtc_irq_fixup()
-
-commit 277867ade8262583f4280cadbe90e0031a3706a7 upstream.
-
-of_find_compatible_node() is calling of_node_put() on its first argument
-thus leading to an unbalanced of_node_get/put() issue if the node has not
-been retained before that.
-
-Instead of passing the root node, pass NULL, which does exactly the same:
-iterate over all DT nodes, starting from the root node.
-
-Signed-off-by: Boris Brezillon <boris.brezillon@free-electrons.com>
-Reported-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
-Fixes: 3d61467f9bab ("irqchip: atmel-aic: Implement RTC irq fixup")
-Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/irqchip/irq-atmel-aic-common.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/irqchip/irq-atmel-aic-common.c b/drivers/irqchip/irq-atmel-aic-common.c
-index 6df64112bd34..3696bfeac028 100644
+index d84c742dd073..3696bfeac028 100644
 --- a/drivers/irqchip/irq-atmel-aic-common.c
 +++ b/drivers/irqchip/irq-atmel-aic-common.c
 @@ -148,9 +148,9 @@ void __init aic_common_rtc_irq_fixup(struct device_node *root)
@@ -416,115 +26,39 @@ index 6df64112bd34..3696bfeac028 100644
  					     "atmel,at91sam9x5-rtc");
  
  	if (!np)
--- 
-2.28.0
-
-
-From 8cf95002f0c9afe06fa1e4b9ebb0e10a77c481b1 Mon Sep 17 00:00:00 2001
-From: Linus Torvalds <torvalds@linux-foundation.org>
-Date: Sun, 20 Aug 2017 13:26:27 -0700
-Subject: [PATCH 08/11] Sanitize 'move_pages()' permission checks
-
-commit 197e7e521384a23b9e585178f3f11c9fa08274b9 upstream.
-
-The 'move_paghes()' system call was introduced long long ago with the
-same permission checks as for sending a signal (except using
-CAP_SYS_NICE instead of CAP_SYS_KILL for the overriding capability).
-
-That turns out to not be a great choice - while the system call really
-only moves physical page allocations around (and you need other
-capabilities to do a lot of it), you can check the return value to map
-out some the virtual address choices and defeat ASLR of a binary that
-still shares your uid.
-
-So change the access checks to the more common 'ptrace_may_access()'
-model instead.
-
-This tightens the access checks for the uid, and also effectively
-changes the CAP_SYS_NICE check to CAP_SYS_PTRACE, but it's unlikely that
-anybody really _uses_ this legacy system call any more (we hav ebetter
-NUMA placement models these days), so I expect nobody to notice.
-
-Famous last words.
-
-Reported-by: Otto Ebeling <otto.ebeling@iki.fi>
-Acked-by: Eric W. Biederman <ebiederm@xmission.com>
-Cc: Willy Tarreau <w@1wt.eu>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/migrate.c | 11 +++--------
- 1 file changed, 3 insertions(+), 8 deletions(-)
-
-diff --git a/mm/migrate.c b/mm/migrate.c
-index 3594defceff9..4d743bce5a23 100644
---- a/mm/migrate.c
-+++ b/mm/migrate.c
-@@ -37,6 +37,7 @@
- #include <linux/gfp.h>
- #include <linux/balloon_compaction.h>
- #include <linux/mmu_notifier.h>
-+#include <linux/ptrace.h>
+@@ -176,7 +176,6 @@ void __init aic_common_irq_fixup(const struct of_device_id *matches)
+ 		return;
  
- #include <asm/tlbflush.h>
+ 	match = of_match_node(matches, root);
+-	of_node_put(root);
  
-@@ -1468,7 +1469,6 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
- 		const int __user *, nodes,
- 		int __user *, status, int, flags)
- {
--	const struct cred *cred = current_cred(), *tcred;
- 	struct task_struct *task;
- 	struct mm_struct *mm;
- 	int err;
-@@ -1492,14 +1492,9 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
+ 	if (match) {
+ 		void (*fixup)(struct device_node *) = match->data;
+diff --git a/drivers/net/usb/qmi_wwan.c b/drivers/net/usb/qmi_wwan.c
+index 31187304afad..b11f8eaba406 100644
+--- a/drivers/net/usb/qmi_wwan.c
++++ b/drivers/net/usb/qmi_wwan.c
+@@ -749,6 +749,7 @@ static const struct usb_device_id products[] = {
+ 	{QMI_FIXED_INTF(0x19d2, 0x1428, 2)},	/* Telewell TW-LTE 4G v2 */
+ 	{QMI_FIXED_INTF(0x19d2, 0x2002, 4)},	/* ZTE (Vodafone) K3765-Z */
+ 	{QMI_FIXED_INTF(0x2001, 0x7e19, 4)},	/* D-Link DWM-221 B1 */
++	{QMI_FIXED_INTF(0x2001, 0x7e35, 4)},	/* D-Link DWM-222 */
+ 	{QMI_FIXED_INTF(0x0f3d, 0x68a2, 8)},    /* Sierra Wireless MC7700 */
+ 	{QMI_FIXED_INTF(0x114f, 0x68a2, 8)},    /* Sierra Wireless MC7750 */
+ 	{QMI_FIXED_INTF(0x1199, 0x68a2, 8)},	/* Sierra Wireless MC7710 in QMI mode */
+diff --git a/drivers/parisc/dino.c b/drivers/parisc/dino.c
+index 7b0ca1551d7b..005ea632ba53 100644
+--- a/drivers/parisc/dino.c
++++ b/drivers/parisc/dino.c
+@@ -954,7 +954,7 @@ static int __init dino_probe(struct parisc_device *dev)
  
- 	/*
- 	 * Check if this process has the right to modify the specified
--	 * process. The right exists if the process has administrative
--	 * capabilities, superuser privileges or the same
--	 * userid as the target process.
-+	 * process. Use the regular "ptrace_may_access()" checks.
- 	 */
--	tcred = __task_cred(task);
--	if (!uid_eq(cred->euid, tcred->suid) && !uid_eq(cred->euid, tcred->uid) &&
--	    !uid_eq(cred->uid,  tcred->suid) && !uid_eq(cred->uid,  tcred->uid) &&
--	    !capable(CAP_SYS_NICE)) {
-+	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)) {
- 		rcu_read_unlock();
- 		err = -EPERM;
- 		goto out;
--- 
-2.28.0
-
-
-From 63407c4d1f9f64015974206e9bf40b318fdd74ee Mon Sep 17 00:00:00 2001
-From: Oleg Nesterov <oleg@redhat.com>
-Date: Mon, 21 Aug 2017 17:35:02 +0200
-Subject: [PATCH 09/11] pids: make task_tgid_nr_ns() safe
-
-commit dd1c1f2f2028a7b851f701fc6a8ebe39dcb95e7c upstream.
-
-This was reported many times, and this was even mentioned in commit
-52ee2dfdd4f5 ("pids: refactor vnr/nr_ns helpers to make them safe") but
-somehow nobody bothered to fix the obvious problem: task_tgid_nr_ns() is
-not safe because task->group_leader points to nowhere after the exiting
-task passes exit_notify(), rcu_read_lock() can not help.
-
-We really need to change __unhash_process() to nullify group_leader,
-parent, and real_parent, but this needs some cleanups.  Until then we
-can turn task_tgid_nr_ns() into another user of __task_pid_nr_ns() and
-fix the problem.
-
-Reported-by: Troy Kensinger <tkensinger@google.com>
-Signed-off-by: Oleg Nesterov <oleg@redhat.com>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/pid.h   |  4 +++-
- include/linux/sched.h | 50 +++++++++++++++++++++++--------------------
- kernel/pid.c          | 11 ++++------
- 3 files changed, 34 insertions(+), 31 deletions(-)
-
+ 	dino_dev->hba.dev = dev;
+ 	dino_dev->hba.base_addr = ioremap_nocache(hpa, 4096);
+-	dino_dev->hba.lmmio_space_offset = 0;	/* CPU addrs == bus addrs */
++	dino_dev->hba.lmmio_space_offset = PCI_F_EXTEND;
+ 	spin_lock_init(&dino_dev->dinosaur_pen);
+ 	dino_dev->hba.iommu = ccio_get_iommu(dev);
+ 
 diff --git a/include/linux/pid.h b/include/linux/pid.h
 index 23705a53abba..97b745ddece5 100644
 --- a/include/linux/pid.h
@@ -610,6 +144,31 @@ index 4863d72acae4..ab10455e5b02 100644
  /* obsolete, do not use */
  static inline pid_t task_pgrp_nr(struct task_struct *tsk)
  {
+diff --git a/kernel/audit_watch.c b/kernel/audit_watch.c
+index ad9c1682f616..d39e6e3f1e0a 100644
+--- a/kernel/audit_watch.c
++++ b/kernel/audit_watch.c
+@@ -455,13 +455,15 @@ void audit_remove_watch_rule(struct audit_krule *krule)
+ 	list_del(&krule->rlist);
+ 
+ 	if (list_empty(&watch->rules)) {
++		/*
++		 * audit_remove_watch() drops our reference to 'parent' which
++		 * can get freed. Grab our own reference to be safe.
++		 */
++		audit_get_parent(parent);
+ 		audit_remove_watch(watch);
+-
+-		if (list_empty(&parent->watches)) {
+-			audit_get_parent(parent);
++		if (list_empty(&parent->watches))
+ 			fsnotify_destroy_mark(&parent->mark, audit_watch_group);
+-			audit_put_parent(parent);
+-		}
++		audit_put_parent(parent);
+ 	}
+ }
+ 
 diff --git a/kernel/pid.c b/kernel/pid.c
 index 82430c858d69..65a386e24811 100644
 --- a/kernel/pid.c
@@ -640,61 +199,105 @@ index 82430c858d69..65a386e24811 100644
  struct pid_namespace *task_active_pid_ns(struct task_struct *tsk)
  {
  	return ns_of_pid(task_pid(tsk));
--- 
-2.28.0
-
-
-From ae0ead2b17862e8d0fcf0755625bea5d942523fc Mon Sep 17 00:00:00 2001
-From: Hector Martin <marcan@marcan.st>
-Date: Wed, 2 Aug 2017 00:45:44 +0900
-Subject: [PATCH 10/11] usb: qmi_wwan: add D-Link DWM-222 device ID
-
-commit bed9ff165960921303a100228585f2d1691b42eb upstream.
-
-Signed-off-by: Hector Martin <marcan@marcan.st>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/usb/qmi_wwan.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/net/usb/qmi_wwan.c b/drivers/net/usb/qmi_wwan.c
-index 31187304afad..b11f8eaba406 100644
---- a/drivers/net/usb/qmi_wwan.c
-+++ b/drivers/net/usb/qmi_wwan.c
-@@ -749,6 +749,7 @@ static const struct usb_device_id products[] = {
- 	{QMI_FIXED_INTF(0x19d2, 0x1428, 2)},	/* Telewell TW-LTE 4G v2 */
- 	{QMI_FIXED_INTF(0x19d2, 0x2002, 4)},	/* ZTE (Vodafone) K3765-Z */
- 	{QMI_FIXED_INTF(0x2001, 0x7e19, 4)},	/* D-Link DWM-221 B1 */
-+	{QMI_FIXED_INTF(0x2001, 0x7e35, 4)},	/* D-Link DWM-222 */
- 	{QMI_FIXED_INTF(0x0f3d, 0x68a2, 8)},    /* Sierra Wireless MC7700 */
- 	{QMI_FIXED_INTF(0x114f, 0x68a2, 8)},    /* Sierra Wireless MC7750 */
- 	{QMI_FIXED_INTF(0x1199, 0x68a2, 8)},	/* Sierra Wireless MC7710 in QMI mode */
--- 
-2.28.0
-
-
-From 25efe5c96eb6454d87127afb3affe3c874e1d45e Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Thu, 24 Aug 2017 17:00:20 -0700
-Subject: [PATCH 11/11] Linux 3.18.67
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 32c25e43e43c..7d6526eed64a 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 18
--SUBLEVEL = 66
-+SUBLEVEL = 67
- EXTRAVERSION =
- NAME = Diseased Newt
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 6a23ccc46f0f..d326955b4d05 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -944,11 +944,6 @@ static long do_get_mempolicy(int *policy, nodemask_t *nmask,
+ 		*policy |= (pol->flags & MPOL_MODE_FLAGS);
+ 	}
  
--- 
-2.28.0
-
+-	if (vma) {
+-		up_read(&current->mm->mmap_sem);
+-		vma = NULL;
+-	}
+-
+ 	err = 0;
+ 	if (nmask) {
+ 		if (mpol_store_user_nodemask(pol)) {
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 3594defceff9..4d743bce5a23 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -37,6 +37,7 @@
+ #include <linux/gfp.h>
+ #include <linux/balloon_compaction.h>
+ #include <linux/mmu_notifier.h>
++#include <linux/ptrace.h>
+ 
+ #include <asm/tlbflush.h>
+ 
+@@ -1468,7 +1469,6 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
+ 		const int __user *, nodes,
+ 		int __user *, status, int, flags)
+ {
+-	const struct cred *cred = current_cred(), *tcred;
+ 	struct task_struct *task;
+ 	struct mm_struct *mm;
+ 	int err;
+@@ -1492,14 +1492,9 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
+ 
+ 	/*
+ 	 * Check if this process has the right to modify the specified
+-	 * process. The right exists if the process has administrative
+-	 * capabilities, superuser privileges or the same
+-	 * userid as the target process.
++	 * process. Use the regular "ptrace_may_access()" checks.
+ 	 */
+-	tcred = __task_cred(task);
+-	if (!uid_eq(cred->euid, tcred->suid) && !uid_eq(cred->euid, tcred->uid) &&
+-	    !uid_eq(cred->uid,  tcred->suid) && !uid_eq(cred->uid,  tcred->uid) &&
+-	    !capable(CAP_SYS_NICE)) {
++	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)) {
+ 		rcu_read_unlock();
+ 		err = -EPERM;
+ 		goto out;
+diff --git a/net/netfilter/nf_conntrack_extend.c b/net/netfilter/nf_conntrack_extend.c
+index 1a9545965c0d..531ca55f1af6 100644
+--- a/net/netfilter/nf_conntrack_extend.c
++++ b/net/netfilter/nf_conntrack_extend.c
+@@ -53,7 +53,11 @@ nf_ct_ext_create(struct nf_ct_ext **ext, enum nf_ct_ext_id id,
+ 
+ 	rcu_read_lock();
+ 	t = rcu_dereference(nf_ct_ext_types[id]);
+-	BUG_ON(t == NULL);
++	if (!t) {
++		rcu_read_unlock();
++		return NULL;
++	}
++
+ 	off = ALIGN(sizeof(struct nf_ct_ext), t->align);
+ 	len = off + t->len + var_alloc_len;
+ 	alloc_size = t->alloc_size + var_alloc_len;
+@@ -88,7 +92,10 @@ void *__nf_ct_ext_add_length(struct nf_conn *ct, enum nf_ct_ext_id id,
+ 
+ 	rcu_read_lock();
+ 	t = rcu_dereference(nf_ct_ext_types[id]);
+-	BUG_ON(t == NULL);
++	if (!t) {
++		rcu_read_unlock();
++		return NULL;
++	}
+ 
+ 	newoff = ALIGN(old->len, t->align);
+ 	newlen = newoff + t->len + var_alloc_len;
+@@ -186,6 +193,6 @@ void nf_ct_extend_unregister(struct nf_ct_ext_type *type)
+ 	RCU_INIT_POINTER(nf_ct_ext_types[type->id], NULL);
+ 	update_alloc_size(type);
+ 	mutex_unlock(&nf_ct_ext_type_mutex);
+-	rcu_barrier(); /* Wait for completion of call_rcu()'s */
++	synchronize_rcu();
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_extend_unregister);
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index 5ace1fb54595..9fd1c7a68a3a 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -1127,6 +1127,7 @@ bool snd_usb_get_sample_rate_quirk(struct snd_usb_audio *chip)
+ 	case USB_ID(0x04D8, 0xFEEA): /* Benchmark DAC1 Pre */
+ 	case USB_ID(0x0556, 0x0014): /* Phoenix Audio TMX320VC */
+ 	case USB_ID(0x074D, 0x3553): /* Outlaw RR2150 (Micronas UAC3553B) */
++	case USB_ID(0x1395, 0x740a): /* Sennheiser DECT */
+ 	case USB_ID(0x1901, 0x0191): /* GE B850V3 CP2114 audio interface */
+ 	case USB_ID(0x1de7, 0x0013): /* Phoenix Audio MT202exe */
+ 	case USB_ID(0x1de7, 0x0014): /* Phoenix Audio TMX320 */

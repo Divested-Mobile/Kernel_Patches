@@ -1,40 +1,556 @@
-From 1d3d0f8b7cf758136ed36b30620442d989601737 Mon Sep 17 00:00:00 2001
-From: Kees Cook <keescook@chromium.org>
-Date: Fri, 23 Jun 2017 15:08:57 -0700
-Subject: [PATCH 01/27] fs/exec.c: account for argv/envp pointers
-
-commit 98da7d08850fb8bdeb395d6368ed15753304aa0c upstream.
-
-When limiting the argv/envp strings during exec to 1/4 of the stack limit,
-the storage of the pointers to the strings was not included.  This means
-that an exec with huge numbers of tiny strings could eat 1/4 of the stack
-limit in strings and then additional space would be later used by the
-pointers to the strings.
-
-For example, on 32-bit with a 8MB stack rlimit, an exec with 1677721
-single-byte strings would consume less than 2MB of stack, the max (8MB /
-4) amount allowed, but the pointers to the strings would consume the
-remaining additional stack space (1677721 * 4 == 6710884).
-
-The result (1677721 + 6710884 == 8388605) would exhaust stack space
-entirely.  Controlling this stack exhaustion could result in
-pathological behavior in setuid binaries (CVE-2017-1000365).
-
-[akpm@linux-foundation.org: additional commenting from Kees]
-Fixes: b6a2fea39318 ("mm: variable length argument support")
-Link: http://lkml.kernel.org/r/20170622001720.GA32173@beast
-Signed-off-by: Kees Cook <keescook@chromium.org>
-Acked-by: Rik van Riel <riel@redhat.com>
-Acked-by: Michal Hocko <mhocko@suse.com>
-Cc: Alexander Viro <viro@zeniv.linux.org.uk>
-Cc: Qualys Security Advisory <qsa@qualys.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/exec.c | 28 ++++++++++++++++++++++++----
- 1 file changed, 24 insertions(+), 4 deletions(-)
-
+diff --git a/Makefile b/Makefile
+index 1f75507acbf4..696d15d8ad5d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+-SUBLEVEL = 74
++SUBLEVEL = 75
+ EXTRAVERSION =
+ NAME = Blurry Fish Butt
+ 
+diff --git a/arch/powerpc/kernel/kprobes.c b/arch/powerpc/kernel/kprobes.c
+index 7c053f281406..1138fec3dd65 100644
+--- a/arch/powerpc/kernel/kprobes.c
++++ b/arch/powerpc/kernel/kprobes.c
+@@ -514,6 +514,15 @@ int __kprobes setjmp_pre_handler(struct kprobe *p, struct pt_regs *regs)
+ #endif
+ #endif
+ 
++	/*
++	 * jprobes use jprobe_return() which skips the normal return
++	 * path of the function, and this messes up the accounting of the
++	 * function graph tracer.
++	 *
++	 * Pause function graph tracing while performing the jprobe function.
++	 */
++	pause_graph_tracing();
++
+ 	return 1;
+ }
+ 
+@@ -536,6 +545,8 @@ int __kprobes longjmp_break_handler(struct kprobe *p, struct pt_regs *regs)
+ 	 * saved regs...
+ 	 */
+ 	memcpy(regs, &kcb->jprobe_saved_regs, sizeof(struct pt_regs));
++	/* It's OK to start function graph tracing again */
++	unpause_graph_tracing();
+ 	preempt_enable_no_resched();
+ 	return 1;
+ }
+diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
+index 3c3a367b6e59..396dc44e783b 100644
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@ -2693,6 +2693,27 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Don't allow entry with a suspended transaction, because
++	 * the guest entry/exit code will lose it.
++	 * If the guest has TM enabled, save away their TM-related SPRs
++	 * (they will get restored by the TM unavailable interrupt).
++	 */
++#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++	if (cpu_has_feature(CPU_FTR_TM) && current->thread.regs &&
++	    (current->thread.regs->msr & MSR_TM)) {
++		if (MSR_TM_ACTIVE(current->thread.regs->msr)) {
++			run->exit_reason = KVM_EXIT_FAIL_ENTRY;
++			run->fail_entry.hardware_entry_failure_reason = 0;
++			return -EINVAL;
++		}
++		current->thread.tm_tfhar = mfspr(SPRN_TFHAR);
++		current->thread.tm_tfiar = mfspr(SPRN_TFIAR);
++		current->thread.tm_texasr = mfspr(SPRN_TEXASR);
++		current->thread.regs->msr &= ~MSR_TM;
++	}
++#endif
++
+ 	kvmppc_core_prepare_to_enter(vcpu);
+ 
+ 	/* No need to go into the guest when all we'll do is come back out */
+diff --git a/arch/powerpc/mm/slb_low.S b/arch/powerpc/mm/slb_low.S
+index 4c48b487698c..0b48ce40d351 100644
+--- a/arch/powerpc/mm/slb_low.S
++++ b/arch/powerpc/mm/slb_low.S
+@@ -179,6 +179,16 @@ END_MMU_FTR_SECTION_IFSET(MMU_FTR_1T_SEGMENT)
+ 	b	slb_finish_load
+ 
+ 8:	/* invalid EA */
++	/*
++	 * It's possible the bad EA is too large to fit in the SLB cache, which
++	 * would mean we'd fail to invalidate it on context switch. So mark the
++	 * SLB cache as full so we force a full flush. We also set cr7+eq to
++	 * mark the address as a kernel address, so slb_finish_load() skips
++	 * trying to insert it into the SLB cache.
++	 */
++	li	r9,SLB_CACHE_ENTRIES + 1
++	sth	r9,PACASLBCACHEPTR(r13)
++	crset	4*cr7+eq
+ 	li	r10,0			/* BAD_VSID */
+ 	li	r9,0			/* BAD_VSID */
+ 	li	r11,SLB_VSID_USER	/* flags don't much matter */
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
+index 51a9942cdb40..f4cae5357e40 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
+@@ -681,6 +681,10 @@ int amdgpu_atombios_get_clock_info(struct amdgpu_device *adev)
+ 			DRM_INFO("Changing default dispclk from %dMhz to 600Mhz\n",
+ 				 adev->clock.default_dispclk / 100);
+ 			adev->clock.default_dispclk = 60000;
++		} else if (adev->clock.default_dispclk <= 60000) {
++			DRM_INFO("Changing default dispclk from %dMhz to 625Mhz\n",
++				 adev->clock.default_dispclk / 100);
++			adev->clock.default_dispclk = 62500;
+ 		}
+ 		adev->clock.dp_extclk =
+ 			le16_to_cpu(firmware_info->info_21.usUniphyDPModeExtClkFreq);
+diff --git a/drivers/gpu/drm/amd/amdgpu/atombios_crtc.c b/drivers/gpu/drm/amd/amdgpu/atombios_crtc.c
+index 49aa35016653..247b088990dc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/atombios_crtc.c
++++ b/drivers/gpu/drm/amd/amdgpu/atombios_crtc.c
+@@ -164,7 +164,7 @@ void amdgpu_atombios_crtc_powergate(struct drm_crtc *crtc, int state)
+ 	struct drm_device *dev = crtc->dev;
+ 	struct amdgpu_device *adev = dev->dev_private;
+ 	int index = GetIndexIntoMasterTable(COMMAND, EnableDispPowerGating);
+-	ENABLE_DISP_POWER_GATING_PARAMETERS_V2_1 args;
++	ENABLE_DISP_POWER_GATING_PS_ALLOCATION args;
+ 
+ 	memset(&args, 0, sizeof(args));
+ 
+@@ -177,7 +177,7 @@ void amdgpu_atombios_crtc_powergate(struct drm_crtc *crtc, int state)
+ void amdgpu_atombios_crtc_powergate_init(struct amdgpu_device *adev)
+ {
+ 	int index = GetIndexIntoMasterTable(COMMAND, EnableDispPowerGating);
+-	ENABLE_DISP_POWER_GATING_PARAMETERS_V2_1 args;
++	ENABLE_DISP_POWER_GATING_PS_ALLOCATION args;
+ 
+ 	memset(&args, 0, sizeof(args));
+ 
+diff --git a/drivers/gpu/drm/radeon/radeon_combios.c b/drivers/gpu/drm/radeon/radeon_combios.c
+index a9b01bcf7d0a..fcecaf5b5526 100644
+--- a/drivers/gpu/drm/radeon/radeon_combios.c
++++ b/drivers/gpu/drm/radeon/radeon_combios.c
+@@ -3394,6 +3394,13 @@ void radeon_combios_asic_init(struct drm_device *dev)
+ 	    rdev->pdev->subsystem_vendor == 0x103c &&
+ 	    rdev->pdev->subsystem_device == 0x280a)
+ 		return;
++	/* quirk for rs4xx Toshiba Sattellite L20-183 latop to make it resume
++	 * - it hangs on resume inside the dynclk 1 table.
++	 */
++	if (rdev->family == CHIP_RS400 &&
++	    rdev->pdev->subsystem_vendor == 0x1179 &&
++	    rdev->pdev->subsystem_device == 0xff31)
++	        return;
+ 
+ 	/* DYN CLK 1 */
+ 	table = combios_get_table_offset(dev, COMBIOS_DYN_CLK_1_TABLE);
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 4aa2cbe4c85f..a77521695c9a 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -127,6 +127,10 @@ static struct radeon_px_quirk radeon_px_quirk_list[] = {
+ 	 * https://bugzilla.kernel.org/show_bug.cgi?id=51381
+ 	 */
+ 	{ PCI_VENDOR_ID_ATI, 0x6840, 0x1043, 0x2122, RADEON_PX_QUIRK_DISABLE_PX },
++	/* Asus K53TK laptop with AMD A6-3420M APU and Radeon 7670m GPU
++	 * https://bugs.freedesktop.org/show_bug.cgi?id=101491
++	 */
++	{ PCI_VENDOR_ID_ATI, 0x6741, 0x1043, 0x2122, RADEON_PX_QUIRK_DISABLE_PX },
+ 	/* macbook pro 8.2 */
+ 	{ PCI_VENDOR_ID_ATI, 0x6741, PCI_VENDOR_ID_APPLE, 0x00e2, RADEON_PX_QUIRK_LONG_WAKEUP },
+ 	{ 0, 0, 0, 0, 0 },
+diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
+index e37030624165..c7f8b70d15ee 100644
+--- a/drivers/hid/hid-ids.h
++++ b/drivers/hid/hid-ids.h
+@@ -285,6 +285,9 @@
+ #define USB_VENDOR_ID_DEALEXTREAME	0x10c5
+ #define USB_DEVICE_ID_DEALEXTREAME_RADIO_SI4701	0x819a
+ 
++#define USB_VENDOR_ID_DELL				0x413c
++#define USB_DEVICE_ID_DELL_PIXART_USB_OPTICAL_MOUSE	0x301a
++
+ #define USB_VENDOR_ID_DELORME		0x1163
+ #define USB_DEVICE_ID_DELORME_EARTHMATE	0x0100
+ #define USB_DEVICE_ID_DELORME_EM_LT20	0x0200
+diff --git a/drivers/hid/usbhid/hid-quirks.c b/drivers/hid/usbhid/hid-quirks.c
+index 6ca6ab00fa93..ce1543d69acb 100644
+--- a/drivers/hid/usbhid/hid-quirks.c
++++ b/drivers/hid/usbhid/hid-quirks.c
+@@ -72,6 +72,7 @@ static const struct hid_blacklist {
+ 	{ USB_VENDOR_ID_CH, USB_DEVICE_ID_CH_AXIS_295, HID_QUIRK_NOGET },
+ 	{ USB_VENDOR_ID_CHICONY, USB_DEVICE_ID_CHICONY_PIXART_USB_OPTICAL_MOUSE, HID_QUIRK_ALWAYS_POLL },
+ 	{ USB_VENDOR_ID_CREATIVELABS, USB_DEVICE_ID_CREATIVE_SB_OMNI_SURROUND_51, HID_QUIRK_NOGET },
++	{ USB_VENDOR_ID_DELL, USB_DEVICE_ID_DELL_PIXART_USB_OPTICAL_MOUSE, HID_QUIRK_ALWAYS_POLL },
+ 	{ USB_VENDOR_ID_DMI, USB_DEVICE_ID_DMI_ENC, HID_QUIRK_NOGET },
+ 	{ USB_VENDOR_ID_DRAGONRISE, USB_DEVICE_ID_DRAGONRISE_WIIU, HID_QUIRK_MULTI_INPUT },
+ 	{ USB_VENDOR_ID_ELAN, HID_ANY_ID, HID_QUIRK_ALWAYS_POLL },
+diff --git a/drivers/input/serio/i8042-x86ia64io.h b/drivers/input/serio/i8042-x86ia64io.h
+index e7b96f1ac2c5..5be14ad29d46 100644
+--- a/drivers/input/serio/i8042-x86ia64io.h
++++ b/drivers/input/serio/i8042-x86ia64io.h
+@@ -788,6 +788,13 @@ static const struct dmi_system_id __initconst i8042_dmi_notimeout_table[] = {
+ 			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK U574"),
+ 		},
+ 	},
++	{
++		/* Fujitsu UH554 laptop */
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK UH544"),
++		},
++	},
+ 	{ }
+ };
+ 
+diff --git a/drivers/mtd/spi-nor/spi-nor.c b/drivers/mtd/spi-nor/spi-nor.c
+index 37e4135ab213..64d6f053c2a5 100644
+--- a/drivers/mtd/spi-nor/spi-nor.c
++++ b/drivers/mtd/spi-nor/spi-nor.c
+@@ -1057,6 +1057,13 @@ static int spansion_quad_enable(struct spi_nor *nor)
+ 		return -EINVAL;
+ 	}
+ 
++	ret = spi_nor_wait_till_ready(nor);
++	if (ret) {
++		dev_err(nor->dev,
++			"timeout while writing configuration register\n");
++		return ret;
++	}
++
+ 	/* read back and check it */
+ 	ret = read_cr(nor);
+ 	if (!(ret > 0 && (ret & CR_QUAD_EN_SPAN))) {
+diff --git a/drivers/net/phy/marvell.c b/drivers/net/phy/marvell.c
+index d2701c53ed68..ebec2dceff45 100644
+--- a/drivers/net/phy/marvell.c
++++ b/drivers/net/phy/marvell.c
+@@ -822,8 +822,6 @@ static int marvell_read_status(struct phy_device *phydev)
+ 		phydev->lp_advertising = mii_stat1000_to_ethtool_lpa_t(lpagb) |
+ 					 mii_lpa_to_ethtool_lpa_t(lpa);
+ 
+-		lpa &= adv;
+-
+ 		if (status & MII_M1011_PHY_STATUS_FULLDUPLEX)
+ 			phydev->duplex = DUPLEX_FULL;
+ 		else
+diff --git a/drivers/net/phy/mdio-bcm-iproc.c b/drivers/net/phy/mdio-bcm-iproc.c
+index c0b4e65267af..46fe1ae919a3 100644
+--- a/drivers/net/phy/mdio-bcm-iproc.c
++++ b/drivers/net/phy/mdio-bcm-iproc.c
+@@ -81,8 +81,6 @@ static int iproc_mdio_read(struct mii_bus *bus, int phy_id, int reg)
+ 	if (rc)
+ 		return rc;
+ 
+-	iproc_mdio_config_clk(priv->base);
+-
+ 	/* Prepare the read operation */
+ 	cmd = (MII_DATA_TA_VAL << MII_DATA_TA_SHIFT) |
+ 		(reg << MII_DATA_RA_SHIFT) |
+@@ -112,8 +110,6 @@ static int iproc_mdio_write(struct mii_bus *bus, int phy_id,
+ 	if (rc)
+ 		return rc;
+ 
+-	iproc_mdio_config_clk(priv->base);
+-
+ 	/* Prepare the write operation */
+ 	cmd = (MII_DATA_TA_VAL << MII_DATA_TA_SHIFT) |
+ 		(reg << MII_DATA_RA_SHIFT) |
+@@ -163,6 +159,8 @@ static int iproc_mdio_probe(struct platform_device *pdev)
+ 	bus->read = iproc_mdio_read;
+ 	bus->write = iproc_mdio_write;
+ 
++	iproc_mdio_config_clk(priv->base);
++
+ 	rc = of_mdiobus_register(bus, pdev->dev.of_node);
+ 	if (rc) {
+ 		dev_err(&pdev->dev, "MDIO bus registration failed\n");
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 044253dca30a..b8a5a8e8f57d 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -27,6 +27,13 @@ enum {
+ 	NVME_NS_LIGHTNVM	= 1,
+ };
+ 
++/* The below value is the specific amount of delay needed before checking
++ * readiness in case of the PCI_DEVICE(0x1c58, 0x0003), which needs the
++ * NVME_QUIRK_DELAY_BEFORE_CHK_RDY quirk enabled. The value (in ms) was
++ * found empirically.
++ */
++#define NVME_QUIRK_DELAY_AMOUNT		2000
++
+ /*
+  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
+  */
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index c851bc53831c..4c673d45f1bd 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1633,10 +1633,15 @@ static int nvme_wait_ready(struct nvme_dev *dev, u64 cap, bool enabled)
+  */
+ static int nvme_disable_ctrl(struct nvme_dev *dev, u64 cap)
+ {
++	struct pci_dev *pdev = to_pci_dev(dev->dev);
++
+ 	dev->ctrl_config &= ~NVME_CC_SHN_MASK;
+ 	dev->ctrl_config &= ~NVME_CC_ENABLE;
+ 	writel(dev->ctrl_config, &dev->bar->cc);
+ 
++	if (pdev->vendor == 0x1c58 && pdev->device == 0x0003)
++		msleep(NVME_QUIRK_DELAY_AMOUNT);
++
+ 	return nvme_wait_ready(dev, cap, false);
+ }
+ 
+diff --git a/drivers/of/fdt.c b/drivers/of/fdt.c
+index 655f79db7899..58048dd5fcd0 100644
+--- a/drivers/of/fdt.c
++++ b/drivers/of/fdt.c
+@@ -632,9 +632,12 @@ int __init of_scan_flat_dt(int (*it)(unsigned long node,
+ 	const char *pathp;
+ 	int offset, rc = 0, depth = -1;
+ 
+-        for (offset = fdt_next_node(blob, -1, &depth);
+-             offset >= 0 && depth >= 0 && !rc;
+-             offset = fdt_next_node(blob, offset, &depth)) {
++	if (!blob)
++		return 0;
++
++	for (offset = fdt_next_node(blob, -1, &depth);
++	     offset >= 0 && depth >= 0 && !rc;
++	     offset = fdt_next_node(blob, offset, &depth)) {
+ 
+ 		pathp = fdt_get_name(blob, offset, NULL);
+ 		if (*pathp == '/')
+diff --git a/drivers/target/iscsi/iscsi_target.c b/drivers/target/iscsi/iscsi_target.c
+index 200d3de8bc1e..a180c000e246 100644
+--- a/drivers/target/iscsi/iscsi_target.c
++++ b/drivers/target/iscsi/iscsi_target.c
+@@ -1112,6 +1112,18 @@ iscsit_get_immediate_data(struct iscsi_cmd *cmd, struct iscsi_scsi_req *hdr,
+ 	 */
+ 	if (dump_payload)
+ 		goto after_immediate_data;
++	/*
++	 * Check for underflow case where both EDTL and immediate data payload
++	 * exceeds what is presented by CDB's TRANSFER LENGTH, and what has
++	 * already been set in target_cmd_size_check() as se_cmd->data_length.
++	 *
++	 * For this special case, fail the command and dump the immediate data
++	 * payload.
++	 */
++	if (cmd->first_burst_len > cmd->se_cmd.data_length) {
++		cmd->sense_reason = TCM_INVALID_CDB_FIELD;
++		goto after_immediate_data;
++	}
+ 
+ 	immed_ret = iscsit_handle_immediate_data(cmd, hdr,
+ 					cmd->first_burst_len);
+diff --git a/drivers/target/target_core_internal.h b/drivers/target/target_core_internal.h
+index 253a91bff943..272e6f755322 100644
+--- a/drivers/target/target_core_internal.h
++++ b/drivers/target/target_core_internal.h
+@@ -132,7 +132,7 @@ int	init_se_kmem_caches(void);
+ void	release_se_kmem_caches(void);
+ u32	scsi_get_new_index(scsi_index_t);
+ void	transport_subsystem_check_init(void);
+-void	transport_cmd_finish_abort(struct se_cmd *, int);
++int	transport_cmd_finish_abort(struct se_cmd *, int);
+ unsigned char *transport_dump_cmd_direction(struct se_cmd *);
+ void	transport_dump_dev_state(struct se_device *, char *, int *);
+ void	transport_dump_dev_info(struct se_device *, struct se_lun *,
+diff --git a/drivers/target/target_core_tmr.c b/drivers/target/target_core_tmr.c
+index 46b1991fbb50..c9be953496ec 100644
+--- a/drivers/target/target_core_tmr.c
++++ b/drivers/target/target_core_tmr.c
+@@ -75,7 +75,7 @@ void core_tmr_release_req(struct se_tmr_req *tmr)
+ 	kfree(tmr);
+ }
+ 
+-static void core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
++static int core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
+ {
+ 	unsigned long flags;
+ 	bool remove = true, send_tas;
+@@ -91,7 +91,7 @@ static void core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
+ 		transport_send_task_abort(cmd);
+ 	}
+ 
+-	transport_cmd_finish_abort(cmd, remove);
++	return transport_cmd_finish_abort(cmd, remove);
+ }
+ 
+ static int target_check_cdb_and_preempt(struct list_head *list,
+@@ -185,8 +185,8 @@ void core_tmr_abort_task(
+ 		cancel_work_sync(&se_cmd->work);
+ 		transport_wait_for_tasks(se_cmd);
+ 
+-		transport_cmd_finish_abort(se_cmd, true);
+-		target_put_sess_cmd(se_cmd);
++		if (!transport_cmd_finish_abort(se_cmd, true))
++			target_put_sess_cmd(se_cmd);
+ 
+ 		printk("ABORT_TASK: Sending TMR_FUNCTION_COMPLETE for"
+ 				" ref_tag: %llu\n", ref_tag);
+@@ -286,8 +286,8 @@ static void core_tmr_drain_tmr_list(
+ 		cancel_work_sync(&cmd->work);
+ 		transport_wait_for_tasks(cmd);
+ 
+-		transport_cmd_finish_abort(cmd, 1);
+-		target_put_sess_cmd(cmd);
++		if (!transport_cmd_finish_abort(cmd, 1))
++			target_put_sess_cmd(cmd);
+ 	}
+ }
+ 
+@@ -385,8 +385,8 @@ static void core_tmr_drain_state_list(
+ 		cancel_work_sync(&cmd->work);
+ 		transport_wait_for_tasks(cmd);
+ 
+-		core_tmr_handle_tas_abort(cmd, tas);
+-		target_put_sess_cmd(cmd);
++		if (!core_tmr_handle_tas_abort(cmd, tas))
++			target_put_sess_cmd(cmd);
+ 	}
+ }
+ 
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index 60743bf27f37..37c77db6e737 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -639,9 +639,10 @@ static void transport_lun_remove_cmd(struct se_cmd *cmd)
+ 		percpu_ref_put(&lun->lun_ref);
+ }
+ 
+-void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
++int transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
+ {
+ 	bool ack_kref = (cmd->se_cmd_flags & SCF_ACK_KREF);
++	int ret = 0;
+ 
+ 	if (cmd->se_cmd_flags & SCF_SE_LUN_CMD)
+ 		transport_lun_remove_cmd(cmd);
+@@ -653,9 +654,11 @@ void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
+ 		cmd->se_tfo->aborted_task(cmd);
+ 
+ 	if (transport_cmd_check_stop_to_fabric(cmd))
+-		return;
++		return 1;
+ 	if (remove && ack_kref)
+-		transport_put_cmd(cmd);
++		ret = transport_put_cmd(cmd);
++
++	return ret;
+ }
+ 
+ static void target_complete_failure_work(struct work_struct *work)
+diff --git a/drivers/usb/gadget/function/f_fs.c b/drivers/usb/gadget/function/f_fs.c
+index 9ad5145d3103..6d8f865a2fb7 100644
+--- a/drivers/usb/gadget/function/f_fs.c
++++ b/drivers/usb/gadget/function/f_fs.c
+@@ -1668,12 +1668,12 @@ static int ffs_func_eps_enable(struct ffs_function *func)
+ 		ep->ep->driver_data = ep;
+ 		ep->ep->desc = ds;
+ 
+-		comp_desc = (struct usb_ss_ep_comp_descriptor *)(ds +
+-				USB_DT_ENDPOINT_SIZE);
+-		ep->ep->maxburst = comp_desc->bMaxBurst + 1;
+-
+-		if (needs_comp_desc)
++		if (needs_comp_desc) {
++			comp_desc = (struct usb_ss_ep_comp_descriptor *)(ds +
++					USB_DT_ENDPOINT_SIZE);
++			ep->ep->maxburst = comp_desc->bMaxBurst + 1;
+ 			ep->ep->comp_desc = comp_desc;
++		}
+ 
+ 		ret = usb_ep_enable(ep->ep);
+ 		if (likely(!ret)) {
+diff --git a/drivers/usb/usbip/vhci_hcd.c b/drivers/usb/usbip/vhci_hcd.c
+index 7fbe19d5279e..81b2b9f808b5 100644
+--- a/drivers/usb/usbip/vhci_hcd.c
++++ b/drivers/usb/usbip/vhci_hcd.c
+@@ -215,14 +215,19 @@ done:
+ 
+ static inline void hub_descriptor(struct usb_hub_descriptor *desc)
+ {
++	int width;
++
+ 	memset(desc, 0, sizeof(*desc));
+ 	desc->bDescriptorType = USB_DT_HUB;
+-	desc->bDescLength = 9;
+ 	desc->wHubCharacteristics = cpu_to_le16(
+ 		HUB_CHAR_INDV_PORT_LPSM | HUB_CHAR_COMMON_OCPM);
++
+ 	desc->bNbrPorts = VHCI_NPORTS;
+-	desc->u.hs.DeviceRemovable[0] = 0xff;
+-	desc->u.hs.DeviceRemovable[1] = 0xff;
++	BUILD_BUG_ON(VHCI_NPORTS > USB_MAXCHILDREN);
++	width = desc->bNbrPorts / 8 + 1;
++	desc->bDescLength = USB_DT_HUB_NONVAR_SIZE + 2 * width;
++	memset(&desc->u.hs.DeviceRemovable[0], 0, width);
++	memset(&desc->u.hs.DeviceRemovable[width], 0xff, width);
+ }
+ 
+ static int vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
+diff --git a/fs/autofs4/dev-ioctl.c b/fs/autofs4/dev-ioctl.c
+index ac7d921ed984..257425511d10 100644
+--- a/fs/autofs4/dev-ioctl.c
++++ b/fs/autofs4/dev-ioctl.c
+@@ -331,7 +331,7 @@ static int autofs_dev_ioctl_fail(struct file *fp,
+ 	int status;
+ 
+ 	token = (autofs_wqt_t) param->fail.token;
+-	status = param->fail.status ? param->fail.status : -ENOENT;
++	status = param->fail.status < 0 ? param->fail.status : -ENOENT;
+ 	return autofs4_wait_release(sbi, token, status);
+ }
+ 
+diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
+index 87b87e091e8e..efd72e1fae74 100644
+--- a/fs/cifs/smb1ops.c
++++ b/fs/cifs/smb1ops.c
+@@ -849,8 +849,13 @@ cifs_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
+ 		     struct cifs_fid *fid, __u16 search_flags,
+ 		     struct cifs_search_info *srch_inf)
+ {
+-	return CIFSFindFirst(xid, tcon, path, cifs_sb,
+-			     &fid->netfid, search_flags, srch_inf, true);
++	int rc;
++
++	rc = CIFSFindFirst(xid, tcon, path, cifs_sb,
++			   &fid->netfid, search_flags, srch_inf, true);
++	if (rc)
++		cifs_dbg(FYI, "find first failed=%d\n", rc);
++	return rc;
+ }
+ 
+ static int
+diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
+index 087918c4612a..1d125d3d0d89 100644
+--- a/fs/cifs/smb2ops.c
++++ b/fs/cifs/smb2ops.c
+@@ -909,7 +909,7 @@ smb2_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
+ 	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL);
+ 	kfree(utf16_path);
+ 	if (rc) {
+-		cifs_dbg(VFS, "open dir failed\n");
++		cifs_dbg(FYI, "open dir failed rc=%d\n", rc);
+ 		return rc;
+ 	}
+ 
+@@ -919,7 +919,7 @@ smb2_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
+ 	rc = SMB2_query_directory(xid, tcon, fid->persistent_fid,
+ 				  fid->volatile_fid, 0, srch_inf);
+ 	if (rc) {
+-		cifs_dbg(VFS, "query directory failed\n");
++		cifs_dbg(FYI, "query directory failed rc=%d\n", rc);
+ 		SMB2_close(xid, tcon, fid->persistent_fid, fid->volatile_fid);
+ 	}
+ 	return rc;
 diff --git a/fs/exec.c b/fs/exec.c
 index 3a6de10d3891..02153068a694 100644
 --- a/fs/exec.c
@@ -86,376 +602,18 @@ index 3a6de10d3891..02153068a694 100644
  }
  
  static void put_arg_page(struct page *page)
--- 
-2.28.0
-
-
-From b95aa98e77d7086f4a303a5e9402ab165a5f0cc6 Mon Sep 17 00:00:00 2001
-From: NeilBrown <neilb@suse.com>
-Date: Fri, 23 Jun 2017 15:08:43 -0700
-Subject: [PATCH 02/27] autofs: sanity check status reported with
- AUTOFS_DEV_IOCTL_FAIL
-
-commit 9fa4eb8e490a28de40964b1b0e583d8db4c7e57c upstream.
-
-If a positive status is passed with the AUTOFS_DEV_IOCTL_FAIL ioctl,
-autofs4_d_automount() will return
-
-   ERR_PTR(status)
-
-with that status to follow_automount(), which will then dereference an
-invalid pointer.
-
-So treat a positive status the same as zero, and map to ENOENT.
-
-See comment in systemd src/core/automount.c::automount_send_ready().
-
-Link: http://lkml.kernel.org/r/871sqwczx5.fsf@notabene.neil.brown.name
-Signed-off-by: NeilBrown <neilb@suse.com>
-Cc: Ian Kent <raven@themaw.net>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/autofs4/dev-ioctl.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/fs/autofs4/dev-ioctl.c b/fs/autofs4/dev-ioctl.c
-index ac7d921ed984..257425511d10 100644
---- a/fs/autofs4/dev-ioctl.c
-+++ b/fs/autofs4/dev-ioctl.c
-@@ -331,7 +331,7 @@ static int autofs_dev_ioctl_fail(struct file *fp,
- 	int status;
- 
- 	token = (autofs_wqt_t) param->fail.token;
--	status = param->fail.status ? param->fail.status : -ENOENT;
-+	status = param->fail.status < 0 ? param->fail.status : -ENOENT;
- 	return autofs4_wait_release(sbi, token, status);
- }
- 
--- 
-2.28.0
-
-
-From 7b88f761929e86813c2a1eb878dcc17abbb6119f Mon Sep 17 00:00:00 2001
-From: Ilya Matveychikov <matvejchikov@gmail.com>
-Date: Fri, 23 Jun 2017 15:08:49 -0700
-Subject: [PATCH 03/27] lib/cmdline.c: fix get_options() overflow while parsing
- ranges
-
-commit a91e0f680bcd9e10c253ae8b62462a38bd48f09f upstream.
-
-When using get_options() it's possible to specify a range of numbers,
-like 1-100500.  The problem is that it doesn't track array size while
-calling internally to get_range() which iterates over the range and
-fills the memory with numbers.
-
-Link: http://lkml.kernel.org/r/2613C75C-B04D-4BFF-82A6-12F97BA0F620@gmail.com
-Signed-off-by: Ilya V. Matveychikov <matvejchikov@gmail.com>
-Cc: Jonathan Corbet <corbet@lwn.net>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- lib/cmdline.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/lib/cmdline.c b/lib/cmdline.c
-index 8f13cf73c2ec..79069d7938ea 100644
---- a/lib/cmdline.c
-+++ b/lib/cmdline.c
-@@ -22,14 +22,14 @@
-  *	the values[M, M+1, ..., N] into the ints array in get_options.
+diff --git a/include/linux/timekeeper_internal.h b/include/linux/timekeeper_internal.h
+index 25247220b4b7..f0f1793cfa49 100644
+--- a/include/linux/timekeeper_internal.h
++++ b/include/linux/timekeeper_internal.h
+@@ -29,7 +29,6 @@
   */
- 
--static int get_range(char **str, int *pint)
-+static int get_range(char **str, int *pint, int n)
- {
- 	int x, inc_counter, upper_range;
- 
- 	(*str)++;
- 	upper_range = simple_strtol((*str), NULL, 0);
- 	inc_counter = upper_range - *pint;
--	for (x = *pint; x < upper_range; x++)
-+	for (x = *pint; n && x < upper_range; x++, n--)
- 		*pint++ = x;
- 	return inc_counter;
- }
-@@ -96,7 +96,7 @@ char *get_options(const char *str, int nints, int *ints)
- 			break;
- 		if (res == 3) {
- 			int range_nums;
--			range_nums = get_range((char **)&str, ints + i);
-+			range_nums = get_range((char **)&str, ints + i, nints - i);
- 			if (range_nums < 0)
- 				break;
- 			/*
--- 
-2.28.0
-
-
-From 824b9506e4f27bf63dea55f1af27a2a75ff8934e Mon Sep 17 00:00:00 2001
-From: Paul Mackerras <paulus@ozlabs.org>
-Date: Thu, 15 Jun 2017 16:10:27 +1000
-Subject: [PATCH 04/27] KVM: PPC: Book3S HV: Preserve userspace HTM state
- properly
-
-commit 46a704f8409f79fd66567ad3f8a7304830a84293 upstream.
-
-If userspace attempts to call the KVM_RUN ioctl when it has hardware
-transactional memory (HTM) enabled, the values that it has put in the
-HTM-related SPRs TFHAR, TFIAR and TEXASR will get overwritten by
-guest values.  To fix this, we detect this condition and save those
-SPR values in the thread struct, and disable HTM for the task.  If
-userspace goes to access those SPRs or the HTM facility in future,
-a TM-unavailable interrupt will occur and the handler will reload
-those SPRs and re-enable HTM.
-
-If userspace has started a transaction and suspended it, we would
-currently lose the transactional state in the guest entry path and
-would almost certainly get a "TM Bad Thing" interrupt, which would
-cause the host to crash.  To avoid this, we detect this case and
-return from the KVM_RUN ioctl with an EINVAL error, with the KVM
-exit reason set to KVM_EXIT_FAIL_ENTRY.
-
-Fixes: b005255e12a3 ("KVM: PPC: Book3S HV: Context-switch new POWER8 SPRs", 2014-01-08)
-Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/kvm/book3s_hv.c | 21 +++++++++++++++++++++
- 1 file changed, 21 insertions(+)
-
-diff --git a/arch/powerpc/kvm/book3s_hv.c b/arch/powerpc/kvm/book3s_hv.c
-index 3c3a367b6e59..396dc44e783b 100644
---- a/arch/powerpc/kvm/book3s_hv.c
-+++ b/arch/powerpc/kvm/book3s_hv.c
-@@ -2693,6 +2693,27 @@ static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
- 		return -EINVAL;
- 	}
- 
-+	/*
-+	 * Don't allow entry with a suspended transaction, because
-+	 * the guest entry/exit code will lose it.
-+	 * If the guest has TM enabled, save away their TM-related SPRs
-+	 * (they will get restored by the TM unavailable interrupt).
-+	 */
-+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
-+	if (cpu_has_feature(CPU_FTR_TM) && current->thread.regs &&
-+	    (current->thread.regs->msr & MSR_TM)) {
-+		if (MSR_TM_ACTIVE(current->thread.regs->msr)) {
-+			run->exit_reason = KVM_EXIT_FAIL_ENTRY;
-+			run->fail_entry.hardware_entry_failure_reason = 0;
-+			return -EINVAL;
-+		}
-+		current->thread.tm_tfhar = mfspr(SPRN_TFHAR);
-+		current->thread.tm_tfiar = mfspr(SPRN_TFIAR);
-+		current->thread.tm_texasr = mfspr(SPRN_TEXASR);
-+		current->thread.regs->msr &= ~MSR_TM;
-+	}
-+#endif
-+
- 	kvmppc_core_prepare_to_enter(vcpu);
- 
- 	/* No need to go into the guest when all we'll do is come back out */
--- 
-2.28.0
-
-
-From 63ba840a53d61a502a742db2ca6f2334b9717a4f Mon Sep 17 00:00:00 2001
-From: Pavel Shilovsky <pshilov@microsoft.com>
-Date: Tue, 6 Jun 2017 16:58:58 -0700
-Subject: [PATCH 05/27] CIFS: Improve readdir verbosity
-
-commit dcd87838c06f05ab7650b249ebf0d5b57ae63e1e upstream.
-
-Downgrade the loglevel for SMB2 to prevent filling the log
-with messages if e.g. readdir was interrupted. Also make SMB2
-and SMB1 codepaths do the same logging during readdir.
-
-Signed-off-by: Pavel Shilovsky <pshilov@microsoft.com>
-Signed-off-by: Steve French <smfrench@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/cifs/smb1ops.c | 9 +++++++--
- fs/cifs/smb2ops.c | 4 ++--
- 2 files changed, 9 insertions(+), 4 deletions(-)
-
-diff --git a/fs/cifs/smb1ops.c b/fs/cifs/smb1ops.c
-index 87b87e091e8e..efd72e1fae74 100644
---- a/fs/cifs/smb1ops.c
-+++ b/fs/cifs/smb1ops.c
-@@ -849,8 +849,13 @@ cifs_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
- 		     struct cifs_fid *fid, __u16 search_flags,
- 		     struct cifs_search_info *srch_inf)
- {
--	return CIFSFindFirst(xid, tcon, path, cifs_sb,
--			     &fid->netfid, search_flags, srch_inf, true);
-+	int rc;
-+
-+	rc = CIFSFindFirst(xid, tcon, path, cifs_sb,
-+			   &fid->netfid, search_flags, srch_inf, true);
-+	if (rc)
-+		cifs_dbg(FYI, "find first failed=%d\n", rc);
-+	return rc;
- }
- 
- static int
-diff --git a/fs/cifs/smb2ops.c b/fs/cifs/smb2ops.c
-index 087918c4612a..1d125d3d0d89 100644
---- a/fs/cifs/smb2ops.c
-+++ b/fs/cifs/smb2ops.c
-@@ -909,7 +909,7 @@ smb2_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
- 	rc = SMB2_open(xid, &oparms, utf16_path, &oplock, NULL, NULL);
- 	kfree(utf16_path);
- 	if (rc) {
--		cifs_dbg(VFS, "open dir failed\n");
-+		cifs_dbg(FYI, "open dir failed rc=%d\n", rc);
- 		return rc;
- 	}
- 
-@@ -919,7 +919,7 @@ smb2_query_dir_first(const unsigned int xid, struct cifs_tcon *tcon,
- 	rc = SMB2_query_directory(xid, tcon, fid->persistent_fid,
- 				  fid->volatile_fid, 0, srch_inf);
- 	if (rc) {
--		cifs_dbg(VFS, "query directory failed\n");
-+		cifs_dbg(FYI, "query directory failed rc=%d\n", rc);
- 		SMB2_close(xid, tcon, fid->persistent_fid, fid->volatile_fid);
- 	}
- 	return rc;
--- 
-2.28.0
-
-
-From 005253ffe4ad25341ee040e0de0e42b316a8d082 Mon Sep 17 00:00:00 2001
-From: Sebastian Parschauer <sparschauer@suse.de>
-Date: Tue, 6 Jun 2017 13:53:13 +0200
-Subject: [PATCH 06/27] HID: Add quirk for Dell PIXART OEM mouse
-
-commit 3db28271f0feae129262d30e41384a7c4c767987 upstream.
-
-This mouse is also known under other IDs. It needs the quirk
-ALWAYS_POLL or will disconnect in runlevel 1 or 3.
-
-Signed-off-by: Sebastian Parschauer <sparschauer@suse.de>
-Signed-off-by: Jiri Kosina <jkosina@suse.cz>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/hid/hid-ids.h           | 3 +++
- drivers/hid/usbhid/hid-quirks.c | 1 +
- 2 files changed, 4 insertions(+)
-
-diff --git a/drivers/hid/hid-ids.h b/drivers/hid/hid-ids.h
-index e37030624165..c7f8b70d15ee 100644
---- a/drivers/hid/hid-ids.h
-+++ b/drivers/hid/hid-ids.h
-@@ -285,6 +285,9 @@
- #define USB_VENDOR_ID_DEALEXTREAME	0x10c5
- #define USB_DEVICE_ID_DEALEXTREAME_RADIO_SI4701	0x819a
- 
-+#define USB_VENDOR_ID_DELL				0x413c
-+#define USB_DEVICE_ID_DELL_PIXART_USB_OPTICAL_MOUSE	0x301a
-+
- #define USB_VENDOR_ID_DELORME		0x1163
- #define USB_DEVICE_ID_DELORME_EARTHMATE	0x0100
- #define USB_DEVICE_ID_DELORME_EM_LT20	0x0200
-diff --git a/drivers/hid/usbhid/hid-quirks.c b/drivers/hid/usbhid/hid-quirks.c
-index 6ca6ab00fa93..ce1543d69acb 100644
---- a/drivers/hid/usbhid/hid-quirks.c
-+++ b/drivers/hid/usbhid/hid-quirks.c
-@@ -72,6 +72,7 @@ static const struct hid_blacklist {
- 	{ USB_VENDOR_ID_CH, USB_DEVICE_ID_CH_AXIS_295, HID_QUIRK_NOGET },
- 	{ USB_VENDOR_ID_CHICONY, USB_DEVICE_ID_CHICONY_PIXART_USB_OPTICAL_MOUSE, HID_QUIRK_ALWAYS_POLL },
- 	{ USB_VENDOR_ID_CREATIVELABS, USB_DEVICE_ID_CREATIVE_SB_OMNI_SURROUND_51, HID_QUIRK_NOGET },
-+	{ USB_VENDOR_ID_DELL, USB_DEVICE_ID_DELL_PIXART_USB_OPTICAL_MOUSE, HID_QUIRK_ALWAYS_POLL },
- 	{ USB_VENDOR_ID_DMI, USB_DEVICE_ID_DMI_ENC, HID_QUIRK_NOGET },
- 	{ USB_VENDOR_ID_DRAGONRISE, USB_DEVICE_ID_DRAGONRISE_WIIU, HID_QUIRK_MULTI_INPUT },
- 	{ USB_VENDOR_ID_ELAN, HID_ANY_ID, HID_QUIRK_ALWAYS_POLL },
--- 
-2.28.0
-
-
-From bc7b3e9984a8e83e3256c08a059ca745b5d0935c Mon Sep 17 00:00:00 2001
-From: "Eric W. Biederman" <ebiederm@xmission.com>
-Date: Tue, 13 Jun 2017 04:31:16 -0500
-Subject: [PATCH 07/27] signal: Only reschedule timers on signals timers have
- sent
-
-commit 57db7e4a2d92c2d3dfbca4ef8057849b2682436b upstream.
-
-Thomas Gleixner  wrote:
-> The CRIU support added a 'feature' which allows a user space task to send
-> arbitrary (kernel) signals to itself. The changelog says:
->
->   The kernel prevents sending of siginfo with positive si_code, because
->   these codes are reserved for kernel.  I think we can allow a task to
->   send such a siginfo to itself.  This operation should not be dangerous.
->
-> Quite contrary to that claim, it turns out that it is outright dangerous
-> for signals with info->si_code == SI_TIMER. The following code sequence in
-> a user space task allows to crash the kernel:
->
->    id = timer_create(CLOCK_XXX, ..... signo = SIGX);
->    timer_set(id, ....);
->    info->si_signo = SIGX;
->    info->si_code = SI_TIMER:
->    info->_sifields._timer._tid = id;
->    info->_sifields._timer._sys_private = 2;
->    rt_[tg]sigqueueinfo(..., SIGX, info);
->    sigemptyset(&sigset);
->    sigaddset(&sigset, SIGX);
->    rt_sigtimedwait(sigset, info);
->
-> For timers based on CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID this
-> results in a kernel crash because sigwait() dequeues the signal and the
-> dequeue code observes:
->
->   info->si_code == SI_TIMER && info->_sifields._timer._sys_private != 0
->
-> which triggers the following callchain:
->
->  do_schedule_next_timer() -> posix_cpu_timer_schedule() -> arm_timer()
->
-> arm_timer() executes a list_add() on the timer, which is already armed via
-> the timer_set() syscall. That's a double list add which corrupts the posix
-> cpu timer list. As a consequence the kernel crashes on the next operation
-> touching the posix cpu timer list.
->
-> Posix clocks which are internally implemented based on hrtimers are not
-> affected by this because hrtimer_start() can handle already armed timers
-> nicely, but it's a reliable way to trigger the WARN_ON() in
-> hrtimer_forward(), which complains about calling that function on an
-> already armed timer.
-
-This problem has existed since the posix timer code was merged into
-2.5.63. A few releases earlier in 2.5.60 ptrace gained the ability to
-inject not just a signal (which linux has supported since 1.0) but the
-full siginfo of a signal.
-
-The core problem is that the code will reschedule in response to
-signals getting dequeued not just for signals the timers sent but
-for other signals that happen to a si_code of SI_TIMER.
-
-Avoid this confusion by testing to see if the queued signal was
-preallocated as all timer signals are preallocated, and so far
-only the timer code preallocates signals.
-
-Move the check for if a timer needs to be rescheduled up into
-collect_signal where the preallocation check must be performed,
-and pass the result back to dequeue_signal where the code reschedules
-timers.   This makes it clear why the code cares about preallocated
-timers.
-
-Reported-by: Thomas Gleixner <tglx@linutronix.de>
-History Tree: https://git.kernel.org/pub/scm/linux/kernel/git/tglx/history.git
-Reference: 66dd34ad31e5 ("signal: allow to send any siginfo to itself")
-Reference: 1669ce53e2ff ("Add PTRACE_GETSIGINFO and PTRACE_SETSIGINFO")
-Fixes: db8b50ba75f2 ("[PATCH] POSIX clocks & timers")
-Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/signal.c | 20 ++++++++++++++------
- 1 file changed, 14 insertions(+), 6 deletions(-)
-
+ struct tk_read_base {
+ 	struct clocksource	*clock;
+-	cycle_t			(*read)(struct clocksource *cs);
+ 	cycle_t			mask;
+ 	cycle_t			cycle_last;
+ 	u32			mult;
 diff --git a/kernel/signal.c b/kernel/signal.c
 index f3f1f7a972fd..b92a047ddc82 100644
 --- a/kernel/signal.c
@@ -526,192 +684,6 @@ index f3f1f7a972fd..b92a047ddc82 100644
  		/*
  		 * Release the siglock to ensure proper locking order
  		 * of timer locks outside of siglocks.  Note, we leave
--- 
-2.28.0
-
-
-From 3ee9033e228def8bef0e450d492421f0a6abaac4 Mon Sep 17 00:00:00 2001
-From: "Naveen N. Rao" <naveen.n.rao@linux.vnet.ibm.com>
-Date: Thu, 1 Jun 2017 16:18:15 +0530
-Subject: [PATCH 08/27] powerpc/kprobes: Pause function_graph tracing during
- jprobes handling
-
-commit a9f8553e935f26cb5447f67e280946b0923cd2dc upstream.
-
-This fixes a crash when function_graph and jprobes are used together.
-This is essentially commit 237d28db036e ("ftrace/jprobes/x86: Fix
-conflict between jprobes and function graph tracing"), but for powerpc.
-
-Jprobes breaks function_graph tracing since the jprobe hook needs to use
-jprobe_return(), which never returns back to the hook, but instead to
-the original jprobe'd function. The solution is to momentarily pause
-function_graph tracing before invoking the jprobe hook and re-enable it
-when returning back to the original jprobe'd function.
-
-Fixes: 6794c78243bf ("powerpc64: port of the function graph tracer")
-Signed-off-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
-Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
-Acked-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
-Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/kernel/kprobes.c | 11 +++++++++++
- 1 file changed, 11 insertions(+)
-
-diff --git a/arch/powerpc/kernel/kprobes.c b/arch/powerpc/kernel/kprobes.c
-index 7c053f281406..1138fec3dd65 100644
---- a/arch/powerpc/kernel/kprobes.c
-+++ b/arch/powerpc/kernel/kprobes.c
-@@ -514,6 +514,15 @@ int __kprobes setjmp_pre_handler(struct kprobe *p, struct pt_regs *regs)
- #endif
- #endif
- 
-+	/*
-+	 * jprobes use jprobe_return() which skips the normal return
-+	 * path of the function, and this messes up the accounting of the
-+	 * function graph tracer.
-+	 *
-+	 * Pause function graph tracing while performing the jprobe function.
-+	 */
-+	pause_graph_tracing();
-+
- 	return 1;
- }
- 
-@@ -536,6 +545,8 @@ int __kprobes longjmp_break_handler(struct kprobe *p, struct pt_regs *regs)
- 	 * saved regs...
- 	 */
- 	memcpy(regs, &kcb->jprobe_saved_regs, sizeof(struct pt_regs));
-+	/* It's OK to start function graph tracing again */
-+	unpause_graph_tracing();
- 	preempt_enable_no_resched();
- 	return 1;
- }
--- 
-2.28.0
-
-
-From 255ad85b5ecc9e76af7c7f3ab2a57c43f0f3e12c Mon Sep 17 00:00:00 2001
-From: Daniel Drake <drake@endlessm.com>
-Date: Mon, 19 Jun 2017 19:48:52 -0700
-Subject: [PATCH 09/27] Input: i8042 - add Fujitsu Lifebook AH544 to notimeout
- list
-
-commit 817ae460c784f32cd45e60b2b1b21378c3c6a847 upstream.
-
-Without this quirk, the touchpad is not responsive on this product, with
-the following message repeated in the logs:
-
- psmouse serio1: bad data from KBC - timeout
-
-Add it to the notimeout list alongside other similar Fujitsu laptops.
-
-Signed-off-by: Daniel Drake <drake@endlessm.com>
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/serio/i8042-x86ia64io.h | 7 +++++++
- 1 file changed, 7 insertions(+)
-
-diff --git a/drivers/input/serio/i8042-x86ia64io.h b/drivers/input/serio/i8042-x86ia64io.h
-index e7b96f1ac2c5..5be14ad29d46 100644
---- a/drivers/input/serio/i8042-x86ia64io.h
-+++ b/drivers/input/serio/i8042-x86ia64io.h
-@@ -788,6 +788,13 @@ static const struct dmi_system_id __initconst i8042_dmi_notimeout_table[] = {
- 			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK U574"),
- 		},
- 	},
-+	{
-+		/* Fujitsu UH554 laptop */
-+		.matches = {
-+			DMI_MATCH(DMI_SYS_VENDOR, "FUJITSU"),
-+			DMI_MATCH(DMI_PRODUCT_NAME, "LIFEBOOK UH544"),
-+		},
-+	},
- 	{ }
- };
- 
--- 
-2.28.0
-
-
-From 1fecf3977defb3161ba194e5ddbdeca9be638377 Mon Sep 17 00:00:00 2001
-From: John Stultz <john.stultz@linaro.org>
-Date: Thu, 8 Jun 2017 16:44:20 -0700
-Subject: [PATCH 10/27] time: Fix clock->read(clock) race around clocksource
- changes
-
-commit ceea5e3771ed2378668455fa21861bead7504df5 upstream.
-
-In tests, which excercise switching of clocksources, a NULL
-pointer dereference can be observed on AMR64 platforms in the
-clocksource read() function:
-
-u64 clocksource_mmio_readl_down(struct clocksource *c)
-{
-	return ~(u64)readl_relaxed(to_mmio_clksrc(c)->reg) & c->mask;
-}
-
-This is called from the core timekeeping code via:
-
-	cycle_now = tkr->read(tkr->clock);
-
-tkr->read is the cached tkr->clock->read() function pointer.
-When the clocksource is changed then tkr->clock and tkr->read
-are updated sequentially. The code above results in a sequential
-load operation of tkr->read and tkr->clock as well.
-
-If the store to tkr->clock hits between the loads of tkr->read
-and tkr->clock, then the old read() function is called with the
-new clock pointer. As a consequence the read() function
-dereferences a different data structure and the resulting 'reg'
-pointer can point anywhere including NULL.
-
-This problem was introduced when the timekeeping code was
-switched over to use struct tk_read_base. Before that, it was
-theoretically possible as well when the compiler decided to
-reload clock in the code sequence:
-
-     now = tk->clock->read(tk->clock);
-
-Add a helper function which avoids the issue by reading
-tk_read_base->clock once into a local variable clk and then issue
-the read function via clk->read(clk). This guarantees that the
-read() function always gets the proper clocksource pointer handed
-in.
-
-Since there is now no use for the tkr.read pointer, this patch
-also removes it, and to address stopping the fast timekeeper
-during suspend/resume, it introduces a dummy clocksource to use
-rather then just a dummy read function.
-
-Signed-off-by: John Stultz <john.stultz@linaro.org>
-Acked-by: Ingo Molnar <mingo@kernel.org>
-Cc: Prarit Bhargava <prarit@redhat.com>
-Cc: Richard Cochran <richardcochran@gmail.com>
-Cc: Stephen Boyd <stephen.boyd@linaro.org>
-Cc: Miroslav Lichvar <mlichvar@redhat.com>
-Cc: Daniel Mentz <danielmentz@google.com>
-Link: http://lkml.kernel.org/r/1496965462-20003-2-git-send-email-john.stultz@linaro.org
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/timekeeper_internal.h |  1 -
- kernel/time/timekeeping.c           | 47 +++++++++++++++++++++--------
- 2 files changed, 34 insertions(+), 14 deletions(-)
-
-diff --git a/include/linux/timekeeper_internal.h b/include/linux/timekeeper_internal.h
-index 25247220b4b7..f0f1793cfa49 100644
---- a/include/linux/timekeeper_internal.h
-+++ b/include/linux/timekeeper_internal.h
-@@ -29,7 +29,6 @@
-  */
- struct tk_read_base {
- 	struct clocksource	*clock;
--	cycle_t			(*read)(struct clocksource *cs);
- 	cycle_t			mask;
- 	cycle_t			cycle_last;
- 	u32			mult;
 diff --git a/kernel/time/timekeeping.c b/kernel/time/timekeeping.c
 index 738012d68117..6e4866834d26 100644
 --- a/kernel/time/timekeeping.c
@@ -843,501 +815,36 @@ index 738012d68117..6e4866834d26 100644
  				   tk->tkr_mono.cycle_last, tk->tkr_mono.mask);
  #endif
  
--- 
-2.28.0
-
-
-From d374be75f4c7e178fc34140ebec3f54f3f72ae15 Mon Sep 17 00:00:00 2001
-From: Nicholas Bellinger <nab@linux-iscsi.org>
-Date: Fri, 2 Jun 2017 20:00:17 -0700
-Subject: [PATCH 11/27] target: Fix kref->refcount underflow in
- transport_cmd_finish_abort
-
-commit 73d4e580ccc5c3e05cea002f18111f66c9c07034 upstream.
-
-This patch fixes a se_cmd->cmd_kref underflow during CMD_T_ABORTED
-when a fabric driver drops it's second reference from below the
-target_core_tmr.c based callers of transport_cmd_finish_abort().
-
-Recently with the conversion of kref to refcount_t, this bug was
-manifesting itself as:
-
-[705519.601034] refcount_t: underflow; use-after-free.
-[705519.604034] INFO: NMI handler (kgdb_nmi_handler) took too long to run: 20116.512 msecs
-[705539.719111] ------------[ cut here ]------------
-[705539.719117] WARNING: CPU: 3 PID: 26510 at lib/refcount.c:184 refcount_sub_and_test+0x33/0x51
-
-Since the original kref atomic_t based kref_put() didn't check for
-underflow and only invoked the final callback when zero was reached,
-this bug did not manifest in practice since all se_cmd memory is
-using preallocated tags.
-
-To address this, go ahead and propigate the existing return from
-transport_put_cmd() up via transport_cmd_finish_abort(), and
-change transport_cmd_finish_abort() + core_tmr_handle_tas_abort()
-callers to only do their local target_put_sess_cmd() if necessary.
-
-Reported-by: Bart Van Assche <bart.vanassche@sandisk.com>
-Tested-by: Bart Van Assche <bart.vanassche@sandisk.com>
-Cc: Mike Christie <mchristi@redhat.com>
-Cc: Hannes Reinecke <hare@suse.de>
-Cc: Christoph Hellwig <hch@lst.de>
-Cc: Himanshu Madhani <himanshu.madhani@qlogic.com>
-Cc: Sagi Grimberg <sagig@mellanox.com>
-Tested-by: Gary Guo <ghg@datera.io>
-Tested-by: Chu Yuan Lin <cyl@datera.io>
-Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/target/target_core_internal.h  |  2 +-
- drivers/target/target_core_tmr.c       | 16 ++++++++--------
- drivers/target/target_core_transport.c |  9 ++++++---
- 3 files changed, 15 insertions(+), 12 deletions(-)
-
-diff --git a/drivers/target/target_core_internal.h b/drivers/target/target_core_internal.h
-index 253a91bff943..272e6f755322 100644
---- a/drivers/target/target_core_internal.h
-+++ b/drivers/target/target_core_internal.h
-@@ -132,7 +132,7 @@ int	init_se_kmem_caches(void);
- void	release_se_kmem_caches(void);
- u32	scsi_get_new_index(scsi_index_t);
- void	transport_subsystem_check_init(void);
--void	transport_cmd_finish_abort(struct se_cmd *, int);
-+int	transport_cmd_finish_abort(struct se_cmd *, int);
- unsigned char *transport_dump_cmd_direction(struct se_cmd *);
- void	transport_dump_dev_state(struct se_device *, char *, int *);
- void	transport_dump_dev_info(struct se_device *, struct se_lun *,
-diff --git a/drivers/target/target_core_tmr.c b/drivers/target/target_core_tmr.c
-index 46b1991fbb50..c9be953496ec 100644
---- a/drivers/target/target_core_tmr.c
-+++ b/drivers/target/target_core_tmr.c
-@@ -75,7 +75,7 @@ void core_tmr_release_req(struct se_tmr_req *tmr)
- 	kfree(tmr);
- }
+diff --git a/lib/cmdline.c b/lib/cmdline.c
+index 8f13cf73c2ec..79069d7938ea 100644
+--- a/lib/cmdline.c
++++ b/lib/cmdline.c
+@@ -22,14 +22,14 @@
+  *	the values[M, M+1, ..., N] into the ints array in get_options.
+  */
  
--static void core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
-+static int core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
+-static int get_range(char **str, int *pint)
++static int get_range(char **str, int *pint, int n)
  {
- 	unsigned long flags;
- 	bool remove = true, send_tas;
-@@ -91,7 +91,7 @@ static void core_tmr_handle_tas_abort(struct se_cmd *cmd, int tas)
- 		transport_send_task_abort(cmd);
- 	}
+ 	int x, inc_counter, upper_range;
  
--	transport_cmd_finish_abort(cmd, remove);
-+	return transport_cmd_finish_abort(cmd, remove);
+ 	(*str)++;
+ 	upper_range = simple_strtol((*str), NULL, 0);
+ 	inc_counter = upper_range - *pint;
+-	for (x = *pint; x < upper_range; x++)
++	for (x = *pint; n && x < upper_range; x++, n--)
+ 		*pint++ = x;
+ 	return inc_counter;
  }
- 
- static int target_check_cdb_and_preempt(struct list_head *list,
-@@ -185,8 +185,8 @@ void core_tmr_abort_task(
- 		cancel_work_sync(&se_cmd->work);
- 		transport_wait_for_tasks(se_cmd);
- 
--		transport_cmd_finish_abort(se_cmd, true);
--		target_put_sess_cmd(se_cmd);
-+		if (!transport_cmd_finish_abort(se_cmd, true))
-+			target_put_sess_cmd(se_cmd);
- 
- 		printk("ABORT_TASK: Sending TMR_FUNCTION_COMPLETE for"
- 				" ref_tag: %llu\n", ref_tag);
-@@ -286,8 +286,8 @@ static void core_tmr_drain_tmr_list(
- 		cancel_work_sync(&cmd->work);
- 		transport_wait_for_tasks(cmd);
- 
--		transport_cmd_finish_abort(cmd, 1);
--		target_put_sess_cmd(cmd);
-+		if (!transport_cmd_finish_abort(cmd, 1))
-+			target_put_sess_cmd(cmd);
- 	}
- }
- 
-@@ -385,8 +385,8 @@ static void core_tmr_drain_state_list(
- 		cancel_work_sync(&cmd->work);
- 		transport_wait_for_tasks(cmd);
- 
--		core_tmr_handle_tas_abort(cmd, tas);
--		target_put_sess_cmd(cmd);
-+		if (!core_tmr_handle_tas_abort(cmd, tas))
-+			target_put_sess_cmd(cmd);
- 	}
- }
- 
-diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
-index 60743bf27f37..37c77db6e737 100644
---- a/drivers/target/target_core_transport.c
-+++ b/drivers/target/target_core_transport.c
-@@ -639,9 +639,10 @@ static void transport_lun_remove_cmd(struct se_cmd *cmd)
- 		percpu_ref_put(&lun->lun_ref);
- }
- 
--void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
-+int transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
- {
- 	bool ack_kref = (cmd->se_cmd_flags & SCF_ACK_KREF);
-+	int ret = 0;
- 
- 	if (cmd->se_cmd_flags & SCF_SE_LUN_CMD)
- 		transport_lun_remove_cmd(cmd);
-@@ -653,9 +654,11 @@ void transport_cmd_finish_abort(struct se_cmd *cmd, int remove)
- 		cmd->se_tfo->aborted_task(cmd);
- 
- 	if (transport_cmd_check_stop_to_fabric(cmd))
--		return;
-+		return 1;
- 	if (remove && ack_kref)
--		transport_put_cmd(cmd);
-+		ret = transport_put_cmd(cmd);
-+
-+	return ret;
- }
- 
- static void target_complete_failure_work(struct work_struct *work)
--- 
-2.28.0
-
-
-From fe8003da611320aa8b2a5cf0a37e866ea254011a Mon Sep 17 00:00:00 2001
-From: Nicholas Bellinger <nab@linux-iscsi.org>
-Date: Wed, 7 Jun 2017 20:29:50 -0700
-Subject: [PATCH 12/27] iscsi-target: Reject immediate data underflow larger
- than SCSI transfer length
-
-commit abb85a9b512e8ca7ad04a5a8a6db9664fe644974 upstream.
-
-When iscsi WRITE underflow occurs there are two different scenarios
-that can happen.
-
-Normally in practice, when an EDTL vs. SCSI CDB TRANSFER LENGTH
-underflow is detected, the iscsi immediate data payload is the
-smaller SCSI CDB TRANSFER LENGTH.
-
-That is, when a host fabric LLD is using a fixed size EDTL for
-a specific control CDB, the SCSI CDB TRANSFER LENGTH and actual
-SCSI payload ends up being smaller than EDTL.  In iscsi, this
-means the received iscsi immediate data payload matches the
-smaller SCSI CDB TRANSFER LENGTH, because there is no more
-SCSI payload to accept beyond SCSI CDB TRANSFER LENGTH.
-
-However, it's possible for a malicous host to send a WRITE
-underflow where EDTL is larger than SCSI CDB TRANSFER LENGTH,
-but incoming iscsi immediate data actually matches EDTL.
-
-In the wild, we've never had a iscsi host environment actually
-try to do this.
-
-For this special case, it's wrong to truncate part of the
-control CDB payload and continue to process the command during
-underflow when immediate data payload received was larger than
-SCSI CDB TRANSFER LENGTH, so go ahead and reject and drop the
-bogus payload as a defensive action.
-
-Note this potential bug was originally relaxed by the following
-for allowing WRITE underflow in MSFT FCP host environments:
-
-   commit c72c5250224d475614a00c1d7e54a67f77cd3410
-   Author: Roland Dreier <roland@purestorage.com>
-   Date:   Wed Jul 22 15:08:18 2015 -0700
-
-      target: allow underflow/overflow for PR OUT etc. commands
-
-Cc: Roland Dreier <roland@purestorage.com>
-Cc: Mike Christie <mchristi@redhat.com>
-Cc: Hannes Reinecke <hare@suse.de>
-Cc: Martin K. Petersen <martin.petersen@oracle.com>
-Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/target/iscsi/iscsi_target.c | 12 ++++++++++++
- 1 file changed, 12 insertions(+)
-
-diff --git a/drivers/target/iscsi/iscsi_target.c b/drivers/target/iscsi/iscsi_target.c
-index 200d3de8bc1e..a180c000e246 100644
---- a/drivers/target/iscsi/iscsi_target.c
-+++ b/drivers/target/iscsi/iscsi_target.c
-@@ -1112,6 +1112,18 @@ iscsit_get_immediate_data(struct iscsi_cmd *cmd, struct iscsi_scsi_req *hdr,
- 	 */
- 	if (dump_payload)
- 		goto after_immediate_data;
-+	/*
-+	 * Check for underflow case where both EDTL and immediate data payload
-+	 * exceeds what is presented by CDB's TRANSFER LENGTH, and what has
-+	 * already been set in target_cmd_size_check() as se_cmd->data_length.
-+	 *
-+	 * For this special case, fail the command and dump the immediate data
-+	 * payload.
-+	 */
-+	if (cmd->first_burst_len > cmd->se_cmd.data_length) {
-+		cmd->sense_reason = TCM_INVALID_CDB_FIELD;
-+		goto after_immediate_data;
-+	}
- 
- 	immed_ret = iscsit_handle_immediate_data(cmd, hdr,
- 					cmd->first_burst_len);
--- 
-2.28.0
-
-
-From f8242fa8119b935d4b94557139fca1ba7ad8dd66 Mon Sep 17 00:00:00 2001
-From: Alex Deucher <alexander.deucher@amd.com>
-Date: Mon, 19 Jun 2017 12:52:47 -0400
-Subject: [PATCH 13/27] drm/radeon: add a PX quirk for another K53TK variant
-
-commit 4eb59793cca00b0e629b6d55b5abb5acb82c5868 upstream.
-
-Disable PX on these systems.
-
-bug: https://bugs.freedesktop.org/show_bug.cgi?id=101491
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/radeon/radeon_device.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
-index 4aa2cbe4c85f..a77521695c9a 100644
---- a/drivers/gpu/drm/radeon/radeon_device.c
-+++ b/drivers/gpu/drm/radeon/radeon_device.c
-@@ -127,6 +127,10 @@ static struct radeon_px_quirk radeon_px_quirk_list[] = {
- 	 * https://bugzilla.kernel.org/show_bug.cgi?id=51381
- 	 */
- 	{ PCI_VENDOR_ID_ATI, 0x6840, 0x1043, 0x2122, RADEON_PX_QUIRK_DISABLE_PX },
-+	/* Asus K53TK laptop with AMD A6-3420M APU and Radeon 7670m GPU
-+	 * https://bugs.freedesktop.org/show_bug.cgi?id=101491
-+	 */
-+	{ PCI_VENDOR_ID_ATI, 0x6741, 0x1043, 0x2122, RADEON_PX_QUIRK_DISABLE_PX },
- 	/* macbook pro 8.2 */
- 	{ PCI_VENDOR_ID_ATI, 0x6741, PCI_VENDOR_ID_APPLE, 0x00e2, RADEON_PX_QUIRK_LONG_WAKEUP },
- 	{ 0, 0, 0, 0, 0 },
--- 
-2.28.0
-
-
-From 4f3d0f468552b83eaa011e17af358bf418d23da2 Mon Sep 17 00:00:00 2001
-From: Alex Deucher <alexander.deucher@amd.com>
-Date: Mon, 19 Jun 2017 15:59:58 -0400
-Subject: [PATCH 14/27] drm/radeon: add a quirk for Toshiba Satellite L20-183
-
-commit acfd6ee4fa7ebeee75511825fe02be3f7ac1d668 upstream.
-
-Fixes resume from suspend.
-
-bug: https://bugzilla.kernel.org/show_bug.cgi?id=196121
-Reported-by: Przemek <soprwa@gmail.com>
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/radeon/radeon_combios.c | 7 +++++++
- 1 file changed, 7 insertions(+)
-
-diff --git a/drivers/gpu/drm/radeon/radeon_combios.c b/drivers/gpu/drm/radeon/radeon_combios.c
-index a9b01bcf7d0a..fcecaf5b5526 100644
---- a/drivers/gpu/drm/radeon/radeon_combios.c
-+++ b/drivers/gpu/drm/radeon/radeon_combios.c
-@@ -3394,6 +3394,13 @@ void radeon_combios_asic_init(struct drm_device *dev)
- 	    rdev->pdev->subsystem_vendor == 0x103c &&
- 	    rdev->pdev->subsystem_device == 0x280a)
- 		return;
-+	/* quirk for rs4xx Toshiba Sattellite L20-183 latop to make it resume
-+	 * - it hangs on resume inside the dynclk 1 table.
-+	 */
-+	if (rdev->family == CHIP_RS400 &&
-+	    rdev->pdev->subsystem_vendor == 0x1179 &&
-+	    rdev->pdev->subsystem_device == 0xff31)
-+	        return;
- 
- 	/* DYN CLK 1 */
- 	table = combios_get_table_offset(dev, COMBIOS_DYN_CLK_1_TABLE);
--- 
-2.28.0
-
-
-From 526527847355f703a519c62edf505f158592723c Mon Sep 17 00:00:00 2001
-From: Alex Deucher <alexander.deucher@amd.com>
-Date: Thu, 15 Jun 2017 10:55:11 -0400
-Subject: [PATCH 15/27] drm/amdgpu/atom: fix ps allocation size for
- EnableDispPowerGating
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 05b4017b37f1fce4b7185f138126dd8decdb381f upstream.
-
-We were using the wrong structure which lead to an overflow
-on some boards.
-
-bug: https://bugs.freedesktop.org/show_bug.cgi?id=101387
-Acked-by: Chunming Zhou <david1.zhou@amd.com>
-Acked-by: Christian König <christian.koenig@amd.com>
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/amd/amdgpu/atombios_crtc.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/gpu/drm/amd/amdgpu/atombios_crtc.c b/drivers/gpu/drm/amd/amdgpu/atombios_crtc.c
-index 49aa35016653..247b088990dc 100644
---- a/drivers/gpu/drm/amd/amdgpu/atombios_crtc.c
-+++ b/drivers/gpu/drm/amd/amdgpu/atombios_crtc.c
-@@ -164,7 +164,7 @@ void amdgpu_atombios_crtc_powergate(struct drm_crtc *crtc, int state)
- 	struct drm_device *dev = crtc->dev;
- 	struct amdgpu_device *adev = dev->dev_private;
- 	int index = GetIndexIntoMasterTable(COMMAND, EnableDispPowerGating);
--	ENABLE_DISP_POWER_GATING_PARAMETERS_V2_1 args;
-+	ENABLE_DISP_POWER_GATING_PS_ALLOCATION args;
- 
- 	memset(&args, 0, sizeof(args));
- 
-@@ -177,7 +177,7 @@ void amdgpu_atombios_crtc_powergate(struct drm_crtc *crtc, int state)
- void amdgpu_atombios_crtc_powergate_init(struct amdgpu_device *adev)
- {
- 	int index = GetIndexIntoMasterTable(COMMAND, EnableDispPowerGating);
--	ENABLE_DISP_POWER_GATING_PARAMETERS_V2_1 args;
-+	ENABLE_DISP_POWER_GATING_PS_ALLOCATION args;
- 
- 	memset(&args, 0, sizeof(args));
- 
--- 
-2.28.0
-
-
-From 525e496a9722a6189f7ece9236a76f00cb8abef0 Mon Sep 17 00:00:00 2001
-From: Alex Deucher <alexander.deucher@amd.com>
-Date: Thu, 15 Jun 2017 11:12:28 -0400
-Subject: [PATCH 16/27] drm/amdgpu: adjust default display clock
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 52b482b0f4fd6d5267faf29fe91398e203f3c230 upstream.
-
-Increase the default display clock on newer asics to
-accomodate some high res modes with really high refresh
-rates.
-
-bug: https://bugs.freedesktop.org/show_bug.cgi?id=93826
-Acked-by: Chunming Zhou <david1.zhou@amd.com>
-Acked-by: Christian König <christian.koenig@amd.com>
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
-index 51a9942cdb40..f4cae5357e40 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_atombios.c
-@@ -681,6 +681,10 @@ int amdgpu_atombios_get_clock_info(struct amdgpu_device *adev)
- 			DRM_INFO("Changing default dispclk from %dMhz to 600Mhz\n",
- 				 adev->clock.default_dispclk / 100);
- 			adev->clock.default_dispclk = 60000;
-+		} else if (adev->clock.default_dispclk <= 60000) {
-+			DRM_INFO("Changing default dispclk from %dMhz to 625Mhz\n",
-+				 adev->clock.default_dispclk / 100);
-+			adev->clock.default_dispclk = 62500;
- 		}
- 		adev->clock.dp_extclk =
- 			le16_to_cpu(firmware_info->info_21.usUniphyDPModeExtClkFreq);
--- 
-2.28.0
-
-
-From 800d7454e50fea1af3801adf4debf249922b2c88 Mon Sep 17 00:00:00 2001
-From: Johan Hovold <johan@kernel.org>
-Date: Wed, 10 May 2017 18:18:26 +0200
-Subject: [PATCH 17/27] USB: usbip: fix nonconforming hub descriptor
-
-commit ec963b412a54aac8e527708ecad06a6988a86fb4 upstream.
-
-Fix up the root-hub descriptor to accommodate the variable-length
-DeviceRemovable and PortPwrCtrlMask fields, while marking all ports as
-removable (and leaving the reserved bit zero unset).
-
-Also add a build-time constraint on VHCI_HC_PORTS which must never be
-greater than USB_MAXCHILDREN (but this was only enforced through a
-KConfig constant).
-
-This specifically fixes the descriptor layout whenever VHCI_HC_PORTS is
-greater than seven (default is 8).
-
-Fixes: 04679b3489e0 ("Staging: USB/IP: add client driver")
-Cc: Takahiro Hirofuchi <hirofuchi@users.sourceforge.net>
-Cc: Valentina Manea <valentina.manea.m@gmail.com>
-Signed-off-by: Johan Hovold <johan@kernel.org>
-Acked-by: Shuah Khan <shuahkh@osg.samsung.com>
-[ johan: backport to v4.4, which uses VHCI_NPORTS ]
-Signed-off-by: Johan Hovold <johan@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/usbip/vhci_hcd.c | 11 ++++++++---
- 1 file changed, 8 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/usb/usbip/vhci_hcd.c b/drivers/usb/usbip/vhci_hcd.c
-index 7fbe19d5279e..81b2b9f808b5 100644
---- a/drivers/usb/usbip/vhci_hcd.c
-+++ b/drivers/usb/usbip/vhci_hcd.c
-@@ -215,14 +215,19 @@ done:
- 
- static inline void hub_descriptor(struct usb_hub_descriptor *desc)
- {
-+	int width;
-+
- 	memset(desc, 0, sizeof(*desc));
- 	desc->bDescriptorType = USB_DT_HUB;
--	desc->bDescLength = 9;
- 	desc->wHubCharacteristics = cpu_to_le16(
- 		HUB_CHAR_INDV_PORT_LPSM | HUB_CHAR_COMMON_OCPM);
-+
- 	desc->bNbrPorts = VHCI_NPORTS;
--	desc->u.hs.DeviceRemovable[0] = 0xff;
--	desc->u.hs.DeviceRemovable[1] = 0xff;
-+	BUILD_BUG_ON(VHCI_NPORTS > USB_MAXCHILDREN);
-+	width = desc->bNbrPorts / 8 + 1;
-+	desc->bDescLength = USB_DT_HUB_NONVAR_SIZE + 2 * width;
-+	memset(&desc->u.hs.DeviceRemovable[0], 0, width);
-+	memset(&desc->u.hs.DeviceRemovable[width], 0xff, width);
- }
- 
- static int vhci_hub_control(struct usb_hcd *hcd, u16 typeReq, u16 wValue,
--- 
-2.28.0
-
-
-From eab38dfd66d7f13b9eecfae7728ff0d2e49ff16f Mon Sep 17 00:00:00 2001
-From: David Howells <dhowells@redhat.com>
-Date: Thu, 15 Jun 2017 00:12:24 +0100
-Subject: [PATCH 18/27] rxrpc: Fix several cases where a padded len isn't
- checked in ticket decode
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 5f2f97656ada8d811d3c1bef503ced266fcd53a0 upstream.
-
-This fixes CVE-2017-7482.
-
-When a kerberos 5 ticket is being decoded so that it can be loaded into an
-rxrpc-type key, there are several places in which the length of a
-variable-length field is checked to make sure that it's not going to
-overrun the available data - but the data is padded to the nearest
-four-byte boundary and the code doesn't check for this extra.  This could
-lead to the size-remaining variable wrapping and the data pointer going
-over the end of the buffer.
-
-Fix this by making the various variable-length data checks use the padded
-length.
-
-Reported-by: 石磊 <shilei-c@360.cn>
-Signed-off-by: David Howells <dhowells@redhat.com>
-Reviewed-by: Marc Dionne <marc.c.dionne@auristor.com>
-Reviewed-by: Dan Carpenter <dan.carpenter@oracle.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/rxrpc/ar-key.c | 64 ++++++++++++++++++++++++----------------------
- 1 file changed, 34 insertions(+), 30 deletions(-)
-
+@@ -96,7 +96,7 @@ char *get_options(const char *str, int nints, int *ints)
+ 			break;
+ 		if (res == 3) {
+ 			int range_nums;
+-			range_nums = get_range((char **)&str, ints + i);
++			range_nums = get_range((char **)&str, ints + i, nints - i);
+ 			if (range_nums < 0)
+ 				break;
+ 			/*
 diff --git a/net/rxrpc/ar-key.c b/net/rxrpc/ar-key.c
 index da3cc09f683e..91d43ab3a961 100644
 --- a/net/rxrpc/ar-key.c
@@ -1509,605 +1016,3 @@ index da3cc09f683e..91d43ab3a961 100644
  
  	} while (--loop > 0);
  
--- 
-2.28.0
-
-
-From 7dfea167fc1d4ba886a305802c94fde99516b2e1 Mon Sep 17 00:00:00 2001
-From: Tobias Wolf <dev-NTEO@vplace.de>
-Date: Wed, 23 Nov 2016 10:40:07 +0100
-Subject: [PATCH 19/27] of: Add check to of_scan_flat_dt() before accessing
- initial_boot_params
-
-commit 3ec754410cb3e931a6c4920b1a150f21a94a2bf4 upstream.
-
-An empty __dtb_start to __dtb_end section might result in
-initial_boot_params being null for arch/mips/ralink. This showed that the
-boot process hangs indefinitely in of_scan_flat_dt().
-
-Signed-off-by: Tobias Wolf <dev-NTEO@vplace.de>
-Cc: Sergei Shtylyov <sergei.shtylyov@cogentembedded.com>
-Cc: linux-mips@linux-mips.org
-Patchwork: https://patchwork.linux-mips.org/patch/14605/
-Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
-Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/of/fdt.c | 9 ++++++---
- 1 file changed, 6 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/of/fdt.c b/drivers/of/fdt.c
-index 655f79db7899..58048dd5fcd0 100644
---- a/drivers/of/fdt.c
-+++ b/drivers/of/fdt.c
-@@ -632,9 +632,12 @@ int __init of_scan_flat_dt(int (*it)(unsigned long node,
- 	const char *pathp;
- 	int offset, rc = 0, depth = -1;
- 
--        for (offset = fdt_next_node(blob, -1, &depth);
--             offset >= 0 && depth >= 0 && !rc;
--             offset = fdt_next_node(blob, offset, &depth)) {
-+	if (!blob)
-+		return 0;
-+
-+	for (offset = fdt_next_node(blob, -1, &depth);
-+	     offset >= 0 && depth >= 0 && !rc;
-+	     offset = fdt_next_node(blob, offset, &depth)) {
- 
- 		pathp = fdt_get_name(blob, offset, NULL);
- 		if (*pathp == '/')
--- 
-2.28.0
-
-
-From 8fcb215c5426301fa6d49899028b7161dc189d88 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Jo=C3=ABl=20Esponde?= <joel.esponde@honeywell.com>
-Date: Wed, 23 Nov 2016 12:47:40 +0100
-Subject: [PATCH 20/27] mtd: spi-nor: fix spansion quad enable
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 807c16253319ee6ccf8873ae64f070f7eb532cd5 upstream.
-
-With the S25FL127S nor flash part, each writing to the configuration
-register takes hundreds of ms. During that  time, no more accesses to
-the flash should be done (even reads).
-
-This commit adds a wait loop after the register writing until the flash
-finishes its work.
-
-This issue could make rootfs mounting fail when the latter was done too
-much closely to this quad enable bit setting step. And in this case, a
-driver as UBIFS may try to recover the filesystem and may broke it
-completely.
-
-Signed-off-by: Joël Esponde <joel.esponde@honeywell.com>
-Signed-off-by: Cyrille Pitchen <cyrille.pitchen@atmel.com>
-Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/mtd/spi-nor/spi-nor.c | 7 +++++++
- 1 file changed, 7 insertions(+)
-
-diff --git a/drivers/mtd/spi-nor/spi-nor.c b/drivers/mtd/spi-nor/spi-nor.c
-index 37e4135ab213..64d6f053c2a5 100644
---- a/drivers/mtd/spi-nor/spi-nor.c
-+++ b/drivers/mtd/spi-nor/spi-nor.c
-@@ -1057,6 +1057,13 @@ static int spansion_quad_enable(struct spi_nor *nor)
- 		return -EINVAL;
- 	}
- 
-+	ret = spi_nor_wait_till_ready(nor);
-+	if (ret) {
-+		dev_err(nor->dev,
-+			"timeout while writing configuration register\n");
-+		return ret;
-+	}
-+
- 	/* read back and check it */
- 	ret = read_cr(nor);
- 	if (!(ret > 0 && (ret & CR_QUAD_EN_SPAN))) {
--- 
-2.28.0
-
-
-From db7130d63fd80256d448686a06a5154a8b9b4f62 Mon Sep 17 00:00:00 2001
-From: Michael Ellerman <mpe@ellerman.id.au>
-Date: Thu, 22 Jun 2017 16:52:51 +1000
-Subject: [PATCH 21/27] powerpc/slb: Force a full SLB flush when we insert for
- a bad EA
-
-[Note this patch is not upstream. The bug fix was fixed differently in
-upstream prior to the bug being identified.]
-
-The SLB miss handler calls slb_allocate_realmode() in order to create an
-SLB entry for the faulting address. At the very start of that function
-we check that the faulting Effective Address (EA) is less than
-PGTABLE_RANGE (ignoring the region), ie. is it an address which could
-possibly fit in the virtual address space.
-
-For an EA which fails that test, we branch out of line (to label 8), but
-we still go on to create an SLB entry for the address. The SLB entry we
-create has a VSID of 0, which means it will never match anything in the
-hash table and so can't actually translate to a physical address.
-
-However that SLB entry will be inserted in the SLB, and so needs to be
-managed properly like any other SLB entry. In particular we need to
-insert the SLB entry in the SLB cache, so that it will be flushed when
-the process is descheduled.
-
-And that is where the bugs begin. The first bug is that slb_finish_load()
-uses cr7 to decide if it should insert the SLB entry into the SLB cache.
-When we come from the invalid EA case we don't set cr7, it just has some
-junk value from userspace. So we may or may not insert the SLB entry in
-the SLB cache. If we fail to insert it, we may then incorrectly leave it
-in the SLB when the process is descheduled.
-
-The second bug is that even if we do happen to add the entry to the SLB
-cache, we do not have enough bits in the SLB cache to remember the full
-ESID value for very large EAs.
-
-For example if a process branches to 0x788c545a18000000, that results in
-a 256MB SLB entry with an ESID of 0x788c545a1. But each entry in the SLB
-cache is only 32-bits, meaning we truncate the ESID to 0x88c545a1. This
-has the same effect as the first bug, we incorrectly leave the SLB entry
-in the SLB when the process is descheduled.
-
-When a process accesses an invalid EA it results in a SEGV signal being
-sent to the process, which typically results in the process being
-killed. Process death isn't instantaneous however, the process may catch
-the SEGV signal and continue somehow, or the kernel may start writing a
-core dump for the process, either of which means it's possible for the
-process to be preempted while its processing the SEGV but before it's
-been killed.
-
-If that happens, when the process is scheduled back onto the CPU we will
-allocate a new SLB entry for the NIP, which will insert a second entry
-into the SLB for the bad EA. Because we never flushed the original
-entry, due to either bug one or two, we now have two SLB entries that
-match the same EA.
-
-If another access is made to that EA, either by the process continuing
-after catching the SEGV, or by a second process accessing the same bad
-EA on the same CPU, we will trigger an SLB multi-hit machine check
-exception. This has been observed happening in the wild.
-
-The fix is when we hit the invalid EA case, we mark the SLB cache as
-being full. This causes us to not insert the truncated ESID into the SLB
-cache, and means when the process is switched out we will flush the
-entire SLB. Note that this works both for the original fault and for a
-subsequent call to slb_allocate_realmode() from switch_slb().
-
-Because we mark the SLB cache as full, it doesn't really matter what
-value is in cr7, but rather than leaving it as something random we set
-it to indicate the address was a kernel address. That also skips the
-attempt to insert it in the SLB cache which is a nice side effect.
-
-Another way to fix the bug would be to make the entries in the SLB cache
-wider, so that we don't truncate the ESID. However this would be a more
-intrusive change as it alters the size and layout of the paca.
-
-This bug was fixed in upstream by commit f0f558b131db ("powerpc/mm:
-Preserve CFAR value on SLB miss caused by access to bogus address"),
-which changed the way we handle a bad EA entirely removing this bug in
-the process.
-
-Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
-Reviewed-by: Paul Mackerras <paulus@ozlabs.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/mm/slb_low.S | 10 ++++++++++
- 1 file changed, 10 insertions(+)
-
-diff --git a/arch/powerpc/mm/slb_low.S b/arch/powerpc/mm/slb_low.S
-index 4c48b487698c..0b48ce40d351 100644
---- a/arch/powerpc/mm/slb_low.S
-+++ b/arch/powerpc/mm/slb_low.S
-@@ -179,6 +179,16 @@ END_MMU_FTR_SECTION_IFSET(MMU_FTR_1T_SEGMENT)
- 	b	slb_finish_load
- 
- 8:	/* invalid EA */
-+	/*
-+	 * It's possible the bad EA is too large to fit in the SLB cache, which
-+	 * would mean we'd fail to invalidate it on context switch. So mark the
-+	 * SLB cache as full so we force a full flush. We also set cr7+eq to
-+	 * mark the address as a kernel address, so slb_finish_load() skips
-+	 * trying to insert it into the SLB cache.
-+	 */
-+	li	r9,SLB_CACHE_ENTRIES + 1
-+	sth	r9,PACASLBCACHEPTR(r13)
-+	crset	4*cr7+eq
- 	li	r10,0			/* BAD_VSID */
- 	li	r9,0			/* BAD_VSID */
- 	li	r11,SLB_VSID_USER	/* flags don't much matter */
--- 
-2.28.0
-
-
-From 889caad4fbe49e3a612ccb971e40c50912f90ace Mon Sep 17 00:00:00 2001
-From: William Wu <william.wu@rock-chips.com>
-Date: Tue, 25 Apr 2017 17:45:48 +0800
-Subject: [PATCH 22/27] usb: gadget: f_fs: avoid out of bounds access on
- comp_desc
-
-commit b7f73850bb4fac1e2209a4dd5e636d39be92f42c upstream.
-
-Companion descriptor is only used for SuperSpeed endpoints,
-if the endpoints are HighSpeed or FullSpeed, the Companion
-descriptor will not allocated, so we can only access it if
-gadget is SuperSpeed.
-
-I can reproduce this issue on Rockchip platform rk3368 SoC
-which supports USB 2.0, and use functionfs for ADB. Kernel
-build with CONFIG_KASAN=y and CONFIG_SLUB_DEBUG=y report
-the following BUG:
-
-==================================================================
-BUG: KASAN: slab-out-of-bounds in ffs_func_set_alt+0x224/0x3a0 at addr ffffffc0601f6509
-Read of size 1 by task swapper/0/0
-============================================================================
-BUG kmalloc-256 (Not tainted): kasan: bad access detected
-----------------------------------------------------------------------------
-
-Disabling lock debugging due to kernel taint
-INFO: Allocated in ffs_func_bind+0x52c/0x99c age=1275 cpu=0 pid=1
-alloc_debug_processing+0x128/0x17c
-___slab_alloc.constprop.58+0x50c/0x610
-__slab_alloc.isra.55.constprop.57+0x24/0x34
-__kmalloc+0xe0/0x250
-ffs_func_bind+0x52c/0x99c
-usb_add_function+0xd8/0x1d4
-configfs_composite_bind+0x48c/0x570
-udc_bind_to_driver+0x6c/0x170
-usb_udc_attach_driver+0xa4/0xd0
-gadget_dev_desc_UDC_store+0xcc/0x118
-configfs_write_file+0x1a0/0x1f8
-__vfs_write+0x64/0x174
-vfs_write+0xe4/0x200
-SyS_write+0x68/0xc8
-el0_svc_naked+0x24/0x28
-INFO: Freed in inode_doinit_with_dentry+0x3f0/0x7c4 age=1275 cpu=7 pid=247
-...
-Call trace:
-[<ffffff900808aab4>] dump_backtrace+0x0/0x230
-[<ffffff900808acf8>] show_stack+0x14/0x1c
-[<ffffff90084ad420>] dump_stack+0xa0/0xc8
-[<ffffff90082157cc>] print_trailer+0x188/0x198
-[<ffffff9008215948>] object_err+0x3c/0x4c
-[<ffffff900821b5ac>] kasan_report+0x324/0x4dc
-[<ffffff900821aa38>] __asan_load1+0x24/0x50
-[<ffffff90089eb750>] ffs_func_set_alt+0x224/0x3a0
-[<ffffff90089d3760>] composite_setup+0xdcc/0x1ac8
-[<ffffff90089d7394>] android_setup+0x124/0x1a0
-[<ffffff90089acd18>] _setup+0x54/0x74
-[<ffffff90089b6b98>] handle_ep0+0x3288/0x4390
-[<ffffff90089b9b44>] dwc_otg_pcd_handle_out_ep_intr+0x14dc/0x2ae4
-[<ffffff90089be85c>] dwc_otg_pcd_handle_intr+0x1ec/0x298
-[<ffffff90089ad680>] dwc_otg_pcd_irq+0x10/0x20
-[<ffffff9008116328>] handle_irq_event_percpu+0x124/0x3ac
-[<ffffff9008116610>] handle_irq_event+0x60/0xa0
-[<ffffff900811af30>] handle_fasteoi_irq+0x10c/0x1d4
-[<ffffff9008115568>] generic_handle_irq+0x30/0x40
-[<ffffff90081159b4>] __handle_domain_irq+0xac/0xdc
-[<ffffff9008080e9c>] gic_handle_irq+0x64/0xa4
-...
-Memory state around the buggy address:
-  ffffffc0601f6400: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
-  ffffffc0601f6480: 00 00 00 00 00 00 00 00 00 00 06 fc fc fc fc fc
- >ffffffc0601f6500: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
-                       ^
-  ffffffc0601f6580: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
-  ffffffc0601f6600: fc fc fc fc fc fc fc fc 00 00 00 00 00 00 00 00
-==================================================================
-
-Signed-off-by: William Wu <william.wu@rock-chips.com>
-Signed-off-by: Felipe Balbi <felipe.balbi@linux.intel.com>
-Cc: Jerry Zhang <zhangjerry@google.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/gadget/function/f_fs.c | 10 +++++-----
- 1 file changed, 5 insertions(+), 5 deletions(-)
-
-diff --git a/drivers/usb/gadget/function/f_fs.c b/drivers/usb/gadget/function/f_fs.c
-index 9ad5145d3103..6d8f865a2fb7 100644
---- a/drivers/usb/gadget/function/f_fs.c
-+++ b/drivers/usb/gadget/function/f_fs.c
-@@ -1668,12 +1668,12 @@ static int ffs_func_eps_enable(struct ffs_function *func)
- 		ep->ep->driver_data = ep;
- 		ep->ep->desc = ds;
- 
--		comp_desc = (struct usb_ss_ep_comp_descriptor *)(ds +
--				USB_DT_ENDPOINT_SIZE);
--		ep->ep->maxburst = comp_desc->bMaxBurst + 1;
--
--		if (needs_comp_desc)
-+		if (needs_comp_desc) {
-+			comp_desc = (struct usb_ss_ep_comp_descriptor *)(ds +
-+					USB_DT_ENDPOINT_SIZE);
-+			ep->ep->maxburst = comp_desc->bMaxBurst + 1;
- 			ep->ep->comp_desc = comp_desc;
-+		}
- 
- 		ret = usb_ep_enable(ep->ep);
- 		if (likely(!ret)) {
--- 
-2.28.0
-
-
-From 9b54821d518407b9763b0abf382a413a5029feaa Mon Sep 17 00:00:00 2001
-From: Yendapally Reddy Dhananjaya Reddy <yendapally.reddy@broadcom.com>
-Date: Wed, 8 Feb 2017 17:14:26 -0500
-Subject: [PATCH 23/27] net: phy: Initialize mdio clock at probe function
-
-commit bb1a619735b4660f21bce3e728b937640024b4ad upstream.
-
-USB PHYs need the MDIO clock divisor enabled earlier to work.
-Initialize mdio clock divisor in probe function. The ext bus
-bit available in the same register will be used by mdio mux
-to enable external mdio.
-
-Signed-off-by: Yendapally Reddy Dhananjaya Reddy <yendapally.reddy@broadcom.com>
-Fixes: ddc24ae1 ("net: phy: Broadcom iProc MDIO bus driver")
-Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
-Signed-off-by: Jon Mason <jon.mason@broadcom.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/phy/mdio-bcm-iproc.c | 6 ++----
- 1 file changed, 2 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/net/phy/mdio-bcm-iproc.c b/drivers/net/phy/mdio-bcm-iproc.c
-index c0b4e65267af..46fe1ae919a3 100644
---- a/drivers/net/phy/mdio-bcm-iproc.c
-+++ b/drivers/net/phy/mdio-bcm-iproc.c
-@@ -81,8 +81,6 @@ static int iproc_mdio_read(struct mii_bus *bus, int phy_id, int reg)
- 	if (rc)
- 		return rc;
- 
--	iproc_mdio_config_clk(priv->base);
--
- 	/* Prepare the read operation */
- 	cmd = (MII_DATA_TA_VAL << MII_DATA_TA_SHIFT) |
- 		(reg << MII_DATA_RA_SHIFT) |
-@@ -112,8 +110,6 @@ static int iproc_mdio_write(struct mii_bus *bus, int phy_id,
- 	if (rc)
- 		return rc;
- 
--	iproc_mdio_config_clk(priv->base);
--
- 	/* Prepare the write operation */
- 	cmd = (MII_DATA_TA_VAL << MII_DATA_TA_SHIFT) |
- 		(reg << MII_DATA_RA_SHIFT) |
-@@ -163,6 +159,8 @@ static int iproc_mdio_probe(struct platform_device *pdev)
- 	bus->read = iproc_mdio_read;
- 	bus->write = iproc_mdio_write;
- 
-+	iproc_mdio_config_clk(priv->base);
-+
- 	rc = of_mdiobus_register(bus, pdev->dev.of_node);
- 	if (rc) {
- 		dev_err(&pdev->dev, "MDIO bus registration failed\n");
--- 
-2.28.0
-
-
-From e5f87c73384279f005d9bb27bed03a29335c3492 Mon Sep 17 00:00:00 2001
-From: Russell King <rmk+kernel@armlinux.org.uk>
-Date: Tue, 30 May 2017 16:21:51 +0100
-Subject: [PATCH 24/27] net: phy: fix marvell phy status reading
-
-commit 898805e0cdf7fd860ec21bf661d3a0285a3defbd upstream.
-
-The Marvell driver incorrectly provides phydev->lp_advertising as the
-logical and of the link partner's advert and our advert.  This is
-incorrect - this field is supposed to store the link parter's unmodified
-advertisment.
-
-This allows ethtool to report the correct link partner auto-negotiation
-status.
-
-Fixes: be937f1f89ca ("Marvell PHY m88e1111 driver fix")
-Signed-off-by: Russell King <rmk+kernel@armlinux.org.uk>
-Reviewed-by: Andrew Lunn <andrew@lunn.ch>
-Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Amit Pundir <amit.pundir@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/phy/marvell.c | 2 --
- 1 file changed, 2 deletions(-)
-
-diff --git a/drivers/net/phy/marvell.c b/drivers/net/phy/marvell.c
-index d2701c53ed68..ebec2dceff45 100644
---- a/drivers/net/phy/marvell.c
-+++ b/drivers/net/phy/marvell.c
-@@ -822,8 +822,6 @@ static int marvell_read_status(struct phy_device *phydev)
- 		phydev->lp_advertising = mii_stat1000_to_ethtool_lpa_t(lpagb) |
- 					 mii_lpa_to_ethtool_lpa_t(lpa);
- 
--		lpa &= adv;
--
- 		if (status & MII_M1011_PHY_STATUS_FULLDUPLEX)
- 			phydev->duplex = DUPLEX_FULL;
- 		else
--- 
-2.28.0
-
-
-From bddc80274a128596876f8aad29afb875183c993c Mon Sep 17 00:00:00 2001
-From: "Guilherme G. Piccoli" <gpiccoli@linux.vnet.ibm.com>
-Date: Tue, 14 Jun 2016 18:22:41 -0300
-Subject: [PATCH 25/27] nvme/quirk: Add a delay before checking for adapter
- readiness
-
-commit 54adc01055b75ec8769c5a36574c7a0895c0c0b2 upstream.
-
-When disabling the controller, the specification says the register
-NVME_REG_CC should be written and then driver needs to wait the
-adapter to be ready, which is checked by reading another register
-bit (NVME_CSTS_RDY). There's a timeout validation in this checking,
-so in case this timeout is reached the driver gives up and removes
-the adapter from the system.
-
-After a firmware activation procedure, the PCI_DEVICE(0x1c58, 0x0003)
-(HGST adapter) end up being removed if we issue a reset_controller,
-because driver keeps verifying the NVME_REG_CSTS until the timeout is
-reached. This patch adds a necessary quirk for this adapter, by
-introducing a delay before nvme_wait_ready(), so the reset procedure
-is able to be completed. This quirk is needed because just increasing
-the timeout is not enough in case of this adapter - the driver must
-wait before start reading NVME_REG_CSTS register on this specific
-device.
-
-Signed-off-by: Guilherme G. Piccoli <gpiccoli@linux.vnet.ibm.com>
-Reviewed-by: Christoph Hellwig <hch@lst.de>
-Signed-off-by: Jens Axboe <axboe@fb.com>
-[mauricfo: backport to v4.4.70 without nvme quirk handling & nvme_ctrl]
-Signed-off-by: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
-Tested-by: Narasimhan Vaidyanathan <vnarasimhan@in.ibm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/nvme/host/nvme.h |  7 +++++++
- drivers/nvme/host/pci.c  | 10 ++++++++++
- 2 files changed, 17 insertions(+)
-
-diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
-index 044253dca30a..b8a5a8e8f57d 100644
---- a/drivers/nvme/host/nvme.h
-+++ b/drivers/nvme/host/nvme.h
-@@ -27,6 +27,13 @@ enum {
- 	NVME_NS_LIGHTNVM	= 1,
- };
- 
-+/* The below value is the specific amount of delay needed before checking
-+ * readiness in case of the PCI_DEVICE(0x1c58, 0x0003), which needs the
-+ * NVME_QUIRK_DELAY_BEFORE_CHK_RDY quirk enabled. The value (in ms) was
-+ * found empirically.
-+ */
-+#define NVME_QUIRK_DELAY_AMOUNT		2000
-+
- /*
-  * Represents an NVM Express device.  Each nvme_dev is a PCI function.
-  */
-diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index c851bc53831c..e9750a0a6f2c 100644
---- a/drivers/nvme/host/pci.c
-+++ b/drivers/nvme/host/pci.c
-@@ -1633,10 +1633,20 @@ static int nvme_wait_ready(struct nvme_dev *dev, u64 cap, bool enabled)
-  */
- static int nvme_disable_ctrl(struct nvme_dev *dev, u64 cap)
- {
-+	struct pci_dev *pdev = to_pci_dev(dev->dev);
-+
- 	dev->ctrl_config &= ~NVME_CC_SHN_MASK;
- 	dev->ctrl_config &= ~NVME_CC_ENABLE;
- 	writel(dev->ctrl_config, &dev->bar->cc);
- 
-+	/* Checking for dev->tagset is a trick to avoid sleeping on module
-+	 * load, since we only need the quirk on reset_controller. Notice
-+	 * that the HGST device needs this delay only in firmware activation
-+	 * procedure; unfortunately we have no (easy) way to verify this.
-+	 */
-+	if (pdev->vendor == 0x1c58 && pdev->device == 0x0003 && dev->tagset)
-+		msleep(NVME_QUIRK_DELAY_AMOUNT);
-+
- 	return nvme_wait_ready(dev, cap, false);
- }
- 
--- 
-2.28.0
-
-
-From cb7be08dee4e065d84efe3244fc798e69828a127 Mon Sep 17 00:00:00 2001
-From: "Guilherme G. Piccoli" <gpiccoli@linux.vnet.ibm.com>
-Date: Wed, 28 Dec 2016 22:13:15 -0200
-Subject: [PATCH 26/27] nvme: apply DELAY_BEFORE_CHK_RDY quirk at probe time
- too
-
-commit b5a10c5f7532b7473776da87e67f8301bbc32693 upstream.
-
-Commit 54adc01055b7 ("nvme/quirk: Add a delay before checking for adapter
-readiness") introduced a quirk to adapters that cannot read the bit
-NVME_CSTS_RDY right after register NVME_REG_CC is set; these adapters
-need a delay or else the action of reading the bit NVME_CSTS_RDY could
-somehow corrupt adapter's registers state and it never recovers.
-
-When this quirk was added, we checked ctrl->tagset in order to avoid
-quirking in probe time, supposing we would never require such delay
-during probe. Well, it was too optimistic; we in fact need this quirk
-at probe time in some cases, like after a kexec.
-
-In some experiments, after abnormal shutdown of machine (aka power cord
-unplug), we booted into our bootloader in Power, which is a Linux kernel,
-and kexec'ed into another distro. If this kexec is too quick, we end up
-reaching the probe of NVMe adapter in that distro when adapter is in
-bad state (not fully initialized on our bootloader). What happens next
-is that nvme_wait_ready() is unable to complete, except if the quirk is
-enabled.
-
-So, this patch removes the original ctrl->tagset verification in order
-to enable the quirk even on probe time.
-
-Fixes: 54adc01055b7 ("nvme/quirk: Add a delay before checking for adapter readiness")
-Reported-by: Andrew Byrne <byrneadw@ie.ibm.com>
-Reported-by: Jaime A. H. Gomez <jahgomez@mx1.ibm.com>
-Reported-by: Zachary D. Myers <zdmyers@us.ibm.com>
-Signed-off-by: Guilherme G. Piccoli <gpiccoli@linux.vnet.ibm.com>
-Acked-by: Jeffrey Lien <Jeff.Lien@wdc.com>
-Signed-off-by: Christoph Hellwig <hch@lst.de>
-[mauricfo: backport to v4.4.70 without nvme quirk handling & nvme_ctrl]
-Signed-off-by: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
-Tested-by: Narasimhan Vaidyanathan <vnarasimhan@in.ibm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/nvme/host/pci.c | 7 +------
- 1 file changed, 1 insertion(+), 6 deletions(-)
-
-diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
-index e9750a0a6f2c..4c673d45f1bd 100644
---- a/drivers/nvme/host/pci.c
-+++ b/drivers/nvme/host/pci.c
-@@ -1639,12 +1639,7 @@ static int nvme_disable_ctrl(struct nvme_dev *dev, u64 cap)
- 	dev->ctrl_config &= ~NVME_CC_ENABLE;
- 	writel(dev->ctrl_config, &dev->bar->cc);
- 
--	/* Checking for dev->tagset is a trick to avoid sleeping on module
--	 * load, since we only need the quirk on reset_controller. Notice
--	 * that the HGST device needs this delay only in firmware activation
--	 * procedure; unfortunately we have no (easy) way to verify this.
--	 */
--	if (pdev->vendor == 0x1c58 && pdev->device == 0x0003 && dev->tagset)
-+	if (pdev->vendor == 0x1c58 && pdev->device == 0x0003)
- 		msleep(NVME_QUIRK_DELAY_AMOUNT);
- 
- 	return nvme_wait_ready(dev, cap, false);
--- 
-2.28.0
-
-
-From 6ee496d7218aeccffe5380cb65e9d50d1a61c323 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Thu, 29 Jun 2017 12:49:08 +0200
-Subject: [PATCH 27/27] Linux 4.4.75
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 1f75507acbf4..696d15d8ad5d 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 4
--SUBLEVEL = 74
-+SUBLEVEL = 75
- EXTRAVERSION =
- NAME = Blurry Fish Butt
- 
--- 
-2.28.0
-

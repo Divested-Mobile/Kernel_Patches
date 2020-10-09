@@ -1,34 +1,225 @@
-From 3f611a479962ed4ab3682cbb0deb476f90d513f5 Mon Sep 17 00:00:00 2001
-From: Shmulik Ladkani <shmulik@metanetworks.com>
-Date: Mon, 29 Apr 2019 16:39:30 +0300
-Subject: [PATCH 01/24] ipv4: ip_do_fragment: Preserve skb_iif during
- fragmentation
-
-[ Upstream commit d2f0c961148f65bc73eda72b9fa3a4e80973cb49 ]
-
-Previously, during fragmentation after forwarding, skb->skb_iif isn't
-preserved, i.e. 'ip_copy_metadata' does not copy skb_iif from given
-'from' skb.
-
-As a result, ip_do_fragment's creates fragments with zero skb_iif,
-leading to inconsistent behavior.
-
-Assume for example an eBPF program attached at tc egress (post
-forwarding) that examines __sk_buff->ingress_ifindex:
- - the correct iif is observed if forwarding path does not involve
-   fragmentation/refragmentation
- - a bogus iif is observed if forwarding path involves
-   fragmentation/refragmentatiom
-
-Fix, by preserving skb_iif during 'ip_copy_metadata'.
-
-Signed-off-by: Shmulik Ladkani <shmulik.ladkani@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/ip_output.c | 1 +
- 1 file changed, 1 insertion(+)
-
+diff --git a/Makefile b/Makefile
+index be1bd297bca9..3822720a8a1c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 19
+-SUBLEVEL = 39
++SUBLEVEL = 40
+ EXTRAVERSION =
+ NAME = "People's Front"
+ 
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index fd23d5778ea1..f1645578d9d0 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -378,6 +378,7 @@ struct kvm_sync_regs {
+ #define KVM_X86_QUIRK_LINT0_REENABLED	(1 << 0)
+ #define KVM_X86_QUIRK_CD_NW_CLEARED	(1 << 1)
+ #define KVM_X86_QUIRK_LAPIC_MMIO_HOLE	(1 << 2)
++#define KVM_X86_QUIRK_OUT_7E_INC_RIP	(1 << 3)
+ 
+ #define KVM_STATE_NESTED_GUEST_MODE	0x00000001
+ #define KVM_STATE_NESTED_RUN_PENDING	0x00000002
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 3380a312d186..215339c7d161 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -14236,7 +14236,7 @@ static int vmx_set_nested_state(struct kvm_vcpu *vcpu,
+ 		return ret;
+ 
+ 	/* Empty 'VMXON' state is permitted */
+-	if (kvm_state->size < sizeof(kvm_state) + sizeof(*vmcs12))
++	if (kvm_state->size < sizeof(*kvm_state) + sizeof(*vmcs12))
+ 		return 0;
+ 
+ 	if (kvm_state->vmx.vmcs_pa == kvm_state->vmx.vmxon_pa ||
+@@ -14269,7 +14269,7 @@ static int vmx_set_nested_state(struct kvm_vcpu *vcpu,
+ 	if (nested_cpu_has_shadow_vmcs(vmcs12) &&
+ 	    vmcs12->vmcs_link_pointer != -1ull) {
+ 		struct vmcs12 *shadow_vmcs12 = get_shadow_vmcs12(vcpu);
+-		if (kvm_state->size < sizeof(kvm_state) + 2 * sizeof(*vmcs12))
++		if (kvm_state->size < sizeof(*kvm_state) + 2 * sizeof(*vmcs12))
+ 			return -EINVAL;
+ 
+ 		if (copy_from_user(shadow_vmcs12,
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 4a61e1609c97..f3337adaf9b3 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6328,6 +6328,12 @@ int kvm_emulate_instruction_from_buffer(struct kvm_vcpu *vcpu,
+ }
+ EXPORT_SYMBOL_GPL(kvm_emulate_instruction_from_buffer);
+ 
++static int complete_fast_pio_out_port_0x7e(struct kvm_vcpu *vcpu)
++{
++	vcpu->arch.pio.count = 0;
++	return 1;
++}
++
+ static int complete_fast_pio_out(struct kvm_vcpu *vcpu)
+ {
+ 	vcpu->arch.pio.count = 0;
+@@ -6344,12 +6350,23 @@ static int kvm_fast_pio_out(struct kvm_vcpu *vcpu, int size,
+ 	unsigned long val = kvm_register_read(vcpu, VCPU_REGS_RAX);
+ 	int ret = emulator_pio_out_emulated(&vcpu->arch.emulate_ctxt,
+ 					    size, port, &val, 1);
++	if (ret)
++		return ret;
+ 
+-	if (!ret) {
++	/*
++	 * Workaround userspace that relies on old KVM behavior of %rip being
++	 * incremented prior to exiting to userspace to handle "OUT 0x7e".
++	 */
++	if (port == 0x7e &&
++	    kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_OUT_7E_INC_RIP)) {
++		vcpu->arch.complete_userspace_io =
++			complete_fast_pio_out_port_0x7e;
++		kvm_skip_emulated_instruction(vcpu);
++	} else {
+ 		vcpu->arch.pio.linear_rip = kvm_get_linear_rip(vcpu);
+ 		vcpu->arch.complete_userspace_io = complete_fast_pio_out;
+ 	}
+-	return ret;
++	return 0;
+ }
+ 
+ static int complete_fast_pio_in(struct kvm_vcpu *vcpu)
+diff --git a/drivers/net/dsa/bcm_sf2_cfp.c b/drivers/net/dsa/bcm_sf2_cfp.c
+index 47c5f272a084..21db1804e85d 100644
+--- a/drivers/net/dsa/bcm_sf2_cfp.c
++++ b/drivers/net/dsa/bcm_sf2_cfp.c
+@@ -742,6 +742,9 @@ static int bcm_sf2_cfp_rule_set(struct dsa_switch *ds, int port,
+ 	     fs->m_ext.data[1]))
+ 		return -EINVAL;
+ 
++	if (fs->location != RX_CLS_LOC_ANY && fs->location >= CFP_NUM_RULES)
++		return -EINVAL;
++
+ 	if (fs->location != RX_CLS_LOC_ANY &&
+ 	    test_bit(fs->location, priv->cfp.used))
+ 		return -EBUSY;
+@@ -836,6 +839,9 @@ static int bcm_sf2_cfp_rule_del(struct bcm_sf2_priv *priv, int port,
+ 	u32 next_loc = 0;
+ 	int ret;
+ 
++	if (loc >= CFP_NUM_RULES)
++		return -EINVAL;
++
+ 	/* Refuse deleting unused rules, and those that are not unique since
+ 	 * that could leave IPv6 rules with one of the chained rule in the
+ 	 * table.
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 581ad0a17d0c..de46331aefc1 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -1584,7 +1584,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
+ 			netdev_warn(bp->dev, "RX buffer error %x\n", rx_err);
+ 			bnxt_sched_reset(bp, rxr);
+ 		}
+-		goto next_rx;
++		goto next_rx_no_len;
+ 	}
+ 
+ 	len = le32_to_cpu(rxcmp->rx_cmp_len_flags_type) >> RX_CMP_LEN_SHIFT;
+@@ -1665,12 +1665,13 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
+ 	rc = 1;
+ 
+ next_rx:
+-	rxr->rx_prod = NEXT_RX(prod);
+-	rxr->rx_next_cons = NEXT_RX(cons);
+-
+ 	cpr->rx_packets += 1;
+ 	cpr->rx_bytes += len;
+ 
++next_rx_no_len:
++	rxr->rx_prod = NEXT_RX(prod);
++	rxr->rx_next_cons = NEXT_RX(cons);
++
+ next_rx_no_prod_no_len:
+ 	*raw_cons = tmp_raw_cons;
+ 
+@@ -7441,8 +7442,15 @@ static int bnxt_cfg_rx_mode(struct bnxt *bp)
+ 
+ skip_uc:
+ 	rc = bnxt_hwrm_cfa_l2_set_rx_mask(bp, 0);
++	if (rc && vnic->mc_list_count) {
++		netdev_info(bp->dev, "Failed setting MC filters rc: %d, turning on ALL_MCAST mode\n",
++			    rc);
++		vnic->rx_mask |= CFA_L2_SET_RX_MASK_REQ_MASK_ALL_MCAST;
++		vnic->mc_list_count = 0;
++		rc = bnxt_hwrm_cfa_l2_set_rx_mask(bp, 0);
++	}
+ 	if (rc)
+-		netdev_err(bp->dev, "HWRM cfa l2 rx mask failure rc: %x\n",
++		netdev_err(bp->dev, "HWRM cfa l2 rx mask failure rc: %d\n",
+ 			   rc);
+ 
+ 	return rc;
+@@ -9077,6 +9085,7 @@ init_err_cleanup_tc:
+ 	bnxt_clear_int_mode(bp);
+ 
+ init_err_pci_clean:
++	bnxt_free_hwrm_short_cmd_req(bp);
+ 	bnxt_free_hwrm_resources(bp);
+ 	bnxt_cleanup_pci(bp);
+ 
+diff --git a/drivers/net/phy/marvell.c b/drivers/net/phy/marvell.c
+index 73813c7afa49..bb6107f3b947 100644
+--- a/drivers/net/phy/marvell.c
++++ b/drivers/net/phy/marvell.c
+@@ -1513,9 +1513,10 @@ static int marvell_get_sset_count(struct phy_device *phydev)
+ 
+ static void marvell_get_strings(struct phy_device *phydev, u8 *data)
+ {
++	int count = marvell_get_sset_count(phydev);
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(marvell_hw_stats); i++) {
++	for (i = 0; i < count; i++) {
+ 		strlcpy(data + i * ETH_GSTRING_LEN,
+ 			marvell_hw_stats[i].string, ETH_GSTRING_LEN);
+ 	}
+@@ -1543,9 +1544,10 @@ static u64 marvell_get_stat(struct phy_device *phydev, int i)
+ static void marvell_get_stats(struct phy_device *phydev,
+ 			      struct ethtool_stats *stats, u64 *data)
+ {
++	int count = marvell_get_sset_count(phydev);
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(marvell_hw_stats); i++)
++	for (i = 0; i < count; i++)
+ 		data[i] = marvell_get_stat(phydev, i);
+ }
+ 
+diff --git a/drivers/net/wireless/ath/ath10k/mac.c b/drivers/net/wireless/ath/ath10k/mac.c
+index 90f9372dec25..f3b1cfacfe9d 100644
+--- a/drivers/net/wireless/ath/ath10k/mac.c
++++ b/drivers/net/wireless/ath/ath10k/mac.c
+@@ -5622,7 +5622,7 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
+ 	}
+ 
+ 	if (changed & BSS_CHANGED_MCAST_RATE &&
+-	    !WARN_ON(ath10k_mac_vif_chan(arvif->vif, &def))) {
++	    !ath10k_mac_vif_chan(arvif->vif, &def)) {
+ 		band = def.chan->band;
+ 		rateidx = vif->bss_conf.mcast_rate[band] - 1;
+ 
+diff --git a/include/net/sctp/command.h b/include/net/sctp/command.h
+index 6640f84fe536..6d5beac29bc1 100644
+--- a/include/net/sctp/command.h
++++ b/include/net/sctp/command.h
+@@ -105,7 +105,6 @@ enum sctp_verb {
+ 	SCTP_CMD_T1_RETRAN,	 /* Mark for retransmission after T1 timeout  */
+ 	SCTP_CMD_UPDATE_INITTAG, /* Update peer inittag */
+ 	SCTP_CMD_SEND_MSG,	 /* Send the whole use message */
+-	SCTP_CMD_SEND_NEXT_ASCONF, /* Send the next ASCONF after ACK */
+ 	SCTP_CMD_PURGE_ASCONF_QUEUE, /* Purge all asconf queues.*/
+ 	SCTP_CMD_SET_ASOC,	 /* Restore association context */
+ 	SCTP_CMD_LAST
 diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
 index 9c4e72e9c60a..73894ed12a70 100644
 --- a/net/ipv4/ip_output.c
@@ -41,221 +232,6 @@ index 9c4e72e9c60a..73894ed12a70 100644
  	skb_dst_drop(to);
  	skb_dst_copy(to, from);
  	to->dev = from->dev;
--- 
-2.28.0
-
-
-From 7ea4f000c41f7f29d614a0ebb31adef7f7ad4723 Mon Sep 17 00:00:00 2001
-From: Martin KaFai Lau <kafai@fb.com>
-Date: Tue, 30 Apr 2019 10:45:12 -0700
-Subject: [PATCH 02/24] ipv6: A few fixes on dereferencing rt->from
-
-[ Upstream commit 886b7a50100a50f1cbd08a6f8ec5884dfbe082dc ]
-
-It is a followup after the fix in
-commit 9c69a1320515 ("route: Avoid crash from dereferencing NULL rt->from")
-
-rt6_do_redirect():
-1. NULL checking is needed on rt->from because a parallel
-   fib6_info delete could happen that sets rt->from to NULL.
-   (e.g. rt6_remove_exception() and fib6_drop_pcpu_from()).
-
-2. fib6_info_hold() is not enough.  Same reason as (1).
-   Meaning, holding dst->__refcnt cannot ensure
-   rt->from is not NULL or rt->from->fib6_ref is not 0.
-
-   Instead of using fib6_info_hold_safe() which ip6_rt_cache_alloc()
-   is already doing, this patch chooses to extend the rcu section
-   to keep "from" dereference-able after checking for NULL.
-
-inet6_rtm_getroute():
-1. NULL checking is also needed on rt->from for a similar reason.
-   Note that inet6_rtm_getroute() is using RTNL_FLAG_DOIT_UNLOCKED.
-
-Fixes: a68886a69180 ("net/ipv6: Make from in rt6_info rcu protected")
-Signed-off-by: Martin KaFai Lau <kafai@fb.com>
-Acked-by: Wei Wang <weiwan@google.com>
-Reviewed-by: David Ahern <dsahern@gmail.com>
-Reviewed-by: Eric Dumazet <edumazet@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/route.c | 38 ++++++++++++++++++--------------------
- 1 file changed, 18 insertions(+), 20 deletions(-)
-
-diff --git a/net/ipv6/route.c b/net/ipv6/route.c
-index 06fa8425d82c..12a263dc0d21 100644
---- a/net/ipv6/route.c
-+++ b/net/ipv6/route.c
-@@ -3454,11 +3454,8 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
- 
- 	rcu_read_lock();
- 	from = rcu_dereference(rt->from);
--	/* This fib6_info_hold() is safe here because we hold reference to rt
--	 * and rt already holds reference to fib6_info.
--	 */
--	fib6_info_hold(from);
--	rcu_read_unlock();
-+	if (!from)
-+		goto out;
- 
- 	nrt = ip6_rt_cache_alloc(from, &msg->dest, NULL);
- 	if (!nrt)
-@@ -3470,10 +3467,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
- 
- 	nrt->rt6i_gateway = *(struct in6_addr *)neigh->primary_key;
- 
--	/* No need to remove rt from the exception table if rt is
--	 * a cached route because rt6_insert_exception() will
--	 * takes care of it
--	 */
-+	/* rt6_insert_exception() will take care of duplicated exceptions */
- 	if (rt6_insert_exception(nrt, from)) {
- 		dst_release_immediate(&nrt->dst);
- 		goto out;
-@@ -3486,7 +3480,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
- 	call_netevent_notifiers(NETEVENT_REDIRECT, &netevent);
- 
- out:
--	fib6_info_release(from);
-+	rcu_read_unlock();
- 	neigh_release(neigh);
- }
- 
-@@ -4991,16 +4985,20 @@ static int inet6_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
- 
- 	rcu_read_lock();
- 	from = rcu_dereference(rt->from);
--
--	if (fibmatch)
--		err = rt6_fill_node(net, skb, from, NULL, NULL, NULL, iif,
--				    RTM_NEWROUTE, NETLINK_CB(in_skb).portid,
--				    nlh->nlmsg_seq, 0);
--	else
--		err = rt6_fill_node(net, skb, from, dst, &fl6.daddr,
--				    &fl6.saddr, iif, RTM_NEWROUTE,
--				    NETLINK_CB(in_skb).portid, nlh->nlmsg_seq,
--				    0);
-+	if (from) {
-+		if (fibmatch)
-+			err = rt6_fill_node(net, skb, from, NULL, NULL, NULL,
-+					    iif, RTM_NEWROUTE,
-+					    NETLINK_CB(in_skb).portid,
-+					    nlh->nlmsg_seq, 0);
-+		else
-+			err = rt6_fill_node(net, skb, from, dst, &fl6.daddr,
-+					    &fl6.saddr, iif, RTM_NEWROUTE,
-+					    NETLINK_CB(in_skb).portid,
-+					    nlh->nlmsg_seq, 0);
-+	} else {
-+		err = -ENETUNREACH;
-+	}
- 	rcu_read_unlock();
- 
- 	if (err < 0) {
--- 
-2.28.0
-
-
-From 1a9e0134af40f0d799d09beb18265300125d06d9 Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Sun, 28 Apr 2019 12:22:25 -0700
-Subject: [PATCH 03/24] ipv6: fix races in ip6_dst_destroy()
-
-[ Upstream commit 0e2338749192ce0e52e7174c5352f627632f478a ]
-
-We had many syzbot reports that seem to be caused by use-after-free
-of struct fib6_info.
-
-ip6_dst_destroy(), fib6_drop_pcpu_from() and rt6_remove_exception()
-are writers vs rt->from, and use non consistent synchronization among
-themselves.
-
-Switching to xchg() will solve the issues with no possible
-lockdep issues.
-
-BUG: KASAN: user-memory-access in atomic_dec_and_test include/asm-generic/atomic-instrumented.h:747 [inline]
-BUG: KASAN: user-memory-access in fib6_info_release include/net/ip6_fib.h:294 [inline]
-BUG: KASAN: user-memory-access in fib6_info_release include/net/ip6_fib.h:292 [inline]
-BUG: KASAN: user-memory-access in fib6_drop_pcpu_from net/ipv6/ip6_fib.c:927 [inline]
-BUG: KASAN: user-memory-access in fib6_purge_rt+0x4f6/0x670 net/ipv6/ip6_fib.c:960
-Write of size 4 at addr 0000000000ffffb4 by task syz-executor.1/7649
-
-CPU: 0 PID: 7649 Comm: syz-executor.1 Not tainted 5.1.0-rc6+ #183
-Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
-Call Trace:
- __dump_stack lib/dump_stack.c:77 [inline]
- dump_stack+0x172/0x1f0 lib/dump_stack.c:113
- kasan_report.cold+0x5/0x40 mm/kasan/report.c:321
- check_memory_region_inline mm/kasan/generic.c:185 [inline]
- check_memory_region+0x123/0x190 mm/kasan/generic.c:191
- kasan_check_write+0x14/0x20 mm/kasan/common.c:108
- atomic_dec_and_test include/asm-generic/atomic-instrumented.h:747 [inline]
- fib6_info_release include/net/ip6_fib.h:294 [inline]
- fib6_info_release include/net/ip6_fib.h:292 [inline]
- fib6_drop_pcpu_from net/ipv6/ip6_fib.c:927 [inline]
- fib6_purge_rt+0x4f6/0x670 net/ipv6/ip6_fib.c:960
- fib6_del_route net/ipv6/ip6_fib.c:1813 [inline]
- fib6_del+0xac2/0x10a0 net/ipv6/ip6_fib.c:1844
- fib6_clean_node+0x3a8/0x590 net/ipv6/ip6_fib.c:2006
- fib6_walk_continue+0x495/0x900 net/ipv6/ip6_fib.c:1928
- fib6_walk+0x9d/0x100 net/ipv6/ip6_fib.c:1976
- fib6_clean_tree+0xe0/0x120 net/ipv6/ip6_fib.c:2055
- __fib6_clean_all+0x118/0x2a0 net/ipv6/ip6_fib.c:2071
- fib6_clean_all+0x2b/0x40 net/ipv6/ip6_fib.c:2082
- rt6_sync_down_dev+0x134/0x150 net/ipv6/route.c:4057
- rt6_disable_ip+0x27/0x5f0 net/ipv6/route.c:4062
- addrconf_ifdown+0xa2/0x1220 net/ipv6/addrconf.c:3705
- addrconf_notify+0x19a/0x2260 net/ipv6/addrconf.c:3630
- notifier_call_chain+0xc7/0x240 kernel/notifier.c:93
- __raw_notifier_call_chain kernel/notifier.c:394 [inline]
- raw_notifier_call_chain+0x2e/0x40 kernel/notifier.c:401
- call_netdevice_notifiers_info+0x3f/0x90 net/core/dev.c:1753
- call_netdevice_notifiers_extack net/core/dev.c:1765 [inline]
- call_netdevice_notifiers net/core/dev.c:1779 [inline]
- dev_close_many+0x33f/0x6f0 net/core/dev.c:1522
- rollback_registered_many+0x43b/0xfd0 net/core/dev.c:8177
- rollback_registered+0x109/0x1d0 net/core/dev.c:8242
- unregister_netdevice_queue net/core/dev.c:9289 [inline]
- unregister_netdevice_queue+0x1ee/0x2c0 net/core/dev.c:9282
- unregister_netdevice include/linux/netdevice.h:2658 [inline]
- __tun_detach+0xd5b/0x1000 drivers/net/tun.c:727
- tun_detach drivers/net/tun.c:744 [inline]
- tun_chr_close+0xe0/0x180 drivers/net/tun.c:3443
- __fput+0x2e5/0x8d0 fs/file_table.c:278
- ____fput+0x16/0x20 fs/file_table.c:309
- task_work_run+0x14a/0x1c0 kernel/task_work.c:113
- exit_task_work include/linux/task_work.h:22 [inline]
- do_exit+0x90a/0x2fa0 kernel/exit.c:876
- do_group_exit+0x135/0x370 kernel/exit.c:980
- __do_sys_exit_group kernel/exit.c:991 [inline]
- __se_sys_exit_group kernel/exit.c:989 [inline]
- __x64_sys_exit_group+0x44/0x50 kernel/exit.c:989
- do_syscall_64+0x103/0x610 arch/x86/entry/common.c:290
- entry_SYSCALL_64_after_hwframe+0x49/0xbe
-RIP: 0033:0x458da9
-Code: ad b8 fb ff c3 66 2e 0f 1f 84 00 00 00 00 00 66 90 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 0f 83 7b b8 fb ff c3 66 2e 0f 1f 84 00 00 00 00
-RSP: 002b:00007ffeafc2a6a8 EFLAGS: 00000246 ORIG_RAX: 00000000000000e7
-RAX: ffffffffffffffda RBX: 000000000000001c RCX: 0000000000458da9
-RDX: 0000000000412a80 RSI: 0000000000a54ef0 RDI: 0000000000000043
-RBP: 00000000004be552 R08: 000000000000000c R09: 000000000004c0d1
-R10: 0000000002341940 R11: 0000000000000246 R12: 00000000ffffffff
-R13: 00007ffeafc2a7f0 R14: 000000000004c065 R15: 00007ffeafc2a800
-
-Fixes: a68886a69180 ("net/ipv6: Make from in rt6_info rcu protected")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Reported-by: syzbot <syzkaller@googlegroups.com>
-Cc: David Ahern <dsahern@gmail.com>
-Reviewed-by: David Ahern <dsahern@gmail.com>
-Acked-by: Martin KaFai Lau <kafai@fb.com>
-Acked-by: Wei Wang <weiwan@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/ip6_fib.c | 4 +---
- net/ipv6/route.c   | 9 ++-------
- 2 files changed, 3 insertions(+), 10 deletions(-)
-
 diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
 index cbe46175bb59..3e2a9bd3459c 100644
 --- a/net/ipv6/ip6_fib.c
@@ -271,159 +247,8 @@ index cbe46175bb59..3e2a9bd3459c 100644
  			fib6_info_release(from);
  		}
  	}
-diff --git a/net/ipv6/route.c b/net/ipv6/route.c
-index 12a263dc0d21..2e519f7b983c 100644
---- a/net/ipv6/route.c
-+++ b/net/ipv6/route.c
-@@ -382,11 +382,8 @@ static void ip6_dst_destroy(struct dst_entry *dst)
- 		in6_dev_put(idev);
- 	}
- 
--	rcu_read_lock();
--	from = rcu_dereference(rt->from);
--	rcu_assign_pointer(rt->from, NULL);
-+	from = xchg((__force struct fib6_info **)&rt->from, NULL);
- 	fib6_info_release(from);
--	rcu_read_unlock();
- }
- 
- static void ip6_dst_ifdown(struct dst_entry *dst, struct net_device *dev,
-@@ -1296,9 +1293,7 @@ static void rt6_remove_exception(struct rt6_exception_bucket *bucket,
- 	/* purge completely the exception to allow releasing the held resources:
- 	 * some [sk] cache may keep the dst around for unlimited time
- 	 */
--	from = rcu_dereference_protected(rt6_ex->rt6i->from,
--					 lockdep_is_held(&rt6_exception_lock));
--	rcu_assign_pointer(rt6_ex->rt6i->from, NULL);
-+	from = xchg((__force struct fib6_info **)&rt6_ex->rt6i->from, NULL);
- 	fib6_info_release(from);
- 	dst_dev_put(&rt6_ex->rt6i->dst);
- 
--- 
-2.28.0
-
-
-From 39eddbb7cab34ef3886c900b79ad16339103db9e Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Sat, 27 Apr 2019 16:49:06 -0700
-Subject: [PATCH 04/24] ipv6/flowlabel: wait rcu grace period before put_pid()
-
-[ Upstream commit 6c0afef5fb0c27758f4d52b2210c61b6bd8b4470 ]
-
-syzbot was able to catch a use-after-free read in pid_nr_ns() [1]
-
-ip6fl_seq_show() seems to use RCU protection, dereferencing fl->owner.pid
-but fl_free() releases fl->owner.pid before rcu grace period is started.
-
-[1]
-
-BUG: KASAN: use-after-free in pid_nr_ns+0x128/0x140 kernel/pid.c:407
-Read of size 4 at addr ffff888094012a04 by task syz-executor.0/18087
-
-CPU: 0 PID: 18087 Comm: syz-executor.0 Not tainted 5.1.0-rc6+ #89
-Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
-Call Trace:
- __dump_stack lib/dump_stack.c:77 [inline]
- dump_stack+0x172/0x1f0 lib/dump_stack.c:113
- print_address_description.cold+0x7c/0x20d mm/kasan/report.c:187
- kasan_report.cold+0x1b/0x40 mm/kasan/report.c:317
- __asan_report_load4_noabort+0x14/0x20 mm/kasan/generic_report.c:131
- pid_nr_ns+0x128/0x140 kernel/pid.c:407
- ip6fl_seq_show+0x2f8/0x4f0 net/ipv6/ip6_flowlabel.c:794
- seq_read+0xad3/0x1130 fs/seq_file.c:268
- proc_reg_read+0x1fe/0x2c0 fs/proc/inode.c:227
- do_loop_readv_writev fs/read_write.c:701 [inline]
- do_loop_readv_writev fs/read_write.c:688 [inline]
- do_iter_read+0x4a9/0x660 fs/read_write.c:922
- vfs_readv+0xf0/0x160 fs/read_write.c:984
- kernel_readv fs/splice.c:358 [inline]
- default_file_splice_read+0x475/0x890 fs/splice.c:413
- do_splice_to+0x12a/0x190 fs/splice.c:876
- splice_direct_to_actor+0x2d2/0x970 fs/splice.c:953
- do_splice_direct+0x1da/0x2a0 fs/splice.c:1062
- do_sendfile+0x597/0xd00 fs/read_write.c:1443
- __do_sys_sendfile64 fs/read_write.c:1498 [inline]
- __se_sys_sendfile64 fs/read_write.c:1490 [inline]
- __x64_sys_sendfile64+0x15a/0x220 fs/read_write.c:1490
- do_syscall_64+0x103/0x610 arch/x86/entry/common.c:290
- entry_SYSCALL_64_after_hwframe+0x49/0xbe
-RIP: 0033:0x458da9
-Code: ad b8 fb ff c3 66 2e 0f 1f 84 00 00 00 00 00 66 90 48 89 f8 48 89 f7 48 89 d6 48 89 ca 4d 89 c2 4d 89 c8 4c 8b 4c 24 08 0f 05 <48> 3d 01 f0 ff ff 0f 83 7b b8 fb ff c3 66 2e 0f 1f 84 00 00 00 00
-RSP: 002b:00007f300d24bc78 EFLAGS: 00000246 ORIG_RAX: 0000000000000028
-RAX: ffffffffffffffda RBX: 0000000000000004 RCX: 0000000000458da9
-RDX: 00000000200000c0 RSI: 0000000000000008 RDI: 0000000000000007
-RBP: 000000000073bf00 R08: 0000000000000000 R09: 0000000000000000
-R10: 000000000000005a R11: 0000000000000246 R12: 00007f300d24c6d4
-R13: 00000000004c5fa3 R14: 00000000004da748 R15: 00000000ffffffff
-
-Allocated by task 17543:
- save_stack+0x45/0xd0 mm/kasan/common.c:75
- set_track mm/kasan/common.c:87 [inline]
- __kasan_kmalloc mm/kasan/common.c:497 [inline]
- __kasan_kmalloc.constprop.0+0xcf/0xe0 mm/kasan/common.c:470
- kasan_slab_alloc+0xf/0x20 mm/kasan/common.c:505
- slab_post_alloc_hook mm/slab.h:437 [inline]
- slab_alloc mm/slab.c:3393 [inline]
- kmem_cache_alloc+0x11a/0x6f0 mm/slab.c:3555
- alloc_pid+0x55/0x8f0 kernel/pid.c:168
- copy_process.part.0+0x3b08/0x7980 kernel/fork.c:1932
- copy_process kernel/fork.c:1709 [inline]
- _do_fork+0x257/0xfd0 kernel/fork.c:2226
- __do_sys_clone kernel/fork.c:2333 [inline]
- __se_sys_clone kernel/fork.c:2327 [inline]
- __x64_sys_clone+0xbf/0x150 kernel/fork.c:2327
- do_syscall_64+0x103/0x610 arch/x86/entry/common.c:290
- entry_SYSCALL_64_after_hwframe+0x49/0xbe
-
-Freed by task 7789:
- save_stack+0x45/0xd0 mm/kasan/common.c:75
- set_track mm/kasan/common.c:87 [inline]
- __kasan_slab_free+0x102/0x150 mm/kasan/common.c:459
- kasan_slab_free+0xe/0x10 mm/kasan/common.c:467
- __cache_free mm/slab.c:3499 [inline]
- kmem_cache_free+0x86/0x260 mm/slab.c:3765
- put_pid.part.0+0x111/0x150 kernel/pid.c:111
- put_pid+0x20/0x30 kernel/pid.c:105
- fl_free+0xbe/0xe0 net/ipv6/ip6_flowlabel.c:102
- ip6_fl_gc+0x295/0x3e0 net/ipv6/ip6_flowlabel.c:152
- call_timer_fn+0x190/0x720 kernel/time/timer.c:1325
- expire_timers kernel/time/timer.c:1362 [inline]
- __run_timers kernel/time/timer.c:1681 [inline]
- __run_timers kernel/time/timer.c:1649 [inline]
- run_timer_softirq+0x652/0x1700 kernel/time/timer.c:1694
- __do_softirq+0x266/0x95a kernel/softirq.c:293
-
-The buggy address belongs to the object at ffff888094012a00
- which belongs to the cache pid_2 of size 88
-The buggy address is located 4 bytes inside of
- 88-byte region [ffff888094012a00, ffff888094012a58)
-The buggy address belongs to the page:
-page:ffffea0002500480 count:1 mapcount:0 mapping:ffff88809a483080 index:0xffff888094012980
-flags: 0x1fffc0000000200(slab)
-raw: 01fffc0000000200 ffffea00018a3508 ffffea0002524a88 ffff88809a483080
-raw: ffff888094012980 ffff888094012000 000000010000001b 0000000000000000
-page dumped because: kasan: bad access detected
-
-Memory state around the buggy address:
- ffff888094012900: fb fb fb fb fb fb fb fb fb fb fb fc fc fc fc fc
- ffff888094012980: fb fb fb fb fb fb fb fb fb fb fb fc fc fc fc fc
->ffff888094012a00: fb fb fb fb fb fb fb fb fb fb fb fc fc fc fc fc
-                   ^
- ffff888094012a80: fb fb fb fb fb fb fb fb fb fb fb fc fc fc fc fc
- ffff888094012b00: fb fb fb fb fb fb fb fb fb fb fb fc fc fc fc fc
-
-Fixes: 4f82f45730c6 ("net ip6 flowlabel: Make owner a union of struct pid * and kuid_t")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Cc: Eric W. Biederman <ebiederm@xmission.com>
-Reported-by: syzbot <syzkaller@googlegroups.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/ip6_flowlabel.c | 18 ++++++++++++------
- 1 file changed, 12 insertions(+), 6 deletions(-)
-
 diff --git a/net/ipv6/ip6_flowlabel.c b/net/ipv6/ip6_flowlabel.c
-index cb54a8a3c273..23a525c0a9be 100644
+index cb54a8a3c273..be5f3d7ceb96 100644
 --- a/net/ipv6/ip6_flowlabel.c
 +++ b/net/ipv6/ip6_flowlabel.c
 @@ -94,15 +94,21 @@ static struct ip6_flowlabel *fl_lookup(struct net *net, __be32 label)
@@ -454,37 +279,7 @@ index cb54a8a3c273..23a525c0a9be 100644
  }
  
  static void fl_release(struct ip6_flowlabel *fl)
--- 
-2.28.0
-
-
-From f78ec0cd0664cc1455caf0c18f3e7954ccce5e17 Mon Sep 17 00:00:00 2001
-From: Willem de Bruijn <willemb@google.com>
-Date: Thu, 25 Apr 2019 12:06:54 -0400
-Subject: [PATCH 05/24] ipv6: invert flowlabel sharing check in process and
- user mode
-
-[ Upstream commit 95c169251bf734aa555a1e8043e4d88ec97a04ec ]
-
-A request for a flowlabel fails in process or user exclusive mode must
-fail if the caller pid or uid does not match. Invert the test.
-
-Previously, the test was unsafe wrt PID recycling, but indeed tested
-for inequality: fl1->owner != fl->owner
-
-Fixes: 4f82f45730c68 ("net ip6 flowlabel: Make owner a union of struct pid* and kuid_t")
-Signed-off-by: Willem de Bruijn <willemb@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/ip6_flowlabel.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/net/ipv6/ip6_flowlabel.c b/net/ipv6/ip6_flowlabel.c
-index 23a525c0a9be..be5f3d7ceb96 100644
---- a/net/ipv6/ip6_flowlabel.c
-+++ b/net/ipv6/ip6_flowlabel.c
-@@ -639,9 +639,9 @@ int ipv6_flowlabel_opt(struct sock *sk, char __user *optval, int optlen)
+@@ -633,9 +639,9 @@ recheck:
  				if (fl1->share == IPV6_FL_S_EXCL ||
  				    fl1->share != fl->share ||
  				    ((fl1->share == IPV6_FL_S_PROCESS) &&
@@ -496,68 +291,102 @@ index 23a525c0a9be..be5f3d7ceb96 100644
  					goto release;
  
  				err = -ENOMEM;
--- 
-2.28.0
-
-
-From e571a33963f4d58f2780253635b1361ab7692d7b Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Tue, 30 Apr 2019 06:27:58 -0700
-Subject: [PATCH 06/24] l2ip: fix possible use-after-free
-
-[ Upstream commit a622b40035d16196bf19b2b33b854862595245fc ]
-
-Before taking a refcount on a rcu protected structure,
-we need to make sure the refcount is not zero.
-
-syzbot reported :
-
-refcount_t: increment on 0; use-after-free.
-WARNING: CPU: 1 PID: 23533 at lib/refcount.c:156 refcount_inc_checked lib/refcount.c:156 [inline]
-WARNING: CPU: 1 PID: 23533 at lib/refcount.c:156 refcount_inc_checked+0x61/0x70 lib/refcount.c:154
-Kernel panic - not syncing: panic_on_warn set ...
-CPU: 1 PID: 23533 Comm: syz-executor.2 Not tainted 5.1.0-rc7+ #93
-Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
-Call Trace:
- __dump_stack lib/dump_stack.c:77 [inline]
- dump_stack+0x172/0x1f0 lib/dump_stack.c:113
- panic+0x2cb/0x65c kernel/panic.c:214
- __warn.cold+0x20/0x45 kernel/panic.c:571
- report_bug+0x263/0x2b0 lib/bug.c:186
- fixup_bug arch/x86/kernel/traps.c:179 [inline]
- fixup_bug arch/x86/kernel/traps.c:174 [inline]
- do_error_trap+0x11b/0x200 arch/x86/kernel/traps.c:272
- do_invalid_op+0x37/0x50 arch/x86/kernel/traps.c:291
- invalid_op+0x14/0x20 arch/x86/entry/entry_64.S:973
-RIP: 0010:refcount_inc_checked lib/refcount.c:156 [inline]
-RIP: 0010:refcount_inc_checked+0x61/0x70 lib/refcount.c:154
-Code: 1d 98 2b 2a 06 31 ff 89 de e8 db 2c 40 fe 84 db 75 dd e8 92 2b 40 fe 48 c7 c7 20 7a a1 87 c6 05 78 2b 2a 06 01 e8 7d d9 12 fe <0f> 0b eb c1 90 90 90 90 90 90 90 90 90 90 90 55 48 89 e5 41 57 41
-RSP: 0018:ffff888069f0fba8 EFLAGS: 00010286
-RAX: 0000000000000000 RBX: 0000000000000000 RCX: 0000000000000000
-RDX: 000000000000f353 RSI: ffffffff815afcb6 RDI: ffffed100d3e1f67
-RBP: ffff888069f0fbb8 R08: ffff88809b1845c0 R09: ffffed1015d23ef1
-R10: ffffed1015d23ef0 R11: ffff8880ae91f787 R12: ffff8880a8f26968
-R13: 0000000000000004 R14: dffffc0000000000 R15: ffff8880a49a6440
- l2tp_tunnel_inc_refcount net/l2tp/l2tp_core.h:240 [inline]
- l2tp_tunnel_get+0x250/0x580 net/l2tp/l2tp_core.c:173
- pppol2tp_connect+0xc00/0x1c70 net/l2tp/l2tp_ppp.c:702
- __sys_connect+0x266/0x330 net/socket.c:1808
- __do_sys_connect net/socket.c:1819 [inline]
- __se_sys_connect net/socket.c:1816 [inline]
- __x64_sys_connect+0x73/0xb0 net/socket.c:1816
-
-Fixes: 54652eb12c1b ("l2tp: hold tunnel while looking up sessions in l2tp_netlink")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Reported-by: syzbot <syzkaller@googlegroups.com>
-Cc: Guillaume Nault <g.nault@alphalink.fr>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/l2tp/l2tp_core.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 06fa8425d82c..2e519f7b983c 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -382,11 +382,8 @@ static void ip6_dst_destroy(struct dst_entry *dst)
+ 		in6_dev_put(idev);
+ 	}
+ 
+-	rcu_read_lock();
+-	from = rcu_dereference(rt->from);
+-	rcu_assign_pointer(rt->from, NULL);
++	from = xchg((__force struct fib6_info **)&rt->from, NULL);
+ 	fib6_info_release(from);
+-	rcu_read_unlock();
+ }
+ 
+ static void ip6_dst_ifdown(struct dst_entry *dst, struct net_device *dev,
+@@ -1296,9 +1293,7 @@ static void rt6_remove_exception(struct rt6_exception_bucket *bucket,
+ 	/* purge completely the exception to allow releasing the held resources:
+ 	 * some [sk] cache may keep the dst around for unlimited time
+ 	 */
+-	from = rcu_dereference_protected(rt6_ex->rt6i->from,
+-					 lockdep_is_held(&rt6_exception_lock));
+-	rcu_assign_pointer(rt6_ex->rt6i->from, NULL);
++	from = xchg((__force struct fib6_info **)&rt6_ex->rt6i->from, NULL);
+ 	fib6_info_release(from);
+ 	dst_dev_put(&rt6_ex->rt6i->dst);
+ 
+@@ -3454,11 +3449,8 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
+ 
+ 	rcu_read_lock();
+ 	from = rcu_dereference(rt->from);
+-	/* This fib6_info_hold() is safe here because we hold reference to rt
+-	 * and rt already holds reference to fib6_info.
+-	 */
+-	fib6_info_hold(from);
+-	rcu_read_unlock();
++	if (!from)
++		goto out;
+ 
+ 	nrt = ip6_rt_cache_alloc(from, &msg->dest, NULL);
+ 	if (!nrt)
+@@ -3470,10 +3462,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
+ 
+ 	nrt->rt6i_gateway = *(struct in6_addr *)neigh->primary_key;
+ 
+-	/* No need to remove rt from the exception table if rt is
+-	 * a cached route because rt6_insert_exception() will
+-	 * takes care of it
+-	 */
++	/* rt6_insert_exception() will take care of duplicated exceptions */
+ 	if (rt6_insert_exception(nrt, from)) {
+ 		dst_release_immediate(&nrt->dst);
+ 		goto out;
+@@ -3486,7 +3475,7 @@ static void rt6_do_redirect(struct dst_entry *dst, struct sock *sk, struct sk_bu
+ 	call_netevent_notifiers(NETEVENT_REDIRECT, &netevent);
+ 
+ out:
+-	fib6_info_release(from);
++	rcu_read_unlock();
+ 	neigh_release(neigh);
+ }
+ 
+@@ -4991,16 +4980,20 @@ static int inet6_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
+ 
+ 	rcu_read_lock();
+ 	from = rcu_dereference(rt->from);
+-
+-	if (fibmatch)
+-		err = rt6_fill_node(net, skb, from, NULL, NULL, NULL, iif,
+-				    RTM_NEWROUTE, NETLINK_CB(in_skb).portid,
+-				    nlh->nlmsg_seq, 0);
+-	else
+-		err = rt6_fill_node(net, skb, from, dst, &fl6.daddr,
+-				    &fl6.saddr, iif, RTM_NEWROUTE,
+-				    NETLINK_CB(in_skb).portid, nlh->nlmsg_seq,
+-				    0);
++	if (from) {
++		if (fibmatch)
++			err = rt6_fill_node(net, skb, from, NULL, NULL, NULL,
++					    iif, RTM_NEWROUTE,
++					    NETLINK_CB(in_skb).portid,
++					    nlh->nlmsg_seq, 0);
++		else
++			err = rt6_fill_node(net, skb, from, dst, &fl6.daddr,
++					    &fl6.saddr, iif, RTM_NEWROUTE,
++					    NETLINK_CB(in_skb).portid,
++					    nlh->nlmsg_seq, 0);
++	} else {
++		err = -ENETUNREACH;
++	}
+ 	rcu_read_unlock();
+ 
+ 	if (err < 0) {
 diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
-index fed6becc5daf..fa789c082c3e 100644
+index fed6becc5daf..52b5a2797c0c 100644
 --- a/net/l2tp/l2tp_core.c
 +++ b/net/l2tp/l2tp_core.c
 @@ -169,8 +169,8 @@ struct l2tp_tunnel *l2tp_tunnel_get(const struct net *net, u32 tunnel_id)
@@ -582,35 +411,6 @@ index fed6becc5daf..fa789c082c3e 100644
  			rcu_read_unlock_bh();
  			return tunnel;
  		}
--- 
-2.28.0
-
-
-From 485f382f2c6da326e5ceea085f45257c71f6f907 Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Tue, 23 Apr 2019 09:43:26 -0700
-Subject: [PATCH 07/24] l2tp: use rcu_dereference_sk_user_data() in
- l2tp_udp_encap_recv()
-
-[ Upstream commit c1c477217882c610a2ba0268f5faf36c9c092528 ]
-
-Canonical way to fetch sk_user_data from an encap_rcv() handler called
-from UDP stack in rcu protected section is to use rcu_dereference_sk_user_data(),
-otherwise compiler might read it multiple times.
-
-Fixes: d00fa9adc528 ("il2tp: fix races with tunnel socket close")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Cc: James Chapman <jchapman@katalix.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/l2tp/l2tp_core.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
-index fa789c082c3e..52b5a2797c0c 100644
---- a/net/l2tp/l2tp_core.c
-+++ b/net/l2tp/l2tp_core.c
 @@ -909,7 +909,7 @@ int l2tp_udp_encap_recv(struct sock *sk, struct sk_buff *skb)
  {
  	struct l2tp_tunnel *tunnel;
@@ -620,195 +420,79 @@ index fa789c082c3e..52b5a2797c0c 100644
  	if (tunnel == NULL)
  		goto pass_up;
  
--- 
-2.28.0
-
-
-From b48a0a1207e9033bbb16995a1a091f499710538e Mon Sep 17 00:00:00 2001
-From: Dan Carpenter <dan.carpenter@oracle.com>
-Date: Tue, 30 Apr 2019 13:44:19 +0300
-Subject: [PATCH 08/24] net: dsa: bcm_sf2: fix buffer overflow doing set_rxnfc
-
-[ Upstream commit f949a12fd697479f68d99dc65e9bbab68ee49043 ]
-
-The "fs->location" is a u32 that comes from the user in ethtool_set_rxnfc().
-We can't pass unclamped values to test_bit() or it results in an out of
-bounds access beyond the end of the bitmap.
-
-Fixes: 7318166cacad ("net: dsa: bcm_sf2: Add support for ethtool::rxnfc")
-Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/dsa/bcm_sf2_cfp.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/drivers/net/dsa/bcm_sf2_cfp.c b/drivers/net/dsa/bcm_sf2_cfp.c
-index 47c5f272a084..21db1804e85d 100644
---- a/drivers/net/dsa/bcm_sf2_cfp.c
-+++ b/drivers/net/dsa/bcm_sf2_cfp.c
-@@ -742,6 +742,9 @@ static int bcm_sf2_cfp_rule_set(struct dsa_switch *ds, int port,
- 	     fs->m_ext.data[1]))
- 		return -EINVAL;
- 
-+	if (fs->location != RX_CLS_LOC_ANY && fs->location >= CFP_NUM_RULES)
-+		return -EINVAL;
-+
- 	if (fs->location != RX_CLS_LOC_ANY &&
- 	    test_bit(fs->location, priv->cfp.used))
- 		return -EBUSY;
-@@ -836,6 +839,9 @@ static int bcm_sf2_cfp_rule_del(struct bcm_sf2_priv *priv, int port,
- 	u32 next_loc = 0;
- 	int ret;
- 
-+	if (loc >= CFP_NUM_RULES)
-+		return -EINVAL;
-+
- 	/* Refuse deleting unused rules, and those that are not unique since
- 	 * that could leave IPv6 rules with one of the chained rule in the
- 	 * table.
--- 
-2.28.0
-
-
-From 1d412d873a12f5d7aa1d8ef1792f330a5e0a27c2 Mon Sep 17 00:00:00 2001
-From: Andrew Lunn <andrew@lunn.ch>
-Date: Thu, 25 Apr 2019 00:33:00 +0200
-Subject: [PATCH 09/24] net: phy: marvell: Fix buffer overrun with stats
- counters
-
-[ Upstream commit fdfdf86720a34527f777cbe0d8599bf0528fa146 ]
-
-marvell_get_sset_count() returns how many statistics counters there
-are. If the PHY supports fibre, there are 3, otherwise two.
-
-marvell_get_strings() does not make this distinction, and always
-returns 3 strings. This then often results in writing past the end
-of the buffer for the strings.
-
-Fixes: 2170fef78a40 ("Marvell phy: add field to get errors from fiber link.")
-Signed-off-by: Andrew Lunn <andrew@lunn.ch>
-Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/phy/marvell.c | 6 ++++--
- 1 file changed, 4 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/net/phy/marvell.c b/drivers/net/phy/marvell.c
-index 73813c7afa49..bb6107f3b947 100644
---- a/drivers/net/phy/marvell.c
-+++ b/drivers/net/phy/marvell.c
-@@ -1513,9 +1513,10 @@ static int marvell_get_sset_count(struct phy_device *phydev)
- 
- static void marvell_get_strings(struct phy_device *phydev, u8 *data)
- {
-+	int count = marvell_get_sset_count(phydev);
- 	int i;
- 
--	for (i = 0; i < ARRAY_SIZE(marvell_hw_stats); i++) {
-+	for (i = 0; i < count; i++) {
- 		strlcpy(data + i * ETH_GSTRING_LEN,
- 			marvell_hw_stats[i].string, ETH_GSTRING_LEN);
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index a0d295478e69..ebbb30064251 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -2603,8 +2603,8 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
+ 	void *ph;
+ 	DECLARE_SOCKADDR(struct sockaddr_ll *, saddr, msg->msg_name);
+ 	bool need_wait = !(msg->msg_flags & MSG_DONTWAIT);
++	unsigned char *addr = NULL;
+ 	int tp_len, size_max;
+-	unsigned char *addr;
+ 	void *data;
+ 	int len_sum = 0;
+ 	int status = TP_STATUS_AVAILABLE;
+@@ -2615,7 +2615,6 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
+ 	if (likely(saddr == NULL)) {
+ 		dev	= packet_cached_dev_get(po);
+ 		proto	= po->num;
+-		addr	= NULL;
+ 	} else {
+ 		err = -EINVAL;
+ 		if (msg->msg_namelen < sizeof(struct sockaddr_ll))
+@@ -2625,10 +2624,13 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
+ 						sll_addr)))
+ 			goto out;
+ 		proto	= saddr->sll_protocol;
+-		addr	= saddr->sll_halen ? saddr->sll_addr : NULL;
+ 		dev = dev_get_by_index(sock_net(&po->sk), saddr->sll_ifindex);
+-		if (addr && dev && saddr->sll_halen < dev->addr_len)
+-			goto out_put;
++		if (po->sk.sk_socket->type == SOCK_DGRAM) {
++			if (dev && msg->msg_namelen < dev->addr_len +
++				   offsetof(struct sockaddr_ll, sll_addr))
++				goto out_put;
++			addr = saddr->sll_addr;
++		}
  	}
-@@ -1543,9 +1544,10 @@ static u64 marvell_get_stat(struct phy_device *phydev, int i)
- static void marvell_get_stats(struct phy_device *phydev,
- 			      struct ethtool_stats *stats, u64 *data)
- {
-+	int count = marvell_get_sset_count(phydev);
- 	int i;
  
--	for (i = 0; i < ARRAY_SIZE(marvell_hw_stats); i++)
-+	for (i = 0; i < count; i++)
- 		data[i] = marvell_get_stat(phydev, i);
- }
+ 	err = -ENXIO;
+@@ -2800,7 +2802,7 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
+ 	struct sk_buff *skb;
+ 	struct net_device *dev;
+ 	__be16 proto;
+-	unsigned char *addr;
++	unsigned char *addr = NULL;
+ 	int err, reserve = 0;
+ 	struct sockcm_cookie sockc;
+ 	struct virtio_net_hdr vnet_hdr = { 0 };
+@@ -2817,7 +2819,6 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
+ 	if (likely(saddr == NULL)) {
+ 		dev	= packet_cached_dev_get(po);
+ 		proto	= po->num;
+-		addr	= NULL;
+ 	} else {
+ 		err = -EINVAL;
+ 		if (msg->msg_namelen < sizeof(struct sockaddr_ll))
+@@ -2825,10 +2826,13 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
+ 		if (msg->msg_namelen < (saddr->sll_halen + offsetof(struct sockaddr_ll, sll_addr)))
+ 			goto out;
+ 		proto	= saddr->sll_protocol;
+-		addr	= saddr->sll_halen ? saddr->sll_addr : NULL;
+ 		dev = dev_get_by_index(sock_net(sk), saddr->sll_ifindex);
+-		if (addr && dev && saddr->sll_halen < dev->addr_len)
+-			goto out_unlock;
++		if (sock->type == SOCK_DGRAM) {
++			if (dev && msg->msg_namelen < dev->addr_len +
++				   offsetof(struct sockaddr_ll, sll_addr))
++				goto out_unlock;
++			addr = saddr->sll_addr;
++		}
+ 	}
  
--- 
-2.28.0
-
-
-From a976384b955370e148c462e43f1a13400e33c24a Mon Sep 17 00:00:00 2001
-From: Jakub Kicinski <jakub.kicinski@netronome.com>
-Date: Mon, 29 Apr 2019 12:19:12 -0700
-Subject: [PATCH 10/24] net/tls: avoid NULL pointer deref on nskb->sk in
- fallback
-
-[ Upstream commit 2dcb003314032c6efb13a065ffae60d164b2dd35 ]
-
-update_chksum() accesses nskb->sk before it has been set
-by complete_skb(), move the init up.
-
-Fixes: e8f69799810c ("net/tls: Add generic NIC offload infrastructure")
-Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
-Reviewed-by: Simon Horman <simon.horman@netronome.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/tls/tls_device_fallback.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/net/tls/tls_device_fallback.c b/net/tls/tls_device_fallback.c
-index ef8934fd8698..426dd97725e4 100644
---- a/net/tls/tls_device_fallback.c
-+++ b/net/tls/tls_device_fallback.c
-@@ -200,13 +200,14 @@ static void complete_skb(struct sk_buff *nskb, struct sk_buff *skb, int headln)
- 
- 	skb_put(nskb, skb->len);
- 	memcpy(nskb->data, skb->data, headln);
--	update_chksum(nskb, headln);
- 
- 	nskb->destructor = skb->destructor;
- 	nskb->sk = sk;
- 	skb->destructor = NULL;
- 	skb->sk = NULL;
- 
-+	update_chksum(nskb, headln);
-+
- 	delta = nskb->truesize - skb->truesize;
- 	if (likely(delta < 0))
- 		WARN_ON_ONCE(refcount_sub_and_test(-delta, &sk->sk_wmem_alloc));
--- 
-2.28.0
-
-
-From fdd36abd9d092d0188a97efa74efd7c1771b1d46 Mon Sep 17 00:00:00 2001
-From: David Howells <dhowells@redhat.com>
-Date: Tue, 30 Apr 2019 08:34:08 +0100
-Subject: [PATCH 11/24] rxrpc: Fix net namespace cleanup
-
-[ Upstream commit b13023421b5179413421333f602850914f6a7ad8 ]
-
-In rxrpc_destroy_all_calls(), there are two phases: (1) make sure the
-->calls list is empty, emitting error messages if not, and (2) wait for the
-RCU cleanup to happen on outstanding calls (ie. ->nr_calls becomes 0).
-
-To avoid taking the call_lock, the function prechecks ->calls and if empty,
-it returns to avoid taking the lock - this is wrong, however: it still
-needs to go and do the second phase and wait for ->nr_calls to become 0.
-
-Without this, the rxrpc_net struct may get deallocated before we get to the
-RCU cleanup for the last calls.  This can lead to:
-
-  Slab corruption (Not tainted): kmalloc-16k start=ffff88802b178000, len=16384
-  050: 6b 6b 6b 6b 6b 6b 6b 6b 61 6b 6b 6b 6b 6b 6b 6b  kkkkkkkkakkkkkkk
-
-Note the "61" at offset 0x58.  This corresponds to the ->nr_calls member of
-struct rxrpc_net (which is >9k in size, and thus allocated out of the 16k
-slab).
-
-Fix this by flipping the condition on the if-statement, putting the locked
-section inside the if-body and dropping the return from there.  The
-function will then always go on to wait for the RCU cleanup on outstanding
-calls.
-
-Fixes: 2baec2c3f854 ("rxrpc: Support network namespacing")
-Signed-off-by: David Howells <dhowells@redhat.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/rxrpc/call_object.c | 32 ++++++++++++++++----------------
- 1 file changed, 16 insertions(+), 16 deletions(-)
-
+ 	err = -ENXIO;
 diff --git a/net/rxrpc/call_object.c b/net/rxrpc/call_object.c
 index 8f1a8f85b1f9..215f4d98baa0 100644
 --- a/net/rxrpc/call_object.c
@@ -860,79 +544,6 @@ index 8f1a8f85b1f9..215f4d98baa0 100644
  	atomic_dec(&rxnet->nr_calls);
  	wait_var_event(&rxnet->nr_calls, !atomic_read(&rxnet->nr_calls));
  }
--- 
-2.28.0
-
-
-From b563e9bbabfeddf6d4da3b99e27b337778083018 Mon Sep 17 00:00:00 2001
-From: Xin Long <lucien.xin@gmail.com>
-Date: Mon, 29 Apr 2019 14:16:19 +0800
-Subject: [PATCH 12/24] sctp: avoid running the sctp state machine recursively
-
-[ Upstream commit fbd019737d71e405f86549fd738f81e2ff3dd073 ]
-
-Ying triggered a call trace when doing an asconf testing:
-
-  BUG: scheduling while atomic: swapper/12/0/0x10000100
-  Call Trace:
-   <IRQ>  [<ffffffffa4375904>] dump_stack+0x19/0x1b
-   [<ffffffffa436fcaf>] __schedule_bug+0x64/0x72
-   [<ffffffffa437b93a>] __schedule+0x9ba/0xa00
-   [<ffffffffa3cd5326>] __cond_resched+0x26/0x30
-   [<ffffffffa437bc4a>] _cond_resched+0x3a/0x50
-   [<ffffffffa3e22be8>] kmem_cache_alloc_node+0x38/0x200
-   [<ffffffffa423512d>] __alloc_skb+0x5d/0x2d0
-   [<ffffffffc0995320>] sctp_packet_transmit+0x610/0xa20 [sctp]
-   [<ffffffffc098510e>] sctp_outq_flush+0x2ce/0xc00 [sctp]
-   [<ffffffffc098646c>] sctp_outq_uncork+0x1c/0x20 [sctp]
-   [<ffffffffc0977338>] sctp_cmd_interpreter.isra.22+0xc8/0x1460 [sctp]
-   [<ffffffffc0976ad1>] sctp_do_sm+0xe1/0x350 [sctp]
-   [<ffffffffc099443d>] sctp_primitive_ASCONF+0x3d/0x50 [sctp]
-   [<ffffffffc0977384>] sctp_cmd_interpreter.isra.22+0x114/0x1460 [sctp]
-   [<ffffffffc0976ad1>] sctp_do_sm+0xe1/0x350 [sctp]
-   [<ffffffffc097b3a4>] sctp_assoc_bh_rcv+0xf4/0x1b0 [sctp]
-   [<ffffffffc09840f1>] sctp_inq_push+0x51/0x70 [sctp]
-   [<ffffffffc099732b>] sctp_rcv+0xa8b/0xbd0 [sctp]
-
-As it shows, the first sctp_do_sm() running under atomic context (NET_RX
-softirq) invoked sctp_primitive_ASCONF() that uses GFP_KERNEL flag later,
-and this flag is supposed to be used in non-atomic context only. Besides,
-sctp_do_sm() was called recursively, which is not expected.
-
-Vlad tried to fix this recursive call in Commit c0786693404c ("sctp: Fix
-oops when sending queued ASCONF chunks") by introducing a new command
-SCTP_CMD_SEND_NEXT_ASCONF. But it didn't work as this command is still
-used in the first sctp_do_sm() call, and sctp_primitive_ASCONF() will
-be called in this command again.
-
-To avoid calling sctp_do_sm() recursively, we send the next queued ASCONF
-not by sctp_primitive_ASCONF(), but by sctp_sf_do_prm_asconf() in the 1st
-sctp_do_sm() directly.
-
-Reported-by: Ying Xu <yinxu@redhat.com>
-Signed-off-by: Xin Long <lucien.xin@gmail.com>
-Acked-by: Neil Horman <nhorman@tuxdriver.com>
-Acked-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/net/sctp/command.h |  1 -
- net/sctp/sm_sideeffect.c   | 29 -----------------------------
- net/sctp/sm_statefuns.c    | 35 +++++++++++++++++++++++++++--------
- 3 files changed, 27 insertions(+), 38 deletions(-)
-
-diff --git a/include/net/sctp/command.h b/include/net/sctp/command.h
-index 6640f84fe536..6d5beac29bc1 100644
---- a/include/net/sctp/command.h
-+++ b/include/net/sctp/command.h
-@@ -105,7 +105,6 @@ enum sctp_verb {
- 	SCTP_CMD_T1_RETRAN,	 /* Mark for retransmission after T1 timeout  */
- 	SCTP_CMD_UPDATE_INITTAG, /* Update peer inittag */
- 	SCTP_CMD_SEND_MSG,	 /* Send the whole use message */
--	SCTP_CMD_SEND_NEXT_ASCONF, /* Send the next ASCONF after ACK */
- 	SCTP_CMD_PURGE_ASCONF_QUEUE, /* Purge all asconf queues.*/
- 	SCTP_CMD_SET_ASOC,	 /* Restore association context */
- 	SCTP_CMD_LAST
 diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
 index 85d393090238..48fe8f01265f 100644
 --- a/net/sctp/sm_sideeffect.c
@@ -1033,376 +644,8 @@ index c9ae3404b1bb..713a669d2058 100644
  
  		abort = sctp_make_abort(asoc, asconf_ack,
  					sizeof(struct sctp_errhdr));
--- 
-2.28.0
-
-
-From 7a42cf4dfa43af6b1fc4a18c6ad41891e59bb1ed Mon Sep 17 00:00:00 2001
-From: Hangbin Liu <liuhangbin@gmail.com>
-Date: Tue, 30 Apr 2019 10:46:10 +0800
-Subject: [PATCH 13/24] selftests: fib_rule_tests: print the result and return
- 1 if any tests failed
-
-[ Upstream commit f68d7c44e76532e46f292ad941aa3706cb9e6e40 ]
-
-Fixes: 65b2b4939a64 ("selftests: net: initial fib rule tests")
-Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
-Reviewed-by: David Ahern <dsahern@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/testing/selftests/net/fib_rule_tests.sh | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/tools/testing/selftests/net/fib_rule_tests.sh b/tools/testing/selftests/net/fib_rule_tests.sh
-index d4cfb6a7a086..d84193bdc307 100755
---- a/tools/testing/selftests/net/fib_rule_tests.sh
-+++ b/tools/testing/selftests/net/fib_rule_tests.sh
-@@ -27,6 +27,7 @@ log_test()
- 		nsuccess=$((nsuccess+1))
- 		printf "\n    TEST: %-50s  [ OK ]\n" "${msg}"
- 	else
-+		ret=1
- 		nfail=$((nfail+1))
- 		printf "\n    TEST: %-50s  [FAIL]\n" "${msg}"
- 		if [ "${PAUSE_ON_FAIL}" = "yes" ]; then
-@@ -245,4 +246,9 @@ setup
- run_fibrule_tests
- cleanup
- 
-+if [ "$TESTS" != "none" ]; then
-+	printf "\nTests passed: %3d\n" ${nsuccess}
-+	printf "Tests failed: %3d\n"   ${nfail}
-+fi
-+
- exit $ret
--- 
-2.28.0
-
-
-From 6a57fa6fa7d5d34b9ae9d77e0bb5b61a45312a44 Mon Sep 17 00:00:00 2001
-From: Willem de Bruijn <willemb@google.com>
-Date: Mon, 29 Apr 2019 11:53:18 -0400
-Subject: [PATCH 14/24] packet: validate msg_namelen in send directly
-
-[ Upstream commit 486efdc8f6ce802b27e15921d2353cc740c55451 ]
-
-Packet sockets in datagram mode take a destination address. Verify its
-length before passing to dev_hard_header.
-
-Prior to 2.6.14-rc3, the send code ignored sll_halen. This is
-established behavior. Directly compare msg_namelen to dev->addr_len.
-
-Change v1->v2: initialize addr in all paths
-
-Fixes: 6b8d95f1795c4 ("packet: validate address length if non-zero")
-Suggested-by: David Laight <David.Laight@aculab.com>
-Signed-off-by: Willem de Bruijn <willemb@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/packet/af_packet.c | 24 ++++++++++++++----------
- 1 file changed, 14 insertions(+), 10 deletions(-)
-
-diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
-index a0d295478e69..ebbb30064251 100644
---- a/net/packet/af_packet.c
-+++ b/net/packet/af_packet.c
-@@ -2603,8 +2603,8 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
- 	void *ph;
- 	DECLARE_SOCKADDR(struct sockaddr_ll *, saddr, msg->msg_name);
- 	bool need_wait = !(msg->msg_flags & MSG_DONTWAIT);
-+	unsigned char *addr = NULL;
- 	int tp_len, size_max;
--	unsigned char *addr;
- 	void *data;
- 	int len_sum = 0;
- 	int status = TP_STATUS_AVAILABLE;
-@@ -2615,7 +2615,6 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
- 	if (likely(saddr == NULL)) {
- 		dev	= packet_cached_dev_get(po);
- 		proto	= po->num;
--		addr	= NULL;
- 	} else {
- 		err = -EINVAL;
- 		if (msg->msg_namelen < sizeof(struct sockaddr_ll))
-@@ -2625,10 +2624,13 @@ static int tpacket_snd(struct packet_sock *po, struct msghdr *msg)
- 						sll_addr)))
- 			goto out;
- 		proto	= saddr->sll_protocol;
--		addr	= saddr->sll_halen ? saddr->sll_addr : NULL;
- 		dev = dev_get_by_index(sock_net(&po->sk), saddr->sll_ifindex);
--		if (addr && dev && saddr->sll_halen < dev->addr_len)
--			goto out_put;
-+		if (po->sk.sk_socket->type == SOCK_DGRAM) {
-+			if (dev && msg->msg_namelen < dev->addr_len +
-+				   offsetof(struct sockaddr_ll, sll_addr))
-+				goto out_put;
-+			addr = saddr->sll_addr;
-+		}
- 	}
- 
- 	err = -ENXIO;
-@@ -2800,7 +2802,7 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
- 	struct sk_buff *skb;
- 	struct net_device *dev;
- 	__be16 proto;
--	unsigned char *addr;
-+	unsigned char *addr = NULL;
- 	int err, reserve = 0;
- 	struct sockcm_cookie sockc;
- 	struct virtio_net_hdr vnet_hdr = { 0 };
-@@ -2817,7 +2819,6 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
- 	if (likely(saddr == NULL)) {
- 		dev	= packet_cached_dev_get(po);
- 		proto	= po->num;
--		addr	= NULL;
- 	} else {
- 		err = -EINVAL;
- 		if (msg->msg_namelen < sizeof(struct sockaddr_ll))
-@@ -2825,10 +2826,13 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
- 		if (msg->msg_namelen < (saddr->sll_halen + offsetof(struct sockaddr_ll, sll_addr)))
- 			goto out;
- 		proto	= saddr->sll_protocol;
--		addr	= saddr->sll_halen ? saddr->sll_addr : NULL;
- 		dev = dev_get_by_index(sock_net(sk), saddr->sll_ifindex);
--		if (addr && dev && saddr->sll_halen < dev->addr_len)
--			goto out_unlock;
-+		if (sock->type == SOCK_DGRAM) {
-+			if (dev && msg->msg_namelen < dev->addr_len +
-+				   offsetof(struct sockaddr_ll, sll_addr))
-+				goto out_unlock;
-+			addr = saddr->sll_addr;
-+		}
- 	}
- 
- 	err = -ENXIO;
--- 
-2.28.0
-
-
-From 09a9213613533a7e34245df1f258764cf71a5206 Mon Sep 17 00:00:00 2001
-From: Michael Chan <michael.chan@broadcom.com>
-Date: Thu, 25 Apr 2019 22:31:50 -0400
-Subject: [PATCH 15/24] bnxt_en: Improve multicast address setup logic.
-
-[ Upstream commit b4e30e8e7ea1d1e35ffd64ca46f7d9a7f227b4bf ]
-
-The driver builds a list of multicast addresses and sends it to the
-firmware when the driver's ndo_set_rx_mode() is called.  In rare
-cases, the firmware can fail this call if internal resources to
-add multicast addresses are exhausted.  In that case, we should
-try the call again by setting the ALL_MCAST flag which is more
-guaranteed to succeed.
-
-Fixes: c0c050c58d84 ("bnxt_en: New Broadcom ethernet driver.")
-Signed-off-by: Michael Chan <michael.chan@broadcom.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/broadcom/bnxt/bnxt.c | 9 ++++++++-
- 1 file changed, 8 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-index 581ad0a17d0c..02680357bb5f 100644
---- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-+++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-@@ -7441,8 +7441,15 @@ static int bnxt_cfg_rx_mode(struct bnxt *bp)
- 
- skip_uc:
- 	rc = bnxt_hwrm_cfa_l2_set_rx_mask(bp, 0);
-+	if (rc && vnic->mc_list_count) {
-+		netdev_info(bp->dev, "Failed setting MC filters rc: %d, turning on ALL_MCAST mode\n",
-+			    rc);
-+		vnic->rx_mask |= CFA_L2_SET_RX_MASK_REQ_MASK_ALL_MCAST;
-+		vnic->mc_list_count = 0;
-+		rc = bnxt_hwrm_cfa_l2_set_rx_mask(bp, 0);
-+	}
- 	if (rc)
--		netdev_err(bp->dev, "HWRM cfa l2 rx mask failure rc: %x\n",
-+		netdev_err(bp->dev, "HWRM cfa l2 rx mask failure rc: %d\n",
- 			   rc);
- 
- 	return rc;
--- 
-2.28.0
-
-
-From 396350737326d0e54c848ae14e4eb7160592633d Mon Sep 17 00:00:00 2001
-From: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
-Date: Thu, 25 Apr 2019 22:31:51 -0400
-Subject: [PATCH 16/24] bnxt_en: Free short FW command HWRM memory in error
- path in bnxt_init_one()
-
-[ Upstream commit f9099d611449836a51a65f40ea7dc9cb5f2f665e ]
-
-In the bnxt_init_one() error path, short FW command request memory
-is not freed. This patch fixes it.
-
-Fixes: e605db801bde ("bnxt_en: Support for Short Firmware Message")
-Signed-off-by: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
-Signed-off-by: Michael Chan <michael.chan@broadcom.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/broadcom/bnxt/bnxt.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-index 02680357bb5f..90436c5abbc9 100644
---- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-+++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-@@ -9084,6 +9084,7 @@ static int bnxt_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
- 	bnxt_clear_int_mode(bp);
- 
- init_err_pci_clean:
-+	bnxt_free_hwrm_short_cmd_req(bp);
- 	bnxt_free_hwrm_resources(bp);
- 	bnxt_cleanup_pci(bp);
- 
--- 
-2.28.0
-
-
-From f1fd68e934091734c21e3ea21748d272f08b3fee Mon Sep 17 00:00:00 2001
-From: Michael Chan <michael.chan@broadcom.com>
-Date: Thu, 25 Apr 2019 22:31:55 -0400
-Subject: [PATCH 17/24] bnxt_en: Fix uninitialized variable usage in
- bnxt_rx_pkt().
-
-[ Upstream commit 0b397b17a4120cb80f7bf89eb30587b3dd9b0d1d ]
-
-In bnxt_rx_pkt(), if the driver encounters BD errors, it will recycle
-the buffers and jump to the end where the uninitailized variable "len"
-is referenced.  Fix it by adding a new jump label that will skip
-the length update.  This is the most correct fix since the length
-may not be valid when we get this type of error.
-
-Fixes: 6a8788f25625 ("bnxt_en: add support for software dynamic interrupt moderation")
-Reported-by: Nathan Chancellor <natechancellor@gmail.com>
-Cc: Nathan Chancellor <natechancellor@gmail.com>
-Signed-off-by: Michael Chan <michael.chan@broadcom.com>
-Reviewed-by: Nathan Chancellor <natechancellor@gmail.com>
-Tested-by: Nathan Chancellor <natechancellor@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/broadcom/bnxt/bnxt.c | 9 +++++----
- 1 file changed, 5 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-index 90436c5abbc9..de46331aefc1 100644
---- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-+++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
-@@ -1584,7 +1584,7 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
- 			netdev_warn(bp->dev, "RX buffer error %x\n", rx_err);
- 			bnxt_sched_reset(bp, rxr);
- 		}
--		goto next_rx;
-+		goto next_rx_no_len;
- 	}
- 
- 	len = le32_to_cpu(rxcmp->rx_cmp_len_flags_type) >> RX_CMP_LEN_SHIFT;
-@@ -1665,12 +1665,13 @@ static int bnxt_rx_pkt(struct bnxt *bp, struct bnxt_napi *bnapi, u32 *raw_cons,
- 	rc = 1;
- 
- next_rx:
--	rxr->rx_prod = NEXT_RX(prod);
--	rxr->rx_next_cons = NEXT_RX(cons);
--
- 	cpr->rx_packets += 1;
- 	cpr->rx_bytes += len;
- 
-+next_rx_no_len:
-+	rxr->rx_prod = NEXT_RX(prod);
-+	rxr->rx_next_cons = NEXT_RX(cons);
-+
- next_rx_no_prod_no_len:
- 	*raw_cons = tmp_raw_cons;
- 
--- 
-2.28.0
-
-
-From dd424182bc2d5af26b67f5885c182a02d00a18a6 Mon Sep 17 00:00:00 2001
-From: Jakub Kicinski <jakub.kicinski@netronome.com>
-Date: Thu, 25 Apr 2019 17:35:09 -0700
-Subject: [PATCH 18/24] net/tls: don't copy negative amounts of data in
- reencrypt
-
-[ Upstream commit 97e1caa517e22d62a283b876fb8aa5f4672c83dd ]
-
-There is no guarantee the record starts before the skb frags.
-If we don't check for this condition copy amount will get
-negative, leading to reads and writes to random memory locations.
-Familiar hilarity ensues.
-
-Fixes: 4799ac81e52a ("tls: Add rx inline crypto offload")
-Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
-Reviewed-by: John Hurley <john.hurley@netronome.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/tls/tls_device.c | 14 ++++++++------
- 1 file changed, 8 insertions(+), 6 deletions(-)
-
 diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
-index c9588b682db4..8538ee22a582 100644
---- a/net/tls/tls_device.c
-+++ b/net/tls/tls_device.c
-@@ -600,14 +600,16 @@ static int tls_device_reencrypt(struct sock *sk, struct sk_buff *skb)
- 	else
- 		err = 0;
- 
--	copy = min_t(int, skb_pagelen(skb) - offset,
--		     rxm->full_len - TLS_CIPHER_AES_GCM_128_TAG_SIZE);
-+	if (skb_pagelen(skb) > offset) {
-+		copy = min_t(int, skb_pagelen(skb) - offset,
-+			     rxm->full_len - TLS_CIPHER_AES_GCM_128_TAG_SIZE);
- 
--	if (skb->decrypted)
--		skb_store_bits(skb, offset, buf, copy);
-+		if (skb->decrypted)
-+			skb_store_bits(skb, offset, buf, copy);
- 
--	offset += copy;
--	buf += copy;
-+		offset += copy;
-+		buf += copy;
-+	}
- 
- 	skb_walk_frags(skb, skb_iter) {
- 		copy = min_t(int, skb_iter->len,
--- 
-2.28.0
-
-
-From d0771bd41c27e08af7bb7bb95e3c9450633770f7 Mon Sep 17 00:00:00 2001
-From: Jakub Kicinski <jakub.kicinski@netronome.com>
-Date: Thu, 25 Apr 2019 17:35:10 -0700
-Subject: [PATCH 19/24] net/tls: fix copy to fragments in reencrypt
-
-[ Upstream commit eb3d38d5adb520435d4e4af32529ccb13ccc9935 ]
-
-Fragments may contain data from other records so we have to account
-for that when we calculate the destination and max length of copy we
-can perform.  Note that 'offset' is the offset within the message,
-so it can't be passed as offset within the frag..
-
-Here skb_store_bits() would have realised the call is wrong and
-simply not copy data.
-
-Fixes: 4799ac81e52a ("tls: Add rx inline crypto offload")
-Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
-Reviewed-by: John Hurley <john.hurley@netronome.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/tls/tls_device.c | 29 ++++++++++++++++++++++-------
- 1 file changed, 22 insertions(+), 7 deletions(-)
-
-diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
-index 8538ee22a582..f4a19eac975d 100644
+index c9588b682db4..f4a19eac975d 100644
 --- a/net/tls/tls_device.c
 +++ b/net/tls/tls_device.c
 @@ -569,7 +569,7 @@ void handle_device_resync(struct sock *sk, u32 seq, u64 rcd_sn)
@@ -1414,23 +657,28 @@ index 8538ee22a582..f4a19eac975d 100644
  	struct sk_buff *skb_iter, *unused;
  	struct scatterlist sg[1];
  	char *orig_buf, *buf;
-@@ -600,9 +600,10 @@ static int tls_device_reencrypt(struct sock *sk, struct sk_buff *skb)
+@@ -600,25 +600,42 @@ static int tls_device_reencrypt(struct sock *sk, struct sk_buff *skb)
  	else
  		err = 0;
  
+-	copy = min_t(int, skb_pagelen(skb) - offset,
+-		     rxm->full_len - TLS_CIPHER_AES_GCM_128_TAG_SIZE);
 +	data_len = rxm->full_len - TLS_CIPHER_AES_GCM_128_TAG_SIZE;
-+
- 	if (skb_pagelen(skb) > offset) {
--		copy = min_t(int, skb_pagelen(skb) - offset,
--			     rxm->full_len - TLS_CIPHER_AES_GCM_128_TAG_SIZE);
+ 
+-	if (skb->decrypted)
+-		skb_store_bits(skb, offset, buf, copy);
++	if (skb_pagelen(skb) > offset) {
 +		copy = min_t(int, skb_pagelen(skb) - offset, data_len);
  
- 		if (skb->decrypted)
- 			skb_store_bits(skb, offset, buf, copy);
-@@ -611,16 +612,30 @@ static int tls_device_reencrypt(struct sock *sk, struct sk_buff *skb)
- 		buf += copy;
- 	}
+-	offset += copy;
+-	buf += copy;
++		if (skb->decrypted)
++			skb_store_bits(skb, offset, buf, copy);
  
++		offset += copy;
++		buf += copy;
++	}
++
 +	pos = skb_pagelen(skb);
  	skb_walk_frags(skb, skb_iter) {
 -		copy = min_t(int, skb_iter->len,
@@ -1462,184 +710,26 @@ index 8538ee22a582..f4a19eac975d 100644
  	}
  
  free_buf:
--- 
-2.28.0
-
-
-From 499bbe739d5aeb1bb775fed5523902f840cbe67b Mon Sep 17 00:00:00 2001
-From: Sean Christopherson <sean.j.christopherson@intel.com>
-Date: Mon, 29 Apr 2019 07:04:15 -0700
-Subject: [PATCH 20/24] KVM: x86: Whitelist port 0x7e for pre-incrementing %rip
-
-commit 8764ed55c9705e426d889ff16c26f398bba70b9b upstream.
-
-KVM's recent bug fix to update %rip after emulating I/O broke userspace
-that relied on the previous behavior of incrementing %rip prior to
-exiting to userspace.  When running a Windows XP guest on AMD hardware,
-Qemu may patch "OUT 0x7E" instructions in reaction to the OUT itself.
-Because KVM's old behavior was to increment %rip before exiting to
-userspace to handle the I/O, Qemu manually adjusted %rip to account for
-the OUT instruction.
-
-Arguably this is a userspace bug as KVM requires userspace to re-enter
-the kernel to complete instruction emulation before taking any other
-actions.  That being said, this is a bit of a grey area and breaking
-userspace that has worked for many years is bad.
-
-Pre-increment %rip on OUT to port 0x7e before exiting to userspace to
-hack around the issue.
-
-Fixes: 45def77ebf79e ("KVM: x86: update %rip after emulating IO")
-Reported-by: Simon Becherer <simon@becherer.de>
-Reported-and-tested-by: Iakov Karpov <srid@rkmail.ru>
-Reported-by: Gabriele Balducci <balducci@units.it>
-Reported-by: Antti Antinoja <reader@fennosys.fi>
-Cc: stable@vger.kernel.org
-Cc: Takashi Iwai <tiwai@suse.com>
-Cc: Jiri Slaby <jslaby@suse.com>
-Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/include/uapi/asm/kvm.h |  1 +
- arch/x86/kvm/x86.c              | 21 +++++++++++++++++++--
- 2 files changed, 20 insertions(+), 2 deletions(-)
-
-diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
-index fd23d5778ea1..f1645578d9d0 100644
---- a/arch/x86/include/uapi/asm/kvm.h
-+++ b/arch/x86/include/uapi/asm/kvm.h
-@@ -378,6 +378,7 @@ struct kvm_sync_regs {
- #define KVM_X86_QUIRK_LINT0_REENABLED	(1 << 0)
- #define KVM_X86_QUIRK_CD_NW_CLEARED	(1 << 1)
- #define KVM_X86_QUIRK_LAPIC_MMIO_HOLE	(1 << 2)
-+#define KVM_X86_QUIRK_OUT_7E_INC_RIP	(1 << 3)
+diff --git a/net/tls/tls_device_fallback.c b/net/tls/tls_device_fallback.c
+index ef8934fd8698..426dd97725e4 100644
+--- a/net/tls/tls_device_fallback.c
++++ b/net/tls/tls_device_fallback.c
+@@ -200,13 +200,14 @@ static void complete_skb(struct sk_buff *nskb, struct sk_buff *skb, int headln)
  
- #define KVM_STATE_NESTED_GUEST_MODE	0x00000001
- #define KVM_STATE_NESTED_RUN_PENDING	0x00000002
-diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index 4a61e1609c97..f3337adaf9b3 100644
---- a/arch/x86/kvm/x86.c
-+++ b/arch/x86/kvm/x86.c
-@@ -6328,6 +6328,12 @@ int kvm_emulate_instruction_from_buffer(struct kvm_vcpu *vcpu,
- }
- EXPORT_SYMBOL_GPL(kvm_emulate_instruction_from_buffer);
+ 	skb_put(nskb, skb->len);
+ 	memcpy(nskb->data, skb->data, headln);
+-	update_chksum(nskb, headln);
  
-+static int complete_fast_pio_out_port_0x7e(struct kvm_vcpu *vcpu)
-+{
-+	vcpu->arch.pio.count = 0;
-+	return 1;
-+}
+ 	nskb->destructor = skb->destructor;
+ 	nskb->sk = sk;
+ 	skb->destructor = NULL;
+ 	skb->sk = NULL;
+ 
++	update_chksum(nskb, headln);
 +
- static int complete_fast_pio_out(struct kvm_vcpu *vcpu)
- {
- 	vcpu->arch.pio.count = 0;
-@@ -6344,12 +6350,23 @@ static int kvm_fast_pio_out(struct kvm_vcpu *vcpu, int size,
- 	unsigned long val = kvm_register_read(vcpu, VCPU_REGS_RAX);
- 	int ret = emulator_pio_out_emulated(&vcpu->arch.emulate_ctxt,
- 					    size, port, &val, 1);
-+	if (ret)
-+		return ret;
- 
--	if (!ret) {
-+	/*
-+	 * Workaround userspace that relies on old KVM behavior of %rip being
-+	 * incremented prior to exiting to userspace to handle "OUT 0x7e".
-+	 */
-+	if (port == 0x7e &&
-+	    kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_OUT_7E_INC_RIP)) {
-+		vcpu->arch.complete_userspace_io =
-+			complete_fast_pio_out_port_0x7e;
-+		kvm_skip_emulated_instruction(vcpu);
-+	} else {
- 		vcpu->arch.pio.linear_rip = kvm_get_linear_rip(vcpu);
- 		vcpu->arch.complete_userspace_io = complete_fast_pio_out;
- 	}
--	return ret;
-+	return 0;
- }
- 
- static int complete_fast_pio_in(struct kvm_vcpu *vcpu)
--- 
-2.28.0
-
-
-From 68d49ff47789a8bef15c6bacfb80cee95ccc23f7 Mon Sep 17 00:00:00 2001
-From: Jim Mattson <jmattson@google.com>
-Date: Thu, 17 Jan 2019 11:55:58 -0800
-Subject: [PATCH 21/24] KVM: nVMX: Fix size checks in vmx_set_nested_state
-
-commit e8ab8d24b488632d07ce5ddb261f1d454114415b upstream.
-
-The size checks in vmx_nested_state are wrong because the calculations
-are made based on the size of a pointer to a struct kvm_nested_state
-rather than the size of a struct kvm_nested_state.
-
-Reported-by: Felix Wilhelm  <fwilhelm@google.com>
-Signed-off-by: Jim Mattson <jmattson@google.com>
-Reviewed-by: Drew Schmitt <dasch@google.com>
-Reviewed-by: Marc Orr <marcorr@google.com>
-Reviewed-by: Peter Shier <pshier@google.com>
-Reviewed-by: Krish Sadhukhan <krish.sadhukhan@oracle.com>
-Fixes: 8fcc4b5923af5de58b80b53a069453b135693304
-Cc: stable@ver.kernel.org
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/kvm/vmx.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
-index 3380a312d186..215339c7d161 100644
---- a/arch/x86/kvm/vmx.c
-+++ b/arch/x86/kvm/vmx.c
-@@ -14236,7 +14236,7 @@ static int vmx_set_nested_state(struct kvm_vcpu *vcpu,
- 		return ret;
- 
- 	/* Empty 'VMXON' state is permitted */
--	if (kvm_state->size < sizeof(kvm_state) + sizeof(*vmcs12))
-+	if (kvm_state->size < sizeof(*kvm_state) + sizeof(*vmcs12))
- 		return 0;
- 
- 	if (kvm_state->vmx.vmcs_pa == kvm_state->vmx.vmxon_pa ||
-@@ -14269,7 +14269,7 @@ static int vmx_set_nested_state(struct kvm_vcpu *vcpu,
- 	if (nested_cpu_has_shadow_vmcs(vmcs12) &&
- 	    vmcs12->vmcs_link_pointer != -1ull) {
- 		struct vmcs12 *shadow_vmcs12 = get_shadow_vmcs12(vcpu);
--		if (kvm_state->size < sizeof(kvm_state) + 2 * sizeof(*vmcs12))
-+		if (kvm_state->size < sizeof(*kvm_state) + 2 * sizeof(*vmcs12))
- 			return -EINVAL;
- 
- 		if (copy_from_user(shadow_vmcs12,
--- 
-2.28.0
-
-
-From d0a5000f10e7a568d03c25ad6d397451061a65c4 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sun, 28 Apr 2019 18:04:11 +0200
-Subject: [PATCH 22/24] ALSA: line6: use dynamic buffers
-
-commit e5c812e84f0dece3400d5caf42522287e6ef139f upstream.
-
-The line6 driver uses a lot of USB buffers off of the stack, which is
-not allowed on many systems, causing the driver to crash on some of
-them.  Fix this up by dynamically allocating the buffers with kmalloc()
-which allows for proper DMA-able memory.
-
-Reported-by: Christo Gouws <gouws.christo@gmail.com>
-Reported-by: Alan Stern <stern@rowland.harvard.edu>
-Tested-by: Christo Gouws <gouws.christo@gmail.com>
-Cc: stable <stable@vger.kernel.org>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/line6/driver.c   | 60 ++++++++++++++++++++++----------------
- sound/usb/line6/podhd.c    | 21 +++++++------
- sound/usb/line6/toneport.c | 24 +++++++++++----
- 3 files changed, 65 insertions(+), 40 deletions(-)
-
+ 	delta = nskb->truesize - skb->truesize;
+ 	if (likely(delta < 0))
+ 		WARN_ON_ONCE(refcount_sub_and_test(-delta, &sk->sk_wmem_alloc));
 diff --git a/sound/usb/line6/driver.c b/sound/usb/line6/driver.c
 index c1376bfdc90b..aa28510d23ad 100644
 --- a/sound/usb/line6/driver.c
@@ -1918,78 +1008,25 @@ index f47ba94e6f4a..19bee725de00 100644
  	return line6_resume(interface);
  }
  #endif
--- 
-2.28.0
-
-
-From cc313d405b0ceebd02f2811ab7cf83fd3474d0e8 Mon Sep 17 00:00:00 2001
-From: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
-Date: Sun, 3 Mar 2019 18:24:33 +0100
-Subject: [PATCH 23/24] ath10k: Drop WARN_ON()s that always trigger during
- system resume
-
-commit 9e80ad37f6788ed52b89a3cfcd593e0aa69b216d upstream.
-
-ath10k_mac_vif_chan() always returns an error for the given vif
-during system-wide resume which reliably triggers two WARN_ON()s
-in ath10k_bss_info_changed() and they are not particularly
-useful in that code path, so drop them.
-
-Tested: QCA6174 hw3.2 PCI with WLAN.RM.2.0-00180-QCARMSWPZ-1
-Tested: QCA6174 hw3.2 SDIO with WLAN.RMH.4.4.1-00007-QCARMSWP-1
-
-Fixes: cd93b83ad927 ("ath10k: support for multicast rate control")
-Fixes: f279294e9ee2 ("ath10k: add support for configuring management packet rate")
-Cc: stable@vger.kernel.org
-Reviewed-by: Brian Norris <briannorris@chromium.org>
-Tested-by: Brian Norris <briannorris@chromium.org>
-Tested-by: Claire Chang <tientzu@chromium.org>
-Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
-Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/ath/ath10k/mac.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/net/wireless/ath/ath10k/mac.c b/drivers/net/wireless/ath/ath10k/mac.c
-index 90f9372dec25..f3b1cfacfe9d 100644
---- a/drivers/net/wireless/ath/ath10k/mac.c
-+++ b/drivers/net/wireless/ath/ath10k/mac.c
-@@ -5622,7 +5622,7 @@ static void ath10k_bss_info_changed(struct ieee80211_hw *hw,
- 	}
+diff --git a/tools/testing/selftests/net/fib_rule_tests.sh b/tools/testing/selftests/net/fib_rule_tests.sh
+index d4cfb6a7a086..d84193bdc307 100755
+--- a/tools/testing/selftests/net/fib_rule_tests.sh
++++ b/tools/testing/selftests/net/fib_rule_tests.sh
+@@ -27,6 +27,7 @@ log_test()
+ 		nsuccess=$((nsuccess+1))
+ 		printf "\n    TEST: %-50s  [ OK ]\n" "${msg}"
+ 	else
++		ret=1
+ 		nfail=$((nfail+1))
+ 		printf "\n    TEST: %-50s  [FAIL]\n" "${msg}"
+ 		if [ "${PAUSE_ON_FAIL}" = "yes" ]; then
+@@ -245,4 +246,9 @@ setup
+ run_fibrule_tests
+ cleanup
  
- 	if (changed & BSS_CHANGED_MCAST_RATE &&
--	    !WARN_ON(ath10k_mac_vif_chan(arvif->vif, &def))) {
-+	    !ath10k_mac_vif_chan(arvif->vif, &def)) {
- 		band = def.chan->band;
- 		rateidx = vif->bss_conf.mcast_rate[band] - 1;
- 
--- 
-2.28.0
-
-
-From 1656b14572090df53ff096f158726c1d1355f5ca Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sun, 5 May 2019 14:42:41 +0200
-Subject: [PATCH 24/24] Linux 4.19.40
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index be1bd297bca9..3822720a8a1c 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- # SPDX-License-Identifier: GPL-2.0
- VERSION = 4
- PATCHLEVEL = 19
--SUBLEVEL = 39
-+SUBLEVEL = 40
- EXTRAVERSION =
- NAME = "People's Front"
- 
--- 
-2.28.0
-
++if [ "$TESTS" != "none" ]; then
++	printf "\nTests passed: %3d\n" ${nsuccess}
++	printf "Tests failed: %3d\n"   ${nfail}
++fi
++
+ exit $ret

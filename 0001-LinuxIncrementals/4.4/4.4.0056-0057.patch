@@ -1,382 +1,80 @@
-From ac1a97d8a562161e42edd23e5d0f1740a3d93c85 Mon Sep 17 00:00:00 2001
-From: Chris Bainbridge <chris.bainbridge@gmail.com>
-Date: Mon, 25 Apr 2016 13:48:38 +0100
-Subject: [PATCH 01/31] usb: core: hub: hub_port_init lock controller instead
- of bus
-
-commit feb26ac31a2a5cb88d86680d9a94916a6343e9e6 upstream.
-
-The XHCI controller presents two USB buses to the system - one for USB2
-and one for USB3. The hub init code (hub_port_init) is reentrant but
-only locks one bus per thread, leading to a race condition failure when
-two threads attempt to simultaneously initialise a USB2 and USB3 device:
-
-[    8.034843] xhci_hcd 0000:00:14.0: Timeout while waiting for setup device command
-[   13.183701] usb 3-3: device descriptor read/all, error -110
-
-On a test system this failure occurred on 6% of all boots.
-
-The call traces at the point of failure are:
-
-Call Trace:
- [<ffffffff81b9bab7>] schedule+0x37/0x90
- [<ffffffff817da7cd>] usb_kill_urb+0x8d/0xd0
- [<ffffffff8111e5e0>] ? wake_up_atomic_t+0x30/0x30
- [<ffffffff817dafbe>] usb_start_wait_urb+0xbe/0x150
- [<ffffffff817db10c>] usb_control_msg+0xbc/0xf0
- [<ffffffff817d07de>] hub_port_init+0x51e/0xb70
- [<ffffffff817d4697>] hub_event+0x817/0x1570
- [<ffffffff810f3e6f>] process_one_work+0x1ff/0x620
- [<ffffffff810f3dcf>] ? process_one_work+0x15f/0x620
- [<ffffffff810f4684>] worker_thread+0x64/0x4b0
- [<ffffffff810f4620>] ? rescuer_thread+0x390/0x390
- [<ffffffff810fa7f5>] kthread+0x105/0x120
- [<ffffffff810fa6f0>] ? kthread_create_on_node+0x200/0x200
- [<ffffffff81ba183f>] ret_from_fork+0x3f/0x70
- [<ffffffff810fa6f0>] ? kthread_create_on_node+0x200/0x200
-
-Call Trace:
- [<ffffffff817fd36d>] xhci_setup_device+0x53d/0xa40
- [<ffffffff817fd87e>] xhci_address_device+0xe/0x10
- [<ffffffff817d047f>] hub_port_init+0x1bf/0xb70
- [<ffffffff811247ed>] ? trace_hardirqs_on+0xd/0x10
- [<ffffffff817d4697>] hub_event+0x817/0x1570
- [<ffffffff810f3e6f>] process_one_work+0x1ff/0x620
- [<ffffffff810f3dcf>] ? process_one_work+0x15f/0x620
- [<ffffffff810f4684>] worker_thread+0x64/0x4b0
- [<ffffffff810f4620>] ? rescuer_thread+0x390/0x390
- [<ffffffff810fa7f5>] kthread+0x105/0x120
- [<ffffffff810fa6f0>] ? kthread_create_on_node+0x200/0x200
- [<ffffffff81ba183f>] ret_from_fork+0x3f/0x70
- [<ffffffff810fa6f0>] ? kthread_create_on_node+0x200/0x200
-
-Which results from the two call chains:
-
-hub_port_init
- usb_get_device_descriptor
-  usb_get_descriptor
-   usb_control_msg
-    usb_internal_control_msg
-     usb_start_wait_urb
-      usb_submit_urb / wait_for_completion_timeout / usb_kill_urb
-
-hub_port_init
- hub_set_address
-  xhci_address_device
-   xhci_setup_device
-
-Mathias Nyman explains the current behaviour violates the XHCI spec:
-
- hub_port_reset() will end up moving the corresponding xhci device slot
- to default state.
-
- As hub_port_reset() is called several times in hub_port_init() it
- sounds reasonable that we could end up with two threads having their
- xhci device slots in default state at the same time, which according to
- xhci 4.5.3 specs still is a big no no:
-
- "Note: Software shall not transition more than one Device Slot to the
-  Default State at a time"
-
- So both threads fail at their next task after this.
- One fails to read the descriptor, and the other fails addressing the
- device.
-
-Fix this in hub_port_init by locking the USB controller (instead of an
-individual bus) to prevent simultaneous initialisation of both buses.
-
-Fixes: 638139eb95d2 ("usb: hub: allow to process more usb hub events in parallel")
-Link: https://lkml.org/lkml/2016/2/8/312
-Link: https://lkml.org/lkml/2016/2/4/748
-Signed-off-by: Chris Bainbridge <chris.bainbridge@gmail.com>
-Cc: stable <stable@vger.kernel.org>
-Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
-Signed-off-by: Sumit Semwal <sumit.semwal@linaro.org>
- [sumits: minor merge conflict resolution for linux-4.4.y]
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/core/hcd.c  | 15 +++++++++++++--
- drivers/usb/core/hub.c  |  8 ++++----
- include/linux/usb.h     |  3 +--
- include/linux/usb/hcd.h |  1 +
- 4 files changed, 19 insertions(+), 8 deletions(-)
-
-diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
-index f44ce09367bc..9a5303c17de7 100644
---- a/drivers/usb/core/hcd.c
-+++ b/drivers/usb/core/hcd.c
-@@ -966,7 +966,7 @@ static void usb_bus_init (struct usb_bus *bus)
- 	bus->bandwidth_allocated = 0;
- 	bus->bandwidth_int_reqs  = 0;
- 	bus->bandwidth_isoc_reqs = 0;
--	mutex_init(&bus->usb_address0_mutex);
-+	mutex_init(&bus->devnum_next_mutex);
+diff --git a/Makefile b/Makefile
+index cf9303a5d621..841675e63a38 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+-SUBLEVEL = 56
++SUBLEVEL = 57
+ EXTRAVERSION =
+ NAME = Blurry Fish Butt
  
- 	INIT_LIST_HEAD (&bus->bus_list);
- }
-@@ -2497,6 +2497,14 @@ struct usb_hcd *usb_create_shared_hcd(const struct hc_driver *driver,
- 		return NULL;
+diff --git a/arch/powerpc/boot/zImage.lds.S b/arch/powerpc/boot/zImage.lds.S
+index 861e72109df2..f080abfc2f83 100644
+--- a/arch/powerpc/boot/zImage.lds.S
++++ b/arch/powerpc/boot/zImage.lds.S
+@@ -68,6 +68,7 @@ SECTIONS
+   }
+ 
+ #ifdef CONFIG_PPC64_BOOT_WRAPPER
++  . = ALIGN(256);
+   .got :
+   {
+     __toc_start = .;
+diff --git a/arch/powerpc/kvm/emulate.c b/arch/powerpc/kvm/emulate.c
+index 5cc2e7af3a7b..b379146de55b 100644
+--- a/arch/powerpc/kvm/emulate.c
++++ b/arch/powerpc/kvm/emulate.c
+@@ -302,7 +302,6 @@ int kvmppc_emulate_instruction(struct kvm_run *run, struct kvm_vcpu *vcpu)
+ 			advance = 0;
+ 			printk(KERN_ERR "Couldn't emulate instruction 0x%08x "
+ 			       "(op %d xop %d)\n", inst, get_op(inst), get_xop(inst));
+-			kvmppc_core_queue_program(vcpu, 0);
+ 		}
  	}
- 	if (primary_hcd == NULL) {
-+		hcd->address0_mutex = kmalloc(sizeof(*hcd->address0_mutex),
-+				GFP_KERNEL);
-+		if (!hcd->address0_mutex) {
-+			kfree(hcd);
-+			dev_dbg(dev, "hcd address0 mutex alloc failed\n");
-+			return NULL;
-+		}
-+		mutex_init(hcd->address0_mutex);
- 		hcd->bandwidth_mutex = kmalloc(sizeof(*hcd->bandwidth_mutex),
- 				GFP_KERNEL);
- 		if (!hcd->bandwidth_mutex) {
-@@ -2508,6 +2516,7 @@ struct usb_hcd *usb_create_shared_hcd(const struct hc_driver *driver,
- 		dev_set_drvdata(dev, hcd);
- 	} else {
- 		mutex_lock(&usb_port_peer_mutex);
-+		hcd->address0_mutex = primary_hcd->address0_mutex;
- 		hcd->bandwidth_mutex = primary_hcd->bandwidth_mutex;
- 		hcd->primary_hcd = primary_hcd;
- 		primary_hcd->primary_hcd = primary_hcd;
-@@ -2574,8 +2583,10 @@ static void hcd_release(struct kref *kref)
- 	struct usb_hcd *hcd = container_of (kref, struct usb_hcd, kref);
  
- 	mutex_lock(&usb_port_peer_mutex);
--	if (usb_hcd_is_primary_hcd(hcd))
-+	if (usb_hcd_is_primary_hcd(hcd)) {
-+		kfree(hcd->address0_mutex);
- 		kfree(hcd->bandwidth_mutex);
-+	}
- 	if (hcd->shared_hcd) {
- 		struct usb_hcd *peer = hcd->shared_hcd;
- 
-diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
-index 780db8bb2262..f52d8abf6979 100644
---- a/drivers/usb/core/hub.c
-+++ b/drivers/usb/core/hub.c
-@@ -1980,7 +1980,7 @@ static void choose_devnum(struct usb_device *udev)
- 	struct usb_bus	*bus = udev->bus;
- 
- 	/* be safe when more hub events are proceed in parallel */
--	mutex_lock(&bus->usb_address0_mutex);
-+	mutex_lock(&bus->devnum_next_mutex);
- 	if (udev->wusb) {
- 		devnum = udev->portnum + 1;
- 		BUG_ON(test_bit(devnum, bus->devmap.devicemap));
-@@ -1998,7 +1998,7 @@ static void choose_devnum(struct usb_device *udev)
- 		set_bit(devnum, bus->devmap.devicemap);
- 		udev->devnum = devnum;
+diff --git a/arch/s390/pci/pci_dma.c b/arch/s390/pci/pci_dma.c
+index 3a40f718baef..4004e03267cd 100644
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@ -455,7 +455,7 @@ int zpci_dma_init_device(struct zpci_dev *zdev)
+ 	zdev->dma_table = dma_alloc_cpu_table();
+ 	if (!zdev->dma_table) {
+ 		rc = -ENOMEM;
+-		goto out_clean;
++		goto out;
  	}
--	mutex_unlock(&bus->usb_address0_mutex);
-+	mutex_unlock(&bus->devnum_next_mutex);
+ 
+ 	/*
+@@ -475,18 +475,22 @@ int zpci_dma_init_device(struct zpci_dev *zdev)
+ 	zdev->iommu_bitmap = vzalloc(zdev->iommu_pages / 8);
+ 	if (!zdev->iommu_bitmap) {
+ 		rc = -ENOMEM;
+-		goto out_reg;
++		goto free_dma_table;
+ 	}
+ 
+ 	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+ 				(u64) zdev->dma_table);
+ 	if (rc)
+-		goto out_reg;
+-	return 0;
++		goto free_bitmap;
+ 
+-out_reg:
++	return 0;
++free_bitmap:
++	vfree(zdev->iommu_bitmap);
++	zdev->iommu_bitmap = NULL;
++free_dma_table:
+ 	dma_free_cpu_table(zdev->dma_table);
+-out_clean:
++	zdev->dma_table = NULL;
++out:
+ 	return rc;
  }
  
- static void release_devnum(struct usb_device *udev)
-@@ -4262,7 +4262,7 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
- 	if (oldspeed == USB_SPEED_LOW)
- 		delay = HUB_LONG_RESET_TIME;
- 
--	mutex_lock(&hdev->bus->usb_address0_mutex);
-+	mutex_lock(hcd->address0_mutex);
- 
- 	/* Reset the device; full speed may morph to high speed */
- 	/* FIXME a USB 2.0 device may morph into SuperSpeed on reset. */
-@@ -4548,7 +4548,7 @@ fail:
- 		hub_port_disable(hub, port1, 0);
- 		update_devnum(udev, devnum);	/* for disconnect processing */
- 	}
--	mutex_unlock(&hdev->bus->usb_address0_mutex);
-+	mutex_unlock(hcd->address0_mutex);
- 	return retval;
- }
- 
-diff --git a/include/linux/usb.h b/include/linux/usb.h
-index 12891ffd4bf0..8c75af6b7d5b 100644
---- a/include/linux/usb.h
-+++ b/include/linux/usb.h
-@@ -371,14 +371,13 @@ struct usb_bus {
- 
- 	int devnum_next;		/* Next open device number in
- 					 * round-robin allocation */
-+	struct mutex devnum_next_mutex; /* devnum_next mutex */
- 
- 	struct usb_devmap devmap;	/* device address allocation map */
- 	struct usb_device *root_hub;	/* Root hub */
- 	struct usb_bus *hs_companion;	/* Companion EHCI bus, if any */
- 	struct list_head bus_list;	/* list of busses */
- 
--	struct mutex usb_address0_mutex; /* unaddressed device mutex */
--
- 	int bandwidth_allocated;	/* on this bus: how much of the time
- 					 * reserved for periodic (intr/iso)
- 					 * requests is used, on average?
-diff --git a/include/linux/usb/hcd.h b/include/linux/usb/hcd.h
-index f89c24bd53a4..3993b21f3d11 100644
---- a/include/linux/usb/hcd.h
-+++ b/include/linux/usb/hcd.h
-@@ -180,6 +180,7 @@ struct usb_hcd {
- 	 * bandwidth_mutex should be dropped after a successful control message
- 	 * to the device, or resetting the bandwidth after a failed attempt.
- 	 */
-+	struct mutex		*address0_mutex;
- 	struct mutex		*bandwidth_mutex;
- 	struct usb_hcd		*shared_hcd;
- 	struct usb_hcd		*primary_hcd;
--- 
-2.28.0
-
-
-From 45d9558837d4d79e6d241f1c45cabea8d20dca22 Mon Sep 17 00:00:00 2001
-From: Alan Stern <stern@rowland.harvard.edu>
-Date: Mon, 27 Jun 2016 10:23:10 -0400
-Subject: [PATCH 02/31] USB: don't free bandwidth_mutex too early
-
-commit ab2a4bf83902c170d29ba130a8abb5f9d90559e1 upstream.
-
-The USB core contains a bug that can show up when a USB-3 host
-controller is removed.  If the primary (USB-2) hcd structure is
-released before the shared (USB-3) hcd, the core will try to do a
-double-free of the common bandwidth_mutex.
-
-The problem was described in graphical form by Chung-Geol Kim, who
-first reported it:
-
-=================================================
-     At *remove USB(3.0) Storage
-     sequence <1> --> <5> ((Problem Case))
-=================================================
-                                  VOLD
-------------------------------------|------------
-                                 (uevent)
-                            ________|_________
-                           |<1>               |
-                           |dwc3_otg_sm_work  |
-                           |usb_put_hcd       |
-                           |peer_hcd(kref=2)|
-                           |__________________|
-                            ________|_________
-                           |<2>               |
-                           |New USB BUS #2    |
-                           |                  |
-                           |peer_hcd(kref=1)  |
-                           |                  |
-                         --(Link)-bandXX_mutex|
-                         | |__________________|
-                         |
-    ___________________  |
-   |<3>                | |
-   |dwc3_otg_sm_work   | |
-   |usb_put_hcd        | |
-   |primary_hcd(kref=1)| |
-   |___________________| |
-    _________|_________  |
-   |<4>                | |
-   |New USB BUS #1     | |
-   |hcd_release        | |
-   |primary_hcd(kref=0)| |
-   |                   | |
-   |bandXX_mutex(free) |<-
-   |___________________|
-                               (( VOLD ))
-                            ______|___________
-                           |<5>               |
-                           |      SCSI        |
-                           |usb_put_hcd       |
-                           |peer_hcd(kref=0)  |
-                           |*hcd_release      |
-                           |bandXX_mutex(free*)|<- double free
-                           |__________________|
-
-=================================================
-
-This happens because hcd_release() frees the bandwidth_mutex whenever
-it sees a primary hcd being released (which is not a very good idea
-in any case), but in the course of releasing the primary hcd, it
-changes the pointers in the shared hcd in such a way that the shared
-hcd will appear to be primary when it gets released.
-
-This patch fixes the problem by changing hcd_release() so that it
-deallocates the bandwidth_mutex only when the _last_ hcd structure
-referencing it is released.  The patch also removes an unnecessary
-test, so that when an hcd is released, both the shared_hcd and
-primary_hcd pointers in the hcd's peer will be cleared.
-
-Signed-off-by: Alan Stern <stern@rowland.harvard.edu>
-Reported-by: Chung-Geol Kim <chunggeol.kim@samsung.com>
-Tested-by: Chung-Geol Kim <chunggeol.kim@samsung.com>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/core/hcd.c | 17 +++++++----------
- 1 file changed, 7 insertions(+), 10 deletions(-)
-
-diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
-index 9a5303c17de7..5724d7c41e29 100644
---- a/drivers/usb/core/hcd.c
-+++ b/drivers/usb/core/hcd.c
-@@ -2573,26 +2573,23 @@ EXPORT_SYMBOL_GPL(usb_create_hcd);
-  * Don't deallocate the bandwidth_mutex until the last shared usb_hcd is
-  * deallocated.
-  *
-- * Make sure to only deallocate the bandwidth_mutex when the primary HCD is
-- * freed.  When hcd_release() is called for either hcd in a peer set
-- * invalidate the peer's ->shared_hcd and ->primary_hcd pointers to
-- * block new peering attempts
-+ * Make sure to deallocate the bandwidth_mutex only when the last HCD is
-+ * freed.  When hcd_release() is called for either hcd in a peer set,
-+ * invalidate the peer's ->shared_hcd and ->primary_hcd pointers.
-  */
- static void hcd_release(struct kref *kref)
- {
- 	struct usb_hcd *hcd = container_of (kref, struct usb_hcd, kref);
- 
- 	mutex_lock(&usb_port_peer_mutex);
--	if (usb_hcd_is_primary_hcd(hcd)) {
--		kfree(hcd->address0_mutex);
--		kfree(hcd->bandwidth_mutex);
--	}
- 	if (hcd->shared_hcd) {
- 		struct usb_hcd *peer = hcd->shared_hcd;
- 
- 		peer->shared_hcd = NULL;
--		if (peer->primary_hcd == hcd)
--			peer->primary_hcd = NULL;
-+		peer->primary_hcd = NULL;
-+	} else {
-+		kfree(hcd->address0_mutex);
-+		kfree(hcd->bandwidth_mutex);
- 	}
- 	mutex_unlock(&usb_port_peer_mutex);
- 	kfree(hcd);
--- 
-2.28.0
-
-
-From c78c3376ec6707f4e2177906928b12cb6cd8c5a9 Mon Sep 17 00:00:00 2001
-From: "Wang, Rui Y" <rui.y.wang@intel.com>
-Date: Sun, 29 Nov 2015 22:45:33 +0800
-Subject: [PATCH 03/31] crypto: ghash-clmulni - Fix load failure
-
-commit 3a020a723c65eb8ffa7c237faca26521a024e582 upstream.
-
-ghash_clmulni_intel fails to load on Linux 4.3+ with the following message:
-"modprobe: ERROR: could not insert 'ghash_clmulni_intel': Invalid argument"
-
-After 8996eafdc ("crypto: ahash - ensure statesize is non-zero") all ahash
-drivers are required to implement import()/export(), and must have a non-
-zero statesize.
-
-This patch has been tested with the algif_hash interface. The calculated
-digest values, after several rounds of import()s and export()s, match those
-calculated by tcrypt.
-
-Signed-off-by: Rui Wang <rui.y.wang@intel.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/crypto/ghash-clmulni-intel_glue.c | 26 ++++++++++++++++++++++
- 1 file changed, 26 insertions(+)
-
 diff --git a/arch/x86/crypto/ghash-clmulni-intel_glue.c b/arch/x86/crypto/ghash-clmulni-intel_glue.c
 index 440df0c7a2ee..a69321a77783 100644
 --- a/arch/x86/crypto/ghash-clmulni-intel_glue.c
@@ -423,31 +121,23 @@ index 440df0c7a2ee..a69321a77783 100644
  		.base = {
  			.cra_name		= "ghash",
  			.cra_driver_name	= "ghash-clmulni",
--- 
-2.28.0
-
-
-From 10659b8f5c600e642d0f1cadbbf83c739ac0c739 Mon Sep 17 00:00:00 2001
-From: "Wang, Rui Y" <rui.y.wang@intel.com>
-Date: Sun, 29 Nov 2015 22:45:34 +0800
-Subject: [PATCH 04/31] crypto: cryptd - Assign statesize properly
-
-commit 1a07834024dfca5c4bed5de8f8714306e0a11836 upstream.
-
-cryptd_create_hash() fails by returning -EINVAL.  It is because after
-8996eafdc ("crypto: ahash - ensure statesize is non-zero") all ahash
-drivers must have a non-zero statesize.
-
-This patch fixes the problem by properly assigning the statesize.
-
-Signed-off-by: Rui Wang <rui.y.wang@intel.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/cryptd.c | 1 +
- 1 file changed, 1 insertion(+)
-
+diff --git a/arch/x86/xen/spinlock.c b/arch/x86/xen/spinlock.c
+index 9e2ba5c6e1dd..f42e78de1e10 100644
+--- a/arch/x86/xen/spinlock.c
++++ b/arch/x86/xen/spinlock.c
+@@ -27,6 +27,12 @@ static bool xen_pvspin = true;
+ 
+ static void xen_qlock_kick(int cpu)
+ {
++	int irq = per_cpu(lock_kicker_irq, cpu);
++
++	/* Don't kick if the target's kicker interrupt is not initialized. */
++	if (irq == -1)
++		return;
++
+ 	xen_send_IPI_one(cpu, XEN_SPIN_UNLOCK_VECTOR);
+ }
+ 
 diff --git a/crypto/cryptd.c b/crypto/cryptd.c
 index e7aa904cb20b..26a504db3f53 100644
 --- a/crypto/cryptd.c
@@ -460,29 +150,6 @@ index e7aa904cb20b..26a504db3f53 100644
  	inst->alg.halg.base.cra_ctxsize = sizeof(struct cryptd_hash_ctx);
  
  	inst->alg.halg.base.cra_init = cryptd_hash_init_tfm;
--- 
-2.28.0
-
-
-From f8c07cbc2e72a7e26bff8c5823f6e045eeeb4e16 Mon Sep 17 00:00:00 2001
-From: "Wang, Rui Y" <rui.y.wang@intel.com>
-Date: Wed, 27 Jan 2016 17:08:36 +0800
-Subject: [PATCH 05/31] crypto: mcryptd - Fix load failure
-
-commit ddef482420b1ba8ec45e6123a7e8d3f67b21e5e3 upstream.
-
-mcryptd_create_hash() fails by returning -EINVAL, causing any
-driver using mcryptd to fail to load. It is because it needs
-to set its statesize properly.
-
-Signed-off-by: Rui Wang <rui.y.wang@intel.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/mcryptd.c | 1 +
- 1 file changed, 1 insertion(+)
-
 diff --git a/crypto/mcryptd.c b/crypto/mcryptd.c
 index a0ceb41d5ccc..b4f3930266b1 100644
 --- a/crypto/mcryptd.c
@@ -495,108 +162,6 @@ index a0ceb41d5ccc..b4f3930266b1 100644
  	inst->alg.halg.base.cra_ctxsize = sizeof(struct mcryptd_hash_ctx);
  
  	inst->alg.halg.base.cra_init = mcryptd_hash_init_tfm;
--- 
-2.28.0
-
-
-From 12e1a3cd11ea373143e957cf9698a26a4e43f4a6 Mon Sep 17 00:00:00 2001
-From: "Manoj N. Kumar" <manoj@linux.vnet.ibm.com>
-Date: Fri, 4 Mar 2016 15:55:20 -0600
-Subject: [PATCH 06/31] cxlflash: Increase cmd_per_lun for better throughput
-
-commit 83430833b4d4a9c9b23964babbeb1f36450f8136 upstream.
-
-With the current value of cmd_per_lun at 16, the throughput
-over a single adapter is limited to around 150kIOPS.
-
-Increase the value of cmd_per_lun to 256 to improve
-throughput. With this change a single adapter is able to
-attain close to the maximum throughput (380kIOPS).
-Also change the number of RRQ entries that can be queued.
-
-Signed-off-by: Manoj N. Kumar <manoj@linux.vnet.ibm.com>
-Acked-by: Matthew R. Ochs <mrochs@linux.vnet.ibm.com>
-Reviewed-by: Uma Krishnan <ukrishn@linux.vnet.ibm.com>
-Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/scsi/cxlflash/common.h | 8 +++++---
- drivers/scsi/cxlflash/main.c   | 2 +-
- 2 files changed, 6 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/scsi/cxlflash/common.h b/drivers/scsi/cxlflash/common.h
-index 5ada9268a450..a8ac4c0a1493 100644
---- a/drivers/scsi/cxlflash/common.h
-+++ b/drivers/scsi/cxlflash/common.h
-@@ -34,7 +34,6 @@ extern const struct file_operations cxlflash_cxl_fops;
- 								   sectors
- 								*/
- 
--#define NUM_RRQ_ENTRY    16     /* for master issued cmds */
- #define MAX_RHT_PER_CONTEXT (PAGE_SIZE / sizeof(struct sisl_rht_entry))
- 
- /* AFU command retry limit */
-@@ -48,9 +47,12 @@ extern const struct file_operations cxlflash_cxl_fops;
- 							   index derivation
- 							 */
- 
--#define CXLFLASH_MAX_CMDS               16
-+#define CXLFLASH_MAX_CMDS               256
- #define CXLFLASH_MAX_CMDS_PER_LUN       CXLFLASH_MAX_CMDS
- 
-+/* RRQ for master issued cmds */
-+#define NUM_RRQ_ENTRY                   CXLFLASH_MAX_CMDS
-+
- 
- static inline void check_sizes(void)
- {
-@@ -149,7 +151,7 @@ struct afu_cmd {
- struct afu {
- 	/* Stuff requiring alignment go first. */
- 
--	u64 rrq_entry[NUM_RRQ_ENTRY];	/* 128B RRQ */
-+	u64 rrq_entry[NUM_RRQ_ENTRY];	/* 2K RRQ */
- 	/*
- 	 * Command & data for AFU commands.
- 	 */
-diff --git a/drivers/scsi/cxlflash/main.c b/drivers/scsi/cxlflash/main.c
-index c86847c68448..2882bcac918a 100644
---- a/drivers/scsi/cxlflash/main.c
-+++ b/drivers/scsi/cxlflash/main.c
-@@ -2305,7 +2305,7 @@ static struct scsi_host_template driver_template = {
- 	.eh_device_reset_handler = cxlflash_eh_device_reset_handler,
- 	.eh_host_reset_handler = cxlflash_eh_host_reset_handler,
- 	.change_queue_depth = cxlflash_change_queue_depth,
--	.cmd_per_lun = 16,
-+	.cmd_per_lun = CXLFLASH_MAX_CMDS_PER_LUN,
- 	.can_queue = CXLFLASH_MAX_CMDS,
- 	.this_id = -1,
- 	.sg_tablesize = SG_NONE,	/* No scatter gather support */
--- 
-2.28.0
-
-
-From 962c66c74184b1c7927f5906c9848e605fe8b236 Mon Sep 17 00:00:00 2001
-From: Alex Hung <alex.hung@canonical.com>
-Date: Fri, 27 May 2016 15:47:06 +0800
-Subject: [PATCH 07/31] ACPI / video: skip evaluating _DOD when it does not
- exist
-
-commit e34fbbac669de0b7fb7803929d0477f35f6e2833 upstream.
-
-Some system supports hybrid graphics and its discrete VGA
-does not have any connectors and therefore has no _DOD method.
-
-Signed-off-by: Alex Hung <alex.hung@canonical.com>
-Reviewed-by: Aaron Lu <aaron.lu@intel.com>
-Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/acpi/acpi_video.c | 3 +++
- 1 file changed, 3 insertions(+)
-
 diff --git a/drivers/acpi/acpi_video.c b/drivers/acpi/acpi_video.c
 index 5fdac394207a..549cdbed7b0e 100644
 --- a/drivers/acpi/acpi_video.c
@@ -611,148 +176,50 @@ index 5fdac394207a..549cdbed7b0e 100644
  	status = acpi_evaluate_object(video->device->handle, "_DOD", NULL, &buffer);
  	if (!ACPI_SUCCESS(status)) {
  		ACPI_EXCEPTION((AE_INFO, status, "Evaluating _DOD"));
--- 
-2.28.0
-
-
-From 3787a071d145055a89442cf614ceec39c315bc9f Mon Sep 17 00:00:00 2001
-From: Mika Westerberg <mika.westerberg@linux.intel.com>
-Date: Mon, 22 Aug 2016 14:42:52 +0300
-Subject: [PATCH 08/31] pinctrl: cherryview: Do not mask all interrupts in
- probe
-
-commit bcb48cca23ec9852739e4a464307fa29515bbe48 upstream.
-
-The Cherryview GPIO controller has 8 or 16 wires connected to the I/O-APIC
-which can be used directly by the platform/BIOS or drivers. One such wire
-is used as SCI (System Control Interrupt) which ACPI depends on to be able
-to trigger GPEs (General Purpose Events).
-
-The pinctrl driver itself uses another IRQ resource which is wire OR of all
-the 8 (or 16) wires and follows what BIOS has programmed to the IntSel
-register of each pin.
-
-Currently the driver masks all interrupts at probe time and this prevents
-these direct interrupts from working as expected. The reason for this is
-that some early stage prototypes had some pins misconfigured causing lots
-of spurious interrupts.
-
-We fix this by leaving the interrupt mask untouched. This allows SCI and
-other direct interrupts work properly. What comes to the possible spurious
-interrupts we switch the default handler to be handle_bad_irq() instead of
-handle_simple_irq() (which was not correct anyway).
-
-Reported-by: Yu C Chen <yu.c.chen@intel.com>
-Reported-by: Anisse Astier <anisse@astier.eu>
-Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
-Signed-off-by: Linus Walleij <linus.walleij@linaro.org>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/pinctrl/intel/pinctrl-cherryview.c | 5 ++---
- 1 file changed, 2 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/pinctrl/intel/pinctrl-cherryview.c b/drivers/pinctrl/intel/pinctrl-cherryview.c
-index a009ae34c5ef..930f0f25c1ce 100644
---- a/drivers/pinctrl/intel/pinctrl-cherryview.c
-+++ b/drivers/pinctrl/intel/pinctrl-cherryview.c
-@@ -1466,12 +1466,11 @@ static int chv_gpio_probe(struct chv_pinctrl *pctrl, int irq)
- 		offset += range->npins;
- 	}
+diff --git a/drivers/char/tpm/tpm_tis.c b/drivers/char/tpm/tpm_tis.c
+index 65f7eecc45b0..f10a107614b4 100644
+--- a/drivers/char/tpm/tpm_tis.c
++++ b/drivers/char/tpm/tpm_tis.c
+@@ -401,7 +401,7 @@ static void disable_interrupts(struct tpm_chip *chip)
+ 	iowrite32(intmask,
+ 		  chip->vendor.iobase +
+ 		  TPM_INT_ENABLE(chip->vendor.locality));
+-	free_irq(chip->vendor.irq, chip);
++	devm_free_irq(chip->pdev, chip->vendor.irq, chip);
+ 	chip->vendor.irq = 0;
+ }
  
--	/* Mask and clear all interrupts */
--	chv_writel(0, pctrl->regs + CHV_INTMASK);
-+	/* Clear all interrupts */
- 	chv_writel(0xffff, pctrl->regs + CHV_INTSTAT);
+diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
+index 8412ce5f93a7..86fa9fdc8323 100644
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@ -626,9 +626,11 @@ static ssize_t show_cpuinfo_cur_freq(struct cpufreq_policy *policy,
+ 					char *buf)
+ {
+ 	unsigned int cur_freq = __cpufreq_get(policy);
+-	if (!cur_freq)
+-		return sprintf(buf, "<unknown>");
+-	return sprintf(buf, "%u\n", cur_freq);
++
++	if (cur_freq)
++		return sprintf(buf, "%u\n", cur_freq);
++
++	return sprintf(buf, "<unknown>\n");
+ }
  
- 	ret = gpiochip_irqchip_add(chip, &chv_gpio_irqchip, 0,
--				   handle_simple_irq, IRQ_TYPE_NONE);
-+				   handle_bad_irq, IRQ_TYPE_NONE);
- 	if (ret) {
- 		dev_err(pctrl->dev, "failed to add IRQ chip\n");
- 		goto fail;
--- 
-2.28.0
-
-
-From 0a2512768f1683514ef964e2e0767458baef14de Mon Sep 17 00:00:00 2001
-From: Vitaly Kuznetsov <vkuznets@redhat.com>
-Date: Sat, 30 Apr 2016 19:21:35 -0700
-Subject: [PATCH 09/31] Drivers: hv: balloon: don't crash when memory is added
- in non-sorted order
-
-commit 77c0c9735bc0ba5898e637a3a20d6bcb50e3f67d upstream.
-
-When we iterate through all HA regions in handle_pg_range() we have an
-assumption that all these regions are sorted in the list and the
-'start_pfn >= has->end_pfn' check is enough to find the proper region.
-Unfortunately it's not the case with WS2016 where host can hot-add regions
-in a different order. We end up modifying the wrong HA region and crashing
-later on pages online. Modify the check to make sure we found the region
-we were searching for while iterating. Fix the same check in pfn_covered()
-as well.
-
-Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
-Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/hv/hv_balloon.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/hv/hv_balloon.c b/drivers/hv/hv_balloon.c
-index b853b4b083bd..43af91362be5 100644
---- a/drivers/hv/hv_balloon.c
-+++ b/drivers/hv/hv_balloon.c
-@@ -714,7 +714,7 @@ static bool pfn_covered(unsigned long start_pfn, unsigned long pfn_cnt)
- 		 * If the pfn range we are dealing with is not in the current
- 		 * "hot add block", move on.
- 		 */
--		if ((start_pfn >= has->end_pfn))
-+		if (start_pfn < has->start_pfn || start_pfn >= has->end_pfn)
- 			continue;
- 		/*
- 		 * If the current hot add-request extends beyond
-@@ -768,7 +768,7 @@ static unsigned long handle_pg_range(unsigned long pg_start,
- 		 * If the pfn range we are dealing with is not in the current
- 		 * "hot add block", move on.
- 		 */
--		if ((start_pfn >= has->end_pfn))
-+		if (start_pfn < has->start_pfn || start_pfn >= has->end_pfn)
- 			continue;
- 
- 		old_covered_state = has->covered_end_pfn;
--- 
-2.28.0
-
-
-From b1a0f744f8e63fbef10dc84029e9d213e03a3a18 Mon Sep 17 00:00:00 2001
-From: Vitaly Kuznetsov <vkuznets@redhat.com>
-Date: Fri, 3 Jun 2016 17:09:22 -0700
-Subject: [PATCH 10/31] Drivers: hv: avoid vfree() on crash
-
-commit a9f61ca793becabdefab03b77568d6c6f8c1bc79 upstream.
-
-When we crash from NMI context (e.g. after NMI injection from host when
-'sysctl -w kernel.unknown_nmi_panic=1' is set) we hit
-
-    kernel BUG at mm/vmalloc.c:1530!
-
-as vfree() is denied. While the issue could be solved with in_nmi() check
-instead I opted for skipping vfree on all sorts of crashes to reduce the
-amount of work which can cause consequent crashes. We don't really need to
-free anything on crash.
-
-Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
-Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/hv/hv.c           | 8 +++++---
- drivers/hv/hyperv_vmbus.h | 2 +-
- drivers/hv/vmbus_drv.c    | 8 ++++----
- 3 files changed, 10 insertions(+), 8 deletions(-)
-
+ /**
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+index 7c42ff670080..a0924330d125 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+@@ -25,6 +25,7 @@
+  *          Alex Deucher
+  *          Jerome Glisse
+  */
++#include <linux/irq.h>
+ #include <drm/drmP.h>
+ #include <drm/drm_crtc_helper.h>
+ #include <drm/amdgpu_drm.h>
 diff --git a/drivers/hv/hv.c b/drivers/hv/hv.c
 index 57c191798699..ddbf7e7e0d98 100644
 --- a/drivers/hv/hv.c
@@ -786,6 +253,28 @@ index 57c191798699..ddbf7e7e0d98 100644
  		hv_context.tsc_page = NULL;
  	}
  #endif
+diff --git a/drivers/hv/hv_balloon.c b/drivers/hv/hv_balloon.c
+index b853b4b083bd..43af91362be5 100644
+--- a/drivers/hv/hv_balloon.c
++++ b/drivers/hv/hv_balloon.c
+@@ -714,7 +714,7 @@ static bool pfn_covered(unsigned long start_pfn, unsigned long pfn_cnt)
+ 		 * If the pfn range we are dealing with is not in the current
+ 		 * "hot add block", move on.
+ 		 */
+-		if ((start_pfn >= has->end_pfn))
++		if (start_pfn < has->start_pfn || start_pfn >= has->end_pfn)
+ 			continue;
+ 		/*
+ 		 * If the current hot add-request extends beyond
+@@ -768,7 +768,7 @@ static unsigned long handle_pg_range(unsigned long pg_start,
+ 		 * If the pfn range we are dealing with is not in the current
+ 		 * "hot add block", move on.
+ 		 */
+-		if ((start_pfn >= has->end_pfn))
++		if (start_pfn < has->start_pfn || start_pfn >= has->end_pfn)
+ 			continue;
+ 
+ 		old_covered_state = has->covered_end_pfn;
 diff --git a/drivers/hv/hyperv_vmbus.h b/drivers/hv/hyperv_vmbus.h
 index 12156db2e88e..75e383e6d03d 100644
 --- a/drivers/hv/hyperv_vmbus.h
@@ -839,317 +328,50 @@ index 509ed9731630..802dcb409030 100644
  	for_each_online_cpu(cpu) {
  		tasklet_kill(hv_context.event_dpc[cpu]);
  		smp_call_function_single(cpu, hv_synic_cleanup, NULL, 1);
--- 
-2.28.0
-
-
-From e2d9577854f5a5469bcf7a3d1b17ca5e9b9ba673 Mon Sep 17 00:00:00 2001
-From: Ross Lagerwall <ross.lagerwall@citrix.com>
-Date: Fri, 22 Apr 2016 13:05:31 +0100
-Subject: [PATCH 11/31] xen/qspinlock: Don't kick CPU if IRQ is not initialized
-
-commit 707e59ba494372a90d245f18b0c78982caa88e48 upstream.
-
-The following commit:
-
-  1fb3a8b2cfb2 ("xen/spinlock: Fix locking path engaging too soon under PVHVM.")
-
-... moved the initalization of the kicker interrupt until after
-native_cpu_up() is called.
-
-However, when using qspinlocks, a CPU may try to kick another CPU that is
-spinning (because it has not yet initialized its kicker interrupt), resulting
-in the following crash during boot:
-
-  kernel BUG at /build/linux-Ay7j_C/linux-4.4.0/drivers/xen/events/events_base.c:1210!
-  invalid opcode: 0000 [#1] SMP
-  ...
-  RIP: 0010:[<ffffffff814c97c9>]  [<ffffffff814c97c9>] xen_send_IPI_one+0x59/0x60
-  ...
-  Call Trace:
-   [<ffffffff8102be9e>] xen_qlock_kick+0xe/0x10
-   [<ffffffff810cabc2>] __pv_queued_spin_unlock+0xb2/0xf0
-   [<ffffffff810ca6d1>] ? __raw_callee_save___pv_queued_spin_unlock+0x11/0x20
-   [<ffffffff81052936>] ? check_tsc_warp+0x76/0x150
-   [<ffffffff81052aa6>] check_tsc_sync_source+0x96/0x160
-   [<ffffffff81051e28>] native_cpu_up+0x3d8/0x9f0
-   [<ffffffff8102b315>] xen_hvm_cpu_up+0x35/0x80
-   [<ffffffff8108198c>] _cpu_up+0x13c/0x180
-   [<ffffffff81081a4a>] cpu_up+0x7a/0xa0
-   [<ffffffff81f80dfc>] smp_init+0x7f/0x81
-   [<ffffffff81f5a121>] kernel_init_freeable+0xef/0x212
-   [<ffffffff81817f30>] ? rest_init+0x80/0x80
-   [<ffffffff81817f3e>] kernel_init+0xe/0xe0
-   [<ffffffff8182488f>] ret_from_fork+0x3f/0x70
-   [<ffffffff81817f30>] ? rest_init+0x80/0x80
-
-To fix this, only send the kick if the target CPU's interrupt has been
-initialized. This check isn't racy, because the target is waiting for
-the spinlock, so it won't have initialized the interrupt in the
-meantime.
-
-Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
-Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
-Cc: David Vrabel <david.vrabel@citrix.com>
-Cc: Juergen Gross <jgross@suse.com>
-Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: linux-kernel@vger.kernel.org
-Cc: xen-devel@lists.xenproject.org
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/xen/spinlock.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/arch/x86/xen/spinlock.c b/arch/x86/xen/spinlock.c
-index 9e2ba5c6e1dd..f42e78de1e10 100644
---- a/arch/x86/xen/spinlock.c
-+++ b/arch/x86/xen/spinlock.c
-@@ -27,6 +27,12 @@ static bool xen_pvspin = true;
+diff --git a/drivers/isdn/gigaset/bas-gigaset.c b/drivers/isdn/gigaset/bas-gigaset.c
+index aecec6d32463..7f1c625b08ec 100644
+--- a/drivers/isdn/gigaset/bas-gigaset.c
++++ b/drivers/isdn/gigaset/bas-gigaset.c
+@@ -2317,6 +2317,9 @@ static int gigaset_probe(struct usb_interface *interface,
+ 		return -ENODEV;
+ 	}
  
- static void xen_qlock_kick(int cpu)
- {
-+	int irq = per_cpu(lock_kicker_irq, cpu);
++	if (hostif->desc.bNumEndpoints < 1)
++		return -ENODEV;
 +
-+	/* Don't kick if the target's kicker interrupt is not initialized. */
-+	if (irq == -1)
-+		return;
-+
- 	xen_send_IPI_one(cpu, XEN_SPIN_UNLOCK_VECTOR);
- }
- 
--- 
-2.28.0
-
-
-From 50730d7f361f9915ec7063a629500119b0e8c3b6 Mon Sep 17 00:00:00 2001
-From: Thomas Huth <thuth@redhat.com>
-Date: Wed, 18 May 2016 21:01:20 +0200
-Subject: [PATCH 12/31] KVM: PPC: Book3S PR: Fix illegal opcode emulation
-
-commit 708e75a3ee750dce1072134e630d66c4e6eaf63c upstream.
-
-If kvmppc_handle_exit_pr() calls kvmppc_emulate_instruction() to emulate
-one instruction (in the BOOK3S_INTERRUPT_H_EMUL_ASSIST case), it calls
-kvmppc_core_queue_program() afterwards if kvmppc_emulate_instruction()
-returned EMULATE_FAIL, so the guest gets an program interrupt for the
-illegal opcode.
-However, the kvmppc_emulate_instruction() also tried to inject a
-program exception for this already, so the program interrupt gets
-injected twice and the return address in srr0 gets destroyed.
-All other callers of kvmppc_emulate_instruction() are also injecting
-a program interrupt, and since the callers have the right knowledge
-about the srr1 flags that should be used, it is the function
-kvmppc_emulate_instruction() that should _not_ inject program
-interrupts, so remove the kvmppc_core_queue_program() here.
-
-This fixes the issue discovered by Laurent Vivier with kvm-unit-tests
-where the logs are filled with these messages when the test tries
-to execute an illegal instruction:
-
-     Couldn't emulate instruction 0x00000000 (op 0 xop 0)
-     kvmppc_handle_exit_pr: emulation at 700 failed (00000000)
-
-Signed-off-by: Thomas Huth <thuth@redhat.com>
-Reviewed-by: Alexander Graf <agraf@suse.de>
-Tested-by: Laurent Vivier <lvivier@redhat.com>
-Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/kvm/emulate.c | 1 -
- 1 file changed, 1 deletion(-)
-
-diff --git a/arch/powerpc/kvm/emulate.c b/arch/powerpc/kvm/emulate.c
-index 5cc2e7af3a7b..b379146de55b 100644
---- a/arch/powerpc/kvm/emulate.c
-+++ b/arch/powerpc/kvm/emulate.c
-@@ -302,7 +302,6 @@ int kvmppc_emulate_instruction(struct kvm_run *run, struct kvm_vcpu *vcpu)
- 			advance = 0;
- 			printk(KERN_ERR "Couldn't emulate instruction 0x%08x "
- 			       "(op %d xop %d)\n", inst, get_op(inst), get_xop(inst));
--			kvmppc_core_queue_program(vcpu, 0);
+ 	dev_info(&udev->dev,
+ 		 "%s: Device matched (Vendor: 0x%x, Product: 0x%x)\n",
+ 		 __func__, le16_to_cpu(udev->descriptor.idVendor),
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index ebb0dd612ebd..122af340a531 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -1477,7 +1477,25 @@ static void make_request(struct mddev *mddev, struct bio *bio)
+ 			split = bio;
  		}
- 	}
  
--- 
-2.28.0
-
-
-From 68ea3948ed3d48dd1e0897b121f37da6f14ffbcc Mon Sep 17 00:00:00 2001
-From: Sebastian Ott <sebott@linux.vnet.ibm.com>
-Date: Fri, 15 Apr 2016 09:41:35 +0200
-Subject: [PATCH 13/31] s390/pci: fix use after free in dma_init
-
-commit dba599091c191d209b1499511a524ad9657c0e5a upstream.
-
-After a failure during registration of the dma_table (because of the
-function being in error state) we free its memory but don't reset the
-associated pointer to zero.
-
-When we then receive a notification from firmware (about the function
-being in error state) we'll try to walk and free the dma_table again.
-
-Fix this by resetting the dma_table pointer. In addition to that make
-sure that we free the iommu_bitmap when appropriate.
-
-Signed-off-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
-Reviewed-by: Gerald Schaefer <gerald.schaefer@de.ibm.com>
-Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/s390/pci/pci_dma.c | 16 ++++++++++------
- 1 file changed, 10 insertions(+), 6 deletions(-)
-
-diff --git a/arch/s390/pci/pci_dma.c b/arch/s390/pci/pci_dma.c
-index 3a40f718baef..4004e03267cd 100644
---- a/arch/s390/pci/pci_dma.c
-+++ b/arch/s390/pci/pci_dma.c
-@@ -455,7 +455,7 @@ int zpci_dma_init_device(struct zpci_dev *zdev)
- 	zdev->dma_table = dma_alloc_cpu_table();
- 	if (!zdev->dma_table) {
- 		rc = -ENOMEM;
--		goto out_clean;
-+		goto out;
- 	}
++		/*
++		 * If a bio is splitted, the first part of bio will pass
++		 * barrier but the bio is queued in current->bio_list (see
++		 * generic_make_request). If there is a raise_barrier() called
++		 * here, the second part of bio can't pass barrier. But since
++		 * the first part bio isn't dispatched to underlaying disks
++		 * yet, the barrier is never released, hence raise_barrier will
++		 * alays wait. We have a deadlock.
++		 * Note, this only happens in read path. For write path, the
++		 * first part of bio is dispatched in a schedule() call
++		 * (because of blk plug) or offloaded to raid10d.
++		 * Quitting from the function immediately can change the bio
++		 * order queued in bio_list and avoid the deadlock.
++		 */
+ 		__make_request(mddev, split);
++		if (split != bio && bio_data_dir(bio) == READ) {
++			generic_make_request(bio);
++			break;
++		}
+ 	} while (split != bio);
  
- 	/*
-@@ -475,18 +475,22 @@ int zpci_dma_init_device(struct zpci_dev *zdev)
- 	zdev->iommu_bitmap = vzalloc(zdev->iommu_pages / 8);
- 	if (!zdev->iommu_bitmap) {
- 		rc = -ENOMEM;
--		goto out_reg;
-+		goto free_dma_table;
- 	}
- 
- 	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
- 				(u64) zdev->dma_table);
- 	if (rc)
--		goto out_reg;
--	return 0;
-+		goto free_bitmap;
- 
--out_reg:
-+	return 0;
-+free_bitmap:
-+	vfree(zdev->iommu_bitmap);
-+	zdev->iommu_bitmap = NULL;
-+free_dma_table:
- 	dma_free_cpu_table(zdev->dma_table);
--out_clean:
-+	zdev->dma_table = NULL;
-+out:
- 	return rc;
- }
- 
--- 
-2.28.0
-
-
-From 13a26889cbc1eb8a7b9a7712c05538c55659fe40 Mon Sep 17 00:00:00 2001
-From: Dave Airlie <airlied@redhat.com>
-Date: Thu, 14 Jan 2016 08:07:55 +1000
-Subject: [PATCH 14/31] drm/amdgpu: add missing irq.h include
-
-commit e9c5e7402dad6f4f04c2430db6f283512bcd4392 upstream.
-
-this fixes the build on arm.
-
-Signed-off-by: Dave Airlie <airlied@redhat.com>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
-index 7c42ff670080..a0924330d125 100644
---- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
-+++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
-@@ -25,6 +25,7 @@
-  *          Alex Deucher
-  *          Jerome Glisse
-  */
-+#include <linux/irq.h>
- #include <drm/drmP.h>
- #include <drm/drm_crtc_helper.h>
- #include <drm/amdgpu_drm.h>
--- 
-2.28.0
-
-
-From cea050150323a2c09efc316f0272af053e0b87e2 Mon Sep 17 00:00:00 2001
-From: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
-Date: Wed, 25 Nov 2015 14:05:30 -0700
-Subject: [PATCH 15/31] tpm_tis: Use devm_free_irq not free_irq
-
-commit 727f28b8ca24a581c7bd868326b8cea1058c720a upstream.
-
-The interrupt is always allocated with devm_request_irq so it
-must always be freed with devm_free_irq.
-
-Fixes: 448e9c55c12d ("tpm_tis: verify interrupt during init")
-Signed-off-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
-Acked-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Tested-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Tested-by: Martin Wilck <Martin.Wilck@ts.fujitsu.com>
-Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Acked-by: Peter Huewe <peterhuewe@gmx.de>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/char/tpm/tpm_tis.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/char/tpm/tpm_tis.c b/drivers/char/tpm/tpm_tis.c
-index 65f7eecc45b0..f10a107614b4 100644
---- a/drivers/char/tpm/tpm_tis.c
-+++ b/drivers/char/tpm/tpm_tis.c
-@@ -401,7 +401,7 @@ static void disable_interrupts(struct tpm_chip *chip)
- 	iowrite32(intmask,
- 		  chip->vendor.iobase +
- 		  TPM_INT_ENABLE(chip->vendor.locality));
--	free_irq(chip->vendor.irq, chip);
-+	devm_free_irq(chip->pdev, chip->vendor.irq, chip);
- 	chip->vendor.irq = 0;
- }
- 
--- 
-2.28.0
-
-
-From 6cc5b73d79697e1a529249572ac022192f1ddffd Mon Sep 17 00:00:00 2001
-From: Vitaly Kuznetsov <vkuznets@redhat.com>
-Date: Mon, 25 Jan 2016 16:00:41 +0100
-Subject: [PATCH 16/31] hv_netvsc: use skb_get_hash() instead of a homegrown
- implementation
-
-commit 757647e10e55c01fb7a9c4356529442e316a7c72 upstream.
-
-Recent changes to 'struct flow_keys' (e.g commit d34af823ff40 ("net: Add
-VLAN ID to flow_keys")) introduced a performance regression in netvsc
-driver. Is problem is, however, not the above mentioned commit but the
-fact that netvsc_set_hash() function did some assumptions on the struct
-flow_keys data layout and this is wrong.
-
-Get rid of netvsc_set_hash() by switching to skb_get_hash(). This change
-will also imply switching to Jenkins hash from the currently used Toeplitz
-but it seems there is no good excuse for Toeplitz to stay.
-
-Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
-Acked-by: Eric Dumazet <edumazet@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/hyperv/netvsc_drv.c | 67 ++-------------------------------
- 1 file changed, 3 insertions(+), 64 deletions(-)
-
+ 	/* In case raid10d snuck in to freeze_array */
 diff --git a/drivers/net/hyperv/netvsc_drv.c b/drivers/net/hyperv/netvsc_drv.c
 index e8a09ff9e724..c8a7802d2953 100644
 --- a/drivers/net/hyperv/netvsc_drv.c
@@ -1235,701 +457,73 @@ index e8a09ff9e724..c8a7802d2953 100644
  
  	return q_idx;
  }
--- 
-2.28.0
-
-
-From 6052eb871217c0679ac63779fc5e43eb49c83b0c Mon Sep 17 00:00:00 2001
-From: Andi Kleen <ak@linux.intel.com>
-Date: Mon, 23 May 2016 16:24:05 -0700
-Subject: [PATCH 17/31] kernek/fork.c: allocate idle task for a CPU always on
- its local node
-
-commit 725fc629ff2545b061407305ae51016c9f928fce upstream.
-
-Linux preallocates the task structs of the idle tasks for all possible
-CPUs.  This currently means they all end up on node 0.  This also
-implies that the cache line of MWAIT, which is around the flags field in
-the task struct, are all located in node 0.
-
-We see a noticeable performance improvement on Knights Landing CPUs when
-the cache lines used for MWAIT are located in the local nodes of the
-CPUs using them.  I would expect this to give a (likely slight)
-improvement on other systems too.
-
-The patch implements placing the idle task in the node of its CPUs, by
-passing the right target node to copy_process()
-
-[akpm@linux-foundation.org: use NUMA_NO_NODE, not a bare -1]
-Link: http://lkml.kernel.org/r/1463492694-15833-1-git-send-email-andi@firstfloor.org
-Signed-off-by: Andi Kleen <ak@linux.intel.com>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Sumit Semwal <sumit.semwal@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/fork.c | 15 +++++++++------
- 1 file changed, 9 insertions(+), 6 deletions(-)
-
-diff --git a/kernel/fork.c b/kernel/fork.c
-index 2e55b53399de..278a2ddad351 100644
---- a/kernel/fork.c
-+++ b/kernel/fork.c
-@@ -331,13 +331,14 @@ void set_task_stack_end_magic(struct task_struct *tsk)
- 	*stackend = STACK_END_MAGIC;	/* for overflow detection */
- }
- 
--static struct task_struct *dup_task_struct(struct task_struct *orig)
-+static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
- {
- 	struct task_struct *tsk;
- 	struct thread_info *ti;
--	int node = tsk_fork_get_node(orig);
- 	int err;
- 
-+	if (node == NUMA_NO_NODE)
-+		node = tsk_fork_get_node(orig);
- 	tsk = alloc_task_struct_node(node);
- 	if (!tsk)
- 		return NULL;
-@@ -1270,7 +1271,8 @@ static struct task_struct *copy_process(unsigned long clone_flags,
- 					int __user *child_tidptr,
- 					struct pid *pid,
- 					int trace,
--					unsigned long tls)
-+					unsigned long tls,
-+					int node)
- {
- 	int retval;
- 	struct task_struct *p;
-@@ -1323,7 +1325,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
- 		goto fork_out;
- 
- 	retval = -ENOMEM;
--	p = dup_task_struct(current);
-+	p = dup_task_struct(current, node);
- 	if (!p)
- 		goto fork_out;
- 
-@@ -1699,7 +1701,8 @@ static inline void init_idle_pids(struct pid_link *links)
- struct task_struct *fork_idle(int cpu)
- {
- 	struct task_struct *task;
--	task = copy_process(CLONE_VM, 0, 0, NULL, &init_struct_pid, 0, 0);
-+	task = copy_process(CLONE_VM, 0, 0, NULL, &init_struct_pid, 0, 0,
-+			    cpu_to_node(cpu));
- 	if (!IS_ERR(task)) {
- 		init_idle_pids(task->pids);
- 		init_idle(task, cpu);
-@@ -1744,7 +1747,7 @@ long _do_fork(unsigned long clone_flags,
+diff --git a/drivers/pinctrl/intel/pinctrl-cherryview.c b/drivers/pinctrl/intel/pinctrl-cherryview.c
+index a009ae34c5ef..930f0f25c1ce 100644
+--- a/drivers/pinctrl/intel/pinctrl-cherryview.c
++++ b/drivers/pinctrl/intel/pinctrl-cherryview.c
+@@ -1466,12 +1466,11 @@ static int chv_gpio_probe(struct chv_pinctrl *pctrl, int irq)
+ 		offset += range->npins;
  	}
  
- 	p = copy_process(clone_flags, stack_start, stack_size,
--			 child_tidptr, NULL, trace, tls);
-+			 child_tidptr, NULL, trace, tls, NUMA_NO_NODE);
- 	/*
- 	 * Do this prior waking up the new thread - the thread pointer
- 	 * might get invalid after that point, if the thread exits quickly.
--- 
-2.28.0
-
-
-From 4cb0c0b73d1c79a8ce260836b3f27650aa1c57f1 Mon Sep 17 00:00:00 2001
-From: Linus Torvalds <torvalds@linux-foundation.org>
-Date: Thu, 2 Mar 2017 12:17:22 -0800
-Subject: [PATCH 18/31] give up on gcc ilog2() constant optimizations
-
-commit 474c90156c8dcc2fa815e6716cc9394d7930cb9c upstream.
-
-gcc-7 has an "optimization" pass that completely screws up, and
-generates the code expansion for the (impossible) case of calling
-ilog2() with a zero constant, even when the code gcc compiles does not
-actually have a zero constant.
-
-And we try to generate a compile-time error for anybody doing ilog2() on
-a constant where that doesn't make sense (be it zero or negative).  So
-now gcc7 will fail the build due to our sanity checking, because it
-created that constant-zero case that didn't actually exist in the source
-code.
-
-There's a whole long discussion on the kernel mailing about how to work
-around this gcc bug.  The gcc people themselevs have discussed their
-"feature" in
-
-   https://gcc.gnu.org/bugzilla/show_bug.cgi?id=72785
-
-but it's all water under the bridge, because while it looked at one
-point like it would be solved by the time gcc7 was released, that was
-not to be.
-
-So now we have to deal with this compiler braindamage.
-
-And the only simple approach seems to be to just delete the code that
-tries to warn about bad uses of ilog2().
-
-So now "ilog2()" will just return 0 not just for the value 1, but for
-any non-positive value too.
-
-It's not like I can recall anybody having ever actually tried to use
-this function on any invalid value, but maybe the sanity check just
-meant that such code never made it out in public.
-
-Reported-by: Laura Abbott <labbott@redhat.com>
-Cc: John Stultz <john.stultz@linaro.org>,
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: Ard Biesheuvel <ard.biesheuvel@linaro.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Jiri Slaby <jslaby@suse.cz>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/log2.h       | 13 ++-----------
- tools/include/linux/log2.h | 13 ++-----------
- 2 files changed, 4 insertions(+), 22 deletions(-)
-
-diff --git a/include/linux/log2.h b/include/linux/log2.h
-index fd7ff3d91e6a..f38fae23bdac 100644
---- a/include/linux/log2.h
-+++ b/include/linux/log2.h
-@@ -15,12 +15,6 @@
- #include <linux/types.h>
- #include <linux/bitops.h>
+-	/* Mask and clear all interrupts */
+-	chv_writel(0, pctrl->regs + CHV_INTMASK);
++	/* Clear all interrupts */
+ 	chv_writel(0xffff, pctrl->regs + CHV_INTSTAT);
  
--/*
-- * deal with unrepresentable constant logarithms
-- */
--extern __attribute__((const, noreturn))
--int ____ilog2_NaN(void);
--
- /*
-  * non-constant log of base 2 calculators
-  * - the arch may override these in asm/bitops.h if they can be implemented
-@@ -85,7 +79,7 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
- #define ilog2(n)				\
- (						\
- 	__builtin_constant_p(n) ? (		\
--		(n) < 1 ? ____ilog2_NaN() :	\
-+		(n) < 2 ? 0 :			\
- 		(n) & (1ULL << 63) ? 63 :	\
- 		(n) & (1ULL << 62) ? 62 :	\
- 		(n) & (1ULL << 61) ? 61 :	\
-@@ -148,10 +142,7 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
- 		(n) & (1ULL <<  4) ?  4 :	\
- 		(n) & (1ULL <<  3) ?  3 :	\
- 		(n) & (1ULL <<  2) ?  2 :	\
--		(n) & (1ULL <<  1) ?  1 :	\
--		(n) & (1ULL <<  0) ?  0 :	\
--		____ilog2_NaN()			\
--				   ) :		\
-+		1 ) :				\
- 	(sizeof(n) <= 4) ?			\
- 	__ilog2_u32(n) :			\
- 	__ilog2_u64(n)				\
-diff --git a/tools/include/linux/log2.h b/tools/include/linux/log2.h
-index 41446668ccce..d5677d39c1e4 100644
---- a/tools/include/linux/log2.h
-+++ b/tools/include/linux/log2.h
-@@ -12,12 +12,6 @@
- #ifndef _TOOLS_LINUX_LOG2_H
- #define _TOOLS_LINUX_LOG2_H
+ 	ret = gpiochip_irqchip_add(chip, &chv_gpio_irqchip, 0,
+-				   handle_simple_irq, IRQ_TYPE_NONE);
++				   handle_bad_irq, IRQ_TYPE_NONE);
+ 	if (ret) {
+ 		dev_err(pctrl->dev, "failed to add IRQ chip\n");
+ 		goto fail;
+diff --git a/drivers/scsi/cxlflash/common.h b/drivers/scsi/cxlflash/common.h
+index 5ada9268a450..a8ac4c0a1493 100644
+--- a/drivers/scsi/cxlflash/common.h
++++ b/drivers/scsi/cxlflash/common.h
+@@ -34,7 +34,6 @@ extern const struct file_operations cxlflash_cxl_fops;
+ 								   sectors
+ 								*/
  
--/*
-- * deal with unrepresentable constant logarithms
-- */
--extern __attribute__((const, noreturn))
--int ____ilog2_NaN(void);
--
- /*
-  * non-constant log of base 2 calculators
-  * - the arch may override these in asm/bitops.h if they can be implemented
-@@ -78,7 +72,7 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
- #define ilog2(n)				\
- (						\
- 	__builtin_constant_p(n) ? (		\
--		(n) < 1 ? ____ilog2_NaN() :	\
-+		(n) < 2 ? 0 :			\
- 		(n) & (1ULL << 63) ? 63 :	\
- 		(n) & (1ULL << 62) ? 62 :	\
- 		(n) & (1ULL << 61) ? 61 :	\
-@@ -141,10 +135,7 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
- 		(n) & (1ULL <<  4) ?  4 :	\
- 		(n) & (1ULL <<  3) ?  3 :	\
- 		(n) & (1ULL <<  2) ?  2 :	\
--		(n) & (1ULL <<  1) ?  1 :	\
--		(n) & (1ULL <<  0) ?  0 :	\
--		____ilog2_NaN()			\
--				   ) :		\
-+		1 ) :				\
- 	(sizeof(n) <= 4) ?			\
- 	__ilog2_u32(n) :			\
- 	__ilog2_u64(n)				\
--- 
-2.28.0
-
-
-From f02729f2ab87c84bbc959e7631487a4b84dbdf63 Mon Sep 17 00:00:00 2001
-From: Peter Zijlstra <peterz@infradead.org>
-Date: Thu, 16 Mar 2017 13:47:49 +0100
-Subject: [PATCH 19/31] perf/core: Fix event inheritance on fork()
-
-commit e7cc4865f0f31698ef2f7aac01a50e78968985b7 upstream.
-
-While hunting for clues to a use-after-free, Oleg spotted that
-perf_event_init_context() can loose an error value with the result
-that fork() can succeed even though we did not fully inherit the perf
-event context.
-
-Spotted-by: Oleg Nesterov <oleg@redhat.com>
-Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
-Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
-Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
-Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
-Cc: Dmitry Vyukov <dvyukov@google.com>
-Cc: Frederic Weisbecker <fweisbec@gmail.com>
-Cc: Jiri Olsa <jolsa@redhat.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Mathieu Desnoyers <mathieu.desnoyers@efficios.com>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Stephane Eranian <eranian@google.com>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: Vince Weaver <vincent.weaver@maine.edu>
-Cc: oleg@redhat.com
-Fixes: 889ff0150661 ("perf/core: Split context's event group list into pinned and non-pinned lists")
-Link: http://lkml.kernel.org/r/20170316125823.190342547@infradead.org
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/events/core.c | 5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
-
-diff --git a/kernel/events/core.c b/kernel/events/core.c
-index 9bbe9ac23cf2..e4b5494f05f8 100644
---- a/kernel/events/core.c
-+++ b/kernel/events/core.c
-@@ -9230,7 +9230,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
- 		ret = inherit_task_group(event, parent, parent_ctx,
- 					 child, ctxn, &inherited_all);
- 		if (ret)
--			break;
-+			goto out_unlock;
- 	}
+-#define NUM_RRQ_ENTRY    16     /* for master issued cmds */
+ #define MAX_RHT_PER_CONTEXT (PAGE_SIZE / sizeof(struct sisl_rht_entry))
  
- 	/*
-@@ -9246,7 +9246,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
- 		ret = inherit_task_group(event, parent, parent_ctx,
- 					 child, ctxn, &inherited_all);
- 		if (ret)
--			break;
-+			goto out_unlock;
- 	}
+ /* AFU command retry limit */
+@@ -48,9 +47,12 @@ extern const struct file_operations cxlflash_cxl_fops;
+ 							   index derivation
+ 							 */
  
- 	raw_spin_lock_irqsave(&parent_ctx->lock, flags);
-@@ -9274,6 +9274,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
- 	}
+-#define CXLFLASH_MAX_CMDS               16
++#define CXLFLASH_MAX_CMDS               256
+ #define CXLFLASH_MAX_CMDS_PER_LUN       CXLFLASH_MAX_CMDS
  
- 	raw_spin_unlock_irqrestore(&parent_ctx->lock, flags);
-+out_unlock:
- 	mutex_unlock(&parent_ctx->mutex);
- 
- 	perf_unpin_context(parent_ctx);
--- 
-2.28.0
-
-
-From 09875d1393d4589bcdfeeba8747a12dd69810cc9 Mon Sep 17 00:00:00 2001
-From: "Rafael J. Wysocki" <rafael.j.wysocki@intel.com>
-Date: Wed, 15 Mar 2017 00:12:16 +0100
-Subject: [PATCH 20/31] cpufreq: Fix and clean up show_cpuinfo_cur_freq()
-
-commit 9b4f603e7a9f4282aec451063ffbbb8bb410dcd9 upstream.
-
-There is a missing newline in show_cpuinfo_cur_freq(), so add it,
-but while at it clean that function up somewhat too.
-
-Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
-Acked-by: Viresh Kumar <viresh.kumar@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/cpufreq/cpufreq.c | 8 +++++---
- 1 file changed, 5 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/cpufreq/cpufreq.c b/drivers/cpufreq/cpufreq.c
-index 8412ce5f93a7..86fa9fdc8323 100644
---- a/drivers/cpufreq/cpufreq.c
-+++ b/drivers/cpufreq/cpufreq.c
-@@ -626,9 +626,11 @@ static ssize_t show_cpuinfo_cur_freq(struct cpufreq_policy *policy,
- 					char *buf)
- {
- 	unsigned int cur_freq = __cpufreq_get(policy);
--	if (!cur_freq)
--		return sprintf(buf, "<unknown>");
--	return sprintf(buf, "%u\n", cur_freq);
++/* RRQ for master issued cmds */
++#define NUM_RRQ_ENTRY                   CXLFLASH_MAX_CMDS
 +
-+	if (cur_freq)
-+		return sprintf(buf, "%u\n", cur_freq);
-+
-+	return sprintf(buf, "<unknown>\n");
- }
  
- /**
--- 
-2.28.0
-
-
-From b24473976b985fd1c1d57a9ea934f9792bf654cc Mon Sep 17 00:00:00 2001
-From: Michael Ellerman <mpe@ellerman.id.au>
-Date: Tue, 7 Mar 2017 16:14:49 +1100
-Subject: [PATCH 21/31] powerpc/boot: Fix zImage TOC alignment
-
-commit 97ee351b50a49717543533cfb85b4bf9d88c9680 upstream.
-
-Recent toolchains force the TOC to be 256 byte aligned. We need to
-enforce this alignment in the zImage linker script, otherwise pointers
-to our TOC variables (__toc_start) could be incorrect. If the actual
-start of the TOC and __toc_start don't have the same value we crash
-early in the zImage wrapper.
-
-Suggested-by: Alan Modra <amodra@gmail.com>
-Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/boot/zImage.lds.S | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/arch/powerpc/boot/zImage.lds.S b/arch/powerpc/boot/zImage.lds.S
-index 861e72109df2..f080abfc2f83 100644
---- a/arch/powerpc/boot/zImage.lds.S
-+++ b/arch/powerpc/boot/zImage.lds.S
-@@ -68,6 +68,7 @@ SECTIONS
-   }
+ static inline void check_sizes(void)
+ {
+@@ -149,7 +151,7 @@ struct afu_cmd {
+ struct afu {
+ 	/* Stuff requiring alignment go first. */
  
- #ifdef CONFIG_PPC64_BOOT_WRAPPER
-+  . = ALIGN(256);
-   .got :
-   {
-     __toc_start = .;
--- 
-2.28.0
-
-
-From 582f548924cdda2dadf842020075f6b2525421d2 Mon Sep 17 00:00:00 2001
-From: Shaohua Li <shli@fb.com>
-Date: Tue, 28 Feb 2017 13:00:20 -0800
-Subject: [PATCH 22/31] md/raid1/10: fix potential deadlock
-
-commit 61eb2b43b99ebdc9bc6bc83d9792257b243e7cb3 upstream.
-
-Neil Brown pointed out a potential deadlock in raid 10 code with
-bio_split/chain. The raid1 code could have the same issue, but recent
-barrier rework makes it less likely to happen. The deadlock happens in
-below sequence:
-
-1. generic_make_request(bio), this will set current->bio_list
-2. raid10_make_request will split bio to bio1 and bio2
-3. __make_request(bio1), wait_barrer, add underlayer disk bio to
-current->bio_list
-4. __make_request(bio2), wait_barrer
-
-If raise_barrier happens between 3 & 4, since wait_barrier runs at 3,
-raise_barrier waits for IO completion from 3. And since raise_barrier
-sets barrier, 4 waits for raise_barrier. But IO from 3 can't be
-dispatched because raid10_make_request() doesn't finished yet.
-
-The solution is to adjust the IO ordering. Quotes from Neil:
-"
-It is much safer to:
-
-    if (need to split) {
-        split = bio_split(bio, ...)
-        bio_chain(...)
-        make_request_fn(split);
-        generic_make_request(bio);
-   } else
-        make_request_fn(mddev, bio);
-
-This way we first process the initial section of the bio (in 'split')
-which will queue some requests to the underlying devices.  These
-requests will be queued in generic_make_request.
-Then we queue the remainder of the bio, which will be added to the end
-of the generic_make_request queue.
-Then we return.
-generic_make_request() will pop the lower-level device requests off the
-queue and handle them first.  Then it will process the remainder
-of the original bio once the first section has been fully processed.
-"
-
-Note, this only happens in read path. In write path, the bio is flushed to
-underlaying disks either by blk flush (from schedule) or offladed to raid1/10d.
-It's queued in current->bio_list.
-
-Cc: Coly Li <colyli@suse.de>
-Suggested-by: NeilBrown <neilb@suse.com>
-Reviewed-by: Jack Wang <jinpu.wang@profitbricks.com>
-Signed-off-by: Shaohua Li <shli@fb.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/md/raid10.c | 18 ++++++++++++++++++
- 1 file changed, 18 insertions(+)
-
-diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
-index ebb0dd612ebd..122af340a531 100644
---- a/drivers/md/raid10.c
-+++ b/drivers/md/raid10.c
-@@ -1477,7 +1477,25 @@ static void make_request(struct mddev *mddev, struct bio *bio)
- 			split = bio;
- 		}
- 
-+		/*
-+		 * If a bio is splitted, the first part of bio will pass
-+		 * barrier but the bio is queued in current->bio_list (see
-+		 * generic_make_request). If there is a raise_barrier() called
-+		 * here, the second part of bio can't pass barrier. But since
-+		 * the first part bio isn't dispatched to underlaying disks
-+		 * yet, the barrier is never released, hence raise_barrier will
-+		 * alays wait. We have a deadlock.
-+		 * Note, this only happens in read path. For write path, the
-+		 * first part of bio is dispatched in a schedule() call
-+		 * (because of blk plug) or offloaded to raid10d.
-+		 * Quitting from the function immediately can change the bio
-+		 * order queued in bio_list and avoid the deadlock.
-+		 */
- 		__make_request(mddev, split);
-+		if (split != bio && bio_data_dir(bio) == READ) {
-+			generic_make_request(bio);
-+			break;
-+		}
- 	} while (split != bio);
- 
- 	/* In case raid10d snuck in to freeze_array */
--- 
-2.28.0
-
-
-From 0a621633cdfa780c50907506457798c907cb8110 Mon Sep 17 00:00:00 2001
-From: Nicholas Bellinger <nab@linux-iscsi.org>
-Date: Thu, 3 Nov 2016 23:06:53 -0700
-Subject: [PATCH 23/31] target/pscsi: Fix TYPE_TAPE + TYPE_MEDIMUM_CHANGER
- export
-
-commit a04e54f2c35823ca32d56afcd5cea5b783e2f51a upstream.
-
-The following fixes a divide by zero OOPs with TYPE_TAPE
-due to pscsi_tape_read_blocksize() failing causing a zero
-sd->sector_size being propigated up via dev_attrib.hw_block_size.
-
-It also fixes another long-standing bug where TYPE_TAPE and
-TYPE_MEDIMUM_CHANGER where using pscsi_create_type_other(),
-which does not call scsi_device_get() to take the device
-reference.  Instead, rename pscsi_create_type_rom() to
-pscsi_create_type_nondisk() and use it for all cases.
-
-Finally, also drop a dump_stack() in pscsi_get_blocks() for
-non TYPE_DISK, which in modern target-core can get invoked
-via target_sense_desc_format() during CHECK_CONDITION.
-
-Reported-by: Malcolm Haak <insanemal@gmail.com>
-Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/target/target_core_pscsi.c | 47 ++++++++----------------------
- 1 file changed, 12 insertions(+), 35 deletions(-)
-
-diff --git a/drivers/target/target_core_pscsi.c b/drivers/target/target_core_pscsi.c
-index de18790eb21c..d72a4058fd08 100644
---- a/drivers/target/target_core_pscsi.c
-+++ b/drivers/target/target_core_pscsi.c
-@@ -154,7 +154,7 @@ static void pscsi_tape_read_blocksize(struct se_device *dev,
- 
- 	buf = kzalloc(12, GFP_KERNEL);
- 	if (!buf)
--		return;
-+		goto out_free;
- 
- 	memset(cdb, 0, MAX_COMMAND_SIZE);
- 	cdb[0] = MODE_SENSE;
-@@ -169,9 +169,10 @@ static void pscsi_tape_read_blocksize(struct se_device *dev,
- 	 * If MODE_SENSE still returns zero, set the default value to 1024.
+-	u64 rrq_entry[NUM_RRQ_ENTRY];	/* 128B RRQ */
++	u64 rrq_entry[NUM_RRQ_ENTRY];	/* 2K RRQ */
+ 	/*
+ 	 * Command & data for AFU commands.
  	 */
- 	sdev->sector_size = (buf[9] << 16) | (buf[10] << 8) | (buf[11]);
-+out_free:
- 	if (!sdev->sector_size)
- 		sdev->sector_size = 1024;
--out_free:
-+
- 	kfree(buf);
- }
- 
-@@ -314,9 +315,10 @@ static int pscsi_add_device_to_list(struct se_device *dev,
- 				sd->lun, sd->queue_depth);
- 	}
- 
--	dev->dev_attrib.hw_block_size = sd->sector_size;
-+	dev->dev_attrib.hw_block_size =
-+		min_not_zero((int)sd->sector_size, 512);
- 	dev->dev_attrib.hw_max_sectors =
--		min_t(int, sd->host->max_sectors, queue_max_hw_sectors(q));
-+		min_not_zero(sd->host->max_sectors, queue_max_hw_sectors(q));
- 	dev->dev_attrib.hw_queue_depth = sd->queue_depth;
- 
- 	/*
-@@ -339,8 +341,10 @@ static int pscsi_add_device_to_list(struct se_device *dev,
- 	/*
- 	 * For TYPE_TAPE, attempt to determine blocksize with MODE_SENSE.
- 	 */
--	if (sd->type == TYPE_TAPE)
-+	if (sd->type == TYPE_TAPE) {
- 		pscsi_tape_read_blocksize(dev, sd);
-+		dev->dev_attrib.hw_block_size = sd->sector_size;
-+	}
- 	return 0;
- }
- 
-@@ -406,7 +410,7 @@ static int pscsi_create_type_disk(struct se_device *dev, struct scsi_device *sd)
- /*
-  * Called with struct Scsi_Host->host_lock called.
-  */
--static int pscsi_create_type_rom(struct se_device *dev, struct scsi_device *sd)
-+static int pscsi_create_type_nondisk(struct se_device *dev, struct scsi_device *sd)
- 	__releases(sh->host_lock)
- {
- 	struct pscsi_hba_virt *phv = dev->se_hba->hba_ptr;
-@@ -433,28 +437,6 @@ static int pscsi_create_type_rom(struct se_device *dev, struct scsi_device *sd)
- 	return 0;
- }
- 
--/*
-- * Called with struct Scsi_Host->host_lock called.
-- */
--static int pscsi_create_type_other(struct se_device *dev,
--		struct scsi_device *sd)
--	__releases(sh->host_lock)
--{
--	struct pscsi_hba_virt *phv = dev->se_hba->hba_ptr;
--	struct Scsi_Host *sh = sd->host;
--	int ret;
--
--	spin_unlock_irq(sh->host_lock);
--	ret = pscsi_add_device_to_list(dev, sd);
--	if (ret)
--		return ret;
--
--	pr_debug("CORE_PSCSI[%d] - Added Type: %s for %d:%d:%d:%llu\n",
--		phv->phv_host_id, scsi_device_type(sd->type), sh->host_no,
--		sd->channel, sd->id, sd->lun);
--	return 0;
--}
--
- static int pscsi_configure_device(struct se_device *dev)
- {
- 	struct se_hba *hba = dev->se_hba;
-@@ -542,11 +524,8 @@ static int pscsi_configure_device(struct se_device *dev)
- 		case TYPE_DISK:
- 			ret = pscsi_create_type_disk(dev, sd);
- 			break;
--		case TYPE_ROM:
--			ret = pscsi_create_type_rom(dev, sd);
--			break;
- 		default:
--			ret = pscsi_create_type_other(dev, sd);
-+			ret = pscsi_create_type_nondisk(dev, sd);
- 			break;
- 		}
- 
-@@ -611,8 +590,7 @@ static void pscsi_free_device(struct se_device *dev)
- 		else if (pdv->pdv_lld_host)
- 			scsi_host_put(pdv->pdv_lld_host);
- 
--		if ((sd->type == TYPE_DISK) || (sd->type == TYPE_ROM))
--			scsi_device_put(sd);
-+		scsi_device_put(sd);
- 
- 		pdv->pdv_sd = NULL;
- 	}
-@@ -1088,7 +1066,6 @@ static sector_t pscsi_get_blocks(struct se_device *dev)
- 	if (pdv->pdv_bd && pdv->pdv_bd->bd_part)
- 		return pdv->pdv_bd->bd_part->nr_sects;
- 
--	dump_stack();
- 	return 0;
- }
- 
--- 
-2.28.0
-
-
-From 82bd06aba880215dadd3e33dc3d583d32df9dbbb Mon Sep 17 00:00:00 2001
-From: Anton Blanchard <anton@samba.org>
-Date: Mon, 13 Feb 2017 08:49:20 +1100
-Subject: [PATCH 24/31] scsi: lpfc: Add shutdown method for kexec
-
-commit 85e8a23936ab3442de0c42da97d53b29f004ece1 upstream.
-
-We see lpfc devices regularly fail during kexec. Fix this by adding a
-shutdown method which mirrors the remove method.
-
-Signed-off-by: Anton Blanchard <anton@samba.org>
-Reviewed-by: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
-Tested-by: Mauricio Faria de Oliveira <mauricfo@linux.vnet.ibm.com>
-Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/scsi/lpfc/lpfc_init.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
-index c14ab6c3ae40..60c21093f865 100644
---- a/drivers/scsi/lpfc/lpfc_init.c
-+++ b/drivers/scsi/lpfc/lpfc_init.c
-@@ -11387,6 +11387,7 @@ static struct pci_driver lpfc_driver = {
- 	.id_table	= lpfc_id_table,
- 	.probe		= lpfc_pci_probe_one,
- 	.remove		= lpfc_pci_remove_one,
-+	.shutdown	= lpfc_pci_remove_one,
- 	.suspend        = lpfc_pci_suspend_one,
- 	.resume		= lpfc_pci_resume_one,
- 	.err_handler    = &lpfc_err_handler,
--- 
-2.28.0
-
-
-From 246760c61d9c4c0114ba5bd324df4ae17468e238 Mon Sep 17 00:00:00 2001
-From: Chris Leech <cleech@redhat.com>
-Date: Mon, 27 Feb 2017 16:58:36 -0800
-Subject: [PATCH 25/31] scsi: libiscsi: add lock around task lists to fix list
- corruption regression
-
-commit 6f8830f5bbab16e54f261de187f3df4644a5b977 upstream.
-
-There's a rather long standing regression from the commit "libiscsi:
-Reduce locking contention in fast path"
-
-Depending on iSCSI target behavior, it's possible to hit the case in
-iscsi_complete_task where the task is still on a pending list
-(!list_empty(&task->running)).  When that happens the task is removed
-from the list while holding the session back_lock, but other task list
-modification occur under the frwd_lock.  That leads to linked list
-corruption and eventually a panicked system.
-
-Rather than back out the session lock split entirely, in order to try
-and keep some of the performance gains this patch adds another lock to
-maintain the task lists integrity.
-
-Major enterprise supported kernels have been backing out the lock split
-for while now, thanks to the efforts at IBM where a lab setup has the
-most reliable reproducer I've seen on this issue.  This patch has been
-tested there successfully.
-
-Signed-off-by: Chris Leech <cleech@redhat.com>
-Fixes: 659743b02c41 ("[SCSI] libiscsi: Reduce locking contention in fast path")
-Reported-by: Prashantha Subbarao <psubbara@us.ibm.com>
-Reviewed-by: Guilherme G. Piccoli <gpiccoli@linux.vnet.ibm.com>
-Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/scsi/libiscsi.c | 26 +++++++++++++++++++++++++-
- include/scsi/libiscsi.h |  1 +
- 2 files changed, 26 insertions(+), 1 deletion(-)
-
+diff --git a/drivers/scsi/cxlflash/main.c b/drivers/scsi/cxlflash/main.c
+index c86847c68448..2882bcac918a 100644
+--- a/drivers/scsi/cxlflash/main.c
++++ b/drivers/scsi/cxlflash/main.c
+@@ -2305,7 +2305,7 @@ static struct scsi_host_template driver_template = {
+ 	.eh_device_reset_handler = cxlflash_eh_device_reset_handler,
+ 	.eh_host_reset_handler = cxlflash_eh_host_reset_handler,
+ 	.change_queue_depth = cxlflash_change_queue_depth,
+-	.cmd_per_lun = 16,
++	.cmd_per_lun = CXLFLASH_MAX_CMDS_PER_LUN,
+ 	.can_queue = CXLFLASH_MAX_CMDS,
+ 	.this_id = -1,
+ 	.sg_tablesize = SG_NONE,	/* No scatter gather support */
 diff --git a/drivers/scsi/libiscsi.c b/drivers/scsi/libiscsi.c
 index 6bffd91b973a..c1ccf1ee99ea 100644
 --- a/drivers/scsi/libiscsi.c
@@ -2063,45 +657,137 @@ index 6bffd91b973a..c1ccf1ee99ea 100644
  	INIT_WORK(&conn->xmitwork, iscsi_xmitworker);
  
  	/* allocate login_task used for the login/text sequences */
-diff --git a/include/scsi/libiscsi.h b/include/scsi/libiscsi.h
-index 4d1c46aac331..c7b1dc713cdd 100644
---- a/include/scsi/libiscsi.h
-+++ b/include/scsi/libiscsi.h
-@@ -196,6 +196,7 @@ struct iscsi_conn {
- 	struct iscsi_task	*task;		/* xmit task in progress */
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index c14ab6c3ae40..60c21093f865 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -11387,6 +11387,7 @@ static struct pci_driver lpfc_driver = {
+ 	.id_table	= lpfc_id_table,
+ 	.probe		= lpfc_pci_probe_one,
+ 	.remove		= lpfc_pci_remove_one,
++	.shutdown	= lpfc_pci_remove_one,
+ 	.suspend        = lpfc_pci_suspend_one,
+ 	.resume		= lpfc_pci_resume_one,
+ 	.err_handler    = &lpfc_err_handler,
+diff --git a/drivers/target/target_core_pscsi.c b/drivers/target/target_core_pscsi.c
+index de18790eb21c..d72a4058fd08 100644
+--- a/drivers/target/target_core_pscsi.c
++++ b/drivers/target/target_core_pscsi.c
+@@ -154,7 +154,7 @@ static void pscsi_tape_read_blocksize(struct se_device *dev,
  
- 	/* xmit */
-+	spinlock_t		taskqueuelock;  /* protects the next three lists */
- 	struct list_head	mgmtqueue;	/* mgmt (control) xmit queue */
- 	struct list_head	cmdqueue;	/* data-path cmd queue */
- 	struct list_head	requeue;	/* tasks needing another run */
--- 
-2.28.0
-
-
-From d267ecbdfdb4199c0e3a967ecc17a6b80d95209a Mon Sep 17 00:00:00 2001
-From: Max Lohrmann <post@wickenrode.com>
-Date: Tue, 7 Mar 2017 22:09:56 -0800
-Subject: [PATCH 26/31] target: Fix VERIFY_16 handling in sbc_parse_cdb
-
-commit 13603685c1f12c67a7a2427f00b63f39a2b6f7c9 upstream.
-
-As reported by Max, the Windows 2008 R2 chkdsk utility expects
-VERIFY_16 to be supported, and does not handle the returned
-CHECK_CONDITION properly, resulting in an infinite loop.
-
-The kernel will log huge amounts of this error:
-
-kernel: TARGET_CORE[iSCSI]: Unsupported SCSI Opcode 0x8f, sending
-CHECK_CONDITION.
-
-Signed-off-by: Max Lohrmann <post@wickenrode.com>
-Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/target/target_core_sbc.c | 10 ++++++++--
- 1 file changed, 8 insertions(+), 2 deletions(-)
-
+ 	buf = kzalloc(12, GFP_KERNEL);
+ 	if (!buf)
+-		return;
++		goto out_free;
+ 
+ 	memset(cdb, 0, MAX_COMMAND_SIZE);
+ 	cdb[0] = MODE_SENSE;
+@@ -169,9 +169,10 @@ static void pscsi_tape_read_blocksize(struct se_device *dev,
+ 	 * If MODE_SENSE still returns zero, set the default value to 1024.
+ 	 */
+ 	sdev->sector_size = (buf[9] << 16) | (buf[10] << 8) | (buf[11]);
++out_free:
+ 	if (!sdev->sector_size)
+ 		sdev->sector_size = 1024;
+-out_free:
++
+ 	kfree(buf);
+ }
+ 
+@@ -314,9 +315,10 @@ static int pscsi_add_device_to_list(struct se_device *dev,
+ 				sd->lun, sd->queue_depth);
+ 	}
+ 
+-	dev->dev_attrib.hw_block_size = sd->sector_size;
++	dev->dev_attrib.hw_block_size =
++		min_not_zero((int)sd->sector_size, 512);
+ 	dev->dev_attrib.hw_max_sectors =
+-		min_t(int, sd->host->max_sectors, queue_max_hw_sectors(q));
++		min_not_zero(sd->host->max_sectors, queue_max_hw_sectors(q));
+ 	dev->dev_attrib.hw_queue_depth = sd->queue_depth;
+ 
+ 	/*
+@@ -339,8 +341,10 @@ static int pscsi_add_device_to_list(struct se_device *dev,
+ 	/*
+ 	 * For TYPE_TAPE, attempt to determine blocksize with MODE_SENSE.
+ 	 */
+-	if (sd->type == TYPE_TAPE)
++	if (sd->type == TYPE_TAPE) {
+ 		pscsi_tape_read_blocksize(dev, sd);
++		dev->dev_attrib.hw_block_size = sd->sector_size;
++	}
+ 	return 0;
+ }
+ 
+@@ -406,7 +410,7 @@ static int pscsi_create_type_disk(struct se_device *dev, struct scsi_device *sd)
+ /*
+  * Called with struct Scsi_Host->host_lock called.
+  */
+-static int pscsi_create_type_rom(struct se_device *dev, struct scsi_device *sd)
++static int pscsi_create_type_nondisk(struct se_device *dev, struct scsi_device *sd)
+ 	__releases(sh->host_lock)
+ {
+ 	struct pscsi_hba_virt *phv = dev->se_hba->hba_ptr;
+@@ -433,28 +437,6 @@ static int pscsi_create_type_rom(struct se_device *dev, struct scsi_device *sd)
+ 	return 0;
+ }
+ 
+-/*
+- * Called with struct Scsi_Host->host_lock called.
+- */
+-static int pscsi_create_type_other(struct se_device *dev,
+-		struct scsi_device *sd)
+-	__releases(sh->host_lock)
+-{
+-	struct pscsi_hba_virt *phv = dev->se_hba->hba_ptr;
+-	struct Scsi_Host *sh = sd->host;
+-	int ret;
+-
+-	spin_unlock_irq(sh->host_lock);
+-	ret = pscsi_add_device_to_list(dev, sd);
+-	if (ret)
+-		return ret;
+-
+-	pr_debug("CORE_PSCSI[%d] - Added Type: %s for %d:%d:%d:%llu\n",
+-		phv->phv_host_id, scsi_device_type(sd->type), sh->host_no,
+-		sd->channel, sd->id, sd->lun);
+-	return 0;
+-}
+-
+ static int pscsi_configure_device(struct se_device *dev)
+ {
+ 	struct se_hba *hba = dev->se_hba;
+@@ -542,11 +524,8 @@ static int pscsi_configure_device(struct se_device *dev)
+ 		case TYPE_DISK:
+ 			ret = pscsi_create_type_disk(dev, sd);
+ 			break;
+-		case TYPE_ROM:
+-			ret = pscsi_create_type_rom(dev, sd);
+-			break;
+ 		default:
+-			ret = pscsi_create_type_other(dev, sd);
++			ret = pscsi_create_type_nondisk(dev, sd);
+ 			break;
+ 		}
+ 
+@@ -611,8 +590,7 @@ static void pscsi_free_device(struct se_device *dev)
+ 		else if (pdv->pdv_lld_host)
+ 			scsi_host_put(pdv->pdv_lld_host);
+ 
+-		if ((sd->type == TYPE_DISK) || (sd->type == TYPE_ROM))
+-			scsi_device_put(sd);
++		scsi_device_put(sd);
+ 
+ 		pdv->pdv_sd = NULL;
+ 	}
+@@ -1088,7 +1066,6 @@ static sector_t pscsi_get_blocks(struct se_device *dev)
+ 	if (pdv->pdv_bd && pdv->pdv_bd->bd_part)
+ 		return pdv->pdv_bd->bd_part->nr_sects;
+ 
+-	dump_stack();
+ 	return 0;
+ }
+ 
 diff --git a/drivers/target/target_core_sbc.c b/drivers/target/target_core_sbc.c
 index 2e27b1034ede..90c5dffc9fa4 100644
 --- a/drivers/target/target_core_sbc.c
@@ -2124,67 +810,127 @@ index 2e27b1034ede..90c5dffc9fa4 100644
  		cmd->execute_cmd = sbc_emulate_noop;
  		goto check_lba;
  	case REZERO_UNIT:
--- 
-2.28.0
-
-
-From 4f47ca4882564c4b76cc9c426583a49d23893dda Mon Sep 17 00:00:00 2001
-From: Johan Hovold <johan@kernel.org>
-Date: Mon, 13 Mar 2017 13:39:01 +0100
-Subject: [PATCH 27/31] isdn/gigaset: fix NULL-deref at probe
-
-commit 68c32f9c2a36d410aa242e661506e5b2c2764179 upstream.
-
-Make sure to check the number of endpoints to avoid dereferencing a
-NULL-pointer should a malicious device lack endpoints.
-
-Fixes: cf7776dc05b8 ("[PATCH] isdn4linux: Siemens Gigaset drivers - direct USB connection")
-Cc: Hansjoerg Lipp <hjlipp@web.de>
-Signed-off-by: Johan Hovold <johan@kernel.org>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/isdn/gigaset/bas-gigaset.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/drivers/isdn/gigaset/bas-gigaset.c b/drivers/isdn/gigaset/bas-gigaset.c
-index aecec6d32463..7f1c625b08ec 100644
---- a/drivers/isdn/gigaset/bas-gigaset.c
-+++ b/drivers/isdn/gigaset/bas-gigaset.c
-@@ -2317,6 +2317,9 @@ static int gigaset_probe(struct usb_interface *interface,
- 		return -ENODEV;
- 	}
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index f44ce09367bc..5724d7c41e29 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -966,7 +966,7 @@ static void usb_bus_init (struct usb_bus *bus)
+ 	bus->bandwidth_allocated = 0;
+ 	bus->bandwidth_int_reqs  = 0;
+ 	bus->bandwidth_isoc_reqs = 0;
+-	mutex_init(&bus->usb_address0_mutex);
++	mutex_init(&bus->devnum_next_mutex);
  
-+	if (hostif->desc.bNumEndpoints < 1)
-+		return -ENODEV;
-+
- 	dev_info(&udev->dev,
- 		 "%s: Device matched (Vendor: 0x%x, Product: 0x%x)\n",
- 		 __func__, le16_to_cpu(udev->descriptor.idVendor),
--- 
-2.28.0
-
-
-From e08f608ab4288f4192a504e6c94dd7c9c931dad8 Mon Sep 17 00:00:00 2001
-From: Andreas Gruenbacher <agruenba@redhat.com>
-Date: Mon, 6 Mar 2017 12:58:42 -0500
-Subject: [PATCH 28/31] gfs2: Avoid alignment hole in struct lm_lockname
-
-commit 28ea06c46fbcab63fd9a55531387b7928a18a590 upstream.
-
-Commit 88ffbf3e03 switches to using rhashtables for glocks, hashing over
-the entire struct lm_lockname instead of its individual fields.  On some
-architectures, struct lm_lockname contains a hole of uninitialized
-memory due to alignment rules, which now leads to incorrect hash values.
-Get rid of that hole.
-
-Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
-Signed-off-by: Bob Peterson <rpeterso@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/gfs2/incore.h | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
+ 	INIT_LIST_HEAD (&bus->bus_list);
+ }
+@@ -2497,6 +2497,14 @@ struct usb_hcd *usb_create_shared_hcd(const struct hc_driver *driver,
+ 		return NULL;
+ 	}
+ 	if (primary_hcd == NULL) {
++		hcd->address0_mutex = kmalloc(sizeof(*hcd->address0_mutex),
++				GFP_KERNEL);
++		if (!hcd->address0_mutex) {
++			kfree(hcd);
++			dev_dbg(dev, "hcd address0 mutex alloc failed\n");
++			return NULL;
++		}
++		mutex_init(hcd->address0_mutex);
+ 		hcd->bandwidth_mutex = kmalloc(sizeof(*hcd->bandwidth_mutex),
+ 				GFP_KERNEL);
+ 		if (!hcd->bandwidth_mutex) {
+@@ -2508,6 +2516,7 @@ struct usb_hcd *usb_create_shared_hcd(const struct hc_driver *driver,
+ 		dev_set_drvdata(dev, hcd);
+ 	} else {
+ 		mutex_lock(&usb_port_peer_mutex);
++		hcd->address0_mutex = primary_hcd->address0_mutex;
+ 		hcd->bandwidth_mutex = primary_hcd->bandwidth_mutex;
+ 		hcd->primary_hcd = primary_hcd;
+ 		primary_hcd->primary_hcd = primary_hcd;
+@@ -2564,24 +2573,23 @@ EXPORT_SYMBOL_GPL(usb_create_hcd);
+  * Don't deallocate the bandwidth_mutex until the last shared usb_hcd is
+  * deallocated.
+  *
+- * Make sure to only deallocate the bandwidth_mutex when the primary HCD is
+- * freed.  When hcd_release() is called for either hcd in a peer set
+- * invalidate the peer's ->shared_hcd and ->primary_hcd pointers to
+- * block new peering attempts
++ * Make sure to deallocate the bandwidth_mutex only when the last HCD is
++ * freed.  When hcd_release() is called for either hcd in a peer set,
++ * invalidate the peer's ->shared_hcd and ->primary_hcd pointers.
+  */
+ static void hcd_release(struct kref *kref)
+ {
+ 	struct usb_hcd *hcd = container_of (kref, struct usb_hcd, kref);
+ 
+ 	mutex_lock(&usb_port_peer_mutex);
+-	if (usb_hcd_is_primary_hcd(hcd))
+-		kfree(hcd->bandwidth_mutex);
+ 	if (hcd->shared_hcd) {
+ 		struct usb_hcd *peer = hcd->shared_hcd;
+ 
+ 		peer->shared_hcd = NULL;
+-		if (peer->primary_hcd == hcd)
+-			peer->primary_hcd = NULL;
++		peer->primary_hcd = NULL;
++	} else {
++		kfree(hcd->address0_mutex);
++		kfree(hcd->bandwidth_mutex);
+ 	}
+ 	mutex_unlock(&usb_port_peer_mutex);
+ 	kfree(hcd);
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index 780db8bb2262..f52d8abf6979 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -1980,7 +1980,7 @@ static void choose_devnum(struct usb_device *udev)
+ 	struct usb_bus	*bus = udev->bus;
+ 
+ 	/* be safe when more hub events are proceed in parallel */
+-	mutex_lock(&bus->usb_address0_mutex);
++	mutex_lock(&bus->devnum_next_mutex);
+ 	if (udev->wusb) {
+ 		devnum = udev->portnum + 1;
+ 		BUG_ON(test_bit(devnum, bus->devmap.devicemap));
+@@ -1998,7 +1998,7 @@ static void choose_devnum(struct usb_device *udev)
+ 		set_bit(devnum, bus->devmap.devicemap);
+ 		udev->devnum = devnum;
+ 	}
+-	mutex_unlock(&bus->usb_address0_mutex);
++	mutex_unlock(&bus->devnum_next_mutex);
+ }
+ 
+ static void release_devnum(struct usb_device *udev)
+@@ -4262,7 +4262,7 @@ hub_port_init(struct usb_hub *hub, struct usb_device *udev, int port1,
+ 	if (oldspeed == USB_SPEED_LOW)
+ 		delay = HUB_LONG_RESET_TIME;
+ 
+-	mutex_lock(&hdev->bus->usb_address0_mutex);
++	mutex_lock(hcd->address0_mutex);
+ 
+ 	/* Reset the device; full speed may morph to high speed */
+ 	/* FIXME a USB 2.0 device may morph into SuperSpeed on reset. */
+@@ -4548,7 +4548,7 @@ fail:
+ 		hub_port_disable(hub, port1, 0);
+ 		update_devnum(udev, devnum);	/* for disconnect processing */
+ 	}
+-	mutex_unlock(&hdev->bus->usb_address0_mutex);
++	mutex_unlock(hcd->address0_mutex);
+ 	return retval;
+ }
+ 
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index 6fe8e30eeb99..68345a9e59b8 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -3666,7 +3666,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
+ 		   EXT4_DESC_PER_BLOCK(sb);
+ 	if (ext4_has_feature_meta_bg(sb)) {
+-		if (le32_to_cpu(es->s_first_meta_bg) >= db_count) {
++		if (le32_to_cpu(es->s_first_meta_bg) > db_count) {
+ 			ext4_msg(sb, KERN_WARNING,
+ 				 "first meta block group too large: %u "
+ 				 "(group descriptor block count %u)",
 diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
 index de7b4f97ac75..be519416c112 100644
 --- a/fs/gfs2/incore.h
@@ -2198,30 +944,177 @@ index de7b4f97ac75..be519416c112 100644
  
  #define lm_name_equal(name1, name2) \
          (((name1)->ln_number == (name2)->ln_number) &&	\
--- 
-2.28.0
-
-
-From d88b83e66bbf588a5d85168d9839501cd47fe561 Mon Sep 17 00:00:00 2001
-From: Tahsin Erdogan <tahsin@google.com>
-Date: Sat, 25 Feb 2017 13:00:19 -0800
-Subject: [PATCH 29/31] percpu: acquire pcpu_lock when updating
- pcpu_nr_empty_pop_pages
-
-commit 320661b08dd6f1746d5c7ab4eb435ec64b97cd45 upstream.
-
-Update to pcpu_nr_empty_pop_pages in pcpu_alloc() is currently done
-without holding pcpu_lock. This can lead to bad updates to the variable.
-Add missing lock calls.
-
-Fixes: b539b87fed37 ("percpu: implmeent pcpu_nr_empty_pop_pages and chunk->nr_populated")
-Signed-off-by: Tahsin Erdogan <tahsin@google.com>
-Signed-off-by: Tejun Heo <tj@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/percpu.c | 5 ++++-
- 1 file changed, 4 insertions(+), 1 deletion(-)
-
+diff --git a/include/linux/log2.h b/include/linux/log2.h
+index fd7ff3d91e6a..f38fae23bdac 100644
+--- a/include/linux/log2.h
++++ b/include/linux/log2.h
+@@ -16,12 +16,6 @@
+ #include <linux/bitops.h>
+ 
+ /*
+- * deal with unrepresentable constant logarithms
+- */
+-extern __attribute__((const, noreturn))
+-int ____ilog2_NaN(void);
+-
+-/*
+  * non-constant log of base 2 calculators
+  * - the arch may override these in asm/bitops.h if they can be implemented
+  *   more efficiently than using fls() and fls64()
+@@ -85,7 +79,7 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
+ #define ilog2(n)				\
+ (						\
+ 	__builtin_constant_p(n) ? (		\
+-		(n) < 1 ? ____ilog2_NaN() :	\
++		(n) < 2 ? 0 :			\
+ 		(n) & (1ULL << 63) ? 63 :	\
+ 		(n) & (1ULL << 62) ? 62 :	\
+ 		(n) & (1ULL << 61) ? 61 :	\
+@@ -148,10 +142,7 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
+ 		(n) & (1ULL <<  4) ?  4 :	\
+ 		(n) & (1ULL <<  3) ?  3 :	\
+ 		(n) & (1ULL <<  2) ?  2 :	\
+-		(n) & (1ULL <<  1) ?  1 :	\
+-		(n) & (1ULL <<  0) ?  0 :	\
+-		____ilog2_NaN()			\
+-				   ) :		\
++		1 ) :				\
+ 	(sizeof(n) <= 4) ?			\
+ 	__ilog2_u32(n) :			\
+ 	__ilog2_u64(n)				\
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 12891ffd4bf0..8c75af6b7d5b 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -371,14 +371,13 @@ struct usb_bus {
+ 
+ 	int devnum_next;		/* Next open device number in
+ 					 * round-robin allocation */
++	struct mutex devnum_next_mutex; /* devnum_next mutex */
+ 
+ 	struct usb_devmap devmap;	/* device address allocation map */
+ 	struct usb_device *root_hub;	/* Root hub */
+ 	struct usb_bus *hs_companion;	/* Companion EHCI bus, if any */
+ 	struct list_head bus_list;	/* list of busses */
+ 
+-	struct mutex usb_address0_mutex; /* unaddressed device mutex */
+-
+ 	int bandwidth_allocated;	/* on this bus: how much of the time
+ 					 * reserved for periodic (intr/iso)
+ 					 * requests is used, on average?
+diff --git a/include/linux/usb/hcd.h b/include/linux/usb/hcd.h
+index f89c24bd53a4..3993b21f3d11 100644
+--- a/include/linux/usb/hcd.h
++++ b/include/linux/usb/hcd.h
+@@ -180,6 +180,7 @@ struct usb_hcd {
+ 	 * bandwidth_mutex should be dropped after a successful control message
+ 	 * to the device, or resetting the bandwidth after a failed attempt.
+ 	 */
++	struct mutex		*address0_mutex;
+ 	struct mutex		*bandwidth_mutex;
+ 	struct usb_hcd		*shared_hcd;
+ 	struct usb_hcd		*primary_hcd;
+diff --git a/include/scsi/libiscsi.h b/include/scsi/libiscsi.h
+index 4d1c46aac331..c7b1dc713cdd 100644
+--- a/include/scsi/libiscsi.h
++++ b/include/scsi/libiscsi.h
+@@ -196,6 +196,7 @@ struct iscsi_conn {
+ 	struct iscsi_task	*task;		/* xmit task in progress */
+ 
+ 	/* xmit */
++	spinlock_t		taskqueuelock;  /* protects the next three lists */
+ 	struct list_head	mgmtqueue;	/* mgmt (control) xmit queue */
+ 	struct list_head	cmdqueue;	/* data-path cmd queue */
+ 	struct list_head	requeue;	/* tasks needing another run */
+diff --git a/kernel/events/core.c b/kernel/events/core.c
+index 9bbe9ac23cf2..e4b5494f05f8 100644
+--- a/kernel/events/core.c
++++ b/kernel/events/core.c
+@@ -9230,7 +9230,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
+ 		ret = inherit_task_group(event, parent, parent_ctx,
+ 					 child, ctxn, &inherited_all);
+ 		if (ret)
+-			break;
++			goto out_unlock;
+ 	}
+ 
+ 	/*
+@@ -9246,7 +9246,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
+ 		ret = inherit_task_group(event, parent, parent_ctx,
+ 					 child, ctxn, &inherited_all);
+ 		if (ret)
+-			break;
++			goto out_unlock;
+ 	}
+ 
+ 	raw_spin_lock_irqsave(&parent_ctx->lock, flags);
+@@ -9274,6 +9274,7 @@ static int perf_event_init_context(struct task_struct *child, int ctxn)
+ 	}
+ 
+ 	raw_spin_unlock_irqrestore(&parent_ctx->lock, flags);
++out_unlock:
+ 	mutex_unlock(&parent_ctx->mutex);
+ 
+ 	perf_unpin_context(parent_ctx);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 2e55b53399de..278a2ddad351 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -331,13 +331,14 @@ void set_task_stack_end_magic(struct task_struct *tsk)
+ 	*stackend = STACK_END_MAGIC;	/* for overflow detection */
+ }
+ 
+-static struct task_struct *dup_task_struct(struct task_struct *orig)
++static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
+ {
+ 	struct task_struct *tsk;
+ 	struct thread_info *ti;
+-	int node = tsk_fork_get_node(orig);
+ 	int err;
+ 
++	if (node == NUMA_NO_NODE)
++		node = tsk_fork_get_node(orig);
+ 	tsk = alloc_task_struct_node(node);
+ 	if (!tsk)
+ 		return NULL;
+@@ -1270,7 +1271,8 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 					int __user *child_tidptr,
+ 					struct pid *pid,
+ 					int trace,
+-					unsigned long tls)
++					unsigned long tls,
++					int node)
+ {
+ 	int retval;
+ 	struct task_struct *p;
+@@ -1323,7 +1325,7 @@ static struct task_struct *copy_process(unsigned long clone_flags,
+ 		goto fork_out;
+ 
+ 	retval = -ENOMEM;
+-	p = dup_task_struct(current);
++	p = dup_task_struct(current, node);
+ 	if (!p)
+ 		goto fork_out;
+ 
+@@ -1699,7 +1701,8 @@ static inline void init_idle_pids(struct pid_link *links)
+ struct task_struct *fork_idle(int cpu)
+ {
+ 	struct task_struct *task;
+-	task = copy_process(CLONE_VM, 0, 0, NULL, &init_struct_pid, 0, 0);
++	task = copy_process(CLONE_VM, 0, 0, NULL, &init_struct_pid, 0, 0,
++			    cpu_to_node(cpu));
+ 	if (!IS_ERR(task)) {
+ 		init_idle_pids(task->pids);
+ 		init_idle(task, cpu);
+@@ -1744,7 +1747,7 @@ long _do_fork(unsigned long clone_flags,
+ 	}
+ 
+ 	p = copy_process(clone_flags, stack_start, stack_size,
+-			 child_tidptr, NULL, trace, tls);
++			 child_tidptr, NULL, trace, tls, NUMA_NO_NODE);
+ 	/*
+ 	 * Do this prior waking up the new thread - the thread pointer
+ 	 * might get invalid after that point, if the thread exits quickly.
 diff --git a/mm/percpu.c b/mm/percpu.c
 index 1f376bce413c..ef6353f0adbd 100644
 --- a/mm/percpu.c
@@ -2239,69 +1132,41 @@ index 1f376bce413c..ef6353f0adbd 100644
  
  	if (pcpu_nr_empty_pop_pages < PCPU_EMPTY_POP_PAGES_LOW)
  		pcpu_schedule_balance_work();
--- 
-2.28.0
-
-
-From 5fa513cb07213608907d4daa123b81e5a32d13e0 Mon Sep 17 00:00:00 2001
-From: Theodore Ts'o <tytso@mit.edu>
-Date: Wed, 15 Feb 2017 01:26:39 -0500
-Subject: [PATCH 30/31] ext4: fix fencepost in s_first_meta_bg validation
-
-commit 2ba3e6e8afc9b6188b471f27cf2b5e3cf34e7af2 upstream.
-
-It is OK for s_first_meta_bg to be equal to the number of block group
-descriptor blocks.  (It rarely happens, but it shouldn't cause any
-problems.)
-
-https://bugzilla.kernel.org/show_bug.cgi?id=194567
-
-Fixes: 3a4b77cd47bb837b8557595ec7425f281f2ca1fe
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Cc: Jiri Slaby <jslaby@suse.cz>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ext4/super.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/fs/ext4/super.c b/fs/ext4/super.c
-index 6fe8e30eeb99..68345a9e59b8 100644
---- a/fs/ext4/super.c
-+++ b/fs/ext4/super.c
-@@ -3666,7 +3666,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
- 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
- 		   EXT4_DESC_PER_BLOCK(sb);
- 	if (ext4_has_feature_meta_bg(sb)) {
--		if (le32_to_cpu(es->s_first_meta_bg) >= db_count) {
-+		if (le32_to_cpu(es->s_first_meta_bg) > db_count) {
- 			ext4_msg(sb, KERN_WARNING,
- 				 "first meta block group too large: %u "
- 				 "(group descriptor block count %u)",
--- 
-2.28.0
-
-
-From a5c3f390eb7799c3d1d92121382372b1fd365fa3 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sun, 26 Mar 2017 12:13:55 +0200
-Subject: [PATCH 31/31] Linux 4.4.57
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index cf9303a5d621..841675e63a38 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 4
--SUBLEVEL = 56
-+SUBLEVEL = 57
- EXTRAVERSION =
- NAME = Blurry Fish Butt
+diff --git a/tools/include/linux/log2.h b/tools/include/linux/log2.h
+index 41446668ccce..d5677d39c1e4 100644
+--- a/tools/include/linux/log2.h
++++ b/tools/include/linux/log2.h
+@@ -13,12 +13,6 @@
+ #define _TOOLS_LINUX_LOG2_H
  
--- 
-2.28.0
-
+ /*
+- * deal with unrepresentable constant logarithms
+- */
+-extern __attribute__((const, noreturn))
+-int ____ilog2_NaN(void);
+-
+-/*
+  * non-constant log of base 2 calculators
+  * - the arch may override these in asm/bitops.h if they can be implemented
+  *   more efficiently than using fls() and fls64()
+@@ -78,7 +72,7 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
+ #define ilog2(n)				\
+ (						\
+ 	__builtin_constant_p(n) ? (		\
+-		(n) < 1 ? ____ilog2_NaN() :	\
++		(n) < 2 ? 0 :			\
+ 		(n) & (1ULL << 63) ? 63 :	\
+ 		(n) & (1ULL << 62) ? 62 :	\
+ 		(n) & (1ULL << 61) ? 61 :	\
+@@ -141,10 +135,7 @@ unsigned long __rounddown_pow_of_two(unsigned long n)
+ 		(n) & (1ULL <<  4) ?  4 :	\
+ 		(n) & (1ULL <<  3) ?  3 :	\
+ 		(n) & (1ULL <<  2) ?  2 :	\
+-		(n) & (1ULL <<  1) ?  1 :	\
+-		(n) & (1ULL <<  0) ?  0 :	\
+-		____ilog2_NaN()			\
+-				   ) :		\
++		1 ) :				\
+ 	(sizeof(n) <= 4) ?			\
+ 	__ilog2_u32(n) :			\
+ 	__ilog2_u64(n)				\

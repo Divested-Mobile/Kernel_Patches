@@ -1,192 +1,82 @@
-From 29ec60ccee541893e18a749044084fc2caa79137 Mon Sep 17 00:00:00 2001
-From: Jeff Layton <jeff.layton@primarydata.com>
-Date: Thu, 7 Jan 2016 16:38:10 -0500
-Subject: [PATCH 01/25] locks: fix unlock when fcntl_setlk races with a close
-
-commit 7f3697e24dc3820b10f445a4a7d914fc356012d1 upstream.
-
-Dmitry reported that he was able to reproduce the WARN_ON_ONCE that
-fires in locks_free_lock_context when the flc_posix list isn't empty.
-
-The problem turns out to be that we're basically rebuilding the
-file_lock from scratch in fcntl_setlk when we discover that the setlk
-has raced with a close. If the l_whence field is SEEK_CUR or SEEK_END,
-then we may end up with fl_start and fl_end values that differ from
-when the lock was initially set, if the file position or length of the
-file has changed in the interim.
-
-Fix this by just reusing the same lock request structure, and simply
-override fl_type value with F_UNLCK as appropriate. That ensures that
-we really are unlocking the lock that was initially set.
-
-While we're there, make sure that we do pop a WARN_ON_ONCE if the
-removal ever fails. Also return -EBADF in this event, since that's
-what we would have returned if the close had happened earlier.
-
-Cc: Alexander Viro <viro@zeniv.linux.org.uk>
-Fixes: c293621bbf67 (stale POSIX lock handling)
-Reported-by: Dmitry Vyukov <dvyukov@google.com>
-Signed-off-by: Jeff Layton <jeff.layton@primarydata.com>
-Acked-by: "J. Bruce Fields" <bfields@fieldses.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/locks.c | 51 ++++++++++++++++++++++++++++++---------------------
- 1 file changed, 30 insertions(+), 21 deletions(-)
-
-diff --git a/fs/locks.c b/fs/locks.c
-index 0274c953b07d..f7b1de7e6735 100644
---- a/fs/locks.c
-+++ b/fs/locks.c
-@@ -1852,7 +1852,6 @@ int fcntl_setlk(unsigned int fd, struct file *filp, unsigned int cmd,
- 		goto out;
- 	}
+diff --git a/Makefile b/Makefile
+index f1e6491fd7d8..40d4d3bf52c3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 10
+-SUBLEVEL = 99
++SUBLEVEL = 100
+ EXTRAVERSION =
+ NAME = TOSSUG Baby Fish
  
--again:
- 	error = flock_to_posix_lock(filp, file_lock, &flock);
- 	if (error)
- 		goto out;
-@@ -1883,19 +1882,22 @@ again:
- 	 * Attempt to detect a close/fcntl race and recover by
- 	 * releasing the lock that was just acquired.
- 	 */
--	/*
--	 * we need that spin_lock here - it prevents reordering between
--	 * update of inode->i_flock and check for it done in close().
--	 * rcu_read_lock() wouldn't do.
--	 */
--	spin_lock(&current->files->file_lock);
--	f = fcheck(fd);
--	spin_unlock(&current->files->file_lock);
--	if (!error && f != filp && flock.l_type != F_UNLCK) {
--		flock.l_type = F_UNLCK;
--		goto again;
-+	if (!error && file_lock->fl_type != F_UNLCK) {
-+		/*
-+		 * We need that spin_lock here - it prevents reordering between
-+		 * update of inode->i_flock and check for it done in
-+		 * close(). rcu_read_lock() wouldn't do.
-+		 */
-+		spin_lock(&current->files->file_lock);
-+		f = fcheck(fd);
-+		spin_unlock(&current->files->file_lock);
-+		if (f != filp) {
-+			file_lock->fl_type = F_UNLCK;
-+			error = do_lock_file_wait(filp, cmd, file_lock);
-+			WARN_ON_ONCE(error);
-+			error = -EBADF;
-+		}
- 	}
--
- out:
- 	locks_free_lock(file_lock);
- 	return error;
-@@ -1970,7 +1972,6 @@ int fcntl_setlk64(unsigned int fd, struct file *filp, unsigned int cmd,
- 		goto out;
- 	}
+diff --git a/arch/x86/ia32/ia32entry.S b/arch/x86/ia32/ia32entry.S
+index c9305ef1d411..e73982b93537 100644
+--- a/arch/x86/ia32/ia32entry.S
++++ b/arch/x86/ia32/ia32entry.S
+@@ -422,6 +422,7 @@ ENTRY(ia32_syscall)
+ 	/*CFI_REL_OFFSET	cs,CS-RIP*/
+ 	CFI_REL_OFFSET	rip,RIP-RIP
+ 	PARAVIRT_ADJUST_EXCEPTION_FRAME
++	ASM_CLAC			/* Do this early to minimize exposure */
+ 	SWAPGS
+ 	/*
+ 	 * No need to follow this irqs on/off section: the syscall
+diff --git a/arch/x86/kernel/acpi/sleep.c b/arch/x86/kernel/acpi/sleep.c
+index ec94e11807dc..ca0805633f26 100644
+--- a/arch/x86/kernel/acpi/sleep.c
++++ b/arch/x86/kernel/acpi/sleep.c
+@@ -16,6 +16,7 @@
+ #include <asm/cacheflush.h>
+ #include <asm/realmode.h>
  
--again:
- 	error = flock64_to_posix_lock(filp, file_lock, &flock);
- 	if (error)
- 		goto out;
-@@ -2001,14 +2002,22 @@ again:
- 	 * Attempt to detect a close/fcntl race and recover by
- 	 * releasing the lock that was just acquired.
- 	 */
--	spin_lock(&current->files->file_lock);
--	f = fcheck(fd);
--	spin_unlock(&current->files->file_lock);
--	if (!error && f != filp && flock.l_type != F_UNLCK) {
--		flock.l_type = F_UNLCK;
--		goto again;
-+	if (!error && file_lock->fl_type != F_UNLCK) {
-+		/*
-+		 * We need that spin_lock here - it prevents reordering between
-+		 * update of inode->i_flock and check for it done in
-+		 * close(). rcu_read_lock() wouldn't do.
-+		 */
-+		spin_lock(&current->files->file_lock);
-+		f = fcheck(fd);
-+		spin_unlock(&current->files->file_lock);
-+		if (f != filp) {
-+			file_lock->fl_type = F_UNLCK;
-+			error = do_lock_file_wait(filp, cmd, file_lock);
-+			WARN_ON_ONCE(error);
-+			error = -EBADF;
-+		}
- 	}
--
- out:
- 	locks_free_lock(file_lock);
- 	return error;
--- 
-2.28.0
-
-
-From 9f2c4c9b3e4b2647af324d565f401e2b6fc96649 Mon Sep 17 00:00:00 2001
-From: Borislav Petkov <bp@suse.de>
-Date: Tue, 1 Dec 2015 15:52:36 +0100
-Subject: [PATCH 02/25] EDAC, mc_sysfs: Fix freeing bus' name
-
-commit 12e26969b32c79018165d52caff3762135614aa1 upstream.
-
-I get the splat below when modprobing/rmmoding EDAC drivers. It happens
-because bus->name is invalid after bus_unregister() has run. The Code: section
-below corresponds to:
-
-  .loc 1 1108 0
-  movq    672(%rbx), %rax # mci_1(D)->bus, mci_1(D)->bus
-  .loc 1 1109 0
-  popq    %rbx    #
-
-  .loc 1 1108 0
-  movq    (%rax), %rdi    # _7->name,
-  jmp     kfree   #
-
-and %rax has some funky stuff 2030203020312030 which looks a lot like
-something walked over it.
-
-Fix that by saving the name ptr before doing stuff to string it points to.
-
-  general protection fault: 0000 [#1] SMP
-  Modules linked in: ...
-  CPU: 4 PID: 10318 Comm: modprobe Tainted: G          I EN  3.12.51-11-default+ #48
-  Hardware name: HP ProLiant DL380 G7, BIOS P67 05/05/2011
-  task: ffff880311320280 ti: ffff88030da3e000 task.ti: ffff88030da3e000
-  RIP: 0010:[<ffffffffa019da92>]  [<ffffffffa019da92>] edac_unregister_sysfs+0x22/0x30 [edac_core]
-  RSP: 0018:ffff88030da3fe28  EFLAGS: 00010292
-  RAX: 2030203020312030 RBX: ffff880311b4e000 RCX: 000000000000095c
-  RDX: 0000000000000001 RSI: ffff880327bb9600 RDI: 0000000000000286
-  RBP: ffff880311b4e750 R08: 0000000000000000 R09: ffffffff81296110
-  R10: 0000000000000400 R11: 0000000000000000 R12: ffff88030ba1ac68
-  R13: 0000000000000001 R14: 00000000011b02f0 R15: 0000000000000000
-  FS:  00007fc9bf8f5700(0000) GS:ffff8801a7c40000(0000) knlGS:0000000000000000
-  CS:  0010 DS: 0000 ES: 0000 CR0: 000000008005003b
-  CR2: 0000000000403c90 CR3: 000000019ebdf000 CR4: 00000000000007e0
-  Stack:
-  Call Trace:
-    i7core_unregister_mci.isra.9
-    i7core_remove
-    pci_device_remove
-    __device_release_driver
-    driver_detach
-    bus_remove_driver
-    pci_unregister_driver
-    i7core_exit
-    SyS_delete_module
-    system_call_fastpath
-    0x7fc9bf426536
-  Code: 2e 0f 1f 84 00 00 00 00 00 66 66 66 66 90 53 48 89 fb e8 52 2a 1f e1 48 8b bb a0 02 00 00 e8 46 59 1f e1 48 8b 83 a0 02 00 00 5b <48> 8b 38 e9 26 9a fe e0 66 0f 1f 44 00 00 66 66 66 66 90 48 8b
-  RIP  [<ffffffffa019da92>] edac_unregister_sysfs+0x22/0x30 [edac_core]
-   RSP <ffff88030da3fe28>
-
-Signed-off-by: Borislav Petkov <bp@suse.de>
-Cc: Mauro Carvalho Chehab <mchehab@osg.samsung.com>
-Fixes: 7a623c039075 ("edac: rewrite the sysfs code to use struct device")
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/edac/edac_mc_sysfs.c | 18 +++++++++++++-----
- 1 file changed, 13 insertions(+), 5 deletions(-)
-
++#include <linux/ftrace.h>
+ #include "../../realmode/rm/wakeup.h"
+ #include "sleep.h"
+ 
+@@ -96,7 +97,13 @@ int acpi_suspend_lowlevel(void)
+        saved_magic = 0x123456789abcdef0L;
+ #endif /* CONFIG_64BIT */
+ 
++	/*
++	 * Pause/unpause graph tracing around do_suspend_lowlevel as it has
++	 * inconsistent call/return info after it jumps to the wakeup vector.
++	 */
++	pause_graph_tracing();
+ 	do_suspend_lowlevel();
++	unpause_graph_tracing();
+ 	return 0;
+ }
+ 
+diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
+index 04e7db668362..f3f0801a0e81 100644
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@ -673,19 +673,18 @@ static int ata_ioc32(struct ata_port *ap)
+ int ata_sas_scsi_ioctl(struct ata_port *ap, struct scsi_device *scsidev,
+ 		     int cmd, void __user *arg)
+ {
+-	int val = -EINVAL, rc = -EINVAL;
++	unsigned long val;
++	int rc = -EINVAL;
+ 	unsigned long flags;
+ 
+ 	switch (cmd) {
+-	case ATA_IOC_GET_IO32:
++	case HDIO_GET_32BIT:
+ 		spin_lock_irqsave(ap->lock, flags);
+ 		val = ata_ioc32(ap);
+ 		spin_unlock_irqrestore(ap->lock, flags);
+-		if (copy_to_user(arg, &val, 1))
+-			return -EFAULT;
+-		return 0;
++		return put_user(val, (unsigned long __user *)arg);
+ 
+-	case ATA_IOC_SET_IO32:
++	case HDIO_SET_32BIT:
+ 		val = (unsigned long) arg;
+ 		rc = 0;
+ 		spin_lock_irqsave(ap->lock, flags);
 diff --git a/drivers/edac/edac_mc_sysfs.c b/drivers/edac/edac_mc_sysfs.c
 index 88cd940ece63..453c816b4537 100644
 --- a/drivers/edac/edac_mc_sysfs.c
@@ -245,30 +135,92 @@ index 88cd940ece63..453c816b4537 100644
  }
  
  static void mc_attr_release(struct device *dev)
--- 
-2.28.0
-
-
-From ad1ec23ce4e167adffe90faa5526c89a14491866 Mon Sep 17 00:00:00 2001
-From: Pavel Shilovsky <pshilovsky@samba.org>
-Date: Sat, 27 Feb 2016 11:58:18 +0300
-Subject: [PATCH 03/25] CIFS: Fix SMB2+ interim response processing for read
- requests
-
-commit 6cc3b24235929b54acd5ecc987ef11a425bd209e upstream.
-
-For interim responses we only need to parse a header and update
-a number credits. Now it is done for all SMB2+ command except
-SMB2_READ which is wrong. Fix this by adding such processing.
-
-Signed-off-by: Pavel Shilovsky <pshilovsky@samba.org>
-Tested-by: Shirish Pargaonkar <shirishpargaonkar@gmail.com>
-Signed-off-by: Steve French <smfrench@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/cifs/cifssmb.c | 21 ++++++++++++++++++---
- 1 file changed, 18 insertions(+), 3 deletions(-)
-
+diff --git a/drivers/gpu/drm/ast/ast_main.c b/drivers/gpu/drm/ast/ast_main.c
+index 313ccaf25f49..62834322b337 100644
+--- a/drivers/gpu/drm/ast/ast_main.c
++++ b/drivers/gpu/drm/ast/ast_main.c
+@@ -124,7 +124,7 @@ static int ast_get_dram_info(struct drm_device *dev)
+ 	} while (ast_read32(ast, 0x10000) != 0x01);
+ 	data = ast_read32(ast, 0x10004);
+ 
+-	if (data & 0x400)
++	if (data & 0x40)
+ 		ast->dram_bus_width = 16;
+ 	else
+ 		ast->dram_bus_width = 32;
+diff --git a/drivers/gpu/drm/radeon/radeon_sa.c b/drivers/gpu/drm/radeon/radeon_sa.c
+index bb166849aa6e..f0bac68254b7 100644
+--- a/drivers/gpu/drm/radeon/radeon_sa.c
++++ b/drivers/gpu/drm/radeon/radeon_sa.c
+@@ -349,13 +349,8 @@ int radeon_sa_bo_new(struct radeon_device *rdev,
+ 			/* see if we can skip over some allocations */
+ 		} while (radeon_sa_bo_next_hole(sa_manager, fences, tries));
+ 
+-		for (i = 0; i < RADEON_NUM_RINGS; ++i)
+-			radeon_fence_ref(fences[i]);
+-
+ 		spin_unlock(&sa_manager->wq.lock);
+ 		r = radeon_fence_wait_any(rdev, fences, false);
+-		for (i = 0; i < RADEON_NUM_RINGS; ++i)
+-			radeon_fence_unref(&fences[i]);
+ 		spin_lock(&sa_manager->wq.lock);
+ 		/* if we have nothing to wait for block */
+ 		if (r == -ENOENT && block) {
+diff --git a/drivers/mtd/ubi/upd.c b/drivers/mtd/ubi/upd.c
+index 2a1b6e037e1a..0134ba32a057 100644
+--- a/drivers/mtd/ubi/upd.c
++++ b/drivers/mtd/ubi/upd.c
+@@ -193,7 +193,7 @@ int ubi_start_leb_change(struct ubi_device *ubi, struct ubi_volume *vol,
+ 	vol->changing_leb = 1;
+ 	vol->ch_lnum = req->lnum;
+ 
+-	vol->upd_buf = vmalloc(req->bytes);
++	vol->upd_buf = vmalloc(ALIGN((int)req->bytes, ubi->min_io_size));
+ 	if (!vol->upd_buf)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
+index 303f3b3fb65f..84b770461655 100644
+--- a/drivers/usb/serial/cp210x.c
++++ b/drivers/usb/serial/cp210x.c
+@@ -164,6 +164,7 @@ static const struct usb_device_id id_table[] = {
+ 	{ USB_DEVICE(0x18EF, 0xE025) }, /* ELV Marble Sound Board 1 */
+ 	{ USB_DEVICE(0x1901, 0x0190) }, /* GE B850 CP2105 Recorder interface */
+ 	{ USB_DEVICE(0x1901, 0x0193) }, /* GE B650 CP2104 PMC interface */
++	{ USB_DEVICE(0x19CF, 0x3000) }, /* Parrot NMEA GPS Flight Recorder */
+ 	{ USB_DEVICE(0x1ADB, 0x0001) }, /* Schweitzer Engineering C662 Cable */
+ 	{ USB_DEVICE(0x1B1C, 0x1C00) }, /* Corsair USB Dongle */
+ 	{ USB_DEVICE(0x1BA4, 0x0002) },	/* Silicon Labs 358x factory default */
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index 9bab34cf01d4..24366a2afea6 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -271,6 +271,7 @@ static void option_instat_callback(struct urb *urb);
+ #define TELIT_PRODUCT_UE910_V2			0x1012
+ #define TELIT_PRODUCT_LE922_USBCFG0		0x1042
+ #define TELIT_PRODUCT_LE922_USBCFG3		0x1043
++#define TELIT_PRODUCT_LE922_USBCFG5		0x1045
+ #define TELIT_PRODUCT_LE920			0x1200
+ #define TELIT_PRODUCT_LE910			0x1201
+ 
+@@ -1140,6 +1141,8 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x6613)}, /* Onda H600/ZTE MF330 */
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x0023)}, /* ONYX 3G device */
+ 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x9000)}, /* SIMCom SIM5218 */
++	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x9003), /* Quectel UC20 */
++	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6001) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CMU_300) },
+ 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6003),
+@@ -1191,6 +1194,8 @@ static const struct usb_device_id option_ids[] = {
+ 		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg0 },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG3),
+ 		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg3 },
++	{ USB_DEVICE_INTERFACE_CLASS(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG5, 0xff),
++		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg0 },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE910),
+ 		.driver_info = (kernel_ulong_t)&telit_le910_blacklist },
+ 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920),
 diff --git a/fs/cifs/cifssmb.c b/fs/cifs/cifssmb.c
 index d17c5d72cd29..4c86850bd627 100644
 --- a/fs/cifs/cifssmb.c
@@ -321,455 +273,6 @@ index d17c5d72cd29..4c86850bd627 100644
  	/* Was the SMB read successful? */
  	rdata->result = server->ops->map_error(buf, false);
  	if (rdata->result != 0) {
--- 
-2.28.0
-
-
-From 4e24fd54662144e7ed6aa4ca6279dc6cf29dd57e Mon Sep 17 00:00:00 2001
-From: Andy Lutomirski <luto@kernel.org>
-Date: Wed, 24 Feb 2016 12:18:49 -0800
-Subject: [PATCH 04/25] x86/entry/compat: Add missing CLAC to entry_INT80_32
-
-commit 3d44d51bd339766f0178f0cf2e8d048b4a4872aa upstream.
-
-This doesn't seem to fix a regression -- I don't think the CLAC was
-ever there.
-
-I double-checked in a debugger: entries through the int80 gate do
-not automatically clear AC.
-
-Stable maintainers: I can provide a backport to 4.3 and earlier if
-needed.  This needs to be backported all the way to 3.10.
-
-Reported-by: Brian Gerst <brgerst@gmail.com>
-Signed-off-by: Andy Lutomirski <luto@kernel.org>
-Cc: Andy Lutomirski <luto@amacapital.net>
-Cc: Borislav Petkov <bp@alien8.de>
-Cc: Denys Vlasenko <dvlasenk@redhat.com>
-Cc: H. Peter Anvin <hpa@zytor.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Fixes: 63bcff2a307b ("x86, smap: Add STAC and CLAC instructions to control user space access")
-Link: http://lkml.kernel.org/r/b02b7e71ae54074be01fc171cbd4b72517055c0e.1456345086.git.luto@kernel.org
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-[ kamal: backport to 3.10 through 3.19-stable: file rename; context ]
-Signed-off-by: Kamal Mostafa <kamal@canonical.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/ia32/ia32entry.S | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/arch/x86/ia32/ia32entry.S b/arch/x86/ia32/ia32entry.S
-index c9305ef1d411..e73982b93537 100644
---- a/arch/x86/ia32/ia32entry.S
-+++ b/arch/x86/ia32/ia32entry.S
-@@ -422,6 +422,7 @@ ENTRY(ia32_syscall)
- 	/*CFI_REL_OFFSET	cs,CS-RIP*/
- 	CFI_REL_OFFSET	rip,RIP-RIP
- 	PARAVIRT_ADJUST_EXCEPTION_FRAME
-+	ASM_CLAC			/* Do this early to minimize exposure */
- 	SWAPGS
- 	/*
- 	 * No need to follow this irqs on/off section: the syscall
--- 
-2.28.0
-
-
-From eed92d81a3f0d555c13f73e4c35e6017c76904ac Mon Sep 17 00:00:00 2001
-From: Timothy Pearson <tpearson@raptorengineeringinc.com>
-Date: Fri, 26 Feb 2016 15:29:32 -0600
-Subject: [PATCH 05/25] drm/ast: Fix incorrect register check for DRAM width
-
-commit 2d02b8bdba322b527c5f5168ce1ca10c2d982a78 upstream.
-
-During DRAM initialization on certain ASpeed devices, an incorrect
-bit (bit 10) was checked in the "SDRAM Bus Width Status" register
-to determine DRAM width.
-
-Query bit 6 instead in accordance with the Aspeed AST2050 datasheet v1.05.
-
-Signed-off-by: Timothy Pearson <tpearson@raptorengineeringinc.com>
-Signed-off-by: Dave Airlie <airlied@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/ast/ast_main.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/gpu/drm/ast/ast_main.c b/drivers/gpu/drm/ast/ast_main.c
-index 313ccaf25f49..62834322b337 100644
---- a/drivers/gpu/drm/ast/ast_main.c
-+++ b/drivers/gpu/drm/ast/ast_main.c
-@@ -124,7 +124,7 @@ static int ast_get_dram_info(struct drm_device *dev)
- 	} while (ast_read32(ast, 0x10000) != 0x01);
- 	data = ast_read32(ast, 0x10004);
- 
--	if (data & 0x400)
-+	if (data & 0x40)
- 		ast->dram_bus_width = 16;
- 	else
- 		ast->dram_bus_width = 32;
--- 
-2.28.0
-
-
-From 45eb9d85bdfc2f6737644386c209640b3c6d2165 Mon Sep 17 00:00:00 2001
-From: Arnd Bergmann <arnd@arndb.de>
-Date: Thu, 11 Feb 2016 14:16:27 +0100
-Subject: [PATCH 06/25] libata: fix HDIO_GET_32BIT ioctl
-
-commit 287e6611ab1eac76c2c5ebf6e345e04c80ca9c61 upstream.
-
-As reported by Soohoon Lee, the HDIO_GET_32BIT ioctl does not
-work correctly in compat mode with libata.
-
-I have investigated the issue further and found multiple problems
-that all appeared with the same commit that originally introduced
-HDIO_GET_32BIT handling in libata back in linux-2.6.8 and presumably
-also linux-2.4, as the code uses "copy_to_user(arg, &val, 1)" to copy
-a 'long' variable containing either 0 or 1 to user space.
-
-The problems with this are:
-
-* On big-endian machines, this will always write a zero because it
-  stores the wrong byte into user space.
-
-* In compat mode, the upper three bytes of the variable are updated
-  by the compat_hdio_ioctl() function, but they now contain
-  uninitialized stack data.
-
-* The hdparm tool calling this ioctl uses a 'static long' variable
-  to store the result. This means at least the upper bytes are
-  initialized to zero, but calling another ioctl like HDIO_GET_MULTCOUNT
-  would fill them with data that remains stale when the low byte
-  is overwritten. Fortunately libata doesn't implement any of the
-  affected ioctl commands, so this would only happen when we query
-  both an IDE and an ATA device in the same command such as
-  "hdparm -N -c /dev/hda /dev/sda"
-
-* The libata code for unknown reasons started using ATA_IOC_GET_IO32
-  and ATA_IOC_SET_IO32 as aliases for HDIO_GET_32BIT and HDIO_SET_32BIT,
-  while the ioctl commands that were added later use the normal
-  HDIO_* names. This is harmless but rather confusing.
-
-This addresses all four issues by changing the code to use put_user()
-on an 'unsigned long' variable in HDIO_GET_32BIT, like the IDE subsystem
-does, and by clarifying the names of the ioctl commands.
-
-Signed-off-by: Arnd Bergmann <arnd@arndb.de>
-Reported-by: Soohoon Lee <Soohoon.Lee@f5.com>
-Tested-by: Soohoon Lee <Soohoon.Lee@f5.com>
-Signed-off-by: Tejun Heo <tj@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/ata/libata-scsi.c | 11 +++++------
- include/linux/ata.h       |  4 ++--
- 2 files changed, 7 insertions(+), 8 deletions(-)
-
-diff --git a/drivers/ata/libata-scsi.c b/drivers/ata/libata-scsi.c
-index 04e7db668362..f3f0801a0e81 100644
---- a/drivers/ata/libata-scsi.c
-+++ b/drivers/ata/libata-scsi.c
-@@ -673,19 +673,18 @@ static int ata_ioc32(struct ata_port *ap)
- int ata_sas_scsi_ioctl(struct ata_port *ap, struct scsi_device *scsidev,
- 		     int cmd, void __user *arg)
- {
--	int val = -EINVAL, rc = -EINVAL;
-+	unsigned long val;
-+	int rc = -EINVAL;
- 	unsigned long flags;
- 
- 	switch (cmd) {
--	case ATA_IOC_GET_IO32:
-+	case HDIO_GET_32BIT:
- 		spin_lock_irqsave(ap->lock, flags);
- 		val = ata_ioc32(ap);
- 		spin_unlock_irqrestore(ap->lock, flags);
--		if (copy_to_user(arg, &val, 1))
--			return -EFAULT;
--		return 0;
-+		return put_user(val, (unsigned long __user *)arg);
- 
--	case ATA_IOC_SET_IO32:
-+	case HDIO_SET_32BIT:
- 		val = (unsigned long) arg;
- 		rc = 0;
- 		spin_lock_irqsave(ap->lock, flags);
-diff --git a/include/linux/ata.h b/include/linux/ata.h
-index ee0bd9524055..f60ffe29b3a1 100644
---- a/include/linux/ata.h
-+++ b/include/linux/ata.h
-@@ -477,8 +477,8 @@ enum ata_tf_protocols {
- };
- 
- enum ata_ioctls {
--	ATA_IOC_GET_IO32	= 0x309,
--	ATA_IOC_SET_IO32	= 0x324,
-+	ATA_IOC_GET_IO32	= 0x309, /* HDIO_GET_32BIT */
-+	ATA_IOC_SET_IO32	= 0x324, /* HDIO_SET_32BIT */
- };
- 
- /* core structures */
--- 
-2.28.0
-
-
-From f105a72e6e71244643bc0a5dc44bfab1fe3d76f9 Mon Sep 17 00:00:00 2001
-From: Harvey Hunt <harvey.hunt@imgtec.com>
-Date: Wed, 24 Feb 2016 15:16:43 +0000
-Subject: [PATCH 07/25] libata: Align ata_device's id on a cacheline
-
-commit 4ee34ea3a12396f35b26d90a094c75db95080baa upstream.
-
-The id buffer in ata_device is a DMA target, but it isn't explicitly
-cacheline aligned. Due to this, adjacent fields can be overwritten with
-stale data from memory on non coherent architectures. As a result, the
-kernel is sometimes unable to communicate with an ATA device.
-
-Fix this by ensuring that the id buffer is cacheline aligned.
-
-This issue is similar to that fixed by Commit 84bda12af31f
-("libata: align ap->sector_buf").
-
-Signed-off-by: Harvey Hunt <harvey.hunt@imgtec.com>
-Cc: linux-kernel@vger.kernel.org
-Signed-off-by: Tejun Heo <tj@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/libata.h | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/include/linux/libata.h b/include/linux/libata.h
-index 8ad0771b88ab..8017e5c459cf 100644
---- a/include/linux/libata.h
-+++ b/include/linux/libata.h
-@@ -666,7 +666,7 @@ struct ata_device {
- 	union {
- 		u16		id[ATA_ID_WORDS]; /* IDENTIFY xxx DEVICE data */
- 		u32		gscr[SATA_PMP_GSCR_DWORDS]; /* PMP GSCR block */
--	};
-+	} ____cacheline_aligned;
- 
- 	/* DEVSLP Timing Variables from Identify Device Data Log */
- 	u8			devslp_timing[ATA_LOG_DEVSLP_SIZE];
--- 
-2.28.0
-
-
-From 137d2a237dc2f38bd8623c03e95279643330e878 Mon Sep 17 00:00:00 2001
-From: Todd E Brandt <todd.e.brandt@linux.intel.com>
-Date: Wed, 2 Mar 2016 16:05:29 -0800
-Subject: [PATCH 08/25] PM / sleep / x86: Fix crash on graph trace through x86
- suspend
-
-commit 92f9e179a702a6adbc11e2fedc76ecd6ffc9e3f7 upstream.
-
-Pause/unpause graph tracing around do_suspend_lowlevel as it has
-inconsistent call/return info after it jumps to the wakeup vector.
-The graph trace buffer will otherwise become misaligned and
-may eventually crash and hang on suspend.
-
-To reproduce the issue and test the fix:
-Run a function_graph trace over suspend/resume and set the graph
-function to suspend_devices_and_enter. This consistently hangs the
-system without this fix.
-
-Signed-off-by: Todd Brandt <todd.e.brandt@linux.intel.com>
-Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/kernel/acpi/sleep.c | 7 +++++++
- 1 file changed, 7 insertions(+)
-
-diff --git a/arch/x86/kernel/acpi/sleep.c b/arch/x86/kernel/acpi/sleep.c
-index ec94e11807dc..ca0805633f26 100644
---- a/arch/x86/kernel/acpi/sleep.c
-+++ b/arch/x86/kernel/acpi/sleep.c
-@@ -16,6 +16,7 @@
- #include <asm/cacheflush.h>
- #include <asm/realmode.h>
- 
-+#include <linux/ftrace.h>
- #include "../../realmode/rm/wakeup.h"
- #include "sleep.h"
- 
-@@ -96,7 +97,13 @@ int acpi_suspend_lowlevel(void)
-        saved_magic = 0x123456789abcdef0L;
- #endif /* CONFIG_64BIT */
- 
-+	/*
-+	 * Pause/unpause graph tracing around do_suspend_lowlevel as it has
-+	 * inconsistent call/return info after it jumps to the wakeup vector.
-+	 */
-+	pause_graph_tracing();
- 	do_suspend_lowlevel();
-+	unpause_graph_tracing();
- 	return 0;
- }
- 
--- 
-2.28.0
-
-
-From dc71448e7e054cf8395f8dac5fcd516f374744d2 Mon Sep 17 00:00:00 2001
-From: Thomas Betker <thomas.betker@rohde-schwarz.com>
-Date: Tue, 10 Nov 2015 22:18:15 +0100
-Subject: [PATCH 09/25] Revert "jffs2: Fix lock acquisition order bug in
- jffs2_write_begin"
-
-commit 157078f64b8a9cd7011b6b900b2f2498df850748 upstream.
-
-This reverts commit 5ffd3412ae55
-("jffs2: Fix lock acquisition order bug in jffs2_write_begin").
-
-The commit modified jffs2_write_begin() to remove a deadlock with
-jffs2_garbage_collect_live(), but this introduced new deadlocks found
-by multiple users. page_lock() actually has to be called before
-mutex_lock(&c->alloc_sem) or mutex_lock(&f->sem) because
-jffs2_write_end() and jffs2_readpage() are called with the page locked,
-and they acquire c->alloc_sem and f->sem, resp.
-
-In other words, the lock order in jffs2_write_begin() was correct, and
-it is the jffs2_garbage_collect_live() path that has to be changed.
-
-Revert the commit to get rid of the new deadlocks, and to clear the way
-for a better fix of the original deadlock.
-
-Reported-by: Deng Chao <deng.chao1@zte.com.cn>
-Reported-by: Ming Liu <liu.ming50@gmail.com>
-Reported-by: wangzaiwei <wangzaiwei@top-vision.cn>
-Signed-off-by: Thomas Betker <thomas.betker@rohde-schwarz.com>
-Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/jffs2/file.c | 39 ++++++++++++++++++---------------------
- 1 file changed, 18 insertions(+), 21 deletions(-)
-
-diff --git a/fs/jffs2/file.c b/fs/jffs2/file.c
-index 1506673c087e..60ef3fb707ff 100644
---- a/fs/jffs2/file.c
-+++ b/fs/jffs2/file.c
-@@ -138,39 +138,33 @@ static int jffs2_write_begin(struct file *filp, struct address_space *mapping,
- 	struct page *pg;
- 	struct inode *inode = mapping->host;
- 	struct jffs2_inode_info *f = JFFS2_INODE_INFO(inode);
--	struct jffs2_sb_info *c = JFFS2_SB_INFO(inode->i_sb);
--	struct jffs2_raw_inode ri;
--	uint32_t alloc_len = 0;
- 	pgoff_t index = pos >> PAGE_CACHE_SHIFT;
- 	uint32_t pageofs = index << PAGE_CACHE_SHIFT;
- 	int ret = 0;
- 
--	jffs2_dbg(1, "%s()\n", __func__);
--
--	if (pageofs > inode->i_size) {
--		ret = jffs2_reserve_space(c, sizeof(ri), &alloc_len,
--					  ALLOC_NORMAL, JFFS2_SUMMARY_INODE_SIZE);
--		if (ret)
--			return ret;
--	}
--
--	mutex_lock(&f->sem);
- 	pg = grab_cache_page_write_begin(mapping, index, flags);
--	if (!pg) {
--		if (alloc_len)
--			jffs2_complete_reservation(c);
--		mutex_unlock(&f->sem);
-+	if (!pg)
- 		return -ENOMEM;
--	}
- 	*pagep = pg;
- 
--	if (alloc_len) {
-+	jffs2_dbg(1, "%s()\n", __func__);
-+
-+	if (pageofs > inode->i_size) {
- 		/* Make new hole frag from old EOF to new page */
-+		struct jffs2_sb_info *c = JFFS2_SB_INFO(inode->i_sb);
-+		struct jffs2_raw_inode ri;
- 		struct jffs2_full_dnode *fn;
-+		uint32_t alloc_len;
- 
- 		jffs2_dbg(1, "Writing new hole frag 0x%x-0x%x between current EOF and new page\n",
- 			  (unsigned int)inode->i_size, pageofs);
- 
-+		ret = jffs2_reserve_space(c, sizeof(ri), &alloc_len,
-+					  ALLOC_NORMAL, JFFS2_SUMMARY_INODE_SIZE);
-+		if (ret)
-+			goto out_page;
-+
-+		mutex_lock(&f->sem);
- 		memset(&ri, 0, sizeof(ri));
- 
- 		ri.magic = cpu_to_je16(JFFS2_MAGIC_BITMASK);
-@@ -197,6 +191,7 @@ static int jffs2_write_begin(struct file *filp, struct address_space *mapping,
- 		if (IS_ERR(fn)) {
- 			ret = PTR_ERR(fn);
- 			jffs2_complete_reservation(c);
-+			mutex_unlock(&f->sem);
- 			goto out_page;
- 		}
- 		ret = jffs2_add_full_dnode_to_inode(c, f, fn);
-@@ -211,10 +206,12 @@ static int jffs2_write_begin(struct file *filp, struct address_space *mapping,
- 			jffs2_mark_node_obsolete(c, fn->raw);
- 			jffs2_free_full_dnode(fn);
- 			jffs2_complete_reservation(c);
-+			mutex_unlock(&f->sem);
- 			goto out_page;
- 		}
- 		jffs2_complete_reservation(c);
- 		inode->i_size = pageofs;
-+		mutex_unlock(&f->sem);
- 	}
- 
- 	/*
-@@ -223,18 +220,18 @@ static int jffs2_write_begin(struct file *filp, struct address_space *mapping,
- 	 * case of a short-copy.
- 	 */
- 	if (!PageUptodate(pg)) {
-+		mutex_lock(&f->sem);
- 		ret = jffs2_do_readpage_nolock(inode, pg);
-+		mutex_unlock(&f->sem);
- 		if (ret)
- 			goto out_page;
- 	}
--	mutex_unlock(&f->sem);
- 	jffs2_dbg(1, "end write_begin(). pg->flags %lx\n", pg->flags);
- 	return ret;
- 
- out_page:
- 	unlock_page(pg);
- 	page_cache_release(pg);
--	mutex_unlock(&f->sem);
- 	return ret;
- }
- 
--- 
-2.28.0
-
-
-From 44024ba884560d7936b7c7230880cfc43398c34c Mon Sep 17 00:00:00 2001
-From: David Woodhouse <David.Woodhouse@intel.com>
-Date: Mon, 1 Feb 2016 12:37:20 +0000
-Subject: [PATCH 10/25] jffs2: Fix page lock / f->sem deadlock
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 49e91e7079febe59a20ca885a87dd1c54240d0f1 upstream.
-
-With this fix, all code paths should now be obtaining the page lock before
-f->sem.
-
-Reported-by: Szabó Tamás <sztomi89@gmail.com>
-Tested-by: Thomas Betker <thomas.betker@rohde-schwarz.com>
-Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/jffs2/README.Locking |  5 +----
- fs/jffs2/gc.c           | 17 ++++++++++-------
- 2 files changed, 11 insertions(+), 11 deletions(-)
-
 diff --git a/fs/jffs2/README.Locking b/fs/jffs2/README.Locking
 index 3ea36554107f..8918ac905a3b 100644
 --- a/fs/jffs2/README.Locking
@@ -793,77 +296,6 @@ index 3ea36554107f..8918ac905a3b 100644
  
  
  	erase_completion_lock spinlock
-diff --git a/fs/jffs2/gc.c b/fs/jffs2/gc.c
-index 5a2dec2b064c..95d5880a63ee 100644
---- a/fs/jffs2/gc.c
-+++ b/fs/jffs2/gc.c
-@@ -1296,14 +1296,17 @@ static int jffs2_garbage_collect_dnode(struct jffs2_sb_info *c, struct jffs2_era
- 		BUG_ON(start > orig_start);
- 	}
- 
--	/* First, use readpage() to read the appropriate page into the page cache */
--	/* Q: What happens if we actually try to GC the _same_ page for which commit_write()
--	 *    triggered garbage collection in the first place?
--	 * A: I _think_ it's OK. read_cache_page shouldn't deadlock, we'll write out the
--	 *    page OK. We'll actually write it out again in commit_write, which is a little
--	 *    suboptimal, but at least we're correct.
--	 */
-+	/* The rules state that we must obtain the page lock *before* f->sem, so
-+	 * drop f->sem temporarily. Since we also hold c->alloc_sem, nothing's
-+	 * actually going to *change* so we're safe; we only allow reading.
-+	 *
-+	 * It is important to note that jffs2_write_begin() will ensure that its
-+	 * page is marked Uptodate before allocating space. That means that if we
-+	 * end up here trying to GC the *same* page that jffs2_write_begin() is
-+	 * trying to write out, read_cache_page() will not deadlock. */
-+	mutex_unlock(&f->sem);
- 	pg_ptr = jffs2_gc_fetch_page(c, f, start, &pg);
-+	mutex_lock(&f->sem);
- 
- 	if (IS_ERR(pg_ptr)) {
- 		pr_warn("read_cache_page() returned error: %ld\n",
--- 
-2.28.0
-
-
-From b723bb7c4fa9c68666386b5d83dde7d2bf2d08a8 Mon Sep 17 00:00:00 2001
-From: David Woodhouse <David.Woodhouse@intel.com>
-Date: Mon, 1 Feb 2016 14:04:46 +0000
-Subject: [PATCH 11/25] Fix directory hardlinks from deleted directories
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit be629c62a603e5935f8177fd8a19e014100a259e upstream.
-
-When a directory is deleted, we don't take too much care about killing off
-all the dirents that belong to it — on the basis that on remount, the scan
-will conclude that the directory is dead anyway.
-
-This doesn't work though, when the deleted directory contained a child
-directory which was moved *out*. In the early stages of the fs build
-we can then end up with an apparent hard link, with the child directory
-appearing both in its true location, and as a child of the original
-directory which are this stage of the mount process we don't *yet* know
-is defunct.
-
-To resolve this, take out the early special-casing of the "directories
-shall not have hard links" rule in jffs2_build_inode_pass1(), and let the
-normal nlink processing happen for directories as well as other inodes.
-
-Then later in the build process we can set ic->pino_nlink to the parent
-inode#, as is required for directories during normal operaton, instead
-of the nlink. And complain only *then* about hard links which are still
-in evidence even after killing off all the unreachable paths.
-
-Reported-by: Liu Song <liu.song11@zte.com.cn>
-Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/jffs2/build.c    | 75 ++++++++++++++++++++++++++++++++++-----------
- fs/jffs2/nodelist.h |  6 +++-
- 2 files changed, 62 insertions(+), 19 deletions(-)
-
 diff --git a/fs/jffs2/build.c b/fs/jffs2/build.c
 index a3750f902adc..c1f04947d7dc 100644
 --- a/fs/jffs2/build.c
@@ -996,6 +428,134 @@ index a3750f902adc..c1f04947d7dc 100644
  
  			if (!child_ic->pino_nlink) {
  				dbg_fsbuild("inode #%u (\"%s\") now has no links; adding to dead_fds list.\n",
+diff --git a/fs/jffs2/file.c b/fs/jffs2/file.c
+index 1506673c087e..60ef3fb707ff 100644
+--- a/fs/jffs2/file.c
++++ b/fs/jffs2/file.c
+@@ -138,39 +138,33 @@ static int jffs2_write_begin(struct file *filp, struct address_space *mapping,
+ 	struct page *pg;
+ 	struct inode *inode = mapping->host;
+ 	struct jffs2_inode_info *f = JFFS2_INODE_INFO(inode);
+-	struct jffs2_sb_info *c = JFFS2_SB_INFO(inode->i_sb);
+-	struct jffs2_raw_inode ri;
+-	uint32_t alloc_len = 0;
+ 	pgoff_t index = pos >> PAGE_CACHE_SHIFT;
+ 	uint32_t pageofs = index << PAGE_CACHE_SHIFT;
+ 	int ret = 0;
+ 
+-	jffs2_dbg(1, "%s()\n", __func__);
+-
+-	if (pageofs > inode->i_size) {
+-		ret = jffs2_reserve_space(c, sizeof(ri), &alloc_len,
+-					  ALLOC_NORMAL, JFFS2_SUMMARY_INODE_SIZE);
+-		if (ret)
+-			return ret;
+-	}
+-
+-	mutex_lock(&f->sem);
+ 	pg = grab_cache_page_write_begin(mapping, index, flags);
+-	if (!pg) {
+-		if (alloc_len)
+-			jffs2_complete_reservation(c);
+-		mutex_unlock(&f->sem);
++	if (!pg)
+ 		return -ENOMEM;
+-	}
+ 	*pagep = pg;
+ 
+-	if (alloc_len) {
++	jffs2_dbg(1, "%s()\n", __func__);
++
++	if (pageofs > inode->i_size) {
+ 		/* Make new hole frag from old EOF to new page */
++		struct jffs2_sb_info *c = JFFS2_SB_INFO(inode->i_sb);
++		struct jffs2_raw_inode ri;
+ 		struct jffs2_full_dnode *fn;
++		uint32_t alloc_len;
+ 
+ 		jffs2_dbg(1, "Writing new hole frag 0x%x-0x%x between current EOF and new page\n",
+ 			  (unsigned int)inode->i_size, pageofs);
+ 
++		ret = jffs2_reserve_space(c, sizeof(ri), &alloc_len,
++					  ALLOC_NORMAL, JFFS2_SUMMARY_INODE_SIZE);
++		if (ret)
++			goto out_page;
++
++		mutex_lock(&f->sem);
+ 		memset(&ri, 0, sizeof(ri));
+ 
+ 		ri.magic = cpu_to_je16(JFFS2_MAGIC_BITMASK);
+@@ -197,6 +191,7 @@ static int jffs2_write_begin(struct file *filp, struct address_space *mapping,
+ 		if (IS_ERR(fn)) {
+ 			ret = PTR_ERR(fn);
+ 			jffs2_complete_reservation(c);
++			mutex_unlock(&f->sem);
+ 			goto out_page;
+ 		}
+ 		ret = jffs2_add_full_dnode_to_inode(c, f, fn);
+@@ -211,10 +206,12 @@ static int jffs2_write_begin(struct file *filp, struct address_space *mapping,
+ 			jffs2_mark_node_obsolete(c, fn->raw);
+ 			jffs2_free_full_dnode(fn);
+ 			jffs2_complete_reservation(c);
++			mutex_unlock(&f->sem);
+ 			goto out_page;
+ 		}
+ 		jffs2_complete_reservation(c);
+ 		inode->i_size = pageofs;
++		mutex_unlock(&f->sem);
+ 	}
+ 
+ 	/*
+@@ -223,18 +220,18 @@ static int jffs2_write_begin(struct file *filp, struct address_space *mapping,
+ 	 * case of a short-copy.
+ 	 */
+ 	if (!PageUptodate(pg)) {
++		mutex_lock(&f->sem);
+ 		ret = jffs2_do_readpage_nolock(inode, pg);
++		mutex_unlock(&f->sem);
+ 		if (ret)
+ 			goto out_page;
+ 	}
+-	mutex_unlock(&f->sem);
+ 	jffs2_dbg(1, "end write_begin(). pg->flags %lx\n", pg->flags);
+ 	return ret;
+ 
+ out_page:
+ 	unlock_page(pg);
+ 	page_cache_release(pg);
+-	mutex_unlock(&f->sem);
+ 	return ret;
+ }
+ 
+diff --git a/fs/jffs2/gc.c b/fs/jffs2/gc.c
+index 5a2dec2b064c..95d5880a63ee 100644
+--- a/fs/jffs2/gc.c
++++ b/fs/jffs2/gc.c
+@@ -1296,14 +1296,17 @@ static int jffs2_garbage_collect_dnode(struct jffs2_sb_info *c, struct jffs2_era
+ 		BUG_ON(start > orig_start);
+ 	}
+ 
+-	/* First, use readpage() to read the appropriate page into the page cache */
+-	/* Q: What happens if we actually try to GC the _same_ page for which commit_write()
+-	 *    triggered garbage collection in the first place?
+-	 * A: I _think_ it's OK. read_cache_page shouldn't deadlock, we'll write out the
+-	 *    page OK. We'll actually write it out again in commit_write, which is a little
+-	 *    suboptimal, but at least we're correct.
+-	 */
++	/* The rules state that we must obtain the page lock *before* f->sem, so
++	 * drop f->sem temporarily. Since we also hold c->alloc_sem, nothing's
++	 * actually going to *change* so we're safe; we only allow reading.
++	 *
++	 * It is important to note that jffs2_write_begin() will ensure that its
++	 * page is marked Uptodate before allocating space. That means that if we
++	 * end up here trying to GC the *same* page that jffs2_write_begin() is
++	 * trying to write out, read_cache_page() will not deadlock. */
++	mutex_unlock(&f->sem);
+ 	pg_ptr = jffs2_gc_fetch_page(c, f, start, &pg);
++	mutex_lock(&f->sem);
+ 
+ 	if (IS_ERR(pg_ptr)) {
+ 		pr_warn("read_cache_page() returned error: %ld\n",
 diff --git a/fs/jffs2/nodelist.h b/fs/jffs2/nodelist.h
 index fa35ff79ab35..0637271f3770 100644
 --- a/fs/jffs2/nodelist.h
@@ -1020,32 +580,119 @@ index fa35ff79ab35..0637271f3770 100644
  	struct jffs2_full_dirent *next;
  	uint32_t version;
  	uint32_t ino; /* == zero for unlink */
--- 
-2.28.0
-
-
-From 6146f38b338b1b2bebc26f4b1cf2ef66f50de641 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Sat, 27 Feb 2016 17:52:42 +0100
-Subject: [PATCH 12/25] ALSA: ctl: Fix ioctls for X32 ABI
-
-commit 6236d8bb2afcfe71b88ecea554e0dc638090a45f upstream.
-
-The X32 ABI takes the same alignment like x86-64, and this may result
-in the incompatible struct size from ia32.  Unfortunately, we hit this
-in some control ABI: struct snd_ctl_elem_value differs between them
-due to the position of 64bit variable array.  This ends up with the
-unknown ioctl (ENOTTY) error.
-
-The fix is to add the compat entries for the new aligned struct.
-
-Reported-and-tested-by: Steven Newbury <steve@snewbury.org.uk>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/control_compat.c | 90 ++++++++++++++++++++++++++++++-------
- 1 file changed, 74 insertions(+), 16 deletions(-)
-
+diff --git a/fs/locks.c b/fs/locks.c
+index 0274c953b07d..f7b1de7e6735 100644
+--- a/fs/locks.c
++++ b/fs/locks.c
+@@ -1852,7 +1852,6 @@ int fcntl_setlk(unsigned int fd, struct file *filp, unsigned int cmd,
+ 		goto out;
+ 	}
+ 
+-again:
+ 	error = flock_to_posix_lock(filp, file_lock, &flock);
+ 	if (error)
+ 		goto out;
+@@ -1883,19 +1882,22 @@ again:
+ 	 * Attempt to detect a close/fcntl race and recover by
+ 	 * releasing the lock that was just acquired.
+ 	 */
+-	/*
+-	 * we need that spin_lock here - it prevents reordering between
+-	 * update of inode->i_flock and check for it done in close().
+-	 * rcu_read_lock() wouldn't do.
+-	 */
+-	spin_lock(&current->files->file_lock);
+-	f = fcheck(fd);
+-	spin_unlock(&current->files->file_lock);
+-	if (!error && f != filp && flock.l_type != F_UNLCK) {
+-		flock.l_type = F_UNLCK;
+-		goto again;
++	if (!error && file_lock->fl_type != F_UNLCK) {
++		/*
++		 * We need that spin_lock here - it prevents reordering between
++		 * update of inode->i_flock and check for it done in
++		 * close(). rcu_read_lock() wouldn't do.
++		 */
++		spin_lock(&current->files->file_lock);
++		f = fcheck(fd);
++		spin_unlock(&current->files->file_lock);
++		if (f != filp) {
++			file_lock->fl_type = F_UNLCK;
++			error = do_lock_file_wait(filp, cmd, file_lock);
++			WARN_ON_ONCE(error);
++			error = -EBADF;
++		}
+ 	}
+-
+ out:
+ 	locks_free_lock(file_lock);
+ 	return error;
+@@ -1970,7 +1972,6 @@ int fcntl_setlk64(unsigned int fd, struct file *filp, unsigned int cmd,
+ 		goto out;
+ 	}
+ 
+-again:
+ 	error = flock64_to_posix_lock(filp, file_lock, &flock);
+ 	if (error)
+ 		goto out;
+@@ -2001,14 +2002,22 @@ again:
+ 	 * Attempt to detect a close/fcntl race and recover by
+ 	 * releasing the lock that was just acquired.
+ 	 */
+-	spin_lock(&current->files->file_lock);
+-	f = fcheck(fd);
+-	spin_unlock(&current->files->file_lock);
+-	if (!error && f != filp && flock.l_type != F_UNLCK) {
+-		flock.l_type = F_UNLCK;
+-		goto again;
++	if (!error && file_lock->fl_type != F_UNLCK) {
++		/*
++		 * We need that spin_lock here - it prevents reordering between
++		 * update of inode->i_flock and check for it done in
++		 * close(). rcu_read_lock() wouldn't do.
++		 */
++		spin_lock(&current->files->file_lock);
++		f = fcheck(fd);
++		spin_unlock(&current->files->file_lock);
++		if (f != filp) {
++			file_lock->fl_type = F_UNLCK;
++			error = do_lock_file_wait(filp, cmd, file_lock);
++			WARN_ON_ONCE(error);
++			error = -EBADF;
++		}
+ 	}
+-
+ out:
+ 	locks_free_lock(file_lock);
+ 	return error;
+diff --git a/include/linux/ata.h b/include/linux/ata.h
+index ee0bd9524055..f60ffe29b3a1 100644
+--- a/include/linux/ata.h
++++ b/include/linux/ata.h
+@@ -477,8 +477,8 @@ enum ata_tf_protocols {
+ };
+ 
+ enum ata_ioctls {
+-	ATA_IOC_GET_IO32	= 0x309,
+-	ATA_IOC_SET_IO32	= 0x324,
++	ATA_IOC_GET_IO32	= 0x309, /* HDIO_GET_32BIT */
++	ATA_IOC_SET_IO32	= 0x324, /* HDIO_SET_32BIT */
+ };
+ 
+ /* core structures */
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index 8ad0771b88ab..8017e5c459cf 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -666,7 +666,7 @@ struct ata_device {
+ 	union {
+ 		u16		id[ATA_ID_WORDS]; /* IDENTIFY xxx DEVICE data */
+ 		u32		gscr[SATA_PMP_GSCR_DWORDS]; /* PMP GSCR block */
+-	};
++	} ____cacheline_aligned;
+ 
+ 	/* DEVSLP Timing Variables from Identify Device Data Log */
+ 	u8			devslp_timing[ATA_LOG_DEVSLP_SIZE];
 diff --git a/sound/core/control_compat.c b/sound/core/control_compat.c
 index 2bb95a7a8809..c14565bde887 100644
 --- a/sound/core/control_compat.c
@@ -1248,30 +895,6 @@ index 2bb95a7a8809..c14565bde887 100644
  	}
  
  	down_read(&snd_ioctl_rwsem);
--- 
-2.28.0
-
-
-From f6e85943547f6e2082ac1db81ad0943fcc4d6a7b Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Sun, 28 Feb 2016 11:28:08 +0100
-Subject: [PATCH 13/25] ALSA: rawmidi: Fix ioctls X32 ABI
-
-commit 2251fbbc1539f05b0b206b37a602d5776be37252 upstream.
-
-Like the previous fixes for ctl and PCM, we need a fix for
-incompatible X32 ABI regarding the rawmidi: namely, struct
-snd_rawmidi_status has the timespec, and the size and the alignment on
-X32 differ from IA32.
-
-This patch fixes the incompatible ioctl for X32.
-
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/rawmidi_compat.c | 53 +++++++++++++++++++++++++++++++++++++
- 1 file changed, 53 insertions(+)
-
 diff --git a/sound/core/rawmidi_compat.c b/sound/core/rawmidi_compat.c
 index 5268c1f58c25..09a89094dcf7 100644
 --- a/sound/core/rawmidi_compat.c
@@ -1346,104 +969,6 @@ index 5268c1f58c25..09a89094dcf7 100644
  	}
  	return -ENOIOCTLCMD;
  }
--- 
-2.28.0
-
-
-From 3d0c02d2c0fa9fbdea2da035b57ff3c6a96a2bb8 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Sun, 28 Feb 2016 11:41:47 +0100
-Subject: [PATCH 14/25] ALSA: timer: Fix ioctls for X32 ABI
-
-commit b24e7ad1fdc22177eb3e51584e1cfcb45d818488 upstream.
-
-X32 ABI takes the 64bit timespec, thus the timer user status ioctl becomes
-incompatible with IA32.  This results in NOTTY error when the ioctl is
-issued.
-
-Meanwhile, this struct in X32 is essentially identical with the one in
-X86-64, so we can just bypassing to the existing code for this
-specific compat ioctl.
-
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/timer_compat.c | 13 +++++++++++++
- 1 file changed, 13 insertions(+)
-
-diff --git a/sound/core/timer_compat.c b/sound/core/timer_compat.c
-index e05802ae6e1b..1314b732bff3 100644
---- a/sound/core/timer_compat.c
-+++ b/sound/core/timer_compat.c
-@@ -88,12 +88,21 @@ static int snd_timer_user_status_compat(struct file *file,
- 	return 0;
- }
- 
-+#ifdef CONFIG_X86_X32
-+/* X32 ABI has the same struct as x86-64 */
-+#define snd_timer_user_status_x32(file, s) \
-+	snd_timer_user_status(file, s)
-+#endif /* CONFIG_X86_X32 */
-+
- /*
-  */
- 
- enum {
- 	SNDRV_TIMER_IOCTL_INFO32 = _IOR('T', 0x11, struct snd_timer_info32),
- 	SNDRV_TIMER_IOCTL_STATUS32 = _IOW('T', 0x14, struct snd_timer_status32),
-+#ifdef CONFIG_X86_X32
-+	SNDRV_TIMER_IOCTL_STATUS_X32 = _IOW('T', 0x14, struct snd_timer_status),
-+#endif /* CONFIG_X86_X32 */
- };
- 
- static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, unsigned long arg)
-@@ -122,6 +131,10 @@ static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, uns
- 		return snd_timer_user_info_compat(file, argp);
- 	case SNDRV_TIMER_IOCTL_STATUS32:
- 		return snd_timer_user_status_compat(file, argp);
-+#ifdef CONFIG_X86_X32
-+	case SNDRV_TIMER_IOCTL_STATUS_X32:
-+		return snd_timer_user_status_x32(file, argp);
-+#endif /* CONFIG_X86_X32 */
- 	}
- 	return -ENOIOCTLCMD;
- }
--- 
-2.28.0
-
-
-From e21cf1926a2f3794db8cdec33153e1b5d92d6598 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Tue, 1 Mar 2016 18:30:18 +0100
-Subject: [PATCH 15/25] ALSA: seq: oss: Don't drain at closing a client
-
-commit 197b958c1e76a575d77038cc98b4bebc2134279f upstream.
-
-The OSS sequencer client tries to drain the pending events at
-releasing.  Unfortunately, as spotted by syzkaller fuzzer, this may
-lead to an unkillable process state when the event has been queued at
-the far future.  Since the process being released can't be signaled
-any longer, it remains and waits for the echo-back event in that far
-future.
-
-Back to history, the draining feature was implemented at the time we
-misinterpreted POSIX definition for blocking file operation.
-Actually, such a behavior is superfluous at release, and we should
-just release the device as is instead of keeping it up forever.
-
-This patch just removes the draining call that may block the release
-for too long time unexpectedly.
-
-BugLink: http://lkml.kernel.org/r/CACT4Y+Y4kD-aBGj37rf-xBw9bH3GMU6P+MYg4W1e-s-paVD2pg@mail.gmail.com
-Reported-by: Dmitry Vyukov <dvyukov@google.com>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/seq/oss/seq_oss.c        |  2 --
- sound/core/seq/oss/seq_oss_device.h |  1 -
- sound/core/seq/oss/seq_oss_init.c   | 17 -----------------
- 3 files changed, 20 deletions(-)
-
 diff --git a/sound/core/seq/oss/seq_oss.c b/sound/core/seq/oss/seq_oss.c
 index 8d4d5e853efe..ab774954c985 100644
 --- a/sound/core/seq/oss/seq_oss.c
@@ -1473,11 +998,10 @@ diff --git a/sound/core/seq/oss/seq_oss_init.c b/sound/core/seq/oss/seq_oss_init
 index b3f39b5ed742..f9e09e458227 100644
 --- a/sound/core/seq/oss/seq_oss_init.c
 +++ b/sound/core/seq/oss/seq_oss_init.c
-@@ -456,23 +456,6 @@ snd_seq_oss_release(struct seq_oss_devinfo *dp)
- }
+@@ -457,23 +457,6 @@ snd_seq_oss_release(struct seq_oss_devinfo *dp)
  
  
--/*
+ /*
 - * Wait until the queue is empty (if we don't have nonblock)
 - */
 -void
@@ -1494,82 +1018,64 @@ index b3f39b5ed742..f9e09e458227 100644
 -}
 -
 -
- /*
+-/*
   * reset sequencer devices
   */
--- 
-2.28.0
-
-
-From b8834e4fe7179446638ccb1094a329970c6d7660 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Mon, 29 Feb 2016 14:25:16 +0100
-Subject: [PATCH 16/25] ALSA: hdspm: Fix wrong boolean ctl value accesses
-
-commit 537e48136295c5860a92138c5ea3959b9542868b upstream.
-
-snd-hdspm driver accesses enum item values (int) instead of boolean
-values (long) wrongly for some ctl elements.  This patch fixes them.
-
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/rme9652/hdspm.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/sound/pci/rme9652/hdspm.c b/sound/pci/rme9652/hdspm.c
-index dd910d249987..1f4b1b4de984 100644
---- a/sound/pci/rme9652/hdspm.c
-+++ b/sound/pci/rme9652/hdspm.c
-@@ -2091,7 +2091,7 @@ static int snd_hdspm_put_system_sample_rate(struct snd_kcontrol *kcontrol,
+ void
+diff --git a/sound/core/timer_compat.c b/sound/core/timer_compat.c
+index e05802ae6e1b..2e908225d754 100644
+--- a/sound/core/timer_compat.c
++++ b/sound/core/timer_compat.c
+@@ -70,13 +70,14 @@ static int snd_timer_user_status_compat(struct file *file,
+ 					struct snd_timer_status32 __user *_status)
  {
- 	struct hdspm *hdspm = snd_kcontrol_chip(kcontrol);
- 
--	hdspm_set_dds_value(hdspm, ucontrol->value.enumerated.item[0]);
-+	hdspm_set_dds_value(hdspm, ucontrol->value.integer.value[0]);
+ 	struct snd_timer_user *tu;
+-	struct snd_timer_status status;
++	struct snd_timer_status32 status;
+ 	
+ 	tu = file->private_data;
+ 	if (snd_BUG_ON(!tu->timeri))
+ 		return -ENXIO;
+ 	memset(&status, 0, sizeof(status));
+-	status.tstamp = tu->tstamp;
++	status.tstamp.tv_sec = tu->tstamp.tv_sec;
++	status.tstamp.tv_nsec = tu->tstamp.tv_nsec;
+ 	status.resolution = snd_timer_resolution(tu->timeri);
+ 	status.lost = tu->timeri->lost;
+ 	status.overrun = tu->overrun;
+@@ -88,12 +89,21 @@ static int snd_timer_user_status_compat(struct file *file,
  	return 0;
  }
  
-@@ -4199,7 +4199,7 @@ static int snd_hdspm_get_tco_word_term(struct snd_kcontrol *kcontrol,
- {
- 	struct hdspm *hdspm = snd_kcontrol_chip(kcontrol);
++#ifdef CONFIG_X86_X32
++/* X32 ABI has the same struct as x86-64 */
++#define snd_timer_user_status_x32(file, s) \
++	snd_timer_user_status(file, s)
++#endif /* CONFIG_X86_X32 */
++
+ /*
+  */
  
--	ucontrol->value.enumerated.item[0] = hdspm->tco->term;
-+	ucontrol->value.integer.value[0] = hdspm->tco->term;
+ enum {
+ 	SNDRV_TIMER_IOCTL_INFO32 = _IOR('T', 0x11, struct snd_timer_info32),
+ 	SNDRV_TIMER_IOCTL_STATUS32 = _IOW('T', 0x14, struct snd_timer_status32),
++#ifdef CONFIG_X86_X32
++	SNDRV_TIMER_IOCTL_STATUS_X32 = _IOW('T', 0x14, struct snd_timer_status),
++#endif /* CONFIG_X86_X32 */
+ };
  
- 	return 0;
+ static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, unsigned long arg)
+@@ -122,6 +132,10 @@ static long snd_timer_user_ioctl_compat(struct file *file, unsigned int cmd, uns
+ 		return snd_timer_user_info_compat(file, argp);
+ 	case SNDRV_TIMER_IOCTL_STATUS32:
+ 		return snd_timer_user_status_compat(file, argp);
++#ifdef CONFIG_X86_X32
++	case SNDRV_TIMER_IOCTL_STATUS_X32:
++		return snd_timer_user_status_x32(file, argp);
++#endif /* CONFIG_X86_X32 */
+ 	}
+ 	return -ENOIOCTLCMD;
  }
-@@ -4210,8 +4210,8 @@ static int snd_hdspm_put_tco_word_term(struct snd_kcontrol *kcontrol,
- {
- 	struct hdspm *hdspm = snd_kcontrol_chip(kcontrol);
- 
--	if (hdspm->tco->term != ucontrol->value.enumerated.item[0]) {
--		hdspm->tco->term = ucontrol->value.enumerated.item[0];
-+	if (hdspm->tco->term != ucontrol->value.integer.value[0]) {
-+		hdspm->tco->term = ucontrol->value.integer.value[0];
- 
- 		hdspm_tco_write(hdspm);
- 
--- 
-2.28.0
-
-
-From e3d2f6980030a66bc1ea7e7cbaf7a01b09755e81 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Mon, 29 Feb 2016 14:26:43 +0100
-Subject: [PATCH 17/25] ALSA: hdsp: Fix wrong boolean ctl value accesses
-
-commit eab3c4db193f5fcccf70e884de9a922ca2c63d80 upstream.
-
-snd-hdsp driver accesses enum item values (int) instead of boolean
-values (long) wrongly for some ctl elements.  This patch fixes them.
-
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/rme9652/hdsp.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
 diff --git a/sound/pci/rme9652/hdsp.c b/sound/pci/rme9652/hdsp.c
 index 94084cdb130c..9a281f45eb9c 100644
 --- a/sound/pci/rme9652/hdsp.c
@@ -1592,30 +1098,8 @@ index 94084cdb130c..9a281f45eb9c 100644
  	spin_lock_irq(&hdsp->lock);
  	if (val != hdsp_dds_offset(hdsp))
  		change = (hdsp_set_dds_offset(hdsp, val) == 0) ? 1 : 0;
--- 
-2.28.0
-
-
-From 080c4a4464ccafd42dbf3e329b9f757847d12a79 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Mon, 29 Feb 2016 14:32:42 +0100
-Subject: [PATCH 18/25] ALSA: hdspm: Fix zero-division
-
-commit c1099c3294c2344110085a38c50e478a5992b368 upstream.
-
-HDSPM driver contains a code issuing zero-division potentially in
-system sample rate ctl code.  This patch fixes it by not processing
-a zero or invalid rate value as a divisor, as well as excluding the
-invalid value to be passed via the given ctl element.
-
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/rme9652/hdspm.c | 8 ++++++++
- 1 file changed, 8 insertions(+)
-
 diff --git a/sound/pci/rme9652/hdspm.c b/sound/pci/rme9652/hdspm.c
-index 1f4b1b4de984..8444098d2a8e 100644
+index dd910d249987..8444098d2a8e 100644
 --- a/sound/pci/rme9652/hdspm.c
 +++ b/sound/pci/rme9652/hdspm.c
 @@ -1423,6 +1423,9 @@ static void hdspm_set_dds_value(struct hdspm *hdspm, int rate)
@@ -1637,277 +1121,36 @@ index 1f4b1b4de984..8444098d2a8e 100644
  		}
  	}
  
-@@ -2090,7 +2095,10 @@ static int snd_hdspm_put_system_sample_rate(struct snd_kcontrol *kcontrol,
+@@ -2090,8 +2095,11 @@ static int snd_hdspm_put_system_sample_rate(struct snd_kcontrol *kcontrol,
  					    ucontrol)
  {
  	struct hdspm *hdspm = snd_kcontrol_chip(kcontrol);
 +	int rate = ucontrol->value.integer.value[0];
  
+-	hdspm_set_dds_value(hdspm, ucontrol->value.enumerated.item[0]);
 +	if (rate < 27000 || rate > 207000)
 +		return -EINVAL;
- 	hdspm_set_dds_value(hdspm, ucontrol->value.integer.value[0]);
++	hdspm_set_dds_value(hdspm, ucontrol->value.integer.value[0]);
  	return 0;
  }
--- 
-2.28.0
-
-
-From f196347faf7a9bf9ebf2b540ac19e104d9a5cf9e Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Sun, 28 Feb 2016 11:36:14 +0100
-Subject: [PATCH 19/25] ALSA: timer: Fix broken compat timer user status ioctl
-
-commit 3a72494ac2a3bd229db941d51e7efe2f6ccd947b upstream.
-
-The timer user status compat ioctl returned the bogus struct used for
-64bit architectures instead of the 32bit one.  This patch addresses
-it to return the proper struct.
-
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/timer_compat.c | 5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
-
-diff --git a/sound/core/timer_compat.c b/sound/core/timer_compat.c
-index 1314b732bff3..2e908225d754 100644
---- a/sound/core/timer_compat.c
-+++ b/sound/core/timer_compat.c
-@@ -70,13 +70,14 @@ static int snd_timer_user_status_compat(struct file *file,
- 					struct snd_timer_status32 __user *_status)
+ 
+@@ -4199,7 +4207,7 @@ static int snd_hdspm_get_tco_word_term(struct snd_kcontrol *kcontrol,
  {
- 	struct snd_timer_user *tu;
--	struct snd_timer_status status;
-+	struct snd_timer_status32 status;
- 	
- 	tu = file->private_data;
- 	if (snd_BUG_ON(!tu->timeri))
- 		return -ENXIO;
- 	memset(&status, 0, sizeof(status));
--	status.tstamp = tu->tstamp;
-+	status.tstamp.tv_sec = tu->tstamp.tv_sec;
-+	status.tstamp.tv_nsec = tu->tstamp.tv_nsec;
- 	status.resolution = snd_timer_resolution(tu->timeri);
- 	status.lost = tu->timeri->lost;
- 	status.overrun = tu->overrun;
--- 
-2.28.0
-
-
-From d9f2fa1ed42ab0b573e9416a6e2d5c79ff28e817 Mon Sep 17 00:00:00 2001
-From: Vittorio Alfieri <vittorio88@gmail.com>
-Date: Sun, 28 Feb 2016 14:40:24 +0100
-Subject: [PATCH 20/25] USB: cp210x: Add ID for Parrot NMEA GPS Flight Recorder
-
-commit 3c4c615d70c8cbdc8ba8c79ed702640930652a79 upstream.
-
-The Parrot NMEA GPS Flight Recorder is a USB composite device
-consisting of hub, flash storage, and cp210x usb to serial chip.
-It is an accessory to the mass-produced Parrot AR Drone 2.
-The device emits standard NMEA messages which make the it compatible
-with NMEA compatible software. It was tested using gpsd version 3.11-3
-as an NMEA interpreter and using the official Parrot Flight Recorder.
-
-Signed-off-by: Vittorio Alfieri <vittorio88@gmail.com>
-Signed-off-by: Johan Hovold <johan@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/serial/cp210x.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/usb/serial/cp210x.c b/drivers/usb/serial/cp210x.c
-index 303f3b3fb65f..84b770461655 100644
---- a/drivers/usb/serial/cp210x.c
-+++ b/drivers/usb/serial/cp210x.c
-@@ -164,6 +164,7 @@ static const struct usb_device_id id_table[] = {
- 	{ USB_DEVICE(0x18EF, 0xE025) }, /* ELV Marble Sound Board 1 */
- 	{ USB_DEVICE(0x1901, 0x0190) }, /* GE B850 CP2105 Recorder interface */
- 	{ USB_DEVICE(0x1901, 0x0193) }, /* GE B650 CP2104 PMC interface */
-+	{ USB_DEVICE(0x19CF, 0x3000) }, /* Parrot NMEA GPS Flight Recorder */
- 	{ USB_DEVICE(0x1ADB, 0x0001) }, /* Schweitzer Engineering C662 Cable */
- 	{ USB_DEVICE(0x1B1C, 0x1C00) }, /* Corsair USB Dongle */
- 	{ USB_DEVICE(0x1BA4, 0x0002) },	/* Silicon Labs 358x factory default */
--- 
-2.28.0
-
-
-From 85b14c7a933f2c9dcf1715165bd0932beeca734a Mon Sep 17 00:00:00 2001
-From: Daniele Palmas <dnlplm@gmail.com>
-Date: Mon, 29 Feb 2016 15:36:11 +0100
-Subject: [PATCH 21/25] USB: serial: option: add support for Telit LE922 PID
- 0x1045
-
-commit 5deef5551c77e488922cc4bf4bc76df63be650d0 upstream.
-
-This patch adds support for 0x1045 PID of Telit LE922.
-
-Signed-off-by: Daniele Palmas <dnlplm@gmail.com>
-Signed-off-by: Johan Hovold <johan@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/serial/option.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
-index 9bab34cf01d4..ed5f2cda23c5 100644
---- a/drivers/usb/serial/option.c
-+++ b/drivers/usb/serial/option.c
-@@ -271,6 +271,7 @@ static void option_instat_callback(struct urb *urb);
- #define TELIT_PRODUCT_UE910_V2			0x1012
- #define TELIT_PRODUCT_LE922_USBCFG0		0x1042
- #define TELIT_PRODUCT_LE922_USBCFG3		0x1043
-+#define TELIT_PRODUCT_LE922_USBCFG5		0x1045
- #define TELIT_PRODUCT_LE920			0x1200
- #define TELIT_PRODUCT_LE910			0x1201
+ 	struct hdspm *hdspm = snd_kcontrol_chip(kcontrol);
  
-@@ -1191,6 +1192,8 @@ static const struct usb_device_id option_ids[] = {
- 		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg0 },
- 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG3),
- 		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg3 },
-+	{ USB_DEVICE_INTERFACE_CLASS(TELIT_VENDOR_ID, TELIT_PRODUCT_LE922_USBCFG5, 0xff),
-+		.driver_info = (kernel_ulong_t)&telit_le922_blacklist_usbcfg0 },
- 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE910),
- 		.driver_info = (kernel_ulong_t)&telit_le910_blacklist },
- 	{ USB_DEVICE(TELIT_VENDOR_ID, TELIT_PRODUCT_LE920),
--- 
-2.28.0
-
-
-From 5a86f5f6996b9f8d87f3c6a27b88def217cdbb9e Mon Sep 17 00:00:00 2001
-From: Yegor Yefremov <yegorslists@googlemail.com>
-Date: Mon, 29 Feb 2016 16:39:57 +0100
-Subject: [PATCH 22/25] USB: serial: option: add support for Quectel UC20
-
-commit c0992d0f54847d0d1d85c60fcaa054f175ab1ccd upstream.
-
-Add support for Quectel UC20 and blacklist the QMI interface.
-
-Signed-off-by: Yegor Yefremov <yegorslists@googlemail.com>
-[johan: amend commit message ]
-Signed-off-by: Johan Hovold <johan@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/serial/option.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
-index ed5f2cda23c5..24366a2afea6 100644
---- a/drivers/usb/serial/option.c
-+++ b/drivers/usb/serial/option.c
-@@ -1141,6 +1141,8 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x6613)}, /* Onda H600/ZTE MF330 */
- 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x0023)}, /* ONYX 3G device */
- 	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x9000)}, /* SIMCom SIM5218 */
-+	{ USB_DEVICE(QUALCOMM_VENDOR_ID, 0x9003), /* Quectel UC20 */
-+	  .driver_info = (kernel_ulong_t)&net_intf4_blacklist },
- 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6001) },
- 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_CMU_300) },
- 	{ USB_DEVICE(CMOTECH_VENDOR_ID, CMOTECH_PRODUCT_6003),
--- 
-2.28.0
-
-
-From 552b5325407fd2e9dfd662dd0e69dbfd59ec0950 Mon Sep 17 00:00:00 2001
-From: Richard Weinberger <richard@nod.at>
-Date: Sun, 21 Feb 2016 10:53:03 +0100
-Subject: [PATCH 23/25] ubi: Fix out of bounds write in volume update code
-
-commit e4f6daac20332448529b11f09388f1d55ef2084c upstream.
-
-ubi_start_leb_change() allocates too few bytes.
-ubi_more_leb_change_data() will write up to req->upd_bytes +
-ubi->min_io_size bytes.
-
-Signed-off-by: Richard Weinberger <richard@nod.at>
-Reviewed-by: Boris Brezillon <boris.brezillon@free-electrons.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/mtd/ubi/upd.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/mtd/ubi/upd.c b/drivers/mtd/ubi/upd.c
-index 2a1b6e037e1a..0134ba32a057 100644
---- a/drivers/mtd/ubi/upd.c
-+++ b/drivers/mtd/ubi/upd.c
-@@ -193,7 +193,7 @@ int ubi_start_leb_change(struct ubi_device *ubi, struct ubi_volume *vol,
- 	vol->changing_leb = 1;
- 	vol->ch_lnum = req->lnum;
+-	ucontrol->value.enumerated.item[0] = hdspm->tco->term;
++	ucontrol->value.integer.value[0] = hdspm->tco->term;
  
--	vol->upd_buf = vmalloc(req->bytes);
-+	vol->upd_buf = vmalloc(ALIGN((int)req->bytes, ubi->min_io_size));
- 	if (!vol->upd_buf)
- 		return -ENOMEM;
+ 	return 0;
+ }
+@@ -4210,8 +4218,8 @@ static int snd_hdspm_put_tco_word_term(struct snd_kcontrol *kcontrol,
+ {
+ 	struct hdspm *hdspm = snd_kcontrol_chip(kcontrol);
  
--- 
-2.28.0
-
-
-From 3e04866bc66f4937bb846249eae5fa26b8b58e89 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Mon, 7 Mar 2016 14:56:11 -0800
-Subject: [PATCH 24/25] Revert "drm/radeon: hold reference to fences in
- radeon_sa_bo_new"
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-This reverts commit 8d5e1e5af0c667545c202e8f4051f77aa3bf31b7 which was
-commit f6ff4f67cdf8455d0a4226eeeaf5af17c37d05eb upstream.
-
-It breaks working hardware, a backported version might be provided at
-some unknown time in the future.
-
-Reported-by: Erik Andersen <andersen@codepoet.org>
-Acked-by: Christian König <christian.koenig@amd.com>
-Cc: Nicolai Hähnle <nicolai.haehnle@amd.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/radeon/radeon_sa.c | 5 -----
- 1 file changed, 5 deletions(-)
-
-diff --git a/drivers/gpu/drm/radeon/radeon_sa.c b/drivers/gpu/drm/radeon/radeon_sa.c
-index bb166849aa6e..f0bac68254b7 100644
---- a/drivers/gpu/drm/radeon/radeon_sa.c
-+++ b/drivers/gpu/drm/radeon/radeon_sa.c
-@@ -349,13 +349,8 @@ int radeon_sa_bo_new(struct radeon_device *rdev,
- 			/* see if we can skip over some allocations */
- 		} while (radeon_sa_bo_next_hole(sa_manager, fences, tries));
+-	if (hdspm->tco->term != ucontrol->value.enumerated.item[0]) {
+-		hdspm->tco->term = ucontrol->value.enumerated.item[0];
++	if (hdspm->tco->term != ucontrol->value.integer.value[0]) {
++		hdspm->tco->term = ucontrol->value.integer.value[0];
  
--		for (i = 0; i < RADEON_NUM_RINGS; ++i)
--			radeon_fence_ref(fences[i]);
--
- 		spin_unlock(&sa_manager->wq.lock);
- 		r = radeon_fence_wait_any(rdev, fences, false);
--		for (i = 0; i < RADEON_NUM_RINGS; ++i)
--			radeon_fence_unref(&fences[i]);
- 		spin_lock(&sa_manager->wq.lock);
- 		/* if we have nothing to wait for block */
- 		if (r == -ENOENT && block) {
--- 
-2.28.0
-
-
-From 19d0bd71d564448446bd851d752caf3e31520ac8 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Wed, 9 Mar 2016 15:32:23 -0800
-Subject: [PATCH 25/25] Linux 3.10.100
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index f1e6491fd7d8..40d4d3bf52c3 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 10
--SUBLEVEL = 99
-+SUBLEVEL = 100
- EXTRAVERSION =
- NAME = TOSSUG Baby Fish
+ 		hdspm_tco_write(hdspm);
  
--- 
-2.28.0
-

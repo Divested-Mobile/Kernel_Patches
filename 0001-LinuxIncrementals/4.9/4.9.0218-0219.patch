@@ -1,170 +1,118 @@
-From 8aeff206767ea83d5b36746e03a4dfc9cec8a6b2 Mon Sep 17 00:00:00 2001
-From: Guillaume Nault <g.nault@alphalink.fr>
-Date: Fri, 22 Sep 2017 15:39:23 +0200
-Subject: [PATCH 01/34] l2tp: ensure sessions are freed after their PPPOL2TP
- socket
-
-commit cdd10c9627496ad25c87ce6394e29752253c69d3 upstream.
-
-If l2tp_tunnel_delete() or l2tp_tunnel_closeall() deletes a session
-right after pppol2tp_release() orphaned its socket, then the 'sock'
-variable of the pppol2tp_session_close() callback is NULL. Yet the
-session is still used by pppol2tp_release().
-
-Therefore we need to take an extra reference in any case, to prevent
-l2tp_tunnel_delete() or l2tp_tunnel_closeall() from freeing the session.
-
-Since the pppol2tp_session_close() callback is only set if the session
-is associated to a PPPOL2TP socket and that both l2tp_tunnel_delete()
-and l2tp_tunnel_closeall() hold the PPPOL2TP socket before calling
-pppol2tp_session_close(), we're sure that pppol2tp_session_close() and
-pppol2tp_session_destruct() are paired and called in the right order.
-So the reference taken by the former will be released by the later.
-
-Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Will Deacon <will@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/l2tp/l2tp_ppp.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
-index 16b63e60396f..d919b3e6b548 100644
---- a/net/l2tp/l2tp_ppp.c
-+++ b/net/l2tp/l2tp_ppp.c
-@@ -437,11 +437,11 @@ static void pppol2tp_session_close(struct l2tp_session *session)
+diff --git a/Makefile b/Makefile
+index 1a491b3afc0c..26ad7b28a193 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 9
+-SUBLEVEL = 218
++SUBLEVEL = 219
+ EXTRAVERSION =
+ NAME = Roaring Lionus
  
- 	BUG_ON(session->magic != L2TP_SESSION_MAGIC);
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 3b10b9395960..aba534959377 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -650,7 +650,7 @@ ENTRY(__boot_cpu_mode)
+  * with MMU turned off.
+  */
+ ENTRY(__early_cpu_boot_status)
+-	.long 	0
++	.quad 	0
  
--	if (sock) {
-+	if (sock)
- 		inet_shutdown(sock, SEND_SHUTDOWN);
--		/* Don't let the session go away before our socket does */
--		l2tp_session_inc_refcount(session);
--	}
-+
-+	/* Don't let the session go away before our socket does */
-+	l2tp_session_inc_refcount(session);
+ 	.popsection
+ 
+diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
+index 4bc701b32ce2..89bb6250633d 100644
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@ -336,6 +336,13 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
+ 	struct blk_mq_hw_ctx *hctx;
+ 	int i;
+ 
++	/*
++	 * __blk_mq_update_nr_hw_queues will update the nr_hw_queues and
++	 * queue_hw_ctx after freeze the queue, so we use q_usage_counter
++	 * to avoid race with it.
++	 */
++	if (!percpu_ref_tryget(&q->q_usage_counter))
++		return;
+ 
+ 	queue_for_each_hw_ctx(q, hctx, i) {
+ 		struct blk_mq_tags *tags = hctx->tags;
+@@ -351,7 +358,7 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
+ 			bt_for_each(hctx, &tags->breserved_tags, fn, priv, true);
+ 		bt_for_each(hctx, &tags->bitmap_tags, fn, priv, false);
+ 	}
+-
++	blk_queue_exit(q);
  }
  
- /* Really kill the session socket. (Called from sock_put() if
--- 
-2.28.0
-
-
-From e8b9cf5574e8154a6db2505d028682e830c9f620 Mon Sep 17 00:00:00 2001
-From: Guillaume Nault <g.nault@alphalink.fr>
-Date: Fri, 22 Sep 2017 15:39:24 +0200
-Subject: [PATCH 02/34] l2tp: fix race between l2tp_session_delete() and
- l2tp_tunnel_closeall()
-
-commit b228a94066406b6c456321d69643b0d7ce11cfa6 upstream.
-
-There are several ways to remove L2TP sessions:
-
-  * deleting a session explicitly using the netlink interface (with
-    L2TP_CMD_SESSION_DELETE),
-  * deleting the session's parent tunnel (either by closing the
-    tunnel's file descriptor or using the netlink interface),
-  * closing the PPPOL2TP file descriptor of a PPP pseudo-wire.
-
-In some cases, when these methods are used concurrently on the same
-session, the session can be removed twice, leading to use-after-free
-bugs.
-
-This patch adds a 'dead' flag, used by l2tp_session_delete() and
-l2tp_tunnel_closeall() to prevent them from stepping on each other's
-toes.
-
-The session deletion path used when closing a PPPOL2TP file descriptor
-doesn't need to be adapted. It already has to ensure that a session
-remains valid for the lifetime of its PPPOL2TP file descriptor.
-So it takes an extra reference on the session in the ->session_close()
-callback (pppol2tp_session_close()), which is eventually dropped
-in the ->sk_destruct() callback of the PPPOL2TP socket
-(pppol2tp_session_destruct()).
-Still, __l2tp_session_unhash() and l2tp_session_queue_purge() can be
-called twice and even concurrently for a given session, but thanks to
-proper locking and re-initialisation of list fields, this is not an
-issue.
-
-Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Will Deacon <will@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/l2tp/l2tp_core.c | 6 ++++++
- net/l2tp/l2tp_core.h | 1 +
- 2 files changed, 7 insertions(+)
-
-diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
-index 394a1ddb0782..7c3da29fad8e 100644
---- a/net/l2tp/l2tp_core.c
-+++ b/net/l2tp/l2tp_core.c
-@@ -1351,6 +1351,9 @@ void l2tp_tunnel_closeall(struct l2tp_tunnel *tunnel)
+ static unsigned int bt_unused_tags(const struct sbitmap_queue *bt)
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 24fc09cf7f17..58be2eaa5aaa 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2346,6 +2346,10 @@ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
  
- 			hlist_del_init(&session->hlist);
+ 	list_for_each_entry(q, &set->tag_list, tag_set_list)
+ 		blk_mq_unfreeze_queue(q);
++	/*
++	 * Sync with blk_mq_queue_tag_busy_iter.
++	 */
++	synchronize_rcu();
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
  
-+			if (test_and_set_bit(0, &session->dead))
-+				goto again;
-+
- 			if (session->ref != NULL)
- 				(*session->ref)(session);
+diff --git a/drivers/char/random.c b/drivers/char/random.c
+index 81b65d0e7563..4cbc73173701 100644
+--- a/drivers/char/random.c
++++ b/drivers/char/random.c
+@@ -2118,8 +2118,8 @@ struct batched_entropy {
  
-@@ -1799,6 +1802,9 @@ EXPORT_SYMBOL_GPL(__l2tp_session_unhash);
+ /*
+  * Get a random word for internal kernel use only. The quality of the random
+- * number is either as good as RDRAND or as good as /dev/urandom, with the
+- * goal of being quite fast and not depleting entropy.
++ * number is good as /dev/urandom, but there is no backtrack protection, with
++ * the goal of being quite fast and not depleting entropy.
   */
- int l2tp_session_delete(struct l2tp_session *session)
- {
-+	if (test_and_set_bit(0, &session->dead))
-+		return 0;
-+
- 	if (session->ref)
- 		(*session->ref)(session);
- 	__l2tp_session_unhash(session);
-diff --git a/net/l2tp/l2tp_core.h b/net/l2tp/l2tp_core.h
-index 7cc49715606e..7c2037184b6c 100644
---- a/net/l2tp/l2tp_core.h
-+++ b/net/l2tp/l2tp_core.h
-@@ -84,6 +84,7 @@ struct l2tp_session_cfg {
- struct l2tp_session {
- 	int			magic;		/* should be
- 						 * L2TP_SESSION_MAGIC */
-+	long			dead;
+ static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_long);
+ unsigned long get_random_long(void)
+@@ -2127,9 +2127,6 @@ unsigned long get_random_long(void)
+ 	unsigned long ret;
+ 	struct batched_entropy *batch;
  
- 	struct l2tp_tunnel	*tunnel;	/* back pointer to tunnel
- 						 * context */
--- 
-2.28.0
-
-
-From 4d0cdd6995283c1a78dceedab433bde7a208f1b2 Mon Sep 17 00:00:00 2001
-From: Gerd Hoffmann <kraxel@redhat.com>
-Date: Fri, 13 Mar 2020 09:41:52 +0100
-Subject: [PATCH 03/34] drm/bochs: downgrade pci_request_region failure from
- error to warning
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-[ Upstream commit 8c34cd1a7f089dc03933289c5d4a4d1489549828 ]
-
-Shutdown of firmware framebuffer has a bunch of problems.  Because
-of this the framebuffer region might still be reserved even after
-drm_fb_helper_remove_conflicting_pci_framebuffers() returned.
-
-Don't consider pci_request_region() failure for the framebuffer
-region as fatal error to workaround this issue.
-
-Reported-by: Marek Marczykowski-Górecki <marmarek@invisiblethingslab.com>
-Signed-off-by: Gerd Hoffmann <kraxel@redhat.com>
-Acked-by: Sam Ravnborg <sam@ravnborg.org>
-Link: http://patchwork.freedesktop.org/patch/msgid/20200313084152.2734-1-kraxel@redhat.com
-Signed-off-by: Sasha Levin <sashal@kernel.org>
----
- drivers/gpu/drm/bochs/bochs_hw.c | 6 ++----
- 1 file changed, 2 insertions(+), 4 deletions(-)
-
+-	if (arch_get_random_long(&ret))
+-		return ret;
+-
+ 	batch = &get_cpu_var(batched_entropy_long);
+ 	if (batch->position % ARRAY_SIZE(batch->entropy_long) == 0) {
+ 		extract_crng((u8 *)batch->entropy_long);
+@@ -2153,9 +2150,6 @@ unsigned int get_random_int(void)
+ 	unsigned int ret;
+ 	struct batched_entropy *batch;
+ 
+-	if (arch_get_random_int(&ret))
+-		return ret;
+-
+ 	batch = &get_cpu_var(batched_entropy_int);
+ 	if (batch->position % ARRAY_SIZE(batch->entropy_int) == 0) {
+ 		extract_crng((u8 *)batch->entropy_int);
+diff --git a/drivers/clk/qcom/clk-rcg2.c b/drivers/clk/qcom/clk-rcg2.c
+index d8601b138dc1..29abb600d7e1 100644
+--- a/drivers/clk/qcom/clk-rcg2.c
++++ b/drivers/clk/qcom/clk-rcg2.c
+@@ -107,7 +107,7 @@ static int update_config(struct clk_rcg2 *rcg)
+ 	}
+ 
+ 	WARN(1, "%s: rcg didn't update its configuration.", name);
+-	return 0;
++	return -EBUSY;
+ }
+ 
+ static int clk_rcg2_set_parent(struct clk_hw *hw, u8 index)
 diff --git a/drivers/gpu/drm/bochs/bochs_hw.c b/drivers/gpu/drm/bochs/bochs_hw.c
 index a39b0343c197..401c218567af 100644
 --- a/drivers/gpu/drm/bochs/bochs_hw.c
@@ -182,476 +130,18 @@ index a39b0343c197..401c218567af 100644
  
  	bochs->fb_map = ioremap(addr, size);
  	if (bochs->fb_map == NULL) {
--- 
-2.28.0
-
-
-From 32006be2449ff76c69a0e0c97d236c90b7bdc2a8 Mon Sep 17 00:00:00 2001
-From: Qian Cai <cai@lca.pw>
-Date: Wed, 25 Mar 2020 18:01:00 -0400
-Subject: [PATCH 04/34] ipv4: fix a RCU-list lock in fib_triestat_seq_show
-
-[ Upstream commit fbe4e0c1b298b4665ee6915266c9d6c5b934ef4a ]
-
-fib_triestat_seq_show() calls hlist_for_each_entry_rcu(tb, head,
-tb_hlist) without rcu_read_lock() will trigger a warning,
-
- net/ipv4/fib_trie.c:2579 RCU-list traversed in non-reader section!!
-
- other info that might help us debug this:
-
- rcu_scheduler_active = 2, debug_locks = 1
- 1 lock held by proc01/115277:
-  #0: c0000014507acf00 (&p->lock){+.+.}-{3:3}, at: seq_read+0x58/0x670
-
- Call Trace:
-  dump_stack+0xf4/0x164 (unreliable)
-  lockdep_rcu_suspicious+0x140/0x164
-  fib_triestat_seq_show+0x750/0x880
-  seq_read+0x1a0/0x670
-  proc_reg_read+0x10c/0x1b0
-  __vfs_read+0x3c/0x70
-  vfs_read+0xac/0x170
-  ksys_read+0x7c/0x140
-  system_call+0x5c/0x68
-
-Fix it by adding a pair of rcu_read_lock/unlock() and use
-cond_resched_rcu() to avoid the situation where walking of a large
-number of items  may prevent scheduling for a long time.
-
-Signed-off-by: Qian Cai <cai@lca.pw>
-Reviewed-by: Eric Dumazet <edumazet@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/fib_trie.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
-index 36f0a8c581d0..a1a7ed6fc8dd 100644
---- a/net/ipv4/fib_trie.c
-+++ b/net/ipv4/fib_trie.c
-@@ -2256,6 +2256,7 @@ static int fib_triestat_seq_show(struct seq_file *seq, void *v)
- 		   " %Zd bytes, size of tnode: %Zd bytes.\n",
- 		   LEAF_SIZE, TNODE_SIZE(0));
+diff --git a/drivers/gpu/drm/drm_dp_mst_topology.c b/drivers/gpu/drm/drm_dp_mst_topology.c
+index e05dda92398c..592ebcd440b6 100644
+--- a/drivers/gpu/drm/drm_dp_mst_topology.c
++++ b/drivers/gpu/drm/drm_dp_mst_topology.c
+@@ -431,6 +431,7 @@ static bool drm_dp_sideband_parse_remote_dpcd_read(struct drm_dp_sideband_msg_rx
+ 	if (idx > raw->curlen)
+ 		goto fail_len;
+ 	repmsg->u.remote_dpcd_read_ack.num_bytes = raw->msg[idx];
++	idx++;
+ 	if (idx > raw->curlen)
+ 		goto fail_len;
  
-+	rcu_read_lock();
- 	for (h = 0; h < FIB_TABLE_HASHSZ; h++) {
- 		struct hlist_head *head = &net->ipv4.fib_table_hash[h];
- 		struct fib_table *tb;
-@@ -2275,7 +2276,9 @@ static int fib_triestat_seq_show(struct seq_file *seq, void *v)
- 			trie_show_usage(seq, t->stats);
- #endif
- 		}
-+		cond_resched_rcu();
- 	}
-+	rcu_read_unlock();
- 
- 	return 0;
- }
--- 
-2.28.0
-
-
-From 4f1640e3f156020d76b06ea794a27cd61b415513 Mon Sep 17 00:00:00 2001
-From: William Dauchy <w.dauchy@criteo.com>
-Date: Fri, 27 Mar 2020 19:56:39 +0100
-Subject: [PATCH 05/34] net, ip_tunnel: fix interface lookup with no key
-
-[ Upstream commit 25629fdaff2ff509dd0b3f5ff93d70a75e79e0a1 ]
-
-when creating a new ipip interface with no local/remote configuration,
-the lookup is done with TUNNEL_NO_KEY flag, making it impossible to
-match the new interface (only possible match being fallback or metada
-case interface); e.g: `ip link add tunl1 type ipip dev eth0`
-
-To fix this case, adding a flag check before the key comparison so we
-permit to match an interface with no local/remote config; it also avoids
-breaking possible userland tools relying on TUNNEL_NO_KEY flag and
-uninitialised key.
-
-context being on my side, I'm creating an extra ipip interface attached
-to the physical one, and moving it to a dedicated namespace.
-
-Fixes: c54419321455 ("GRE: Refactor GRE tunneling code.")
-Signed-off-by: William Dauchy <w.dauchy@criteo.com>
-Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/ip_tunnel.c | 6 +-----
- 1 file changed, 1 insertion(+), 5 deletions(-)
-
-diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
-index 65c47b1f0da4..dd5db4cc7d06 100644
---- a/net/ipv4/ip_tunnel.c
-+++ b/net/ipv4/ip_tunnel.c
-@@ -155,11 +155,8 @@ struct ip_tunnel *ip_tunnel_lookup(struct ip_tunnel_net *itn,
- 			cand = t;
- 	}
- 
--	if (flags & TUNNEL_NO_KEY)
--		goto skip_key_lookup;
--
- 	hlist_for_each_entry_rcu(t, head, hash_node) {
--		if (t->parms.i_key != key ||
-+		if ((!(flags & TUNNEL_NO_KEY) && t->parms.i_key != key) ||
- 		    t->parms.iph.saddr != 0 ||
- 		    t->parms.iph.daddr != 0 ||
- 		    !(t->dev->flags & IFF_UP))
-@@ -171,7 +168,6 @@ struct ip_tunnel *ip_tunnel_lookup(struct ip_tunnel_net *itn,
- 			cand = t;
- 	}
- 
--skip_key_lookup:
- 	if (cand)
- 		return cand;
- 
--- 
-2.28.0
-
-
-From a6a758c223d2dd567edd3e6800798313bbcbd18b Mon Sep 17 00:00:00 2001
-From: Qiujun Huang <hqjagain@gmail.com>
-Date: Fri, 27 Mar 2020 11:07:51 +0800
-Subject: [PATCH 06/34] sctp: fix refcount bug in sctp_wfree
-
-[ Upstream commit 5c3e82fe159622e46e91458c1a6509c321a62820 ]
-
-We should iterate over the datamsgs to move
-all chunks(skbs) to newsk.
-
-The following case cause the bug:
-for the trouble SKB, it was in outq->transmitted list
-
-sctp_outq_sack
-        sctp_check_transmitted
-                SKB was moved to outq->sacked list
-        then throw away the sack queue
-                SKB was deleted from outq->sacked
-(but it was held by datamsg at sctp_datamsg_to_asoc
-So, sctp_wfree was not called here)
-
-then migrate happened
-
-        sctp_for_each_tx_datachunk(
-        sctp_clear_owner_w);
-        sctp_assoc_migrate();
-        sctp_for_each_tx_datachunk(
-        sctp_set_owner_w);
-SKB was not in the outq, and was not changed to newsk
-
-finally
-
-__sctp_outq_teardown
-        sctp_chunk_put (for another skb)
-                sctp_datamsg_put
-                        __kfree_skb(msg->frag_list)
-                                sctp_wfree (for SKB)
-	SKB->sk was still oldsk (skb->sk != asoc->base.sk).
-
-Reported-and-tested-by: syzbot+cea71eec5d6de256d54d@syzkaller.appspotmail.com
-Signed-off-by: Qiujun Huang <hqjagain@gmail.com>
-Acked-by: Marcelo Ricardo Leitner <mleitner@redhat.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/sctp/socket.c | 31 +++++++++++++++++++++++--------
- 1 file changed, 23 insertions(+), 8 deletions(-)
-
-diff --git a/net/sctp/socket.c b/net/sctp/socket.c
-index 21ec92011585..95f39dde1e08 100644
---- a/net/sctp/socket.c
-+++ b/net/sctp/socket.c
-@@ -173,29 +173,44 @@ static void sctp_clear_owner_w(struct sctp_chunk *chunk)
- 	skb_orphan(chunk->skb);
- }
- 
-+#define traverse_and_process()	\
-+do {				\
-+	msg = chunk->msg;	\
-+	if (msg == prev_msg)	\
-+		continue;	\
-+	list_for_each_entry(c, &msg->chunks, frag_list) {	\
-+		if ((clear && asoc->base.sk == c->skb->sk) ||	\
-+		    (!clear && asoc->base.sk != c->skb->sk))	\
-+			cb(c);	\
-+	}			\
-+	prev_msg = msg;		\
-+} while (0)
-+
- static void sctp_for_each_tx_datachunk(struct sctp_association *asoc,
-+				       bool clear,
- 				       void (*cb)(struct sctp_chunk *))
- 
- {
-+	struct sctp_datamsg *msg, *prev_msg = NULL;
- 	struct sctp_outq *q = &asoc->outqueue;
-+	struct sctp_chunk *chunk, *c;
- 	struct sctp_transport *t;
--	struct sctp_chunk *chunk;
- 
- 	list_for_each_entry(t, &asoc->peer.transport_addr_list, transports)
- 		list_for_each_entry(chunk, &t->transmitted, transmitted_list)
--			cb(chunk);
-+			traverse_and_process();
- 
- 	list_for_each_entry(chunk, &q->retransmit, transmitted_list)
--		cb(chunk);
-+		traverse_and_process();
- 
- 	list_for_each_entry(chunk, &q->sacked, transmitted_list)
--		cb(chunk);
-+		traverse_and_process();
- 
- 	list_for_each_entry(chunk, &q->abandoned, transmitted_list)
--		cb(chunk);
-+		traverse_and_process();
- 
- 	list_for_each_entry(chunk, &q->out_chunk_list, list)
--		cb(chunk);
-+		traverse_and_process();
- }
- 
- /* Verify that this is a valid address. */
-@@ -7878,9 +7893,9 @@ static void sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
- 	 * paths won't try to lock it and then oldsk.
- 	 */
- 	lock_sock_nested(newsk, SINGLE_DEPTH_NESTING);
--	sctp_for_each_tx_datachunk(assoc, sctp_clear_owner_w);
-+	sctp_for_each_tx_datachunk(assoc, true, sctp_clear_owner_w);
- 	sctp_assoc_migrate(assoc, newsk);
--	sctp_for_each_tx_datachunk(assoc, sctp_set_owner_w);
-+	sctp_for_each_tx_datachunk(assoc, false, sctp_set_owner_w);
- 
- 	/* If the association on the newsk is already closed before accept()
- 	 * is called, set RCV_SHUTDOWN flag.
--- 
-2.28.0
-
-
-From de29be7102682fae4cc10511af87d756cecf0824 Mon Sep 17 00:00:00 2001
-From: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
-Date: Thu, 26 Mar 2020 20:47:46 -0300
-Subject: [PATCH 07/34] sctp: fix possibly using a bad saddr with a given dst
-
-[ Upstream commit 582eea230536a6f104097dd46205822005d5fe3a ]
-
-Under certain circumstances, depending on the order of addresses on the
-interfaces, it could be that sctp_v[46]_get_dst() would return a dst
-with a mismatched struct flowi.
-
-For example, if when walking through the bind addresses and the first
-one is not a match, it saves the dst as a fallback (added in
-410f03831c07), but not the flowi. Then if the next one is also not a
-match, the previous dst will be returned but with the flowi information
-for the 2nd address, which is wrong.
-
-The fix is to use a locally stored flowi that can be used for such
-attempts, and copy it to the parameter only in case it is a possible
-match, together with the corresponding dst entry.
-
-The patch updates IPv6 code mostly just to be in sync. Even though the issue
-is also present there, it fallback is not expected to work with IPv6.
-
-Fixes: 410f03831c07 ("sctp: add routing output fallback")
-Reported-by: Jin Meng <meng.a.jin@nokia-sbell.com>
-Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
-Tested-by: Xin Long <lucien.xin@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/sctp/ipv6.c     | 20 ++++++++++++++------
- net/sctp/protocol.c | 28 +++++++++++++++++++---------
- 2 files changed, 33 insertions(+), 15 deletions(-)
-
-diff --git a/net/sctp/ipv6.c b/net/sctp/ipv6.c
-index 824ebbffea33..34ab7f92f064 100644
---- a/net/sctp/ipv6.c
-+++ b/net/sctp/ipv6.c
-@@ -235,7 +235,8 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- {
- 	struct sctp_association *asoc = t->asoc;
- 	struct dst_entry *dst = NULL;
--	struct flowi6 *fl6 = &fl->u.ip6;
-+	struct flowi _fl;
-+	struct flowi6 *fl6 = &_fl.u.ip6;
- 	struct sctp_bind_addr *bp;
- 	struct ipv6_pinfo *np = inet6_sk(sk);
- 	struct sctp_sockaddr_entry *laddr;
-@@ -245,7 +246,7 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- 	__u8 matchlen = 0;
- 	sctp_scope_t scope;
- 
--	memset(fl6, 0, sizeof(struct flowi6));
-+	memset(&_fl, 0, sizeof(_fl));
- 	fl6->daddr = daddr->v6.sin6_addr;
- 	fl6->fl6_dport = daddr->v6.sin6_port;
- 	fl6->flowi6_proto = IPPROTO_SCTP;
-@@ -269,8 +270,11 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- 	rcu_read_unlock();
- 
- 	dst = ip6_dst_lookup_flow(sk, fl6, final_p);
--	if (!asoc || saddr)
-+	if (!asoc || saddr) {
-+		t->dst = dst;
-+		memcpy(fl, &_fl, sizeof(_fl));
- 		goto out;
-+	}
- 
- 	bp = &asoc->base.bind_addr;
- 	scope = sctp_scope(daddr);
-@@ -293,6 +297,8 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- 			if ((laddr->a.sa.sa_family == AF_INET6) &&
- 			    (sctp_v6_cmp_addr(&dst_saddr, &laddr->a))) {
- 				rcu_read_unlock();
-+				t->dst = dst;
-+				memcpy(fl, &_fl, sizeof(_fl));
- 				goto out;
- 			}
- 		}
-@@ -331,6 +337,8 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- 			if (!IS_ERR_OR_NULL(dst))
- 				dst_release(dst);
- 			dst = bdst;
-+			t->dst = dst;
-+			memcpy(fl, &_fl, sizeof(_fl));
- 			break;
- 		}
- 
-@@ -344,6 +352,8 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- 			dst_release(dst);
- 		dst = bdst;
- 		matchlen = bmatchlen;
-+		t->dst = dst;
-+		memcpy(fl, &_fl, sizeof(_fl));
- 	}
- 	rcu_read_unlock();
- 
-@@ -352,14 +362,12 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- 		struct rt6_info *rt;
- 
- 		rt = (struct rt6_info *)dst;
--		t->dst = dst;
- 		t->dst_cookie = rt6_get_cookie(rt);
- 		pr_debug("rt6_dst:%pI6/%d rt6_src:%pI6\n",
- 			 &rt->rt6i_dst.addr, rt->rt6i_dst.plen,
--			 &fl6->saddr);
-+			 &fl->u.ip6.saddr);
- 	} else {
- 		t->dst = NULL;
--
- 		pr_debug("no route\n");
- 	}
- }
-diff --git a/net/sctp/protocol.c b/net/sctp/protocol.c
-index 446503d3b80c..c5a2a538279b 100644
---- a/net/sctp/protocol.c
-+++ b/net/sctp/protocol.c
-@@ -430,14 +430,15 @@ static void sctp_v4_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- {
- 	struct sctp_association *asoc = t->asoc;
- 	struct rtable *rt;
--	struct flowi4 *fl4 = &fl->u.ip4;
-+	struct flowi _fl;
-+	struct flowi4 *fl4 = &_fl.u.ip4;
- 	struct sctp_bind_addr *bp;
- 	struct sctp_sockaddr_entry *laddr;
- 	struct dst_entry *dst = NULL;
- 	union sctp_addr *daddr = &t->ipaddr;
- 	union sctp_addr dst_saddr;
- 
--	memset(fl4, 0x0, sizeof(struct flowi4));
-+	memset(&_fl, 0x0, sizeof(_fl));
- 	fl4->daddr  = daddr->v4.sin_addr.s_addr;
- 	fl4->fl4_dport = daddr->v4.sin_port;
- 	fl4->flowi4_proto = IPPROTO_SCTP;
-@@ -455,8 +456,11 @@ static void sctp_v4_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- 		 &fl4->saddr);
- 
- 	rt = ip_route_output_key(sock_net(sk), fl4);
--	if (!IS_ERR(rt))
-+	if (!IS_ERR(rt)) {
- 		dst = &rt->dst;
-+		t->dst = dst;
-+		memcpy(fl, &_fl, sizeof(_fl));
-+	}
- 
- 	/* If there is no association or if a source address is passed, no
- 	 * more validation is required.
-@@ -519,27 +523,33 @@ static void sctp_v4_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
- 		odev = __ip_dev_find(sock_net(sk), laddr->a.v4.sin_addr.s_addr,
- 				     false);
- 		if (!odev || odev->ifindex != fl4->flowi4_oif) {
--			if (!dst)
-+			if (!dst) {
- 				dst = &rt->dst;
--			else
-+				t->dst = dst;
-+				memcpy(fl, &_fl, sizeof(_fl));
-+			} else {
- 				dst_release(&rt->dst);
-+			}
- 			continue;
- 		}
- 
- 		dst_release(dst);
- 		dst = &rt->dst;
-+		t->dst = dst;
-+		memcpy(fl, &_fl, sizeof(_fl));
- 		break;
- 	}
- 
- out_unlock:
- 	rcu_read_unlock();
- out:
--	t->dst = dst;
--	if (dst)
-+	if (dst) {
- 		pr_debug("rt_dst:%pI4, rt_src:%pI4\n",
--			 &fl4->daddr, &fl4->saddr);
--	else
-+			 &fl->u.ip4.daddr, &fl->u.ip4.saddr);
-+	} else {
-+		t->dst = NULL;
- 		pr_debug("no route\n");
-+	}
- }
- 
- /* For v4, the source address is cached in the route entry(dst). So no need
--- 
-2.28.0
-
-
-From 4eaf2e4b5e1e50aa4debf08b2875b574f56ff1e9 Mon Sep 17 00:00:00 2001
-From: Lucas Stach <l.stach@pengutronix.de>
-Date: Fri, 5 Jul 2019 19:17:23 +0200
-Subject: [PATCH 08/34] drm/etnaviv: replace MMU flush marker with flush
- sequence
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 4900dda90af2cb13bc1d4c12ce94b98acc8fe64e upstream.
-
-If a MMU is shared between multiple GPUs, all of them need to flush their
-TLBs, so a single marker that gets reset on the first flush won't do.
-Replace the flush marker with a sequence number, so that it's possible to
-check if the TLB is in sync with the current page table state for each GPU.
-
-Signed-off-by: Lucas Stach <l.stach@pengutronix.de>
-Reviewed-by: Philipp Zabel <p.zabel@pengutronix.de>
-Reviewed-by: Guido Günther <agx@sigxcpu.org>
-Signed-off-by: Robert Beckett <bob.beckett@collabora.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/etnaviv/etnaviv_buffer.c | 10 ++++++----
- drivers/gpu/drm/etnaviv/etnaviv_gpu.c    |  2 +-
- drivers/gpu/drm/etnaviv/etnaviv_gpu.h    |  1 +
- drivers/gpu/drm/etnaviv/etnaviv_mmu.c    |  6 +++---
- drivers/gpu/drm/etnaviv/etnaviv_mmu.h    |  2 +-
- 5 files changed, 12 insertions(+), 9 deletions(-)
-
 diff --git a/drivers/gpu/drm/etnaviv/etnaviv_buffer.c b/drivers/gpu/drm/etnaviv/etnaviv_buffer.c
 index d9230132dfbc..d71fa2d9a196 100644
 --- a/drivers/gpu/drm/etnaviv/etnaviv_buffer.c
@@ -769,1875 +259,8 @@ index e787e49c9693..5bdc5f5601b1 100644
  };
  
  struct etnaviv_gem_object;
--- 
-2.28.0
-
-
-From f530afb974c2e82047bd6220303a2dbe30eff304 Mon Sep 17 00:00:00 2001
-From: Jianchao Wang <jianchao.w.wang@oracle.com>
-Date: Tue, 21 Aug 2018 15:15:04 +0800
-Subject: [PATCH 09/34] blk-mq: sync the update nr_hw_queues with
- blk_mq_queue_tag_busy_iter
-
-commit f5bbbbe4d63577026f908a809f22f5fd5a90ea1f upstream.
-
-For blk-mq, part_in_flight/rw will invoke blk_mq_in_flight/rw to
-account the inflight requests. It will access the queue_hw_ctx and
-nr_hw_queues w/o any protection. When updating nr_hw_queues and
-blk_mq_in_flight/rw occur concurrently, panic comes up.
-
-Before update nr_hw_queues, the q will be frozen. So we could use
-q_usage_counter to avoid the race. percpu_ref_is_zero is used here
-so that we will not miss any in-flight request. The access to
-nr_hw_queues and queue_hw_ctx in blk_mq_queue_tag_busy_iter are
-under rcu critical section, __blk_mq_update_nr_hw_queues could use
-synchronize_rcu to ensure the zeroed q_usage_counter to be globally
-visible.
-
-Signed-off-by: Jianchao Wang <jianchao.w.wang@oracle.com>
-Reviewed-by: Ming Lei <ming.lei@redhat.com>
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Cc: Giuliano Procida <gprocida@google.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- block/blk-mq-tag.c | 14 +++++++++++++-
- block/blk-mq.c     |  4 ++++
- 2 files changed, 17 insertions(+), 1 deletion(-)
-
-diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
-index 4bc701b32ce2..0861f15ec0df 100644
---- a/block/blk-mq-tag.c
-+++ b/block/blk-mq-tag.c
-@@ -336,6 +336,18 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
- 	struct blk_mq_hw_ctx *hctx;
- 	int i;
- 
-+	/*
-+	 * __blk_mq_update_nr_hw_queues will update the nr_hw_queues and
-+	 * queue_hw_ctx after freeze the queue. So we could use q_usage_counter
-+	 * to avoid race with it. __blk_mq_update_nr_hw_queues will users
-+	 * synchronize_rcu to ensure all of the users go out of the critical
-+	 * section below and see zeroed q_usage_counter.
-+	 */
-+	rcu_read_lock();
-+	if (percpu_ref_is_zero(&q->q_usage_counter)) {
-+		rcu_read_unlock();
-+		return;
-+	}
- 
- 	queue_for_each_hw_ctx(q, hctx, i) {
- 		struct blk_mq_tags *tags = hctx->tags;
-@@ -351,7 +363,7 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
- 			bt_for_each(hctx, &tags->breserved_tags, fn, priv, true);
- 		bt_for_each(hctx, &tags->bitmap_tags, fn, priv, false);
- 	}
--
-+	rcu_read_unlock();
- }
- 
- static unsigned int bt_unused_tags(const struct sbitmap_queue *bt)
-diff --git a/block/blk-mq.c b/block/blk-mq.c
-index 24fc09cf7f17..58be2eaa5aaa 100644
---- a/block/blk-mq.c
-+++ b/block/blk-mq.c
-@@ -2346,6 +2346,10 @@ void blk_mq_update_nr_hw_queues(struct blk_mq_tag_set *set, int nr_hw_queues)
- 
- 	list_for_each_entry(q, &set->tag_list, tag_set_list)
- 		blk_mq_unfreeze_queue(q);
-+	/*
-+	 * Sync with blk_mq_queue_tag_busy_iter.
-+	 */
-+	synchronize_rcu();
- }
- EXPORT_SYMBOL_GPL(blk_mq_update_nr_hw_queues);
- 
--- 
-2.28.0
-
-
-From d4d74449367e1ca68078db17dedd764916740cca Mon Sep 17 00:00:00 2001
-From: Keith Busch <keith.busch@intel.com>
-Date: Tue, 25 Sep 2018 10:36:20 -0600
-Subject: [PATCH 10/34] blk-mq: Allow blocking queue tag iter callbacks
-
-commit 530ca2c9bd6949c72c9b5cfc330cb3dbccaa3f5b upstream.
-
-A recent commit runs tag iterator callbacks under the rcu read lock,
-but existing callbacks do not satisfy the non-blocking requirement.
-The commit intended to prevent an iterator from accessing a queue that's
-being modified. This patch fixes the original issue by taking a queue
-reference instead of reading it, which allows callbacks to make blocking
-calls.
-
-Fixes: f5bbbbe4d6357 ("blk-mq: sync the update nr_hw_queues with blk_mq_queue_tag_busy_iter")
-Acked-by: Jianchao Wang <jianchao.w.wang@oracle.com>
-Signed-off-by: Keith Busch <keith.busch@intel.com>
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Giuliano Procida <gprocida@google.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- block/blk-mq-tag.c | 13 ++++---------
- 1 file changed, 4 insertions(+), 9 deletions(-)
-
-diff --git a/block/blk-mq-tag.c b/block/blk-mq-tag.c
-index 0861f15ec0df..89bb6250633d 100644
---- a/block/blk-mq-tag.c
-+++ b/block/blk-mq-tag.c
-@@ -338,16 +338,11 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
- 
- 	/*
- 	 * __blk_mq_update_nr_hw_queues will update the nr_hw_queues and
--	 * queue_hw_ctx after freeze the queue. So we could use q_usage_counter
--	 * to avoid race with it. __blk_mq_update_nr_hw_queues will users
--	 * synchronize_rcu to ensure all of the users go out of the critical
--	 * section below and see zeroed q_usage_counter.
-+	 * queue_hw_ctx after freeze the queue, so we use q_usage_counter
-+	 * to avoid race with it.
- 	 */
--	rcu_read_lock();
--	if (percpu_ref_is_zero(&q->q_usage_counter)) {
--		rcu_read_unlock();
-+	if (!percpu_ref_tryget(&q->q_usage_counter))
- 		return;
--	}
- 
- 	queue_for_each_hw_ctx(q, hctx, i) {
- 		struct blk_mq_tags *tags = hctx->tags;
-@@ -363,7 +358,7 @@ void blk_mq_queue_tag_busy_iter(struct request_queue *q, busy_iter_fn *fn,
- 			bt_for_each(hctx, &tags->breserved_tags, fn, priv, true);
- 		bt_for_each(hctx, &tags->bitmap_tags, fn, priv, false);
- 	}
--	rcu_read_unlock();
-+	blk_queue_exit(q);
- }
- 
- static unsigned int bt_unused_tags(const struct sbitmap_queue *bt)
--- 
-2.28.0
-
-
-From 1b62259d8e9021f2b701f5259a8fcec07fbcd237 Mon Sep 17 00:00:00 2001
-From: Eugene Syromiatnikov <esyr@redhat.com>
-Date: Tue, 24 Mar 2020 05:22:13 +0100
-Subject: [PATCH 11/34] coresight: do not use the BIT() macro in the UAPI
- header
-
-commit 9b6eaaf3db5e5888df7bca7fed7752a90f7fd871 upstream.
-
-The BIT() macro definition is not available for the UAPI headers
-(moreover, it can be defined differently in the user space); replace
-its usage with the _BITUL() macro that is defined in <linux/const.h>.
-
-Fixes: 237483aa5cf4 ("coresight: stm: adding driver for CoreSight STM component")
-Signed-off-by: Eugene Syromiatnikov <esyr@redhat.com>
-Cc: stable <stable@vger.kernel.org>
-Reviewed-by: Mathieu Poirier <mathieu.poirier@linaro.org>
-Link: https://lore.kernel.org/r/20200324042213.GA10452@asgard.redhat.com
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/uapi/linux/coresight-stm.h | 6 ++++--
- 1 file changed, 4 insertions(+), 2 deletions(-)
-
-diff --git a/include/uapi/linux/coresight-stm.h b/include/uapi/linux/coresight-stm.h
-index 7e4272cf1fb2..741309cedd2c 100644
---- a/include/uapi/linux/coresight-stm.h
-+++ b/include/uapi/linux/coresight-stm.h
-@@ -1,8 +1,10 @@
- #ifndef __UAPI_CORESIGHT_STM_H_
- #define __UAPI_CORESIGHT_STM_H_
- 
--#define STM_FLAG_TIMESTAMPED   BIT(3)
--#define STM_FLAG_GUARANTEED    BIT(7)
-+#include <linux/const.h>
-+
-+#define STM_FLAG_TIMESTAMPED   _BITUL(3)
-+#define STM_FLAG_GUARANTEED    _BITUL(7)
- 
- /*
-  * The CoreSight STM supports guaranteed and invariant timing
--- 
-2.28.0
-
-
-From 02c0b89493e7e53282df11f669606571b5919376 Mon Sep 17 00:00:00 2001
-From: Florian Fainelli <f.fainelli@gmail.com>
-Date: Mon, 6 Apr 2020 17:54:12 -0700
-Subject: [PATCH 12/34] net: dsa: tag_brcm: Fix skb->fwd_offload_mark location
-
-When the backport of upstream commit
-0e62f543bed03a64495bd2651d4fe1aa4bcb7fe5 ("net: dsa: Fix duplicate
-frames flooded by learning") was done the assignment of
-skb->fwd_offload_mark would land in brcm_tag_xmit() which is incorrect,
-it should have been in brcm_tag_rcv().
-
-Fixes: 5e845dc62f38 ("net: dsa: Fix duplicate frames flooded by learning")
-Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/dsa/tag_brcm.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/net/dsa/tag_brcm.c b/net/dsa/tag_brcm.c
-index 76d55a80f3b9..98074338cd83 100644
---- a/net/dsa/tag_brcm.c
-+++ b/net/dsa/tag_brcm.c
-@@ -84,8 +84,6 @@ static struct sk_buff *brcm_tag_xmit(struct sk_buff *skb, struct net_device *dev
- 		brcm_tag[2] = BRCM_IG_DSTMAP2_MASK;
- 	brcm_tag[3] = (1 << p->port) & BRCM_IG_DSTMAP1_MASK;
- 
--	skb->offload_fwd_mark = 1;
--
- 	return skb;
- 
- out_free:
-@@ -148,6 +146,8 @@ static int brcm_tag_rcv(struct sk_buff *skb, struct net_device *dev,
- 	skb->dev->stats.rx_packets++;
- 	skb->dev->stats.rx_bytes += skb->len;
- 
-+	skb->offload_fwd_mark = 1;
-+
- 	netif_receive_skb(skb);
- 
- 	return 0;
--- 
-2.28.0
-
-
-From b1d47d77e0395cd10962830747436f3a014de7af Mon Sep 17 00:00:00 2001
-From: Daniel Jordan <daniel.m.jordan@oracle.com>
-Date: Tue, 3 Dec 2019 14:31:11 -0500
-Subject: [PATCH 13/34] padata: always acquire cpu_hotplug_lock before
- pinst->lock
-
-commit 38228e8848cd7dd86ccb90406af32de0cad24be3 upstream.
-
-lockdep complains when padata's paths to update cpumasks via CPU hotplug
-and sysfs are both taken:
-
-  # echo 0 > /sys/devices/system/cpu/cpu1/online
-  # echo ff > /sys/kernel/pcrypt/pencrypt/parallel_cpumask
-
-  ======================================================
-  WARNING: possible circular locking dependency detected
-  5.4.0-rc8-padata-cpuhp-v3+ #1 Not tainted
-  ------------------------------------------------------
-  bash/205 is trying to acquire lock:
-  ffffffff8286bcd0 (cpu_hotplug_lock.rw_sem){++++}, at: padata_set_cpumask+0x2b/0x120
-
-  but task is already holding lock:
-  ffff8880001abfa0 (&pinst->lock){+.+.}, at: padata_set_cpumask+0x26/0x120
-
-  which lock already depends on the new lock.
-
-padata doesn't take cpu_hotplug_lock and pinst->lock in a consistent
-order.  Which should be first?  CPU hotplug calls into padata with
-cpu_hotplug_lock already held, so it should have priority.
-
-Fixes: 6751fb3c0e0c ("padata: Use get_online_cpus/put_online_cpus")
-Signed-off-by: Daniel Jordan <daniel.m.jordan@oracle.com>
-Cc: Eric Biggers <ebiggers@kernel.org>
-Cc: Herbert Xu <herbert@gondor.apana.org.au>
-Cc: Steffen Klassert <steffen.klassert@secunet.com>
-Cc: linux-crypto@vger.kernel.org
-Cc: linux-kernel@vger.kernel.org
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/padata.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/kernel/padata.c b/kernel/padata.c
-index 286c5142a0f7..6939111b3cbe 100644
---- a/kernel/padata.c
-+++ b/kernel/padata.c
-@@ -614,8 +614,8 @@ int padata_set_cpumask(struct padata_instance *pinst, int cpumask_type,
- 	struct cpumask *serial_mask, *parallel_mask;
- 	int err = -EINVAL;
- 
--	mutex_lock(&pinst->lock);
- 	get_online_cpus();
-+	mutex_lock(&pinst->lock);
- 
- 	switch (cpumask_type) {
- 	case PADATA_CPU_PARALLEL:
-@@ -633,8 +633,8 @@ int padata_set_cpumask(struct padata_instance *pinst, int cpumask_type,
- 	err =  __padata_set_cpumasks(pinst, parallel_mask, serial_mask);
- 
- out:
--	put_online_cpus();
- 	mutex_unlock(&pinst->lock);
-+	put_online_cpus();
- 
- 	return err;
- }
--- 
-2.28.0
-
-
-From c5544e72014cdb0a739f6971fb3dd4fb641b392c Mon Sep 17 00:00:00 2001
-From: Randy Dunlap <rdunlap@infradead.org>
-Date: Wed, 1 Apr 2020 21:10:58 -0700
-Subject: [PATCH 14/34] mm: mempolicy: require at least one nodeid for
- MPOL_PREFERRED
-
-commit aa9f7d5172fac9bf1f09e678c35e287a40a7b7dd upstream.
-
-Using an empty (malformed) nodelist that is not caught during mount option
-parsing leads to a stack-out-of-bounds access.
-
-The option string that was used was: "mpol=prefer:,".  However,
-MPOL_PREFERRED requires a single node number, which is not being provided
-here.
-
-Add a check that 'nodes' is not empty after parsing for MPOL_PREFERRED's
-nodeid.
-
-Fixes: 095f1fc4ebf3 ("mempolicy: rework shmem mpol parsing and display")
-Reported-by: Entropy Moe <3ntr0py1337@gmail.com>
-Reported-by: syzbot+b055b1a6b2b958707a21@syzkaller.appspotmail.com
-Signed-off-by: Randy Dunlap <rdunlap@infradead.org>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Tested-by: syzbot+b055b1a6b2b958707a21@syzkaller.appspotmail.com
-Cc: Lee Schermerhorn <lee.schermerhorn@hp.com>
-Link: http://lkml.kernel.org/r/89526377-7eb6-b662-e1d8-4430928abde9@infradead.org
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/mempolicy.c | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
-
-diff --git a/mm/mempolicy.c b/mm/mempolicy.c
-index da7a932922cb..a2be65bf5d8c 100644
---- a/mm/mempolicy.c
-+++ b/mm/mempolicy.c
-@@ -2768,7 +2768,9 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)
- 	switch (mode) {
- 	case MPOL_PREFERRED:
- 		/*
--		 * Insist on a nodelist of one node only
-+		 * Insist on a nodelist of one node only, although later
-+		 * we use first_node(nodes) to grab a single node, so here
-+		 * nodelist (or nodes) cannot be empty.
- 		 */
- 		if (nodelist) {
- 			char *rest = nodelist;
-@@ -2776,6 +2778,8 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)
- 				rest++;
- 			if (*rest)
- 				goto out;
-+			if (nodes_empty(nodes))
-+				goto out;
- 		}
- 		break;
- 	case MPOL_INTERLEAVE:
--- 
-2.28.0
-
-
-From 02b303a93906facb61b560dbb7c882e4e34dd68d Mon Sep 17 00:00:00 2001
-From: Florian Fainelli <f.fainelli@gmail.com>
-Date: Sun, 5 Apr 2020 13:00:30 -0700
-Subject: [PATCH 15/34] net: dsa: bcm_sf2: Ensure correct sub-node is parsed
-
-[ Upstream commit afa3b592953bfaecfb4f2f335ec5f935cff56804 ]
-
-When the bcm_sf2 was converted into a proper platform device driver and
-used the new dsa_register_switch() interface, we would still be parsing
-the legacy DSA node that contained all the port information since the
-platform firmware has intentionally maintained backward and forward
-compatibility to client programs. Ensure that we do parse the correct
-node, which is "ports" per the revised DSA binding.
-
-Fixes: d9338023fb8e ("net: dsa: bcm_sf2: Make it a real platform device driver")
-Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
-Reviewed-by: Vivien Didelot <vivien.didelot@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/dsa/bcm_sf2.c | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/net/dsa/bcm_sf2.c b/drivers/net/dsa/bcm_sf2.c
-index a3a8d7b62f3f..796571fccba7 100644
---- a/drivers/net/dsa/bcm_sf2.c
-+++ b/drivers/net/dsa/bcm_sf2.c
-@@ -976,6 +976,7 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
- 	struct device_node *dn = pdev->dev.of_node;
- 	struct b53_platform_data *pdata;
- 	struct dsa_switch_ops *ops;
-+	struct device_node *ports;
- 	struct bcm_sf2_priv *priv;
- 	struct b53_device *dev;
- 	struct dsa_switch *ds;
-@@ -1038,7 +1039,11 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
- 	spin_lock_init(&priv->indir_lock);
- 	mutex_init(&priv->stats_mutex);
- 
--	bcm_sf2_identify_ports(priv, dn->child);
-+	ports = of_find_node_by_name(dn, "ports");
-+	if (ports) {
-+		bcm_sf2_identify_ports(priv, ports);
-+		of_node_put(ports);
-+	}
- 
- 	priv->irq0 = irq_of_parse_and_map(dn, 0);
- 	priv->irq1 = irq_of_parse_and_map(dn, 1);
--- 
-2.28.0
-
-
-From d0eae22fbe98e30a45d5f93fa9ada90756a654d5 Mon Sep 17 00:00:00 2001
-From: Jisheng Zhang <Jisheng.Zhang@synaptics.com>
-Date: Fri, 3 Apr 2020 10:23:29 +0800
-Subject: [PATCH 16/34] net: stmmac: dwmac1000: fix out-of-bounds mac address
- reg setting
-
-[ Upstream commit 3e1221acf6a8f8595b5ce354bab4327a69d54d18 ]
-
-Commit 9463c4455900 ("net: stmmac: dwmac1000: Clear unused address
-entries") cleared the unused mac address entries, but introduced an
-out-of bounds mac address register programming bug -- After setting
-the secondary unicast mac addresses, the "reg" value has reached
-netdev_uc_count() + 1, thus we should only clear address entries
-if (addr < perfect_addr_number)
-
-Fixes: 9463c4455900 ("net: stmmac: dwmac1000: Clear unused address entries")
-Signed-off-by: Jisheng Zhang <Jisheng.Zhang@synaptics.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c b/drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c
-index 093e58e94075..3a2edf9f51e2 100644
---- a/drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c
-+++ b/drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c
-@@ -214,7 +214,7 @@ static void dwmac1000_set_filter(struct mac_device_info *hw,
- 			reg++;
- 		}
- 
--		while (reg <= perfect_addr_number) {
-+		while (reg < perfect_addr_number) {
- 			writel(0, ioaddr + GMAC_ADDR_HIGH(reg));
- 			writel(0, ioaddr + GMAC_ADDR_LOW(reg));
- 			reg++;
--- 
-2.28.0
-
-
-From 925c631e84d77a72188101258878ac58a646d540 Mon Sep 17 00:00:00 2001
-From: Richard Palethorpe <rpalethorpe@suse.com>
-Date: Wed, 1 Apr 2020 12:06:39 +0200
-Subject: [PATCH 17/34] slcan: Don't transmit uninitialized stack data in
- padding
-
-[ Upstream commit b9258a2cece4ec1f020715fe3554bc2e360f6264 ]
-
-struct can_frame contains some padding which is not explicitly zeroed in
-slc_bump. This uninitialized data will then be transmitted if the stack
-initialization hardening feature is not enabled (CONFIG_INIT_STACK_ALL).
-
-This commit just zeroes the whole struct including the padding.
-
-Signed-off-by: Richard Palethorpe <rpalethorpe@suse.com>
-Fixes: a1044e36e457 ("can: add slcan driver for serial/USB-serial CAN adapters")
-Reviewed-by: Kees Cook <keescook@chromium.org>
-Cc: linux-can@vger.kernel.org
-Cc: netdev@vger.kernel.org
-Cc: security@kernel.org
-Cc: wg@grandegger.com
-Cc: mkl@pengutronix.de
-Cc: davem@davemloft.net
-Acked-by: Marc Kleine-Budde <mkl@pengutronix.de>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/can/slcan.c | 4 +---
- 1 file changed, 1 insertion(+), 3 deletions(-)
-
-diff --git a/drivers/net/can/slcan.c b/drivers/net/can/slcan.c
-index 94b37c60fdd0..d0435c7631ff 100644
---- a/drivers/net/can/slcan.c
-+++ b/drivers/net/can/slcan.c
-@@ -147,7 +147,7 @@ static void slc_bump(struct slcan *sl)
- 	u32 tmpid;
- 	char *cmd = sl->rbuff;
- 
--	cf.can_id = 0;
-+	memset(&cf, 0, sizeof(cf));
- 
- 	switch (*cmd) {
- 	case 'r':
-@@ -186,8 +186,6 @@ static void slc_bump(struct slcan *sl)
- 	else
- 		return;
- 
--	*(u64 *) (&cf.data) = 0; /* clear payload */
--
- 	/* RTR frames may have a dlc > 0 but they never have any data bytes */
- 	if (!(cf.can_id & CAN_RTR_FLAG)) {
- 		for (i = 0; i < cf.can_dlc; i++) {
--- 
-2.28.0
-
-
-From 1ee3d823b83e46238347aa9284aad909a97ddba5 Mon Sep 17 00:00:00 2001
-From: Oleksij Rempel <o.rempel@pengutronix.de>
-Date: Fri, 3 Apr 2020 09:53:25 +0200
-Subject: [PATCH 18/34] net: phy: micrel: kszphy_resume(): add delay after
- genphy_resume() before accessing PHY registers
-
-[ Upstream commit 6110dff776f7fa65c35850ef65b41d3b39e2fac2 ]
-
-After the power-down bit is cleared, the chip internally triggers a
-global reset. According to the KSZ9031 documentation, we have to wait at
-least 1ms for the reset to finish.
-
-If the chip is accessed during reset, read will return 0xffff, while
-write will be ignored. Depending on the system performance and MDIO bus
-speed, we may or may not run in to this issue.
-
-This bug was discovered on an iMX6QP system with KSZ9031 PHY and
-attached PHY interrupt line. If IRQ was used, the link status update was
-lost. In polling mode, the link status update was always correct.
-
-The investigation showed, that during a read-modify-write access, the
-read returned 0xffff (while the chip was still in reset) and
-corresponding write hit the chip _after_ reset and triggered (due to the
-0xffff) another reset in an undocumented bit (register 0x1f, bit 1),
-resulting in the next write being lost due to the new reset cycle.
-
-This patch fixes the issue by adding a 1...2 ms sleep after the
-genphy_resume().
-
-Fixes: 836384d2501d ("net: phy: micrel: Add specific suspend")
-Signed-off-by: Oleksij Rempel <o.rempel@pengutronix.de>
-Reviewed-by: Andrew Lunn <andrew@lunn.ch>
-Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/phy/micrel.c | 7 +++++++
- 1 file changed, 7 insertions(+)
-
-diff --git a/drivers/net/phy/micrel.c b/drivers/net/phy/micrel.c
-index 16f074408813..adb38a4ec9ac 100644
---- a/drivers/net/phy/micrel.c
-+++ b/drivers/net/phy/micrel.c
-@@ -28,6 +28,7 @@
- #include <linux/micrel_phy.h>
- #include <linux/of.h>
- #include <linux/clk.h>
-+#include <linux/delay.h>
- 
- /* Operation Mode Strap Override */
- #define MII_KSZPHY_OMSO				0x16
-@@ -728,6 +729,12 @@ static int kszphy_resume(struct phy_device *phydev)
- {
- 	genphy_resume(phydev);
- 
-+	/* After switching from power-down to normal mode, an internal global
-+	 * reset is automatically generated. Wait a minimum of 1 ms before
-+	 * read/write access to the PHY registers.
-+	 */
-+	usleep_range(1000, 2000);
-+
- 	/* Enable PHY Interrupts */
- 	if (phy_interrupt_is_valid(phydev)) {
- 		phydev->interrupts = PHY_INTERRUPT_ENABLED;
--- 
-2.28.0
-
-
-From 5f27cae3002c4e59dcc20067746015933d3d3c58 Mon Sep 17 00:00:00 2001
-From: "Jason A. Donenfeld" <Jason@zx2c4.com>
-Date: Fri, 21 Feb 2020 21:10:37 +0100
-Subject: [PATCH 19/34] random: always use batched entropy for
- get_random_u{32,64}
-
-commit 69efea712f5b0489e67d07565aad5c94e09a3e52 upstream.
-
-It turns out that RDRAND is pretty slow. Comparing these two
-constructions:
-
-  for (i = 0; i < CHACHA_BLOCK_SIZE; i += sizeof(ret))
-    arch_get_random_long(&ret);
-
-and
-
-  long buf[CHACHA_BLOCK_SIZE / sizeof(long)];
-  extract_crng((u8 *)buf);
-
-it amortizes out to 352 cycles per long for the top one and 107 cycles
-per long for the bottom one, on Coffee Lake Refresh, Intel Core i9-9880H.
-
-And importantly, the top one has the drawback of not benefiting from the
-real rng, whereas the bottom one has all the nice benefits of using our
-own chacha rng. As get_random_u{32,64} gets used in more places (perhaps
-beyond what it was originally intended for when it was introduced as
-get_random_{int,long} back in the md5 monstrosity era), it seems like it
-might be a good thing to strengthen its posture a tiny bit. Doing this
-should only be stronger and not any weaker because that pool is already
-initialized with a bunch of rdrand data (when available). This way, we
-get the benefits of the hardware rng as well as our own rng.
-
-Another benefit of this is that we no longer hit pitfalls of the recent
-stream of AMD bugs in RDRAND. One often used code pattern for various
-things is:
-
-  do {
-  	val = get_random_u32();
-  } while (hash_table_contains_key(val));
-
-That recent AMD bug rendered that pattern useless, whereas we're really
-very certain that chacha20 output will give pretty distributed numbers,
-no matter what.
-
-So, this simplification seems better both from a security perspective
-and from a performance perspective.
-
-Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
-Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Link: https://lore.kernel.org/r/20200221201037.30231-1-Jason@zx2c4.com
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/char/random.c | 10 ++--------
- 1 file changed, 2 insertions(+), 8 deletions(-)
-
-diff --git a/drivers/char/random.c b/drivers/char/random.c
-index 81b65d0e7563..4cbc73173701 100644
---- a/drivers/char/random.c
-+++ b/drivers/char/random.c
-@@ -2118,8 +2118,8 @@ struct batched_entropy {
- 
- /*
-  * Get a random word for internal kernel use only. The quality of the random
-- * number is either as good as RDRAND or as good as /dev/urandom, with the
-- * goal of being quite fast and not depleting entropy.
-+ * number is good as /dev/urandom, but there is no backtrack protection, with
-+ * the goal of being quite fast and not depleting entropy.
-  */
- static DEFINE_PER_CPU(struct batched_entropy, batched_entropy_long);
- unsigned long get_random_long(void)
-@@ -2127,9 +2127,6 @@ unsigned long get_random_long(void)
- 	unsigned long ret;
- 	struct batched_entropy *batch;
- 
--	if (arch_get_random_long(&ret))
--		return ret;
--
- 	batch = &get_cpu_var(batched_entropy_long);
- 	if (batch->position % ARRAY_SIZE(batch->entropy_long) == 0) {
- 		extract_crng((u8 *)batch->entropy_long);
-@@ -2153,9 +2150,6 @@ unsigned int get_random_int(void)
- 	unsigned int ret;
- 	struct batched_entropy *batch;
- 
--	if (arch_get_random_int(&ret))
--		return ret;
--
- 	batch = &get_cpu_var(batched_entropy_int);
- 	if (batch->position % ARRAY_SIZE(batch->entropy_int) == 0) {
- 		extract_crng((u8 *)batch->entropy_int);
--- 
-2.28.0
-
-
-From 002e9efb463bc73e246154d28aabfb2034dab001 Mon Sep 17 00:00:00 2001
-From: David Ahern <dsahern@kernel.org>
-Date: Wed, 1 Apr 2020 21:02:25 -0700
-Subject: [PATCH 20/34] tools/accounting/getdelays.c: fix netlink attribute
- length
-
-commit 4054ab64e29bb05b3dfe758fff3c38a74ba753bb upstream.
-
-A recent change to the netlink code: 6e237d099fac ("netlink: Relax attr
-validation for fixed length types") logs a warning when programs send
-messages with invalid attributes (e.g., wrong length for a u32).  Yafang
-reported this error message for tools/accounting/getdelays.c.
-
-send_cmd() is wrongly adding 1 to the attribute length.  As noted in
-include/uapi/linux/netlink.h nla_len should be NLA_HDRLEN + payload
-length, so drop the +1.
-
-Fixes: 9e06d3f9f6b1 ("per task delay accounting taskstats interface: documentation fix")
-Reported-by: Yafang Shao <laoar.shao@gmail.com>
-Signed-off-by: David Ahern <dsahern@kernel.org>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Tested-by: Yafang Shao <laoar.shao@gmail.com>
-Cc: Johannes Berg <johannes@sipsolutions.net>
-Cc: Shailabh Nagar <nagar@watson.ibm.com>
-Cc: <stable@vger.kernel.org>
-Link: http://lkml.kernel.org/r/20200327173111.63922-1-dsahern@kernel.org
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/accounting/getdelays.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/tools/accounting/getdelays.c b/tools/accounting/getdelays.c
-index b5ca536e56a8..34df10a43ef0 100644
---- a/tools/accounting/getdelays.c
-+++ b/tools/accounting/getdelays.c
-@@ -135,7 +135,7 @@ static int send_cmd(int sd, __u16 nlmsg_type, __u32 nlmsg_pid,
- 	msg.g.version = 0x1;
- 	na = (struct nlattr *) GENLMSG_DATA(&msg);
- 	na->nla_type = nla_type;
--	na->nla_len = nla_len + 1 + NLA_HDRLEN;
-+	na->nla_len = nla_len + NLA_HDRLEN;
- 	memcpy(NLA_DATA(na), nla_data, nla_len);
- 	msg.n.nlmsg_len += NLMSG_ALIGN(na->nla_len);
- 
--- 
-2.28.0
-
-
-From 2bc7f1dd544bfc736ab644d23d7d533477f091b7 Mon Sep 17 00:00:00 2001
-From: Paul Cercueil <paul@crapouillou.net>
-Date: Fri, 6 Mar 2020 23:29:27 +0100
-Subject: [PATCH 21/34] ASoC: jz4740-i2s: Fix divider written at incorrect
- offset in register
-
-commit 9401d5aa328e64617d87abd59af1c91cace4c3e4 upstream.
-
-The 4-bit divider value was written at offset 8, while the jz4740
-programming manual locates it at offset 0.
-
-Fixes: 26b0aad80a86 ("ASoC: jz4740: Add dynamic sampling rate support to jz4740-i2s")
-Signed-off-by: Paul Cercueil <paul@crapouillou.net>
-Cc: stable@vger.kernel.org
-Link: https://lore.kernel.org/r/20200306222931.39664-2-paul@crapouillou.net
-Signed-off-by: Mark Brown <broonie@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/jz4740/jz4740-i2s.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/sound/soc/jz4740/jz4740-i2s.c b/sound/soc/jz4740/jz4740-i2s.c
-index 794a3499e567..0dc1ab48fceb 100644
---- a/sound/soc/jz4740/jz4740-i2s.c
-+++ b/sound/soc/jz4740/jz4740-i2s.c
-@@ -92,7 +92,7 @@
- #define JZ_AIC_I2S_STATUS_BUSY BIT(2)
- 
- #define JZ_AIC_CLK_DIV_MASK 0xf
--#define I2SDIV_DV_SHIFT 8
-+#define I2SDIV_DV_SHIFT 0
- #define I2SDIV_DV_MASK (0xf << I2SDIV_DV_SHIFT)
- #define I2SDIV_IDV_SHIFT 8
- #define I2SDIV_IDV_MASK (0xf << I2SDIV_IDV_SHIFT)
--- 
-2.28.0
-
-
-From 95372fb5f8f52d7ab5adfbf820b2eb417b1b2603 Mon Sep 17 00:00:00 2001
-From: Kaike Wan <kaike.wan@intel.com>
-Date: Thu, 26 Mar 2020 12:38:14 -0400
-Subject: [PATCH 22/34] IB/hfi1: Call kobject_put() when kobject_init_and_add()
- fails
-
-commit dfb5394f804ed4fcea1fc925be275a38d66712ab upstream.
-
-When kobject_init_and_add() returns an error in the function
-hfi1_create_port_files(), the function kobject_put() is not called for the
-corresponding kobject, which potentially leads to memory leak.
-
-This patch fixes the issue by calling kobject_put() even if
-kobject_init_and_add() fails.
-
-Cc: <stable@vger.kernel.org>
-Link: https://lore.kernel.org/r/20200326163813.21129.44280.stgit@awfm-01.aw.intel.com
-Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
-Signed-off-by: Kaike Wan <kaike.wan@intel.com>
-Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
-Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/hw/hfi1/sysfs.c | 13 ++++++++-----
- 1 file changed, 8 insertions(+), 5 deletions(-)
-
-diff --git a/drivers/infiniband/hw/hfi1/sysfs.c b/drivers/infiniband/hw/hfi1/sysfs.c
-index 621b60ab74ee..26dc66cd85c9 100644
---- a/drivers/infiniband/hw/hfi1/sysfs.c
-+++ b/drivers/infiniband/hw/hfi1/sysfs.c
-@@ -670,7 +670,11 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
- 		dd_dev_err(dd,
- 			   "Skipping sc2vl sysfs info, (err %d) port %u\n",
- 			   ret, port_num);
--		goto bail;
-+		/*
-+		 * Based on the documentation for kobject_init_and_add(), the
-+		 * caller should call kobject_put even if this call fails.
-+		 */
-+		goto bail_sc2vl;
- 	}
- 	kobject_uevent(&ppd->sc2vl_kobj, KOBJ_ADD);
- 
-@@ -680,7 +684,7 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
- 		dd_dev_err(dd,
- 			   "Skipping sl2sc sysfs info, (err %d) port %u\n",
- 			   ret, port_num);
--		goto bail_sc2vl;
-+		goto bail_sl2sc;
- 	}
- 	kobject_uevent(&ppd->sl2sc_kobj, KOBJ_ADD);
- 
-@@ -690,7 +694,7 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
- 		dd_dev_err(dd,
- 			   "Skipping vl2mtu sysfs info, (err %d) port %u\n",
- 			   ret, port_num);
--		goto bail_sl2sc;
-+		goto bail_vl2mtu;
- 	}
- 	kobject_uevent(&ppd->vl2mtu_kobj, KOBJ_ADD);
- 
-@@ -700,7 +704,7 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
- 		dd_dev_err(dd,
- 			   "Skipping Congestion Control sysfs info, (err %d) port %u\n",
- 			   ret, port_num);
--		goto bail_vl2mtu;
-+		goto bail_cc;
- 	}
- 
- 	kobject_uevent(&ppd->pport_cc_kobj, KOBJ_ADD);
-@@ -738,7 +742,6 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
- 	kobject_put(&ppd->sl2sc_kobj);
- bail_sc2vl:
- 	kobject_put(&ppd->sc2vl_kobj);
--bail:
- 	return ret;
- }
- 
--- 
-2.28.0
-
-
-From 792a15d446ddf13771f9a0452ddbd8f677e9a910 Mon Sep 17 00:00:00 2001
-From: Kaike Wan <kaike.wan@intel.com>
-Date: Thu, 26 Mar 2020 12:38:07 -0400
-Subject: [PATCH 23/34] IB/hfi1: Fix memory leaks in sysfs registration and
- unregistration
-
-commit 5c15abc4328ad696fa61e2f3604918ed0c207755 upstream.
-
-When the hfi1 driver is unloaded, kmemleak will report the following
-issue:
-
-unreferenced object 0xffff8888461a4c08 (size 8):
-comm "kworker/0:0", pid 5, jiffies 4298601264 (age 2047.134s)
-hex dump (first 8 bytes):
-73 64 6d 61 30 00 ff ff sdma0...
-backtrace:
-[<00000000311a6ef5>] kvasprintf+0x62/0xd0
-[<00000000ade94d9f>] kobject_set_name_vargs+0x1c/0x90
-[<0000000060657dbb>] kobject_init_and_add+0x5d/0xb0
-[<00000000346fe72b>] 0xffffffffa0c5ecba
-[<000000006cfc5819>] 0xffffffffa0c866b9
-[<0000000031c65580>] 0xffffffffa0c38e87
-[<00000000e9739b3f>] local_pci_probe+0x41/0x80
-[<000000006c69911d>] work_for_cpu_fn+0x16/0x20
-[<00000000601267b5>] process_one_work+0x171/0x380
-[<0000000049a0eefa>] worker_thread+0x1d1/0x3f0
-[<00000000909cf2b9>] kthread+0xf8/0x130
-[<0000000058f5f874>] ret_from_fork+0x35/0x40
-
-This patch fixes the issue by:
-
-- Releasing dd->per_sdma[i].kobject in hfi1_unregister_sysfs().
-  - This will fix the memory leak.
-
-- Calling kobject_put() to unwind operations only for those entries in
-   dd->per_sdma[] whose operations have succeeded (including the current
-   one that has just failed) in hfi1_verbs_register_sysfs().
-
-Cc: <stable@vger.kernel.org>
-Fixes: 0cb2aa690c7e ("IB/hfi1: Add sysfs interface for affinity setup")
-Link: https://lore.kernel.org/r/20200326163807.21129.27371.stgit@awfm-01.aw.intel.com
-Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
-Signed-off-by: Kaike Wan <kaike.wan@intel.com>
-Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
-Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/hw/hfi1/sysfs.c | 13 +++++++++++--
- 1 file changed, 11 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/infiniband/hw/hfi1/sysfs.c b/drivers/infiniband/hw/hfi1/sysfs.c
-index 26dc66cd85c9..5df1e368096c 100644
---- a/drivers/infiniband/hw/hfi1/sysfs.c
-+++ b/drivers/infiniband/hw/hfi1/sysfs.c
-@@ -861,8 +861,13 @@ int hfi1_verbs_register_sysfs(struct hfi1_devdata *dd)
- 	for (i = 0; i < ARRAY_SIZE(hfi1_attributes); ++i)
- 		device_remove_file(&dev->dev, hfi1_attributes[i]);
- 
--	for (i = 0; i < dd->num_sdma; i++)
--		kobject_del(&dd->per_sdma[i].kobj);
-+	/*
-+	 * The function kobject_put() will call kobject_del() if the kobject
-+	 * has been added successfully. The sysfs files created under the
-+	 * kobject directory will also be removed during the process.
-+	 */
-+	for (; i >= 0; i--)
-+		kobject_put(&dd->per_sdma[i].kobj);
- 
- 	return ret;
- }
-@@ -875,6 +880,10 @@ void hfi1_verbs_unregister_sysfs(struct hfi1_devdata *dd)
- 	struct hfi1_pportdata *ppd;
- 	int i;
- 
-+	/* Unwind operations in hfi1_verbs_register_sysfs() */
-+	for (i = 0; i < dd->num_sdma; i++)
-+		kobject_put(&dd->per_sdma[i].kobj);
-+
- 	for (i = 0; i < dd->num_pports; i++) {
- 		ppd = &dd->pport[i];
- 
--- 
-2.28.0
-
-
-From 68d87669cb58d538f49eafbbdc0fa302b6c7cb4f Mon Sep 17 00:00:00 2001
-From: Xiubo Li <xiubli@redhat.com>
-Date: Fri, 20 Dec 2019 09:34:04 -0500
-Subject: [PATCH 24/34] ceph: remove the extra slashes in the server path
-
-commit 4fbc0c711b2464ee1551850b85002faae0b775d5 upstream.
-
-It's possible to pass the mount helper a server path that has more
-than one contiguous slash character. For example:
-
-  $ mount -t ceph 192.168.195.165:40176:/// /mnt/cephfs/
-
-In the MDS server side the extra slashes of the server path will be
-treated as snap dir, and then we can get the following debug logs:
-
-  ceph:  mount opening path //
-  ceph:  open_root_inode opening '//'
-  ceph:  fill_trace 0000000059b8a3bc is_dentry 0 is_target 1
-  ceph:  alloc_inode 00000000dc4ca00b
-  ceph:  get_inode created new inode 00000000dc4ca00b 1.ffffffffffffffff ino 1
-  ceph:  get_inode on 1=1.ffffffffffffffff got 00000000dc4ca00b
-
-And then when creating any new file or directory under the mount
-point, we can hit the following BUG_ON in ceph_fill_trace():
-
-  BUG_ON(ceph_snap(dir) != dvino.snap);
-
-Have the client ignore the extra slashes in the server path when
-mounting. This will also canonicalize the path, so that identical mounts
-can be consilidated.
-
-1) "//mydir1///mydir//"
-2) "/mydir1/mydir"
-3) "/mydir1/mydir/"
-
-Regardless of the internal treatment of these paths, the kernel still
-stores the original string including the leading '/' for presentation
-to userland.
-
-URL: https://tracker.ceph.com/issues/42771
-Signed-off-by: Xiubo Li <xiubli@redhat.com>
-Reviewed-by: Jeff Layton <jlayton@kernel.org>
-Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
-Signed-off-by: Luis Henriques <lhenriques@suse.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ceph/super.c | 118 ++++++++++++++++++++++++++++++++++++++++--------
- 1 file changed, 99 insertions(+), 19 deletions(-)
-
-diff --git a/fs/ceph/super.c b/fs/ceph/super.c
-index c42cbd19ff05..20e62749bbb7 100644
---- a/fs/ceph/super.c
-+++ b/fs/ceph/super.c
-@@ -85,7 +85,6 @@ static int ceph_statfs(struct dentry *dentry, struct kstatfs *buf)
- 	return 0;
- }
- 
--
- static int ceph_sync_fs(struct super_block *sb, int wait)
- {
- 	struct ceph_fs_client *fsc = ceph_sb_to_client(sb);
-@@ -321,6 +320,73 @@ static int strcmp_null(const char *s1, const char *s2)
- 	return strcmp(s1, s2);
- }
- 
-+/**
-+ * path_remove_extra_slash - Remove the extra slashes in the server path
-+ * @server_path: the server path and could be NULL
-+ *
-+ * Return NULL if the path is NULL or only consists of "/", or a string
-+ * without any extra slashes including the leading slash(es) and the
-+ * slash(es) at the end of the server path, such as:
-+ * "//dir1////dir2///" --> "dir1/dir2"
-+ */
-+static char *path_remove_extra_slash(const char *server_path)
-+{
-+	const char *path = server_path;
-+	const char *cur, *end;
-+	char *buf, *p;
-+	int len;
-+
-+	/* if the server path is omitted */
-+	if (!path)
-+		return NULL;
-+
-+	/* remove all the leading slashes */
-+	while (*path == '/')
-+		path++;
-+
-+	/* if the server path only consists of slashes */
-+	if (*path == '\0')
-+		return NULL;
-+
-+	len = strlen(path);
-+
-+	buf = kmalloc(len + 1, GFP_KERNEL);
-+	if (!buf)
-+		return ERR_PTR(-ENOMEM);
-+
-+	end = path + len;
-+	p = buf;
-+	do {
-+		cur = strchr(path, '/');
-+		if (!cur)
-+			cur = end;
-+
-+		len = cur - path;
-+
-+		/* including one '/' */
-+		if (cur != end)
-+			len += 1;
-+
-+		memcpy(p, path, len);
-+		p += len;
-+
-+		while (cur <= end && *cur == '/')
-+			cur++;
-+		path = cur;
-+	} while (path < end);
-+
-+	*p = '\0';
-+
-+	/*
-+	 * remove the last slash if there has and just to make sure that
-+	 * we will get something like "dir1/dir2"
-+	 */
-+	if (*(--p) == '/')
-+		*p = '\0';
-+
-+	return buf;
-+}
-+
- static int compare_mount_options(struct ceph_mount_options *new_fsopt,
- 				 struct ceph_options *new_opt,
- 				 struct ceph_fs_client *fsc)
-@@ -328,6 +394,7 @@ static int compare_mount_options(struct ceph_mount_options *new_fsopt,
- 	struct ceph_mount_options *fsopt1 = new_fsopt;
- 	struct ceph_mount_options *fsopt2 = fsc->mount_options;
- 	int ofs = offsetof(struct ceph_mount_options, snapdir_name);
-+	char *p1, *p2;
- 	int ret;
- 
- 	ret = memcmp(fsopt1, fsopt2, ofs);
-@@ -341,7 +408,17 @@ static int compare_mount_options(struct ceph_mount_options *new_fsopt,
- 	if (ret)
- 		return ret;
- 
--	ret = strcmp_null(fsopt1->server_path, fsopt2->server_path);
-+	p1 = path_remove_extra_slash(fsopt1->server_path);
-+	if (IS_ERR(p1))
-+		return PTR_ERR(p1);
-+	p2 = path_remove_extra_slash(fsopt2->server_path);
-+	if (IS_ERR(p2)) {
-+		kfree(p1);
-+		return PTR_ERR(p2);
-+	}
-+	ret = strcmp_null(p1, p2);
-+	kfree(p1);
-+	kfree(p2);
- 	if (ret)
- 		return ret;
- 
-@@ -396,12 +473,14 @@ static int parse_mount_options(struct ceph_mount_options **pfsopt,
- 	 */
- 	dev_name_end = strchr(dev_name, '/');
- 	if (dev_name_end) {
--		if (strlen(dev_name_end) > 1) {
--			fsopt->server_path = kstrdup(dev_name_end, GFP_KERNEL);
--			if (!fsopt->server_path) {
--				err = -ENOMEM;
--				goto out;
--			}
-+		/*
-+		 * The server_path will include the whole chars from userland
-+		 * including the leading '/'.
-+		 */
-+		fsopt->server_path = kstrdup(dev_name_end, GFP_KERNEL);
-+		if (!fsopt->server_path) {
-+			err = -ENOMEM;
-+			goto out;
- 		}
- 	} else {
- 		dev_name_end = dev_name + strlen(dev_name);
-@@ -725,7 +804,6 @@ static void destroy_caches(void)
- 	ceph_fscache_unregister();
- }
- 
--
- /*
-  * ceph_umount_begin - initiate forced umount.  Tear down down the
-  * mount, skipping steps that may hang while waiting for server(s).
-@@ -812,9 +890,6 @@ static struct dentry *open_root_dentry(struct ceph_fs_client *fsc,
- 	return root;
- }
- 
--
--
--
- /*
-  * mount: join the ceph cluster, and open root directory.
-  */
-@@ -828,24 +903,29 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
- 	mutex_lock(&fsc->client->mount_mutex);
- 
- 	if (!fsc->sb->s_root) {
--		const char *path;
-+		const char *path, *p;
- 		err = __ceph_open_session(fsc->client, started);
- 		if (err < 0)
- 			goto out;
- 
--		if (!fsc->mount_options->server_path) {
--			path = "";
--			dout("mount opening path \\t\n");
--		} else {
--			path = fsc->mount_options->server_path + 1;
--			dout("mount opening path %s\n", path);
-+		p = path_remove_extra_slash(fsc->mount_options->server_path);
-+		if (IS_ERR(p)) {
-+			err = PTR_ERR(p);
-+			goto out;
- 		}
-+		/* if the server path is omitted or just consists of '/' */
-+		if (!p)
-+			path = "";
-+		else
-+			path = p;
-+		dout("mount opening path '%s'\n", path);
- 
- 		err = ceph_fs_debugfs_init(fsc);
- 		if (err < 0)
- 			goto out;
- 
- 		root = open_root_dentry(fsc, path, started);
-+		kfree(p);
- 		if (IS_ERR(root)) {
- 			err = PTR_ERR(root);
- 			goto out;
--- 
-2.28.0
-
-
-From 1cccf9da6adebd2751f300f598559170c7a68b20 Mon Sep 17 00:00:00 2001
-From: Ilya Dryomov <idryomov@gmail.com>
-Date: Mon, 10 Feb 2020 22:51:08 +0100
-Subject: [PATCH 25/34] ceph: canonicalize server path in place
-
-commit b27a939e8376a3f1ed09b9c33ef44d20f18ec3d0 upstream.
-
-syzbot reported that 4fbc0c711b24 ("ceph: remove the extra slashes in
-the server path") had caused a regression where an allocation could be
-done under a spinlock -- compare_mount_options() is called by sget_fc()
-with sb_lock held.
-
-We don't really need the supplied server path, so canonicalize it
-in place and compare it directly.  To make this work, the leading
-slash is kept around and the logic in ceph_real_mount() to skip it
-is restored.  CEPH_MSG_CLIENT_SESSION now reports the same (i.e.
-canonicalized) path, with the leading slash of course.
-
-Fixes: 4fbc0c711b24 ("ceph: remove the extra slashes in the server path")
-Reported-by: syzbot+98704a51af8e3d9425a9@syzkaller.appspotmail.com
-Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
-Reviewed-by: Jeff Layton <jlayton@kernel.org>
-Signed-off-by: Luis Henriques <lhenriques@suse.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ceph/super.c | 118 +++++++++++-------------------------------------
- fs/ceph/super.h |   2 +-
- 2 files changed, 28 insertions(+), 92 deletions(-)
-
-diff --git a/fs/ceph/super.c b/fs/ceph/super.c
-index 20e62749bbb7..ec1640f3167b 100644
---- a/fs/ceph/super.c
-+++ b/fs/ceph/super.c
-@@ -177,6 +177,26 @@ static match_table_t fsopt_tokens = {
- 	{-1, NULL}
- };
- 
-+/*
-+ * Remove adjacent slashes and then the trailing slash, unless it is
-+ * the only remaining character.
-+ *
-+ * E.g. "//dir1////dir2///" --> "/dir1/dir2", "///" --> "/".
-+ */
-+static void canonicalize_path(char *path)
-+{
-+	int i, j = 0;
-+
-+	for (i = 0; path[i] != '\0'; i++) {
-+		if (path[i] != '/' || j < 1 || path[j - 1] != '/')
-+			path[j++] = path[i];
-+	}
-+
-+	if (j > 1 && path[j - 1] == '/')
-+		j--;
-+	path[j] = '\0';
-+}
-+
- static int parse_fsopt_token(char *c, void *private)
- {
- 	struct ceph_mount_options *fsopt = private;
-@@ -320,73 +340,6 @@ static int strcmp_null(const char *s1, const char *s2)
- 	return strcmp(s1, s2);
- }
- 
--/**
-- * path_remove_extra_slash - Remove the extra slashes in the server path
-- * @server_path: the server path and could be NULL
-- *
-- * Return NULL if the path is NULL or only consists of "/", or a string
-- * without any extra slashes including the leading slash(es) and the
-- * slash(es) at the end of the server path, such as:
-- * "//dir1////dir2///" --> "dir1/dir2"
-- */
--static char *path_remove_extra_slash(const char *server_path)
--{
--	const char *path = server_path;
--	const char *cur, *end;
--	char *buf, *p;
--	int len;
--
--	/* if the server path is omitted */
--	if (!path)
--		return NULL;
--
--	/* remove all the leading slashes */
--	while (*path == '/')
--		path++;
--
--	/* if the server path only consists of slashes */
--	if (*path == '\0')
--		return NULL;
--
--	len = strlen(path);
--
--	buf = kmalloc(len + 1, GFP_KERNEL);
--	if (!buf)
--		return ERR_PTR(-ENOMEM);
--
--	end = path + len;
--	p = buf;
--	do {
--		cur = strchr(path, '/');
--		if (!cur)
--			cur = end;
--
--		len = cur - path;
--
--		/* including one '/' */
--		if (cur != end)
--			len += 1;
--
--		memcpy(p, path, len);
--		p += len;
--
--		while (cur <= end && *cur == '/')
--			cur++;
--		path = cur;
--	} while (path < end);
--
--	*p = '\0';
--
--	/*
--	 * remove the last slash if there has and just to make sure that
--	 * we will get something like "dir1/dir2"
--	 */
--	if (*(--p) == '/')
--		*p = '\0';
--
--	return buf;
--}
--
- static int compare_mount_options(struct ceph_mount_options *new_fsopt,
- 				 struct ceph_options *new_opt,
- 				 struct ceph_fs_client *fsc)
-@@ -394,7 +347,6 @@ static int compare_mount_options(struct ceph_mount_options *new_fsopt,
- 	struct ceph_mount_options *fsopt1 = new_fsopt;
- 	struct ceph_mount_options *fsopt2 = fsc->mount_options;
- 	int ofs = offsetof(struct ceph_mount_options, snapdir_name);
--	char *p1, *p2;
- 	int ret;
- 
- 	ret = memcmp(fsopt1, fsopt2, ofs);
-@@ -404,21 +356,12 @@ static int compare_mount_options(struct ceph_mount_options *new_fsopt,
- 	ret = strcmp_null(fsopt1->snapdir_name, fsopt2->snapdir_name);
- 	if (ret)
- 		return ret;
-+
- 	ret = strcmp_null(fsopt1->mds_namespace, fsopt2->mds_namespace);
- 	if (ret)
- 		return ret;
- 
--	p1 = path_remove_extra_slash(fsopt1->server_path);
--	if (IS_ERR(p1))
--		return PTR_ERR(p1);
--	p2 = path_remove_extra_slash(fsopt2->server_path);
--	if (IS_ERR(p2)) {
--		kfree(p1);
--		return PTR_ERR(p2);
--	}
--	ret = strcmp_null(p1, p2);
--	kfree(p1);
--	kfree(p2);
-+	ret = strcmp_null(fsopt1->server_path, fsopt2->server_path);
- 	if (ret)
- 		return ret;
- 
-@@ -482,6 +425,8 @@ static int parse_mount_options(struct ceph_mount_options **pfsopt,
- 			err = -ENOMEM;
- 			goto out;
- 		}
-+
-+		canonicalize_path(fsopt->server_path);
- 	} else {
- 		dev_name_end = dev_name + strlen(dev_name);
- 	}
-@@ -903,21 +848,13 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
- 	mutex_lock(&fsc->client->mount_mutex);
- 
- 	if (!fsc->sb->s_root) {
--		const char *path, *p;
-+		const char *path = fsc->mount_options->server_path ?
-+				     fsc->mount_options->server_path + 1 : "";
-+
- 		err = __ceph_open_session(fsc->client, started);
- 		if (err < 0)
- 			goto out;
- 
--		p = path_remove_extra_slash(fsc->mount_options->server_path);
--		if (IS_ERR(p)) {
--			err = PTR_ERR(p);
--			goto out;
--		}
--		/* if the server path is omitted or just consists of '/' */
--		if (!p)
--			path = "";
--		else
--			path = p;
- 		dout("mount opening path '%s'\n", path);
- 
- 		err = ceph_fs_debugfs_init(fsc);
-@@ -925,7 +862,6 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
- 			goto out;
- 
- 		root = open_root_dentry(fsc, path, started);
--		kfree(p);
- 		if (IS_ERR(root)) {
- 			err = PTR_ERR(root);
- 			goto out;
-diff --git a/fs/ceph/super.h b/fs/ceph/super.h
-index 9bd0d928057b..9f18635f78c7 100644
---- a/fs/ceph/super.h
-+++ b/fs/ceph/super.h
-@@ -70,7 +70,7 @@ struct ceph_mount_options {
- 
- 	char *snapdir_name;   /* default ".snap" */
- 	char *mds_namespace;  /* default NULL */
--	char *server_path;    /* default  "/" */
-+	char *server_path;    /* default NULL (means "/") */
- };
- 
- struct ceph_fs_client {
--- 
-2.28.0
-
-
-From 5cc241a4bb92cf2d50849bb079c438b7f9838734 Mon Sep 17 00:00:00 2001
-From: Qiujun Huang <hqjagain@gmail.com>
-Date: Sun, 8 Mar 2020 17:45:27 +0800
-Subject: [PATCH 26/34] Bluetooth: RFCOMM: fix ODEBUG bug in rfcomm_dev_ioctl
-
-commit 71811cac8532b2387b3414f7cd8fe9e497482864 upstream.
-
-Needn't call 'rfcomm_dlc_put' here, because 'rfcomm_dlc_exists' didn't
-increase dlc->refcnt.
-
-Reported-by: syzbot+4496e82090657320efc6@syzkaller.appspotmail.com
-Signed-off-by: Qiujun Huang <hqjagain@gmail.com>
-Suggested-by: Hillf Danton <hdanton@sina.com>
-Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/bluetooth/rfcomm/tty.c | 4 +---
- 1 file changed, 1 insertion(+), 3 deletions(-)
-
-diff --git a/net/bluetooth/rfcomm/tty.c b/net/bluetooth/rfcomm/tty.c
-index 2f2cb5e27cdd..a8c63ef75f73 100644
---- a/net/bluetooth/rfcomm/tty.c
-+++ b/net/bluetooth/rfcomm/tty.c
-@@ -413,10 +413,8 @@ static int __rfcomm_create_dev(struct sock *sk, void __user *arg)
- 		dlc = rfcomm_dlc_exists(&req.src, &req.dst, req.channel);
- 		if (IS_ERR(dlc))
- 			return PTR_ERR(dlc);
--		else if (dlc) {
--			rfcomm_dlc_put(dlc);
-+		if (dlc)
- 			return -EBUSY;
--		}
- 		dlc = rfcomm_dlc_alloc(GFP_KERNEL);
- 		if (!dlc)
- 			return -ENOMEM;
--- 
-2.28.0
-
-
-From 1076d21f94c79491b11965c88db4a6cd495ad6ff Mon Sep 17 00:00:00 2001
-From: Avihai Horon <avihaih@mellanox.com>
-Date: Wed, 18 Mar 2020 12:17:41 +0200
-Subject: [PATCH 27/34] RDMA/cm: Update num_paths in cma_resolve_iboe_route
- error flow
-
-commit 987914ab841e2ec281a35b54348ab109b4c0bb4e upstream.
-
-After a successful allocation of path_rec, num_paths is set to 1, but any
-error after such allocation will leave num_paths uncleared.
-
-This causes to de-referencing a NULL pointer later on. Hence, num_paths
-needs to be set back to 0 if such an error occurs.
-
-The following crash from syzkaller revealed it.
-
-  kasan: CONFIG_KASAN_INLINE enabled
-  kasan: GPF could be caused by NULL-ptr deref or user memory access
-  general protection fault: 0000 [#1] SMP DEBUG_PAGEALLOC KASAN PTI
-  CPU: 0 PID: 357 Comm: syz-executor060 Not tainted 4.18.0+ #311
-  Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS
-  rel-1.11.0-0-g63451fca13-prebuilt.qemu-project.org 04/01/2014
-  RIP: 0010:ib_copy_path_rec_to_user+0x94/0x3e0
-  Code: f1 f1 f1 f1 c7 40 0c 00 00 f4 f4 65 48 8b 04 25 28 00 00 00 48 89
-  45 c8 31 c0 e8 d7 60 24 ff 48 8d 7b 4c 48 89 f8 48 c1 e8 03 <42> 0f b6
-  14 30 48 89 f8 83 e0 07 83 c0 03 38 d0 7c 08 84 d2 0f 85
-  RSP: 0018:ffff88006586f980 EFLAGS: 00010207
-  RAX: 0000000000000009 RBX: 0000000000000000 RCX: 1ffff1000d5fe475
-  RDX: ffff8800621e17c0 RSI: ffffffff820d45f9 RDI: 000000000000004c
-  RBP: ffff88006586fa50 R08: ffffed000cb0df73 R09: ffffed000cb0df72
-  R10: ffff88006586fa70 R11: ffffed000cb0df73 R12: 1ffff1000cb0df30
-  R13: ffff88006586fae8 R14: dffffc0000000000 R15: ffff88006aff2200
-  FS: 00000000016fc880(0000) GS:ffff88006d000000(0000)
-  knlGS:0000000000000000
-  CS: 0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-  CR2: 0000000020000040 CR3: 0000000063fec000 CR4: 00000000000006b0
-  DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
-  DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
-  Call Trace:
-  ? ib_copy_path_rec_from_user+0xcc0/0xcc0
-  ? __mutex_unlock_slowpath+0xfc/0x670
-  ? wait_for_completion+0x3b0/0x3b0
-  ? ucma_query_route+0x818/0xc60
-  ucma_query_route+0x818/0xc60
-  ? ucma_listen+0x1b0/0x1b0
-  ? sched_clock_cpu+0x18/0x1d0
-  ? sched_clock_cpu+0x18/0x1d0
-  ? ucma_listen+0x1b0/0x1b0
-  ? ucma_write+0x292/0x460
-  ucma_write+0x292/0x460
-  ? ucma_close_id+0x60/0x60
-  ? sched_clock_cpu+0x18/0x1d0
-  ? sched_clock_cpu+0x18/0x1d0
-  __vfs_write+0xf7/0x620
-  ? ucma_close_id+0x60/0x60
-  ? kernel_read+0x110/0x110
-  ? time_hardirqs_on+0x19/0x580
-  ? lock_acquire+0x18b/0x3a0
-  ? finish_task_switch+0xf3/0x5d0
-  ? _raw_spin_unlock_irq+0x29/0x40
-  ? _raw_spin_unlock_irq+0x29/0x40
-  ? finish_task_switch+0x1be/0x5d0
-  ? __switch_to_asm+0x34/0x70
-  ? __switch_to_asm+0x40/0x70
-  ? security_file_permission+0x172/0x1e0
-  vfs_write+0x192/0x460
-  ksys_write+0xc6/0x1a0
-  ? __ia32_sys_read+0xb0/0xb0
-  ? entry_SYSCALL_64_after_hwframe+0x3e/0xbe
-  ? do_syscall_64+0x1d/0x470
-  do_syscall_64+0x9e/0x470
-  entry_SYSCALL_64_after_hwframe+0x49/0xbe
-
-Fixes: 3c86aa70bf67 ("RDMA/cm: Add RDMA CM support for IBoE devices")
-Link: https://lore.kernel.org/r/20200318101741.47211-1-leon@kernel.org
-Signed-off-by: Avihai Horon <avihaih@mellanox.com>
-Reviewed-by: Maor Gottlieb <maorg@mellanox.com>
-Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
-Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/core/cma.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
-index 27653aad8f21..0a6cc78ebcf7 100644
---- a/drivers/infiniband/core/cma.c
-+++ b/drivers/infiniband/core/cma.c
-@@ -2568,6 +2568,7 @@ static int cma_resolve_iboe_route(struct rdma_id_private *id_priv)
- err2:
- 	kfree(route->path_rec);
- 	route->path_rec = NULL;
-+	route->num_paths = 0;
- err1:
- 	kfree(work);
- 	return ret;
--- 
-2.28.0
-
-
-From fcd93da7fe096b8d08d63e22816426a6dcb73d2c Mon Sep 17 00:00:00 2001
-From: Taniya Das <tdas@codeaurora.org>
-Date: Wed, 8 May 2019 23:54:53 +0530
-Subject: [PATCH 28/34] clk: qcom: rcg: Return failure for RCG update
-
-commit 21ea4b62e1f3dc258001a68da98c9663a9dbd6c7 upstream.
-
-In case of update config failure, return -EBUSY, so that consumers could
-handle the failure gracefully.
-
-Signed-off-by: Taniya Das <tdas@codeaurora.org>
-Link: https://lkml.kernel.org/r/1557339895-21952-2-git-send-email-tdas@codeaurora.org
-Signed-off-by: Stephen Boyd <sboyd@kernel.org>
-Signed-off-by: Lee Jones <lee.jones@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/clk/qcom/clk-rcg2.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/clk/qcom/clk-rcg2.c b/drivers/clk/qcom/clk-rcg2.c
-index d8601b138dc1..29abb600d7e1 100644
---- a/drivers/clk/qcom/clk-rcg2.c
-+++ b/drivers/clk/qcom/clk-rcg2.c
-@@ -107,7 +107,7 @@ static int update_config(struct clk_rcg2 *rcg)
- 	}
- 
- 	WARN(1, "%s: rcg didn't update its configuration.", name);
--	return 0;
-+	return -EBUSY;
- }
- 
- static int clk_rcg2_set_parent(struct clk_hw *hw, u8 index)
--- 
-2.28.0
-
-
-From ed0445d8826cfd759280d3f0ed4b78d922eb98c1 Mon Sep 17 00:00:00 2001
-From: Rob Clark <robdclark@chromium.org>
-Date: Sun, 30 Jun 2019 05:47:22 -0700
-Subject: [PATCH 29/34] drm/msm: stop abusing dma_map/unmap for cache
-
-commit 0036bc73ccbe7e600a3468bf8e8879b122252274 upstream.
-
-Recently splats like this started showing up:
-
-   WARNING: CPU: 4 PID: 251 at drivers/iommu/dma-iommu.c:451 __iommu_dma_unmap+0xb8/0xc0
-   Modules linked in: ath10k_snoc ath10k_core fuse msm ath mac80211 uvcvideo cfg80211 videobuf2_vmalloc videobuf2_memops vide
-   CPU: 4 PID: 251 Comm: kworker/u16:4 Tainted: G        W         5.2.0-rc5-next-20190619+ #2317
-   Hardware name: LENOVO 81JL/LNVNB161216, BIOS 9UCN23WW(V1.06) 10/25/2018
-   Workqueue: msm msm_gem_free_work [msm]
-   pstate: 80c00005 (Nzcv daif +PAN +UAO)
-   pc : __iommu_dma_unmap+0xb8/0xc0
-   lr : __iommu_dma_unmap+0x54/0xc0
-   sp : ffff0000119abce0
-   x29: ffff0000119abce0 x28: 0000000000000000
-   x27: ffff8001f9946648 x26: ffff8001ec271068
-   x25: 0000000000000000 x24: ffff8001ea3580a8
-   x23: ffff8001f95ba010 x22: ffff80018e83ba88
-   x21: ffff8001e548f000 x20: fffffffffffff000
-   x19: 0000000000001000 x18: 00000000c00001fe
-   x17: 0000000000000000 x16: 0000000000000000
-   x15: ffff000015b70068 x14: 0000000000000005
-   x13: 0003142cc1be1768 x12: 0000000000000001
-   x11: ffff8001f6de9100 x10: 0000000000000009
-   x9 : ffff000015b78000 x8 : 0000000000000000
-   x7 : 0000000000000001 x6 : fffffffffffff000
-   x5 : 0000000000000fff x4 : ffff00001065dbc8
-   x3 : 000000000000000d x2 : 0000000000001000
-   x1 : fffffffffffff000 x0 : 0000000000000000
-   Call trace:
-    __iommu_dma_unmap+0xb8/0xc0
-    iommu_dma_unmap_sg+0x98/0xb8
-    put_pages+0x5c/0xf0 [msm]
-    msm_gem_free_work+0x10c/0x150 [msm]
-    process_one_work+0x1e0/0x330
-    worker_thread+0x40/0x438
-    kthread+0x12c/0x130
-    ret_from_fork+0x10/0x18
-   ---[ end trace afc0dc5ab81a06bf ]---
-
-Not quite sure what triggered that, but we really shouldn't be abusing
-dma_{map,unmap}_sg() for cache maint.
-
-Cc: Stephen Boyd <sboyd@kernel.org>
-Tested-by: Stephen Boyd <swboyd@chromium.org>
-Reviewed-by: Jordan Crouse <jcrouse@codeaurora.org>
-Signed-off-by: Rob Clark <robdclark@chromium.org>
-Signed-off-by: Sean Paul <seanpaul@chromium.org>
-Link: https://patchwork.freedesktop.org/patch/msgid/20190630124735.27786-1-robdclark@gmail.com
-Signed-off-by: Lee Jones <lee.jones@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/msm/msm_gem.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
 diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
-index 795660e29b2c..a472d4d902dd 100644
---- a/drivers/gpu/drm/msm/msm_gem.c
-+++ b/drivers/gpu/drm/msm/msm_gem.c
-@@ -106,7 +106,7 @@ static struct page **get_pages(struct drm_gem_object *obj)
- 		 * because display controller, GPU, etc. are not coherent:
- 		 */
- 		if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED))
--			dma_map_sg(dev->dev, msm_obj->sgt->sgl,
-+			dma_sync_sg_for_device(dev->dev, msm_obj->sgt->sgl,
- 					msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
- 	}
- 
-@@ -124,7 +124,7 @@ static void put_pages(struct drm_gem_object *obj)
- 			 * GPU, etc. are not coherent:
- 			 */
- 			if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED))
--				dma_unmap_sg(obj->dev->dev, msm_obj->sgt->sgl,
-+				dma_sync_sg_for_cpu(obj->dev->dev, msm_obj->sgt->sgl,
- 					     msm_obj->sgt->nents,
- 					     DMA_BIDIRECTIONAL);
- 
--- 
-2.28.0
-
-
-From f903a196c4a585bbd6ca26d29fc080681bbc6f78 Mon Sep 17 00:00:00 2001
-From: Arun KS <arunks@codeaurora.org>
-Date: Tue, 30 Apr 2019 16:05:04 +0530
-Subject: [PATCH 30/34] arm64: Fix size of __early_cpu_boot_status
-
-commit 61cf61d81e326163ce1557ceccfca76e11d0e57c upstream.
-
-__early_cpu_boot_status is of type long. Use quad
-assembler directive to allocate proper size.
-
-Acked-by: Mark Rutland <mark.rutland@arm.com>
-Signed-off-by: Arun KS <arunks@codeaurora.org>
-Signed-off-by: Will Deacon <will.deacon@arm.com>
-Signed-off-by: Lee Jones <lee.jones@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm64/kernel/head.S | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
-index 3b10b9395960..aba534959377 100644
---- a/arch/arm64/kernel/head.S
-+++ b/arch/arm64/kernel/head.S
-@@ -650,7 +650,7 @@ ENTRY(__boot_cpu_mode)
-  * with MMU turned off.
-  */
- ENTRY(__early_cpu_boot_status)
--	.long 	0
-+	.quad 	0
- 
- 	.popsection
- 
--- 
-2.28.0
-
-
-From 20fefd8234007fee3269defa0755f40b437cec74 Mon Sep 17 00:00:00 2001
-From: Roger Quadros <rogerq@ti.com>
-Date: Mon, 26 Aug 2019 16:10:58 +0300
-Subject: [PATCH 31/34] usb: dwc3: don't set gadget->is_otg flag
-
-commit c09b73cfac2a9317f1104169045c519c6021aa1d upstream.
-
-This reverts
-commit 6a4290cc28be1 ("usb: dwc3: gadget: set the OTG flag in dwc3 gadget driver.")
-
-We don't yet support any of the OTG mechanisms (HNP/SRP/ADP)
-and are not setting gadget->otg_caps, so don't set gadget->is_otg
-flag.
-
-If we do then we end up publishing a OTG1.0 descriptor in
-the gadget descriptor which causes device enumeration to fail
-if we are connected to a host with CONFIG_USB_OTG enabled.
-
-Host side log without this patch
-
-[   96.720453] usb 1-1: new high-speed USB device number 2 using xhci-hcd
-[   96.901391] usb 1-1: Dual-Role OTG device on non-HNP port
-[   96.907552] usb 1-1: set a_alt_hnp_support failed: -32
-[   97.060447] usb 1-1: new high-speed USB device number 3 using xhci-hcd
-[   97.241378] usb 1-1: Dual-Role OTG device on non-HNP port
-[   97.247536] usb 1-1: set a_alt_hnp_support failed: -32
-[   97.253606] usb usb1-port1: attempt power cycle
-[   97.960449] usb 1-1: new high-speed USB device number 4 using xhci-hcd
-[   98.141383] usb 1-1: Dual-Role OTG device on non-HNP port
-[   98.147540] usb 1-1: set a_alt_hnp_support failed: -32
-[   98.300453] usb 1-1: new high-speed USB device number 5 using xhci-hcd
-[   98.481391] usb 1-1: Dual-Role OTG device on non-HNP port
-[   98.487545] usb 1-1: set a_alt_hnp_support failed: -32
-[   98.493532] usb usb1-port1: unable to enumerate USB device
-
-Signed-off-by: Roger Quadros <rogerq@ti.com>
-Signed-off-by: Felipe Balbi <felipe.balbi@linux.intel.com>
-Signed-off-by: Lee Jones <lee.jones@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/dwc3/gadget.c | 1 -
- 1 file changed, 1 deletion(-)
-
-diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
-index 712bd450f857..bf36eda082d6 100644
---- a/drivers/usb/dwc3/gadget.c
-+++ b/drivers/usb/dwc3/gadget.c
-@@ -2996,7 +2996,6 @@ int dwc3_gadget_init(struct dwc3 *dwc)
- 	dwc->gadget.speed		= USB_SPEED_UNKNOWN;
- 	dwc->gadget.sg_supported	= true;
- 	dwc->gadget.name		= "dwc3-gadget";
--	dwc->gadget.is_otg		= dwc->dr_mode == USB_DR_MODE_OTG;
- 
- 	/*
- 	 * FIXME We might be setting max_speed to <SUPER, however versions
--- 
-2.28.0
-
-
-From 4c1baea0dde8820549f5b2066720637f4d37f0f5 Mon Sep 17 00:00:00 2001
-From: Hans Verkuil <hans.verkuil@cisco.com>
-Date: Mon, 27 Aug 2018 10:07:42 +0200
-Subject: [PATCH 32/34] drm_dp_mst_topology: fix broken
- drm_dp_sideband_parse_remote_dpcd_read()
-
-commit a4c30a4861c54af78c4eb8b7855524c1a96d9f80 upstream.
-
-When parsing the reply of a DP_REMOTE_DPCD_READ DPCD command the
-result is wrong due to a missing idx increment.
-
-This was never noticed since DP_REMOTE_DPCD_READ is currently not
-used, but if you enable it, then it is all wrong.
-
-Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
-Reviewed-by: Lyude Paul <lyude@redhat.com>
-Acked-by: Alex Deucher <alexander.deucher@amd.com>
-Link: https://patchwork.freedesktop.org/patch/msgid/e72ddac2-1dc0-100a-d816-9ac98ac009dd@xs4all.nl
-Signed-off-by: Lee Jones <lee.jones@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/drm_dp_mst_topology.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/gpu/drm/drm_dp_mst_topology.c b/drivers/gpu/drm/drm_dp_mst_topology.c
-index e05dda92398c..592ebcd440b6 100644
---- a/drivers/gpu/drm/drm_dp_mst_topology.c
-+++ b/drivers/gpu/drm/drm_dp_mst_topology.c
-@@ -431,6 +431,7 @@ static bool drm_dp_sideband_parse_remote_dpcd_read(struct drm_dp_sideband_msg_rx
- 	if (idx > raw->curlen)
- 		goto fail_len;
- 	repmsg->u.remote_dpcd_read_ack.num_bytes = raw->msg[idx];
-+	idx++;
- 	if (idx > raw->curlen)
- 		goto fail_len;
- 
--- 
-2.28.0
-
-
-From dca98889e8e548715668c7aadfb4a47d480f16f0 Mon Sep 17 00:00:00 2001
-From: Rob Clark <robdclark@chromium.org>
-Date: Tue, 30 Jul 2019 14:46:28 -0700
-Subject: [PATCH 33/34] drm/msm: Use the correct dma_sync calls in msm_gem
-
-commit 3de433c5b38af49a5fc7602721e2ab5d39f1e69c upstream.
-
-[subject was: drm/msm: shake fist angrily at dma-mapping]
-
-So, using dma_sync_* for our cache needs works out w/ dma iommu ops, but
-it falls appart with dma direct ops.  The problem is that, depending on
-display generation, we can have either set of dma ops (mdp4 and dpu have
-iommu wired to mdss node, which maps to toplevel drm device, but mdp5
-has iommu wired up to the mdp sub-node within mdss).
-
-Fixes this splat on mdp5 devices:
-
-   Unable to handle kernel paging request at virtual address ffffffff80000000
-   Mem abort info:
-     ESR = 0x96000144
-     Exception class = DABT (current EL), IL = 32 bits
-     SET = 0, FnV = 0
-     EA = 0, S1PTW = 0
-   Data abort info:
-     ISV = 0, ISS = 0x00000144
-     CM = 1, WnR = 1
-   swapper pgtable: 4k pages, 48-bit VAs, pgdp=00000000810e4000
-   [ffffffff80000000] pgd=0000000000000000
-   Internal error: Oops: 96000144 [#1] SMP
-   Modules linked in: btqcomsmd btqca bluetooth cfg80211 ecdh_generic ecc rfkill libarc4 panel_simple msm wcnss_ctrl qrtr_smd drm_kms_helper venus_enc venus_dec videobuf2_dma_sg videobuf2_memops drm venus_core ipv6 qrtr qcom_wcnss_pil v4l2_mem2mem qcom_sysmon videobuf2_v4l2 qmi_helpers videobuf2_common crct10dif_ce mdt_loader qcom_common videodev qcom_glink_smem remoteproc bmc150_accel_i2c bmc150_magn_i2c bmc150_accel_core bmc150_magn snd_soc_lpass_apq8016 snd_soc_msm8916_analog mms114 mc nf_defrag_ipv6 snd_soc_lpass_cpu snd_soc_apq8016_sbc industrialio_triggered_buffer kfifo_buf snd_soc_lpass_platform snd_soc_msm8916_digital drm_panel_orientation_quirks
-   CPU: 2 PID: 33 Comm: kworker/2:1 Not tainted 5.3.0-rc2 #1
-   Hardware name: Samsung Galaxy A5U (EUR) (DT)
-   Workqueue: events deferred_probe_work_func
-   pstate: 80000005 (Nzcv daif -PAN -UAO)
-   pc : __clean_dcache_area_poc+0x20/0x38
-   lr : arch_sync_dma_for_device+0x28/0x30
-   sp : ffff0000115736a0
-   x29: ffff0000115736a0 x28: 0000000000000001
-   x27: ffff800074830800 x26: ffff000011478000
-   x25: 0000000000000000 x24: 0000000000000001
-   x23: ffff000011478a98 x22: ffff800009fd1c10
-   x21: 0000000000000001 x20: ffff800075ad0a00
-   x19: 0000000000000000 x18: ffff0000112b2000
-   x17: 0000000000000000 x16: 0000000000000000
-   x15: 00000000fffffff0 x14: ffff000011455d70
-   x13: 0000000000000000 x12: 0000000000000028
-   x11: 0000000000000001 x10: ffff00001106c000
-   x9 : ffff7e0001d6b380 x8 : 0000000000001000
-   x7 : ffff7e0001d6b380 x6 : ffff7e0001d6b382
-   x5 : 0000000000000000 x4 : 0000000000001000
-   x3 : 000000000000003f x2 : 0000000000000040
-   x1 : ffffffff80001000 x0 : ffffffff80000000
-   Call trace:
-    __clean_dcache_area_poc+0x20/0x38
-    dma_direct_sync_sg_for_device+0xb8/0xe8
-    get_pages+0x22c/0x250 [msm]
-    msm_gem_get_and_pin_iova+0xdc/0x168 [msm]
-    ...
-
-Fixes the combination of two patches:
-
-Fixes: 0036bc73ccbe (drm/msm: stop abusing dma_map/unmap for cache)
-Fixes: 449fa54d6815 (dma-direct: correct the physical addr in dma_direct_sync_sg_for_cpu/device)
-Tested-by: Stephan Gerhold <stephan@gerhold.net>
-Signed-off-by: Rob Clark <robdclark@chromium.org>
-[seanpaul changed subject to something more desriptive]
-Signed-off-by: Sean Paul <seanpaul@chromium.org>
-Link: https://patchwork.freedesktop.org/patch/msgid/20190730214633.17820-1-robdclark@gmail.com
-Cc: nobuhiro1.iwamatsu@toshiba.co.jp
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/msm/msm_gem.c | 47 +++++++++++++++++++++++++++++++----
- 1 file changed, 42 insertions(+), 5 deletions(-)
-
-diff --git a/drivers/gpu/drm/msm/msm_gem.c b/drivers/gpu/drm/msm/msm_gem.c
-index a472d4d902dd..569e8c45a59a 100644
+index 795660e29b2c..569e8c45a59a 100644
 --- a/drivers/gpu/drm/msm/msm_gem.c
 +++ b/drivers/gpu/drm/msm/msm_gem.c
 @@ -40,6 +40,46 @@ static bool use_pages(struct drm_gem_object *obj)
@@ -2691,7 +314,7 @@ index a472d4d902dd..569e8c45a59a 100644
  		 * because display controller, GPU, etc. are not coherent:
  		 */
  		if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED))
--			dma_sync_sg_for_device(dev->dev, msm_obj->sgt->sgl,
+-			dma_map_sg(dev->dev, msm_obj->sgt->sgl,
 -					msm_obj->sgt->nents, DMA_BIDIRECTIONAL);
 +			sync_for_device(msm_obj);
  	}
@@ -2701,38 +324,776 @@ index a472d4d902dd..569e8c45a59a 100644
  			 * GPU, etc. are not coherent:
  			 */
  			if (msm_obj->flags & (MSM_BO_WC|MSM_BO_UNCACHED))
--				dma_sync_sg_for_cpu(obj->dev->dev, msm_obj->sgt->sgl,
+-				dma_unmap_sg(obj->dev->dev, msm_obj->sgt->sgl,
 -					     msm_obj->sgt->nents,
 -					     DMA_BIDIRECTIONAL);
 +				sync_for_cpu(msm_obj);
  
  			sg_free_table(msm_obj->sgt);
  			kfree(msm_obj->sgt);
--- 
-2.28.0
-
-
-From 5188957a315f664d46ff58fedecbc0f7503f1b22 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Mon, 13 Apr 2020 10:32:59 +0200
-Subject: [PATCH 34/34] Linux 4.9.219
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 1a491b3afc0c..26ad7b28a193 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 9
--SUBLEVEL = 218
-+SUBLEVEL = 219
- EXTRAVERSION =
- NAME = Roaring Lionus
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index 27653aad8f21..0a6cc78ebcf7 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -2568,6 +2568,7 @@ static int cma_resolve_iboe_route(struct rdma_id_private *id_priv)
+ err2:
+ 	kfree(route->path_rec);
+ 	route->path_rec = NULL;
++	route->num_paths = 0;
+ err1:
+ 	kfree(work);
+ 	return ret;
+diff --git a/drivers/infiniband/hw/hfi1/sysfs.c b/drivers/infiniband/hw/hfi1/sysfs.c
+index 621b60ab74ee..5df1e368096c 100644
+--- a/drivers/infiniband/hw/hfi1/sysfs.c
++++ b/drivers/infiniband/hw/hfi1/sysfs.c
+@@ -670,7 +670,11 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
+ 		dd_dev_err(dd,
+ 			   "Skipping sc2vl sysfs info, (err %d) port %u\n",
+ 			   ret, port_num);
+-		goto bail;
++		/*
++		 * Based on the documentation for kobject_init_and_add(), the
++		 * caller should call kobject_put even if this call fails.
++		 */
++		goto bail_sc2vl;
+ 	}
+ 	kobject_uevent(&ppd->sc2vl_kobj, KOBJ_ADD);
  
--- 
-2.28.0
-
+@@ -680,7 +684,7 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
+ 		dd_dev_err(dd,
+ 			   "Skipping sl2sc sysfs info, (err %d) port %u\n",
+ 			   ret, port_num);
+-		goto bail_sc2vl;
++		goto bail_sl2sc;
+ 	}
+ 	kobject_uevent(&ppd->sl2sc_kobj, KOBJ_ADD);
+ 
+@@ -690,7 +694,7 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
+ 		dd_dev_err(dd,
+ 			   "Skipping vl2mtu sysfs info, (err %d) port %u\n",
+ 			   ret, port_num);
+-		goto bail_sl2sc;
++		goto bail_vl2mtu;
+ 	}
+ 	kobject_uevent(&ppd->vl2mtu_kobj, KOBJ_ADD);
+ 
+@@ -700,7 +704,7 @@ int hfi1_create_port_files(struct ib_device *ibdev, u8 port_num,
+ 		dd_dev_err(dd,
+ 			   "Skipping Congestion Control sysfs info, (err %d) port %u\n",
+ 			   ret, port_num);
+-		goto bail_vl2mtu;
++		goto bail_cc;
+ 	}
+ 
+ 	kobject_uevent(&ppd->pport_cc_kobj, KOBJ_ADD);
+@@ -738,7 +742,6 @@ bail_sl2sc:
+ 	kobject_put(&ppd->sl2sc_kobj);
+ bail_sc2vl:
+ 	kobject_put(&ppd->sc2vl_kobj);
+-bail:
+ 	return ret;
+ }
+ 
+@@ -858,8 +861,13 @@ bail:
+ 	for (i = 0; i < ARRAY_SIZE(hfi1_attributes); ++i)
+ 		device_remove_file(&dev->dev, hfi1_attributes[i]);
+ 
+-	for (i = 0; i < dd->num_sdma; i++)
+-		kobject_del(&dd->per_sdma[i].kobj);
++	/*
++	 * The function kobject_put() will call kobject_del() if the kobject
++	 * has been added successfully. The sysfs files created under the
++	 * kobject directory will also be removed during the process.
++	 */
++	for (; i >= 0; i--)
++		kobject_put(&dd->per_sdma[i].kobj);
+ 
+ 	return ret;
+ }
+@@ -872,6 +880,10 @@ void hfi1_verbs_unregister_sysfs(struct hfi1_devdata *dd)
+ 	struct hfi1_pportdata *ppd;
+ 	int i;
+ 
++	/* Unwind operations in hfi1_verbs_register_sysfs() */
++	for (i = 0; i < dd->num_sdma; i++)
++		kobject_put(&dd->per_sdma[i].kobj);
++
+ 	for (i = 0; i < dd->num_pports; i++) {
+ 		ppd = &dd->pport[i];
+ 
+diff --git a/drivers/net/can/slcan.c b/drivers/net/can/slcan.c
+index 94b37c60fdd0..d0435c7631ff 100644
+--- a/drivers/net/can/slcan.c
++++ b/drivers/net/can/slcan.c
+@@ -147,7 +147,7 @@ static void slc_bump(struct slcan *sl)
+ 	u32 tmpid;
+ 	char *cmd = sl->rbuff;
+ 
+-	cf.can_id = 0;
++	memset(&cf, 0, sizeof(cf));
+ 
+ 	switch (*cmd) {
+ 	case 'r':
+@@ -186,8 +186,6 @@ static void slc_bump(struct slcan *sl)
+ 	else
+ 		return;
+ 
+-	*(u64 *) (&cf.data) = 0; /* clear payload */
+-
+ 	/* RTR frames may have a dlc > 0 but they never have any data bytes */
+ 	if (!(cf.can_id & CAN_RTR_FLAG)) {
+ 		for (i = 0; i < cf.can_dlc; i++) {
+diff --git a/drivers/net/dsa/bcm_sf2.c b/drivers/net/dsa/bcm_sf2.c
+index a3a8d7b62f3f..796571fccba7 100644
+--- a/drivers/net/dsa/bcm_sf2.c
++++ b/drivers/net/dsa/bcm_sf2.c
+@@ -976,6 +976,7 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
+ 	struct device_node *dn = pdev->dev.of_node;
+ 	struct b53_platform_data *pdata;
+ 	struct dsa_switch_ops *ops;
++	struct device_node *ports;
+ 	struct bcm_sf2_priv *priv;
+ 	struct b53_device *dev;
+ 	struct dsa_switch *ds;
+@@ -1038,7 +1039,11 @@ static int bcm_sf2_sw_probe(struct platform_device *pdev)
+ 	spin_lock_init(&priv->indir_lock);
+ 	mutex_init(&priv->stats_mutex);
+ 
+-	bcm_sf2_identify_ports(priv, dn->child);
++	ports = of_find_node_by_name(dn, "ports");
++	if (ports) {
++		bcm_sf2_identify_ports(priv, ports);
++		of_node_put(ports);
++	}
+ 
+ 	priv->irq0 = irq_of_parse_and_map(dn, 0);
+ 	priv->irq1 = irq_of_parse_and_map(dn, 1);
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c b/drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c
+index 093e58e94075..3a2edf9f51e2 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac1000_core.c
+@@ -214,7 +214,7 @@ static void dwmac1000_set_filter(struct mac_device_info *hw,
+ 			reg++;
+ 		}
+ 
+-		while (reg <= perfect_addr_number) {
++		while (reg < perfect_addr_number) {
+ 			writel(0, ioaddr + GMAC_ADDR_HIGH(reg));
+ 			writel(0, ioaddr + GMAC_ADDR_LOW(reg));
+ 			reg++;
+diff --git a/drivers/net/phy/micrel.c b/drivers/net/phy/micrel.c
+index 16f074408813..adb38a4ec9ac 100644
+--- a/drivers/net/phy/micrel.c
++++ b/drivers/net/phy/micrel.c
+@@ -28,6 +28,7 @@
+ #include <linux/micrel_phy.h>
+ #include <linux/of.h>
+ #include <linux/clk.h>
++#include <linux/delay.h>
+ 
+ /* Operation Mode Strap Override */
+ #define MII_KSZPHY_OMSO				0x16
+@@ -728,6 +729,12 @@ static int kszphy_resume(struct phy_device *phydev)
+ {
+ 	genphy_resume(phydev);
+ 
++	/* After switching from power-down to normal mode, an internal global
++	 * reset is automatically generated. Wait a minimum of 1 ms before
++	 * read/write access to the PHY registers.
++	 */
++	usleep_range(1000, 2000);
++
+ 	/* Enable PHY Interrupts */
+ 	if (phy_interrupt_is_valid(phydev)) {
+ 		phydev->interrupts = PHY_INTERRUPT_ENABLED;
+diff --git a/drivers/usb/dwc3/gadget.c b/drivers/usb/dwc3/gadget.c
+index 712bd450f857..bf36eda082d6 100644
+--- a/drivers/usb/dwc3/gadget.c
++++ b/drivers/usb/dwc3/gadget.c
+@@ -2996,7 +2996,6 @@ int dwc3_gadget_init(struct dwc3 *dwc)
+ 	dwc->gadget.speed		= USB_SPEED_UNKNOWN;
+ 	dwc->gadget.sg_supported	= true;
+ 	dwc->gadget.name		= "dwc3-gadget";
+-	dwc->gadget.is_otg		= dwc->dr_mode == USB_DR_MODE_OTG;
+ 
+ 	/*
+ 	 * FIXME We might be setting max_speed to <SUPER, however versions
+diff --git a/fs/ceph/super.c b/fs/ceph/super.c
+index c42cbd19ff05..ec1640f3167b 100644
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -85,7 +85,6 @@ static int ceph_statfs(struct dentry *dentry, struct kstatfs *buf)
+ 	return 0;
+ }
+ 
+-
+ static int ceph_sync_fs(struct super_block *sb, int wait)
+ {
+ 	struct ceph_fs_client *fsc = ceph_sb_to_client(sb);
+@@ -178,6 +177,26 @@ static match_table_t fsopt_tokens = {
+ 	{-1, NULL}
+ };
+ 
++/*
++ * Remove adjacent slashes and then the trailing slash, unless it is
++ * the only remaining character.
++ *
++ * E.g. "//dir1////dir2///" --> "/dir1/dir2", "///" --> "/".
++ */
++static void canonicalize_path(char *path)
++{
++	int i, j = 0;
++
++	for (i = 0; path[i] != '\0'; i++) {
++		if (path[i] != '/' || j < 1 || path[j - 1] != '/')
++			path[j++] = path[i];
++	}
++
++	if (j > 1 && path[j - 1] == '/')
++		j--;
++	path[j] = '\0';
++}
++
+ static int parse_fsopt_token(char *c, void *private)
+ {
+ 	struct ceph_mount_options *fsopt = private;
+@@ -337,6 +356,7 @@ static int compare_mount_options(struct ceph_mount_options *new_fsopt,
+ 	ret = strcmp_null(fsopt1->snapdir_name, fsopt2->snapdir_name);
+ 	if (ret)
+ 		return ret;
++
+ 	ret = strcmp_null(fsopt1->mds_namespace, fsopt2->mds_namespace);
+ 	if (ret)
+ 		return ret;
+@@ -396,13 +416,17 @@ static int parse_mount_options(struct ceph_mount_options **pfsopt,
+ 	 */
+ 	dev_name_end = strchr(dev_name, '/');
+ 	if (dev_name_end) {
+-		if (strlen(dev_name_end) > 1) {
+-			fsopt->server_path = kstrdup(dev_name_end, GFP_KERNEL);
+-			if (!fsopt->server_path) {
+-				err = -ENOMEM;
+-				goto out;
+-			}
++		/*
++		 * The server_path will include the whole chars from userland
++		 * including the leading '/'.
++		 */
++		fsopt->server_path = kstrdup(dev_name_end, GFP_KERNEL);
++		if (!fsopt->server_path) {
++			err = -ENOMEM;
++			goto out;
+ 		}
++
++		canonicalize_path(fsopt->server_path);
+ 	} else {
+ 		dev_name_end = dev_name + strlen(dev_name);
+ 	}
+@@ -725,7 +749,6 @@ static void destroy_caches(void)
+ 	ceph_fscache_unregister();
+ }
+ 
+-
+ /*
+  * ceph_umount_begin - initiate forced umount.  Tear down down the
+  * mount, skipping steps that may hang while waiting for server(s).
+@@ -812,9 +835,6 @@ out:
+ 	return root;
+ }
+ 
+-
+-
+-
+ /*
+  * mount: join the ceph cluster, and open root directory.
+  */
+@@ -828,18 +848,14 @@ static struct dentry *ceph_real_mount(struct ceph_fs_client *fsc)
+ 	mutex_lock(&fsc->client->mount_mutex);
+ 
+ 	if (!fsc->sb->s_root) {
+-		const char *path;
++		const char *path = fsc->mount_options->server_path ?
++				     fsc->mount_options->server_path + 1 : "";
++
+ 		err = __ceph_open_session(fsc->client, started);
+ 		if (err < 0)
+ 			goto out;
+ 
+-		if (!fsc->mount_options->server_path) {
+-			path = "";
+-			dout("mount opening path \\t\n");
+-		} else {
+-			path = fsc->mount_options->server_path + 1;
+-			dout("mount opening path %s\n", path);
+-		}
++		dout("mount opening path '%s'\n", path);
+ 
+ 		err = ceph_fs_debugfs_init(fsc);
+ 		if (err < 0)
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 9bd0d928057b..9f18635f78c7 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -70,7 +70,7 @@ struct ceph_mount_options {
+ 
+ 	char *snapdir_name;   /* default ".snap" */
+ 	char *mds_namespace;  /* default NULL */
+-	char *server_path;    /* default  "/" */
++	char *server_path;    /* default NULL (means "/") */
+ };
+ 
+ struct ceph_fs_client {
+diff --git a/include/uapi/linux/coresight-stm.h b/include/uapi/linux/coresight-stm.h
+index 7e4272cf1fb2..741309cedd2c 100644
+--- a/include/uapi/linux/coresight-stm.h
++++ b/include/uapi/linux/coresight-stm.h
+@@ -1,8 +1,10 @@
+ #ifndef __UAPI_CORESIGHT_STM_H_
+ #define __UAPI_CORESIGHT_STM_H_
+ 
+-#define STM_FLAG_TIMESTAMPED   BIT(3)
+-#define STM_FLAG_GUARANTEED    BIT(7)
++#include <linux/const.h>
++
++#define STM_FLAG_TIMESTAMPED   _BITUL(3)
++#define STM_FLAG_GUARANTEED    _BITUL(7)
+ 
+ /*
+  * The CoreSight STM supports guaranteed and invariant timing
+diff --git a/kernel/padata.c b/kernel/padata.c
+index 286c5142a0f7..6939111b3cbe 100644
+--- a/kernel/padata.c
++++ b/kernel/padata.c
+@@ -614,8 +614,8 @@ int padata_set_cpumask(struct padata_instance *pinst, int cpumask_type,
+ 	struct cpumask *serial_mask, *parallel_mask;
+ 	int err = -EINVAL;
+ 
+-	mutex_lock(&pinst->lock);
+ 	get_online_cpus();
++	mutex_lock(&pinst->lock);
+ 
+ 	switch (cpumask_type) {
+ 	case PADATA_CPU_PARALLEL:
+@@ -633,8 +633,8 @@ int padata_set_cpumask(struct padata_instance *pinst, int cpumask_type,
+ 	err =  __padata_set_cpumasks(pinst, parallel_mask, serial_mask);
+ 
+ out:
+-	put_online_cpus();
+ 	mutex_unlock(&pinst->lock);
++	put_online_cpus();
+ 
+ 	return err;
+ }
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index da7a932922cb..a2be65bf5d8c 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -2768,7 +2768,9 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)
+ 	switch (mode) {
+ 	case MPOL_PREFERRED:
+ 		/*
+-		 * Insist on a nodelist of one node only
++		 * Insist on a nodelist of one node only, although later
++		 * we use first_node(nodes) to grab a single node, so here
++		 * nodelist (or nodes) cannot be empty.
+ 		 */
+ 		if (nodelist) {
+ 			char *rest = nodelist;
+@@ -2776,6 +2778,8 @@ int mpol_parse_str(char *str, struct mempolicy **mpol)
+ 				rest++;
+ 			if (*rest)
+ 				goto out;
++			if (nodes_empty(nodes))
++				goto out;
+ 		}
+ 		break;
+ 	case MPOL_INTERLEAVE:
+diff --git a/net/bluetooth/rfcomm/tty.c b/net/bluetooth/rfcomm/tty.c
+index 2f2cb5e27cdd..a8c63ef75f73 100644
+--- a/net/bluetooth/rfcomm/tty.c
++++ b/net/bluetooth/rfcomm/tty.c
+@@ -413,10 +413,8 @@ static int __rfcomm_create_dev(struct sock *sk, void __user *arg)
+ 		dlc = rfcomm_dlc_exists(&req.src, &req.dst, req.channel);
+ 		if (IS_ERR(dlc))
+ 			return PTR_ERR(dlc);
+-		else if (dlc) {
+-			rfcomm_dlc_put(dlc);
++		if (dlc)
+ 			return -EBUSY;
+-		}
+ 		dlc = rfcomm_dlc_alloc(GFP_KERNEL);
+ 		if (!dlc)
+ 			return -ENOMEM;
+diff --git a/net/dsa/tag_brcm.c b/net/dsa/tag_brcm.c
+index 76d55a80f3b9..98074338cd83 100644
+--- a/net/dsa/tag_brcm.c
++++ b/net/dsa/tag_brcm.c
+@@ -84,8 +84,6 @@ static struct sk_buff *brcm_tag_xmit(struct sk_buff *skb, struct net_device *dev
+ 		brcm_tag[2] = BRCM_IG_DSTMAP2_MASK;
+ 	brcm_tag[3] = (1 << p->port) & BRCM_IG_DSTMAP1_MASK;
+ 
+-	skb->offload_fwd_mark = 1;
+-
+ 	return skb;
+ 
+ out_free:
+@@ -148,6 +146,8 @@ static int brcm_tag_rcv(struct sk_buff *skb, struct net_device *dev,
+ 	skb->dev->stats.rx_packets++;
+ 	skb->dev->stats.rx_bytes += skb->len;
+ 
++	skb->offload_fwd_mark = 1;
++
+ 	netif_receive_skb(skb);
+ 
+ 	return 0;
+diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
+index 36f0a8c581d0..a1a7ed6fc8dd 100644
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@ -2256,6 +2256,7 @@ static int fib_triestat_seq_show(struct seq_file *seq, void *v)
+ 		   " %Zd bytes, size of tnode: %Zd bytes.\n",
+ 		   LEAF_SIZE, TNODE_SIZE(0));
+ 
++	rcu_read_lock();
+ 	for (h = 0; h < FIB_TABLE_HASHSZ; h++) {
+ 		struct hlist_head *head = &net->ipv4.fib_table_hash[h];
+ 		struct fib_table *tb;
+@@ -2275,7 +2276,9 @@ static int fib_triestat_seq_show(struct seq_file *seq, void *v)
+ 			trie_show_usage(seq, t->stats);
+ #endif
+ 		}
++		cond_resched_rcu();
+ 	}
++	rcu_read_unlock();
+ 
+ 	return 0;
+ }
+diff --git a/net/ipv4/ip_tunnel.c b/net/ipv4/ip_tunnel.c
+index 65c47b1f0da4..dd5db4cc7d06 100644
+--- a/net/ipv4/ip_tunnel.c
++++ b/net/ipv4/ip_tunnel.c
+@@ -155,11 +155,8 @@ struct ip_tunnel *ip_tunnel_lookup(struct ip_tunnel_net *itn,
+ 			cand = t;
+ 	}
+ 
+-	if (flags & TUNNEL_NO_KEY)
+-		goto skip_key_lookup;
+-
+ 	hlist_for_each_entry_rcu(t, head, hash_node) {
+-		if (t->parms.i_key != key ||
++		if ((!(flags & TUNNEL_NO_KEY) && t->parms.i_key != key) ||
+ 		    t->parms.iph.saddr != 0 ||
+ 		    t->parms.iph.daddr != 0 ||
+ 		    !(t->dev->flags & IFF_UP))
+@@ -171,7 +168,6 @@ struct ip_tunnel *ip_tunnel_lookup(struct ip_tunnel_net *itn,
+ 			cand = t;
+ 	}
+ 
+-skip_key_lookup:
+ 	if (cand)
+ 		return cand;
+ 
+diff --git a/net/l2tp/l2tp_core.c b/net/l2tp/l2tp_core.c
+index 394a1ddb0782..7c3da29fad8e 100644
+--- a/net/l2tp/l2tp_core.c
++++ b/net/l2tp/l2tp_core.c
+@@ -1351,6 +1351,9 @@ again:
+ 
+ 			hlist_del_init(&session->hlist);
+ 
++			if (test_and_set_bit(0, &session->dead))
++				goto again;
++
+ 			if (session->ref != NULL)
+ 				(*session->ref)(session);
+ 
+@@ -1799,6 +1802,9 @@ EXPORT_SYMBOL_GPL(__l2tp_session_unhash);
+  */
+ int l2tp_session_delete(struct l2tp_session *session)
+ {
++	if (test_and_set_bit(0, &session->dead))
++		return 0;
++
+ 	if (session->ref)
+ 		(*session->ref)(session);
+ 	__l2tp_session_unhash(session);
+diff --git a/net/l2tp/l2tp_core.h b/net/l2tp/l2tp_core.h
+index 7cc49715606e..7c2037184b6c 100644
+--- a/net/l2tp/l2tp_core.h
++++ b/net/l2tp/l2tp_core.h
+@@ -84,6 +84,7 @@ struct l2tp_session_cfg {
+ struct l2tp_session {
+ 	int			magic;		/* should be
+ 						 * L2TP_SESSION_MAGIC */
++	long			dead;
+ 
+ 	struct l2tp_tunnel	*tunnel;	/* back pointer to tunnel
+ 						 * context */
+diff --git a/net/l2tp/l2tp_ppp.c b/net/l2tp/l2tp_ppp.c
+index 16b63e60396f..d919b3e6b548 100644
+--- a/net/l2tp/l2tp_ppp.c
++++ b/net/l2tp/l2tp_ppp.c
+@@ -437,11 +437,11 @@ static void pppol2tp_session_close(struct l2tp_session *session)
+ 
+ 	BUG_ON(session->magic != L2TP_SESSION_MAGIC);
+ 
+-	if (sock) {
++	if (sock)
+ 		inet_shutdown(sock, SEND_SHUTDOWN);
+-		/* Don't let the session go away before our socket does */
+-		l2tp_session_inc_refcount(session);
+-	}
++
++	/* Don't let the session go away before our socket does */
++	l2tp_session_inc_refcount(session);
+ }
+ 
+ /* Really kill the session socket. (Called from sock_put() if
+diff --git a/net/sctp/ipv6.c b/net/sctp/ipv6.c
+index 824ebbffea33..34ab7f92f064 100644
+--- a/net/sctp/ipv6.c
++++ b/net/sctp/ipv6.c
+@@ -235,7 +235,8 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ {
+ 	struct sctp_association *asoc = t->asoc;
+ 	struct dst_entry *dst = NULL;
+-	struct flowi6 *fl6 = &fl->u.ip6;
++	struct flowi _fl;
++	struct flowi6 *fl6 = &_fl.u.ip6;
+ 	struct sctp_bind_addr *bp;
+ 	struct ipv6_pinfo *np = inet6_sk(sk);
+ 	struct sctp_sockaddr_entry *laddr;
+@@ -245,7 +246,7 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ 	__u8 matchlen = 0;
+ 	sctp_scope_t scope;
+ 
+-	memset(fl6, 0, sizeof(struct flowi6));
++	memset(&_fl, 0, sizeof(_fl));
+ 	fl6->daddr = daddr->v6.sin6_addr;
+ 	fl6->fl6_dport = daddr->v6.sin6_port;
+ 	fl6->flowi6_proto = IPPROTO_SCTP;
+@@ -269,8 +270,11 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ 	rcu_read_unlock();
+ 
+ 	dst = ip6_dst_lookup_flow(sk, fl6, final_p);
+-	if (!asoc || saddr)
++	if (!asoc || saddr) {
++		t->dst = dst;
++		memcpy(fl, &_fl, sizeof(_fl));
+ 		goto out;
++	}
+ 
+ 	bp = &asoc->base.bind_addr;
+ 	scope = sctp_scope(daddr);
+@@ -293,6 +297,8 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ 			if ((laddr->a.sa.sa_family == AF_INET6) &&
+ 			    (sctp_v6_cmp_addr(&dst_saddr, &laddr->a))) {
+ 				rcu_read_unlock();
++				t->dst = dst;
++				memcpy(fl, &_fl, sizeof(_fl));
+ 				goto out;
+ 			}
+ 		}
+@@ -331,6 +337,8 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ 			if (!IS_ERR_OR_NULL(dst))
+ 				dst_release(dst);
+ 			dst = bdst;
++			t->dst = dst;
++			memcpy(fl, &_fl, sizeof(_fl));
+ 			break;
+ 		}
+ 
+@@ -344,6 +352,8 @@ static void sctp_v6_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ 			dst_release(dst);
+ 		dst = bdst;
+ 		matchlen = bmatchlen;
++		t->dst = dst;
++		memcpy(fl, &_fl, sizeof(_fl));
+ 	}
+ 	rcu_read_unlock();
+ 
+@@ -352,14 +362,12 @@ out:
+ 		struct rt6_info *rt;
+ 
+ 		rt = (struct rt6_info *)dst;
+-		t->dst = dst;
+ 		t->dst_cookie = rt6_get_cookie(rt);
+ 		pr_debug("rt6_dst:%pI6/%d rt6_src:%pI6\n",
+ 			 &rt->rt6i_dst.addr, rt->rt6i_dst.plen,
+-			 &fl6->saddr);
++			 &fl->u.ip6.saddr);
+ 	} else {
+ 		t->dst = NULL;
+-
+ 		pr_debug("no route\n");
+ 	}
+ }
+diff --git a/net/sctp/protocol.c b/net/sctp/protocol.c
+index 446503d3b80c..c5a2a538279b 100644
+--- a/net/sctp/protocol.c
++++ b/net/sctp/protocol.c
+@@ -430,14 +430,15 @@ static void sctp_v4_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ {
+ 	struct sctp_association *asoc = t->asoc;
+ 	struct rtable *rt;
+-	struct flowi4 *fl4 = &fl->u.ip4;
++	struct flowi _fl;
++	struct flowi4 *fl4 = &_fl.u.ip4;
+ 	struct sctp_bind_addr *bp;
+ 	struct sctp_sockaddr_entry *laddr;
+ 	struct dst_entry *dst = NULL;
+ 	union sctp_addr *daddr = &t->ipaddr;
+ 	union sctp_addr dst_saddr;
+ 
+-	memset(fl4, 0x0, sizeof(struct flowi4));
++	memset(&_fl, 0x0, sizeof(_fl));
+ 	fl4->daddr  = daddr->v4.sin_addr.s_addr;
+ 	fl4->fl4_dport = daddr->v4.sin_port;
+ 	fl4->flowi4_proto = IPPROTO_SCTP;
+@@ -455,8 +456,11 @@ static void sctp_v4_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ 		 &fl4->saddr);
+ 
+ 	rt = ip_route_output_key(sock_net(sk), fl4);
+-	if (!IS_ERR(rt))
++	if (!IS_ERR(rt)) {
+ 		dst = &rt->dst;
++		t->dst = dst;
++		memcpy(fl, &_fl, sizeof(_fl));
++	}
+ 
+ 	/* If there is no association or if a source address is passed, no
+ 	 * more validation is required.
+@@ -519,27 +523,33 @@ static void sctp_v4_get_dst(struct sctp_transport *t, union sctp_addr *saddr,
+ 		odev = __ip_dev_find(sock_net(sk), laddr->a.v4.sin_addr.s_addr,
+ 				     false);
+ 		if (!odev || odev->ifindex != fl4->flowi4_oif) {
+-			if (!dst)
++			if (!dst) {
+ 				dst = &rt->dst;
+-			else
++				t->dst = dst;
++				memcpy(fl, &_fl, sizeof(_fl));
++			} else {
+ 				dst_release(&rt->dst);
++			}
+ 			continue;
+ 		}
+ 
+ 		dst_release(dst);
+ 		dst = &rt->dst;
++		t->dst = dst;
++		memcpy(fl, &_fl, sizeof(_fl));
+ 		break;
+ 	}
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+ out:
+-	t->dst = dst;
+-	if (dst)
++	if (dst) {
+ 		pr_debug("rt_dst:%pI4, rt_src:%pI4\n",
+-			 &fl4->daddr, &fl4->saddr);
+-	else
++			 &fl->u.ip4.daddr, &fl->u.ip4.saddr);
++	} else {
++		t->dst = NULL;
+ 		pr_debug("no route\n");
++	}
+ }
+ 
+ /* For v4, the source address is cached in the route entry(dst). So no need
+diff --git a/net/sctp/socket.c b/net/sctp/socket.c
+index 21ec92011585..95f39dde1e08 100644
+--- a/net/sctp/socket.c
++++ b/net/sctp/socket.c
+@@ -173,29 +173,44 @@ static void sctp_clear_owner_w(struct sctp_chunk *chunk)
+ 	skb_orphan(chunk->skb);
+ }
+ 
++#define traverse_and_process()	\
++do {				\
++	msg = chunk->msg;	\
++	if (msg == prev_msg)	\
++		continue;	\
++	list_for_each_entry(c, &msg->chunks, frag_list) {	\
++		if ((clear && asoc->base.sk == c->skb->sk) ||	\
++		    (!clear && asoc->base.sk != c->skb->sk))	\
++			cb(c);	\
++	}			\
++	prev_msg = msg;		\
++} while (0)
++
+ static void sctp_for_each_tx_datachunk(struct sctp_association *asoc,
++				       bool clear,
+ 				       void (*cb)(struct sctp_chunk *))
+ 
+ {
++	struct sctp_datamsg *msg, *prev_msg = NULL;
+ 	struct sctp_outq *q = &asoc->outqueue;
++	struct sctp_chunk *chunk, *c;
+ 	struct sctp_transport *t;
+-	struct sctp_chunk *chunk;
+ 
+ 	list_for_each_entry(t, &asoc->peer.transport_addr_list, transports)
+ 		list_for_each_entry(chunk, &t->transmitted, transmitted_list)
+-			cb(chunk);
++			traverse_and_process();
+ 
+ 	list_for_each_entry(chunk, &q->retransmit, transmitted_list)
+-		cb(chunk);
++		traverse_and_process();
+ 
+ 	list_for_each_entry(chunk, &q->sacked, transmitted_list)
+-		cb(chunk);
++		traverse_and_process();
+ 
+ 	list_for_each_entry(chunk, &q->abandoned, transmitted_list)
+-		cb(chunk);
++		traverse_and_process();
+ 
+ 	list_for_each_entry(chunk, &q->out_chunk_list, list)
+-		cb(chunk);
++		traverse_and_process();
+ }
+ 
+ /* Verify that this is a valid address. */
+@@ -7878,9 +7893,9 @@ static void sctp_sock_migrate(struct sock *oldsk, struct sock *newsk,
+ 	 * paths won't try to lock it and then oldsk.
+ 	 */
+ 	lock_sock_nested(newsk, SINGLE_DEPTH_NESTING);
+-	sctp_for_each_tx_datachunk(assoc, sctp_clear_owner_w);
++	sctp_for_each_tx_datachunk(assoc, true, sctp_clear_owner_w);
+ 	sctp_assoc_migrate(assoc, newsk);
+-	sctp_for_each_tx_datachunk(assoc, sctp_set_owner_w);
++	sctp_for_each_tx_datachunk(assoc, false, sctp_set_owner_w);
+ 
+ 	/* If the association on the newsk is already closed before accept()
+ 	 * is called, set RCV_SHUTDOWN flag.
+diff --git a/sound/soc/jz4740/jz4740-i2s.c b/sound/soc/jz4740/jz4740-i2s.c
+index 794a3499e567..0dc1ab48fceb 100644
+--- a/sound/soc/jz4740/jz4740-i2s.c
++++ b/sound/soc/jz4740/jz4740-i2s.c
+@@ -92,7 +92,7 @@
+ #define JZ_AIC_I2S_STATUS_BUSY BIT(2)
+ 
+ #define JZ_AIC_CLK_DIV_MASK 0xf
+-#define I2SDIV_DV_SHIFT 8
++#define I2SDIV_DV_SHIFT 0
+ #define I2SDIV_DV_MASK (0xf << I2SDIV_DV_SHIFT)
+ #define I2SDIV_IDV_SHIFT 8
+ #define I2SDIV_IDV_MASK (0xf << I2SDIV_IDV_SHIFT)
+diff --git a/tools/accounting/getdelays.c b/tools/accounting/getdelays.c
+index b5ca536e56a8..34df10a43ef0 100644
+--- a/tools/accounting/getdelays.c
++++ b/tools/accounting/getdelays.c
+@@ -135,7 +135,7 @@ static int send_cmd(int sd, __u16 nlmsg_type, __u32 nlmsg_pid,
+ 	msg.g.version = 0x1;
+ 	na = (struct nlattr *) GENLMSG_DATA(&msg);
+ 	na->nla_type = nla_type;
+-	na->nla_len = nla_len + 1 + NLA_HDRLEN;
++	na->nla_len = nla_len + NLA_HDRLEN;
+ 	memcpy(NLA_DATA(na), nla_data, nla_len);
+ 	msg.n.nlmsg_len += NLMSG_ALIGN(na->nla_len);
+ 

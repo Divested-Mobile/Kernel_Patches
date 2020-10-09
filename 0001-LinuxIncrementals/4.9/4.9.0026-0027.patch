@@ -1,137 +1,422 @@
-From 00cca9768ebe1ac4ac16366662dd9087b6e5f4e7 Mon Sep 17 00:00:00 2001
-From: Thomas Gleixner <tglx@linutronix.de>
-Date: Tue, 31 Jan 2017 15:24:03 +0100
-Subject: [PATCH 01/10] timerfd: Protect the might cancel mechanism proper
-
-commit 1e38da300e1e395a15048b0af1e5305bd91402f6 upstream.
-
-The handling of the might_cancel queueing is not properly protected, so
-parallel operations on the file descriptor can race with each other and
-lead to list corruptions or use after free.
-
-Protect the context for these operations with a seperate lock.
-
-The wait queue lock cannot be reused for this because that would create a
-lock inversion scenario vs. the cancel lock. Replacing might_cancel with an
-atomic (atomic_t or atomic bit) does not help either because it still can
-race vs. the actual list operation.
-
-Reported-by: Dmitry Vyukov <dvyukov@google.com>
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Cc: "linux-fsdevel@vger.kernel.org"
-Cc: syzkaller <syzkaller@googlegroups.com>
-Cc: Al Viro <viro@zeniv.linux.org.uk>
-Cc: linux-fsdevel@vger.kernel.org
-Link: http://lkml.kernel.org/r/alpine.DEB.2.20.1701311521430.3457@nanos
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/timerfd.c | 17 ++++++++++++++---
- 1 file changed, 14 insertions(+), 3 deletions(-)
-
-diff --git a/fs/timerfd.c b/fs/timerfd.c
-index 9ae4abb4110b..ab8dd1538381 100644
---- a/fs/timerfd.c
-+++ b/fs/timerfd.c
-@@ -40,6 +40,7 @@ struct timerfd_ctx {
- 	short unsigned settime_flags;	/* to show in fdinfo */
- 	struct rcu_head rcu;
- 	struct list_head clist;
-+	spinlock_t cancel_lock;
- 	bool might_cancel;
- };
+diff --git a/Makefile b/Makefile
+index c09679c1a70d..35d6b4e76264 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 9
+-SUBLEVEL = 26
++SUBLEVEL = 27
+ EXTRAVERSION =
+ NAME = Roaring Lionus
  
-@@ -112,7 +113,7 @@ void timerfd_clock_was_set(void)
- 	rcu_read_unlock();
- }
- 
--static void timerfd_remove_cancel(struct timerfd_ctx *ctx)
-+static void __timerfd_remove_cancel(struct timerfd_ctx *ctx)
+diff --git a/drivers/char/tpm/tpm-interface.c b/drivers/char/tpm/tpm-interface.c
+index 3a9149cf0110..d0ac2d56520f 100644
+--- a/drivers/char/tpm/tpm-interface.c
++++ b/drivers/char/tpm/tpm-interface.c
+@@ -489,8 +489,7 @@ static int tpm_startup(struct tpm_chip *chip, __be16 startup_type)
+ int tpm_get_timeouts(struct tpm_chip *chip)
  {
- 	if (ctx->might_cancel) {
- 		ctx->might_cancel = false;
-@@ -122,6 +123,13 @@ static void timerfd_remove_cancel(struct timerfd_ctx *ctx)
+ 	struct tpm_cmd_t tpm_cmd;
+-	unsigned long new_timeout[4];
+-	unsigned long old_timeout[4];
++	unsigned long timeout_old[4], timeout_chip[4], timeout_eff[4];
+ 	struct duration_t *duration_cap;
+ 	ssize_t rc;
+ 
+@@ -542,11 +541,15 @@ int tpm_get_timeouts(struct tpm_chip *chip)
+ 	    != sizeof(tpm_cmd.header.out) + sizeof(u32) + 4 * sizeof(u32))
+ 		return -EINVAL;
+ 
+-	old_timeout[0] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.a);
+-	old_timeout[1] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.b);
+-	old_timeout[2] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.c);
+-	old_timeout[3] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.d);
+-	memcpy(new_timeout, old_timeout, sizeof(new_timeout));
++	timeout_old[0] = jiffies_to_usecs(chip->timeout_a);
++	timeout_old[1] = jiffies_to_usecs(chip->timeout_b);
++	timeout_old[2] = jiffies_to_usecs(chip->timeout_c);
++	timeout_old[3] = jiffies_to_usecs(chip->timeout_d);
++	timeout_chip[0] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.a);
++	timeout_chip[1] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.b);
++	timeout_chip[2] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.c);
++	timeout_chip[3] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.d);
++	memcpy(timeout_eff, timeout_chip, sizeof(timeout_eff));
+ 
+ 	/*
+ 	 * Provide ability for vendor overrides of timeout values in case
+@@ -554,16 +557,24 @@ int tpm_get_timeouts(struct tpm_chip *chip)
+ 	 */
+ 	if (chip->ops->update_timeouts != NULL)
+ 		chip->timeout_adjusted =
+-			chip->ops->update_timeouts(chip, new_timeout);
++			chip->ops->update_timeouts(chip, timeout_eff);
+ 
+ 	if (!chip->timeout_adjusted) {
+-		/* Don't overwrite default if value is 0 */
+-		if (new_timeout[0] != 0 && new_timeout[0] < 1000) {
+-			int i;
++		/* Restore default if chip reported 0 */
++		int i;
+ 
++		for (i = 0; i < ARRAY_SIZE(timeout_eff); i++) {
++			if (timeout_eff[i])
++				continue;
++
++			timeout_eff[i] = timeout_old[i];
++			chip->timeout_adjusted = true;
++		}
++
++		if (timeout_eff[0] != 0 && timeout_eff[0] < 1000) {
+ 			/* timeouts in msec rather usec */
+-			for (i = 0; i != ARRAY_SIZE(new_timeout); i++)
+-				new_timeout[i] *= 1000;
++			for (i = 0; i != ARRAY_SIZE(timeout_eff); i++)
++				timeout_eff[i] *= 1000;
+ 			chip->timeout_adjusted = true;
+ 		}
  	}
+@@ -572,16 +583,16 @@ int tpm_get_timeouts(struct tpm_chip *chip)
+ 	if (chip->timeout_adjusted) {
+ 		dev_info(&chip->dev,
+ 			 HW_ERR "Adjusting reported timeouts: A %lu->%luus B %lu->%luus C %lu->%luus D %lu->%luus\n",
+-			 old_timeout[0], new_timeout[0],
+-			 old_timeout[1], new_timeout[1],
+-			 old_timeout[2], new_timeout[2],
+-			 old_timeout[3], new_timeout[3]);
++			 timeout_chip[0], timeout_eff[0],
++			 timeout_chip[1], timeout_eff[1],
++			 timeout_chip[2], timeout_eff[2],
++			 timeout_chip[3], timeout_eff[3]);
+ 	}
+ 
+-	chip->timeout_a = usecs_to_jiffies(new_timeout[0]);
+-	chip->timeout_b = usecs_to_jiffies(new_timeout[1]);
+-	chip->timeout_c = usecs_to_jiffies(new_timeout[2]);
+-	chip->timeout_d = usecs_to_jiffies(new_timeout[3]);
++	chip->timeout_a = usecs_to_jiffies(timeout_eff[0]);
++	chip->timeout_b = usecs_to_jiffies(timeout_eff[1]);
++	chip->timeout_c = usecs_to_jiffies(timeout_eff[2]);
++	chip->timeout_d = usecs_to_jiffies(timeout_eff[3]);
+ 
+ duration:
+ 	tpm_cmd.header.in = tpm_getcap_header;
+diff --git a/drivers/hwmon/it87.c b/drivers/hwmon/it87.c
+index 43146162c122..b99c1df48156 100644
+--- a/drivers/hwmon/it87.c
++++ b/drivers/hwmon/it87.c
+@@ -3115,7 +3115,7 @@ static int __init sm_it87_init(void)
+ {
+ 	int sioaddr[2] = { REG_2E, REG_4E };
+ 	struct it87_sio_data sio_data;
+-	unsigned short isa_address;
++	unsigned short isa_address[2];
+ 	bool found = false;
+ 	int i, err;
+ 
+@@ -3125,15 +3125,29 @@ static int __init sm_it87_init(void)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(sioaddr); i++) {
+ 		memset(&sio_data, 0, sizeof(struct it87_sio_data));
+-		isa_address = 0;
+-		err = it87_find(sioaddr[i], &isa_address, &sio_data);
+-		if (err || isa_address == 0)
++		isa_address[i] = 0;
++		err = it87_find(sioaddr[i], &isa_address[i], &sio_data);
++		if (err || isa_address[i] == 0)
+ 			continue;
++		/*
++		 * Don't register second chip if its ISA address matches
++		 * the first chip's ISA address.
++		 */
++		if (i && isa_address[i] == isa_address[0])
++			break;
+ 
+-		err = it87_device_add(i, isa_address, &sio_data);
++		err = it87_device_add(i, isa_address[i], &sio_data);
+ 		if (err)
+ 			goto exit_dev_unregister;
++
+ 		found = true;
++
++		/*
++		 * IT8705F may respond on both SIO addresses.
++		 * Stop probing after finding one.
++		 */
++		if (sio_data.type == it87)
++			break;
+ 	}
+ 
+ 	if (!found) {
+diff --git a/drivers/md/dm-ioctl.c b/drivers/md/dm-ioctl.c
+index 966eb4b61aed..a68c650aad11 100644
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -1847,7 +1847,7 @@ static int ctl_ioctl(uint command, struct dm_ioctl __user *user)
+ 	if (r)
+ 		goto out;
+ 
+-	param->data_size = sizeof(*param);
++	param->data_size = offsetof(struct dm_ioctl, data);
+ 	r = fn(param, input_param_size);
+ 
+ 	if (unlikely(param->flags & DM_BUFFER_FULL_FLAG) &&
+diff --git a/drivers/scsi/storvsc_drv.c b/drivers/scsi/storvsc_drv.c
+index 3f218f5cf29b..c5ab1b0037fc 100644
+--- a/drivers/scsi/storvsc_drv.c
++++ b/drivers/scsi/storvsc_drv.c
+@@ -400,8 +400,6 @@ MODULE_PARM_DESC(storvsc_vcpus_per_sub_channel, "Ratio of VCPUs to subchannels")
+  */
+ static int storvsc_timeout = 180;
+ 
+-static int msft_blist_flags = BLIST_TRY_VPD_PAGES;
+-
+ #if IS_ENABLED(CONFIG_SCSI_FC_ATTRS)
+ static struct scsi_transport_template *fc_transport_template;
+ #endif
+@@ -1283,6 +1281,22 @@ static int storvsc_do_io(struct hv_device *device,
+ 	return ret;
  }
  
-+static void timerfd_remove_cancel(struct timerfd_ctx *ctx)
++static int storvsc_device_alloc(struct scsi_device *sdevice)
 +{
-+	spin_lock(&ctx->cancel_lock);
-+	__timerfd_remove_cancel(ctx);
-+	spin_unlock(&ctx->cancel_lock);
++	/*
++	 * Set blist flag to permit the reading of the VPD pages even when
++	 * the target may claim SPC-2 compliance. MSFT targets currently
++	 * claim SPC-2 compliance while they implement post SPC-2 features.
++	 * With this flag we can correctly handle WRITE_SAME_16 issues.
++	 *
++	 * Hypervisor reports SCSI_UNKNOWN type for DVD ROM device but
++	 * still supports REPORT LUN.
++	 */
++	sdevice->sdev_bflags = BLIST_REPORTLUN2 | BLIST_TRY_VPD_PAGES;
++
++	return 0;
 +}
 +
- static bool timerfd_canceled(struct timerfd_ctx *ctx)
+ static int storvsc_device_configure(struct scsi_device *sdevice)
  {
- 	if (!ctx->might_cancel || ctx->moffs.tv64 != KTIME_MAX)
-@@ -132,6 +140,7 @@ static bool timerfd_canceled(struct timerfd_ctx *ctx)
  
- static void timerfd_setup_cancel(struct timerfd_ctx *ctx, int flags)
+@@ -1298,14 +1312,6 @@ static int storvsc_device_configure(struct scsi_device *sdevice)
+ 	sdevice->no_write_same = 1;
+ 
+ 	/*
+-	 * Add blist flags to permit the reading of the VPD pages even when
+-	 * the target may claim SPC-2 compliance. MSFT targets currently
+-	 * claim SPC-2 compliance while they implement post SPC-2 features.
+-	 * With this patch we can correctly handle WRITE_SAME_16 issues.
+-	 */
+-	sdevice->sdev_bflags |= msft_blist_flags;
+-
+-	/*
+ 	 * If the host is WIN8 or WIN8 R2, claim conformance to SPC-3
+ 	 * if the device is a MSFT virtual device.  If the host is
+ 	 * WIN10 or newer, allow write_same.
+@@ -1569,6 +1575,7 @@ static struct scsi_host_template scsi_driver = {
+ 	.eh_host_reset_handler =	storvsc_host_reset_handler,
+ 	.proc_name =		"storvsc_host",
+ 	.eh_timed_out =		storvsc_eh_timed_out,
++	.slave_alloc =		storvsc_device_alloc,
+ 	.slave_configure =	storvsc_device_configure,
+ 	.cmd_per_lun =		255,
+ 	.this_id =		-1,
+diff --git a/drivers/tty/serial/8250/8250_pci.c b/drivers/tty/serial/8250/8250_pci.c
+index 6e3e63675e56..22d32d295c5b 100644
+--- a/drivers/tty/serial/8250/8250_pci.c
++++ b/drivers/tty/serial/8250/8250_pci.c
+@@ -5621,17 +5621,15 @@ static pci_ers_result_t serial8250_io_slot_reset(struct pci_dev *dev)
+ static void serial8250_io_resume(struct pci_dev *dev)
  {
-+	spin_lock(&ctx->cancel_lock);
- 	if ((ctx->clockid == CLOCK_REALTIME ||
- 	     ctx->clockid == CLOCK_REALTIME_ALARM) &&
- 	    (flags & TFD_TIMER_ABSTIME) && (flags & TFD_TIMER_CANCEL_ON_SET)) {
-@@ -141,9 +150,10 @@ static void timerfd_setup_cancel(struct timerfd_ctx *ctx, int flags)
- 			list_add_rcu(&ctx->clist, &cancel_list);
- 			spin_unlock(&cancel_lock);
- 		}
--	} else if (ctx->might_cancel) {
--		timerfd_remove_cancel(ctx);
-+	} else {
-+		__timerfd_remove_cancel(ctx);
+ 	struct serial_private *priv = pci_get_drvdata(dev);
+-	const struct pciserial_board *board;
++	struct serial_private *new;
+ 
+ 	if (!priv)
+ 		return;
+ 
+-	board = priv->board;
+-	kfree(priv);
+-	priv = pciserial_init_ports(dev, board);
+-
+-	if (!IS_ERR(priv)) {
+-		pci_set_drvdata(dev, priv);
++	new = pciserial_init_ports(dev, priv->board);
++	if (!IS_ERR(new)) {
++		pci_set_drvdata(dev, new);
++		kfree(priv);
  	}
-+	spin_unlock(&ctx->cancel_lock);
  }
  
- static ktime_t timerfd_get_remaining(struct timerfd_ctx *ctx)
-@@ -400,6 +410,7 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
- 		return -ENOMEM;
+diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
+index 1e643c718917..18dc18f8af2c 100644
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -315,7 +315,32 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
+ 	struct page **pages;
+ 	pgoff_t next_index;
+ 	int nr_pages = 0;
+-	int ret;
++	int got = 0;
++	int ret = 0;
++
++	if (!current->journal_info) {
++		/* caller of readpages does not hold buffer and read caps
++		 * (fadvise, madvise and readahead cases) */
++		int want = CEPH_CAP_FILE_CACHE;
++		ret = ceph_try_get_caps(ci, CEPH_CAP_FILE_RD, want, &got);
++		if (ret < 0) {
++			dout("start_read %p, error getting cap\n", inode);
++		} else if (!(got & want)) {
++			dout("start_read %p, no cache cap\n", inode);
++			ret = 0;
++		}
++		if (ret <= 0) {
++			if (got)
++				ceph_put_cap_refs(ci, got);
++			while (!list_empty(page_list)) {
++				page = list_entry(page_list->prev,
++						  struct page, lru);
++				list_del(&page->lru);
++				put_page(page);
++			}
++			return ret;
++		}
++	}
  
- 	init_waitqueue_head(&ctx->wqh);
-+	spin_lock_init(&ctx->cancel_lock);
- 	ctx->clockid = clockid;
+ 	off = (u64) page_offset(page);
  
- 	if (isalarm(ctx))
--- 
-2.28.0
-
-
-From d8fd99d4721d4a33c928ee0de8370b294a2df150 Mon Sep 17 00:00:00 2001
-From: Sachin Prabhu <sprabhu@redhat.com>
-Date: Fri, 3 Mar 2017 15:41:38 -0800
-Subject: [PATCH 02/10] Handle mismatched open calls
-
-commit 38bd49064a1ecb67baad33598e3d824448ab11ec upstream.
-
-A signal can interrupt a SendReceive call which result in incoming
-responses to the call being ignored. This is a problem for calls such as
-open which results in the successful response being ignored. This
-results in an open file resource on the server.
-
-The patch looks into responses which were cancelled after being sent and
-in case of successful open closes the open fids.
-
-For this patch, the check is only done in SendReceive2()
-
-RH-bz: 1403319
-
-Signed-off-by: Sachin Prabhu <sprabhu@redhat.com>
-Reviewed-by: Pavel Shilovsky <pshilov@microsoft.com>
-Acked-by: Sachin Prabhu <sprabhu@redhat.com>
-Signed-off-by: Pavel Shilovsky <pshilov@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/cifs/cifsglob.h      | 11 ++++++++
- fs/cifs/cifssmb.c       |  4 +++
- fs/cifs/connect.c       | 13 +++++++--
- fs/cifs/smb2misc.c      | 44 +++++++++++++++++++++++++++++++
- fs/cifs/smb2ops.c       |  4 +++
- fs/cifs/smb2proto.h     |  7 +++++
- fs/cifs/smb2transport.c | 58 ++++++++++++++++++++++++++++++++++++-----
- fs/cifs/transport.c     |  2 ++
- 8 files changed, 135 insertions(+), 8 deletions(-)
-
+@@ -338,15 +363,18 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
+ 				    CEPH_OSD_FLAG_READ, NULL,
+ 				    ci->i_truncate_seq, ci->i_truncate_size,
+ 				    false);
+-	if (IS_ERR(req))
+-		return PTR_ERR(req);
++	if (IS_ERR(req)) {
++		ret = PTR_ERR(req);
++		goto out;
++	}
+ 
+ 	/* build page vector */
+ 	nr_pages = calc_pages_for(0, len);
+ 	pages = kmalloc(sizeof(*pages) * nr_pages, GFP_KERNEL);
+-	ret = -ENOMEM;
+-	if (!pages)
+-		goto out;
++	if (!pages) {
++		ret = -ENOMEM;
++		goto out_put;
++	}
+ 	for (i = 0; i < nr_pages; ++i) {
+ 		page = list_entry(page_list->prev, struct page, lru);
+ 		BUG_ON(PageLocked(page));
+@@ -379,6 +407,12 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
+ 	if (ret < 0)
+ 		goto out_pages;
+ 	ceph_osdc_put_request(req);
++
++	/* After adding locked pages to page cache, the inode holds cache cap.
++	 * So we can drop our cap refs. */
++	if (got)
++		ceph_put_cap_refs(ci, got);
++
+ 	return nr_pages;
+ 
+ out_pages:
+@@ -387,8 +421,11 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
+ 		unlock_page(pages[i]);
+ 	}
+ 	ceph_put_page_vector(pages, nr_pages, false);
+-out:
++out_put:
+ 	ceph_osdc_put_request(req);
++out:
++	if (got)
++		ceph_put_cap_refs(ci, got);
+ 	return ret;
+ }
+ 
+@@ -425,7 +462,6 @@ static int ceph_readpages(struct file *file, struct address_space *mapping,
+ 		rc = start_read(inode, page_list, max);
+ 		if (rc < 0)
+ 			goto out;
+-		BUG_ON(rc == 0);
+ 	}
+ out:
+ 	ceph_fscache_readpages_cancel(inode, page_list);
+@@ -1372,9 +1408,11 @@ static int ceph_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+ 	     inode, off, (size_t)PAGE_SIZE, ceph_cap_string(got));
+ 
+ 	if ((got & (CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO)) ||
+-	    ci->i_inline_version == CEPH_INLINE_NONE)
++	    ci->i_inline_version == CEPH_INLINE_NONE) {
++		current->journal_info = vma->vm_file;
+ 		ret = filemap_fault(vma, vmf);
+-	else
++		current->journal_info = NULL;
++	} else
+ 		ret = -EAGAIN;
+ 
+ 	dout("filemap_fault %p %llu~%zd dropping cap refs on %s ret %d\n",
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index f3f21105b860..03951f90ecf7 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -2479,6 +2479,27 @@ static void check_max_size(struct inode *inode, loff_t endoff)
+ 		ceph_check_caps(ci, CHECK_CAPS_AUTHONLY, NULL);
+ }
+ 
++int ceph_try_get_caps(struct ceph_inode_info *ci, int need, int want, int *got)
++{
++	int ret, err = 0;
++
++	BUG_ON(need & ~CEPH_CAP_FILE_RD);
++	BUG_ON(want & ~(CEPH_CAP_FILE_CACHE|CEPH_CAP_FILE_LAZYIO));
++	ret = ceph_pool_perm_check(ci, need);
++	if (ret < 0)
++		return ret;
++
++	ret = try_get_cap_refs(ci, need, want, 0, true, got, &err);
++	if (ret) {
++		if (err == -EAGAIN) {
++			ret = 0;
++		} else if (err < 0) {
++			ret = err;
++		}
++	}
++	return ret;
++}
++
+ /*
+  * Wait for caps, and take cap references.  If we can't get a WR cap
+  * due to a small max_size, make sure we check_max_size (and possibly
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index f995e3528a33..ca3f630db90f 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -1249,8 +1249,9 @@ static ssize_t ceph_read_iter(struct kiocb *iocb, struct iov_iter *to)
+ 		dout("aio_read %p %llx.%llx %llu~%u got cap refs on %s\n",
+ 		     inode, ceph_vinop(inode), iocb->ki_pos, (unsigned)len,
+ 		     ceph_cap_string(got));
+-
++		current->journal_info = filp;
+ 		ret = generic_file_read_iter(iocb, to);
++		current->journal_info = NULL;
+ 	}
+ 	dout("aio_read %p %llx.%llx dropping cap refs on %s = %d\n",
+ 	     inode, ceph_vinop(inode), ceph_cap_string(got), (int)ret);
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 3e3fa9163059..622d5dd9f616 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -905,6 +905,8 @@ extern int ceph_encode_dentry_release(void **p, struct dentry *dn,
+ 
+ extern int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
+ 			 loff_t endoff, int *got, struct page **pinned_page);
++extern int ceph_try_get_caps(struct ceph_inode_info *ci,
++			     int need, int want, int *got);
+ 
+ /* for counting open files by mode */
+ extern void __ceph_get_fmode(struct ceph_inode_info *ci, int mode);
 diff --git a/fs/cifs/cifsglob.h b/fs/cifs/cifsglob.h
 index 94661cf77ae8..b3830f7ab260 100644
 --- a/fs/cifs/cifsglob.h
@@ -446,604 +731,70 @@ index 206a597b2293..cc26d4138d70 100644
  			midQ->callback = DeleteMidQEntry;
  			spin_unlock(&GlobalMid_Lock);
  			cifs_small_buf_release(buf);
--- 
-2.28.0
-
-
-From 1b7f385e049c46ae723126ccea343165e26a943f Mon Sep 17 00:00:00 2001
-From: "Maciej S. Szmigiero" <mail@maciej.szmigiero.name>
-Date: Fri, 13 Jan 2017 22:37:00 +0100
-Subject: [PATCH 03/10] tpm_tis: use default timeout value if chip reports it
- as zero
-
-commit 1d70fe9d9c3a4c627f9757cbba5d628687b121c1 upstream.
-
-Since commit 1107d065fdf1 ("tpm_tis: Introduce intermediate layer for
-TPM access") Atmel 3203 TPM on ThinkPad X61S (TPM firmware version 13.9)
-no longer works.  The initialization proceeds fine until we get and
-start using chip-reported timeouts - and the chip reports C and D
-timeouts of zero.
-
-It turns out that until commit 8e54caf407b98e ("tpm: Provide a generic
-means to override the chip returned timeouts") we had actually let
-default timeout values remain in this case, so let's bring back this
-behavior to make chips like Atmel 3203 work again.
-
-Use a common code that was introduced by that commit so a warning is
-printed in this case and /sys/class/tpm/tpm*/timeouts correctly says the
-timeouts aren't chip-original.
-
-
-This is a backport for 4.9 kernel version of the original commit, with
-renaming of "TPM_TIS_ITPM_POSSIBLE" flag removed since it was only a
-cosmetic change and not a part of the real bug fix.
-
-Fixes: 1107d065fdf1 ("tpm_tis: Introduce intermediate layer for TPM access")
-Cc: stable@vger.kernel.org
-Signed-off-by: Maciej S. Szmigiero <mail@maciej.szmigiero.name>
-Reviewed-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/char/tpm/tpm-interface.c | 53 +++++++++++++++++++-------------
- 1 file changed, 32 insertions(+), 21 deletions(-)
-
-diff --git a/drivers/char/tpm/tpm-interface.c b/drivers/char/tpm/tpm-interface.c
-index 3a9149cf0110..d0ac2d56520f 100644
---- a/drivers/char/tpm/tpm-interface.c
-+++ b/drivers/char/tpm/tpm-interface.c
-@@ -489,8 +489,7 @@ static int tpm_startup(struct tpm_chip *chip, __be16 startup_type)
- int tpm_get_timeouts(struct tpm_chip *chip)
+diff --git a/fs/timerfd.c b/fs/timerfd.c
+index 9ae4abb4110b..ab8dd1538381 100644
+--- a/fs/timerfd.c
++++ b/fs/timerfd.c
+@@ -40,6 +40,7 @@ struct timerfd_ctx {
+ 	short unsigned settime_flags;	/* to show in fdinfo */
+ 	struct rcu_head rcu;
+ 	struct list_head clist;
++	spinlock_t cancel_lock;
+ 	bool might_cancel;
+ };
+ 
+@@ -112,7 +113,7 @@ void timerfd_clock_was_set(void)
+ 	rcu_read_unlock();
+ }
+ 
+-static void timerfd_remove_cancel(struct timerfd_ctx *ctx)
++static void __timerfd_remove_cancel(struct timerfd_ctx *ctx)
  {
- 	struct tpm_cmd_t tpm_cmd;
--	unsigned long new_timeout[4];
--	unsigned long old_timeout[4];
-+	unsigned long timeout_old[4], timeout_chip[4], timeout_eff[4];
- 	struct duration_t *duration_cap;
- 	ssize_t rc;
+ 	if (ctx->might_cancel) {
+ 		ctx->might_cancel = false;
+@@ -122,6 +123,13 @@ static void timerfd_remove_cancel(struct timerfd_ctx *ctx)
+ 	}
+ }
  
-@@ -542,11 +541,15 @@ int tpm_get_timeouts(struct tpm_chip *chip)
- 	    != sizeof(tpm_cmd.header.out) + sizeof(u32) + 4 * sizeof(u32))
- 		return -EINVAL;
- 
--	old_timeout[0] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.a);
--	old_timeout[1] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.b);
--	old_timeout[2] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.c);
--	old_timeout[3] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.d);
--	memcpy(new_timeout, old_timeout, sizeof(new_timeout));
-+	timeout_old[0] = jiffies_to_usecs(chip->timeout_a);
-+	timeout_old[1] = jiffies_to_usecs(chip->timeout_b);
-+	timeout_old[2] = jiffies_to_usecs(chip->timeout_c);
-+	timeout_old[3] = jiffies_to_usecs(chip->timeout_d);
-+	timeout_chip[0] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.a);
-+	timeout_chip[1] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.b);
-+	timeout_chip[2] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.c);
-+	timeout_chip[3] = be32_to_cpu(tpm_cmd.params.getcap_out.cap.timeout.d);
-+	memcpy(timeout_eff, timeout_chip, sizeof(timeout_eff));
- 
- 	/*
- 	 * Provide ability for vendor overrides of timeout values in case
-@@ -554,16 +557,24 @@ int tpm_get_timeouts(struct tpm_chip *chip)
- 	 */
- 	if (chip->ops->update_timeouts != NULL)
- 		chip->timeout_adjusted =
--			chip->ops->update_timeouts(chip, new_timeout);
-+			chip->ops->update_timeouts(chip, timeout_eff);
- 
- 	if (!chip->timeout_adjusted) {
--		/* Don't overwrite default if value is 0 */
--		if (new_timeout[0] != 0 && new_timeout[0] < 1000) {
--			int i;
-+		/* Restore default if chip reported 0 */
-+		int i;
- 
-+		for (i = 0; i < ARRAY_SIZE(timeout_eff); i++) {
-+			if (timeout_eff[i])
-+				continue;
++static void timerfd_remove_cancel(struct timerfd_ctx *ctx)
++{
++	spin_lock(&ctx->cancel_lock);
++	__timerfd_remove_cancel(ctx);
++	spin_unlock(&ctx->cancel_lock);
++}
 +
-+			timeout_eff[i] = timeout_old[i];
-+			chip->timeout_adjusted = true;
-+		}
-+
-+		if (timeout_eff[0] != 0 && timeout_eff[0] < 1000) {
- 			/* timeouts in msec rather usec */
--			for (i = 0; i != ARRAY_SIZE(new_timeout); i++)
--				new_timeout[i] *= 1000;
-+			for (i = 0; i != ARRAY_SIZE(timeout_eff); i++)
-+				timeout_eff[i] *= 1000;
- 			chip->timeout_adjusted = true;
+ static bool timerfd_canceled(struct timerfd_ctx *ctx)
+ {
+ 	if (!ctx->might_cancel || ctx->moffs.tv64 != KTIME_MAX)
+@@ -132,6 +140,7 @@ static bool timerfd_canceled(struct timerfd_ctx *ctx)
+ 
+ static void timerfd_setup_cancel(struct timerfd_ctx *ctx, int flags)
+ {
++	spin_lock(&ctx->cancel_lock);
+ 	if ((ctx->clockid == CLOCK_REALTIME ||
+ 	     ctx->clockid == CLOCK_REALTIME_ALARM) &&
+ 	    (flags & TFD_TIMER_ABSTIME) && (flags & TFD_TIMER_CANCEL_ON_SET)) {
+@@ -141,9 +150,10 @@ static void timerfd_setup_cancel(struct timerfd_ctx *ctx, int flags)
+ 			list_add_rcu(&ctx->clist, &cancel_list);
+ 			spin_unlock(&cancel_lock);
  		}
+-	} else if (ctx->might_cancel) {
+-		timerfd_remove_cancel(ctx);
++	} else {
++		__timerfd_remove_cancel(ctx);
  	}
-@@ -572,16 +583,16 @@ int tpm_get_timeouts(struct tpm_chip *chip)
- 	if (chip->timeout_adjusted) {
- 		dev_info(&chip->dev,
- 			 HW_ERR "Adjusting reported timeouts: A %lu->%luus B %lu->%luus C %lu->%luus D %lu->%luus\n",
--			 old_timeout[0], new_timeout[0],
--			 old_timeout[1], new_timeout[1],
--			 old_timeout[2], new_timeout[2],
--			 old_timeout[3], new_timeout[3]);
-+			 timeout_chip[0], timeout_eff[0],
-+			 timeout_chip[1], timeout_eff[1],
-+			 timeout_chip[2], timeout_eff[2],
-+			 timeout_chip[3], timeout_eff[3]);
- 	}
- 
--	chip->timeout_a = usecs_to_jiffies(new_timeout[0]);
--	chip->timeout_b = usecs_to_jiffies(new_timeout[1]);
--	chip->timeout_c = usecs_to_jiffies(new_timeout[2]);
--	chip->timeout_d = usecs_to_jiffies(new_timeout[3]);
-+	chip->timeout_a = usecs_to_jiffies(timeout_eff[0]);
-+	chip->timeout_b = usecs_to_jiffies(timeout_eff[1]);
-+	chip->timeout_c = usecs_to_jiffies(timeout_eff[2]);
-+	chip->timeout_d = usecs_to_jiffies(timeout_eff[3]);
- 
- duration:
- 	tpm_cmd.header.in = tpm_getcap_header;
--- 
-2.28.0
-
-
-From d24261e567e12e85f2ecea39e512ee8de7d9858b Mon Sep 17 00:00:00 2001
-From: Stephen Hemminger <stephen@networkplumber.org>
-Date: Tue, 7 Mar 2017 09:15:53 -0800
-Subject: [PATCH 04/10] scsi: storvsc: Workaround for virtual DVD SCSI version
-
-commit f1c635b439a5c01776fe3a25b1e2dc546ea82e6f upstream.
-
-Hyper-V host emulation of SCSI for virtual DVD device reports SCSI
-version 0 (UNKNOWN) but is still capable of supporting REPORTLUN.
-
-Without this patch, a GEN2 Linux guest on Hyper-V will not boot 4.11
-successfully with virtual DVD ROM device. What happens is that the SCSI
-scan process falls back to doing sequential probing by INQUIRY.  But the
-storvsc driver has a previous workaround that masks/blocks all errors
-reports from INQUIRY (or MODE_SENSE) commands.  This workaround causes
-the scan to then populate a full set of bogus LUN's on the target and
-then sends kernel spinning off into a death spiral doing block reads on
-the non-existent LUNs.
-
-By setting the correct blacklist flags, the target with the DVD device
-is scanned with REPORTLUN and that works correctly.
-
-Patch needs to go in current 4.11, it is safe but not necessary in older
-kernels.
-
-Signed-off-by: Stephen Hemminger <sthemmin@microsoft.com>
-Reviewed-by: K. Y. Srinivasan <kys@microsoft.com>
-Reviewed-by: Christoph Hellwig <hch@lst.de>
-Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/scsi/storvsc_drv.c | 27 +++++++++++++++++----------
- 1 file changed, 17 insertions(+), 10 deletions(-)
-
-diff --git a/drivers/scsi/storvsc_drv.c b/drivers/scsi/storvsc_drv.c
-index 3f218f5cf29b..c5ab1b0037fc 100644
---- a/drivers/scsi/storvsc_drv.c
-+++ b/drivers/scsi/storvsc_drv.c
-@@ -400,8 +400,6 @@ MODULE_PARM_DESC(storvsc_vcpus_per_sub_channel, "Ratio of VCPUs to subchannels")
-  */
- static int storvsc_timeout = 180;
- 
--static int msft_blist_flags = BLIST_TRY_VPD_PAGES;
--
- #if IS_ENABLED(CONFIG_SCSI_FC_ATTRS)
- static struct scsi_transport_template *fc_transport_template;
- #endif
-@@ -1283,6 +1281,22 @@ static int storvsc_do_io(struct hv_device *device,
- 	return ret;
++	spin_unlock(&ctx->cancel_lock);
  }
  
-+static int storvsc_device_alloc(struct scsi_device *sdevice)
-+{
-+	/*
-+	 * Set blist flag to permit the reading of the VPD pages even when
-+	 * the target may claim SPC-2 compliance. MSFT targets currently
-+	 * claim SPC-2 compliance while they implement post SPC-2 features.
-+	 * With this flag we can correctly handle WRITE_SAME_16 issues.
-+	 *
-+	 * Hypervisor reports SCSI_UNKNOWN type for DVD ROM device but
-+	 * still supports REPORT LUN.
-+	 */
-+	sdevice->sdev_bflags = BLIST_REPORTLUN2 | BLIST_TRY_VPD_PAGES;
-+
-+	return 0;
-+}
-+
- static int storvsc_device_configure(struct scsi_device *sdevice)
- {
+ static ktime_t timerfd_get_remaining(struct timerfd_ctx *ctx)
+@@ -400,6 +410,7 @@ SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
+ 		return -ENOMEM;
  
-@@ -1297,14 +1311,6 @@ static int storvsc_device_configure(struct scsi_device *sdevice)
+ 	init_waitqueue_head(&ctx->wqh);
++	spin_lock_init(&ctx->cancel_lock);
+ 	ctx->clockid = clockid;
  
- 	sdevice->no_write_same = 1;
- 
--	/*
--	 * Add blist flags to permit the reading of the VPD pages even when
--	 * the target may claim SPC-2 compliance. MSFT targets currently
--	 * claim SPC-2 compliance while they implement post SPC-2 features.
--	 * With this patch we can correctly handle WRITE_SAME_16 issues.
--	 */
--	sdevice->sdev_bflags |= msft_blist_flags;
--
- 	/*
- 	 * If the host is WIN8 or WIN8 R2, claim conformance to SPC-3
- 	 * if the device is a MSFT virtual device.  If the host is
-@@ -1569,6 +1575,7 @@ static struct scsi_host_template scsi_driver = {
- 	.eh_host_reset_handler =	storvsc_host_reset_handler,
- 	.proc_name =		"storvsc_host",
- 	.eh_timed_out =		storvsc_eh_timed_out,
-+	.slave_alloc =		storvsc_device_alloc,
- 	.slave_configure =	storvsc_device_configure,
- 	.cmd_per_lun =		255,
- 	.this_id =		-1,
--- 
-2.28.0
-
-
-From 3fbd2ba1da3f79e0352e6c772fab964c3ad963a3 Mon Sep 17 00:00:00 2001
-From: Guenter Roeck <linux@roeck-us.net>
-Date: Sun, 12 Mar 2017 06:18:58 -0700
-Subject: [PATCH 05/10] hwmon: (it87) Avoid registering the same chip on both
- SIO addresses
-
-commit 8358378b22518d92424597503d3c1cd302a490b6 upstream.
-
-IT8705F is known to respond on both SIO addresses. Registering it twice
-may result in system lockups.
-
-Reported-by: Russell King <linux@armlinux.org.uk>
-Fixes: e84bd9535e2b ("hwmon: (it87) Add support for second Super-IO chip")
-Signed-off-by: Guenter Roeck <linux@roeck-us.net>
-Cc: Jean Delvare <jdelvare@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/hwmon/it87.c | 24 +++++++++++++++++++-----
- 1 file changed, 19 insertions(+), 5 deletions(-)
-
-diff --git a/drivers/hwmon/it87.c b/drivers/hwmon/it87.c
-index 43146162c122..b99c1df48156 100644
---- a/drivers/hwmon/it87.c
-+++ b/drivers/hwmon/it87.c
-@@ -3115,7 +3115,7 @@ static int __init sm_it87_init(void)
- {
- 	int sioaddr[2] = { REG_2E, REG_4E };
- 	struct it87_sio_data sio_data;
--	unsigned short isa_address;
-+	unsigned short isa_address[2];
- 	bool found = false;
- 	int i, err;
- 
-@@ -3125,15 +3125,29 @@ static int __init sm_it87_init(void)
- 
- 	for (i = 0; i < ARRAY_SIZE(sioaddr); i++) {
- 		memset(&sio_data, 0, sizeof(struct it87_sio_data));
--		isa_address = 0;
--		err = it87_find(sioaddr[i], &isa_address, &sio_data);
--		if (err || isa_address == 0)
-+		isa_address[i] = 0;
-+		err = it87_find(sioaddr[i], &isa_address[i], &sio_data);
-+		if (err || isa_address[i] == 0)
- 			continue;
-+		/*
-+		 * Don't register second chip if its ISA address matches
-+		 * the first chip's ISA address.
-+		 */
-+		if (i && isa_address[i] == isa_address[0])
-+			break;
- 
--		err = it87_device_add(i, isa_address, &sio_data);
-+		err = it87_device_add(i, isa_address[i], &sio_data);
- 		if (err)
- 			goto exit_dev_unregister;
-+
- 		found = true;
-+
-+		/*
-+		 * IT8705F may respond on both SIO addresses.
-+		 * Stop probing after finding one.
-+		 */
-+		if (sio_data.type == it87)
-+			break;
- 	}
- 
- 	if (!found) {
--- 
-2.28.0
-
-
-From 1bf9bc48133851121d92f0cc908bb5a1446aeba5 Mon Sep 17 00:00:00 2001
-From: Gabriel Krisman Bertazi <krisman@linux.vnet.ibm.com>
-Date: Wed, 28 Dec 2016 16:42:00 -0200
-Subject: [PATCH 06/10] 8250_pci: Fix potential use-after-free in error path
-
-commit c130b666a9a711f985a0a44b58699ebe14bb7245 upstream.
-
-Commit f209fa03fc9d ("serial: 8250_pci: Detach low-level driver during
-PCI error recovery") introduces a potential use-after-free in case the
-pciserial_init_ports call in serial8250_io_resume fails, which may
-happen if a memory allocation fails or if the .init quirk failed for
-whatever reason).  If this happen, further pci_get_drvdata will return a
-pointer to freed memory.
-
-This patch reworks the PCI recovery resume hook to restore the old priv
-structure in this case, which should be ok, since the ports were already
-detached. Such error during recovery causes us to give up on the
-recovery.
-
-Fixes: f209fa03fc9d ("serial: 8250_pci: Detach low-level driver during PCI error recovery")
-Reported-by: Michal Suchanek <msuchanek@suse.com>
-Signed-off-by: Gabriel Krisman Bertazi <krisman@linux.vnet.ibm.com>
-Signed-off-by: Guilherme G. Piccoli <gpiccoli@linux.vnet.ibm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/tty/serial/8250/8250_pci.c | 12 +++++-------
- 1 file changed, 5 insertions(+), 7 deletions(-)
-
-diff --git a/drivers/tty/serial/8250/8250_pci.c b/drivers/tty/serial/8250/8250_pci.c
-index 6e3e63675e56..22d32d295c5b 100644
---- a/drivers/tty/serial/8250/8250_pci.c
-+++ b/drivers/tty/serial/8250/8250_pci.c
-@@ -5621,17 +5621,15 @@ static pci_ers_result_t serial8250_io_slot_reset(struct pci_dev *dev)
- static void serial8250_io_resume(struct pci_dev *dev)
- {
- 	struct serial_private *priv = pci_get_drvdata(dev);
--	const struct pciserial_board *board;
-+	struct serial_private *new;
- 
- 	if (!priv)
- 		return;
- 
--	board = priv->board;
--	kfree(priv);
--	priv = pciserial_init_ports(dev, board);
--
--	if (!IS_ERR(priv)) {
--		pci_set_drvdata(dev, priv);
-+	new = pciserial_init_ports(dev, priv->board);
-+	if (!IS_ERR(new)) {
-+		pci_set_drvdata(dev, new);
-+		kfree(priv);
- 	}
- }
- 
--- 
-2.28.0
-
-
-From e99b0ea39354cf308423588df5daf69c42dbd735 Mon Sep 17 00:00:00 2001
-From: "Yan, Zheng" <zyan@redhat.com>
-Date: Tue, 25 Oct 2016 10:51:55 +0800
-Subject: [PATCH 07/10] ceph: try getting buffer capability for
- readahead/fadvise
-
-commit 2b1ac852eb67a6e95595e576371d23519105559f upstream.
-
-For readahead/fadvise cases, caller of ceph_readpages does not
-hold buffer capability. Pages can be added to page cache while
-there is no buffer capability. This can cause data integrity
-issue.
-
-Signed-off-by: Yan, Zheng <zyan@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ceph/addr.c  | 58 ++++++++++++++++++++++++++++++++++++++++---------
- fs/ceph/caps.c  | 21 ++++++++++++++++++
- fs/ceph/file.c  |  3 ++-
- fs/ceph/super.h |  2 ++
- 4 files changed, 73 insertions(+), 11 deletions(-)
-
-diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
-index 1e643c718917..18dc18f8af2c 100644
---- a/fs/ceph/addr.c
-+++ b/fs/ceph/addr.c
-@@ -315,7 +315,32 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
- 	struct page **pages;
- 	pgoff_t next_index;
- 	int nr_pages = 0;
--	int ret;
-+	int got = 0;
-+	int ret = 0;
-+
-+	if (!current->journal_info) {
-+		/* caller of readpages does not hold buffer and read caps
-+		 * (fadvise, madvise and readahead cases) */
-+		int want = CEPH_CAP_FILE_CACHE;
-+		ret = ceph_try_get_caps(ci, CEPH_CAP_FILE_RD, want, &got);
-+		if (ret < 0) {
-+			dout("start_read %p, error getting cap\n", inode);
-+		} else if (!(got & want)) {
-+			dout("start_read %p, no cache cap\n", inode);
-+			ret = 0;
-+		}
-+		if (ret <= 0) {
-+			if (got)
-+				ceph_put_cap_refs(ci, got);
-+			while (!list_empty(page_list)) {
-+				page = list_entry(page_list->prev,
-+						  struct page, lru);
-+				list_del(&page->lru);
-+				put_page(page);
-+			}
-+			return ret;
-+		}
-+	}
- 
- 	off = (u64) page_offset(page);
- 
-@@ -338,15 +363,18 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
- 				    CEPH_OSD_FLAG_READ, NULL,
- 				    ci->i_truncate_seq, ci->i_truncate_size,
- 				    false);
--	if (IS_ERR(req))
--		return PTR_ERR(req);
-+	if (IS_ERR(req)) {
-+		ret = PTR_ERR(req);
-+		goto out;
-+	}
- 
- 	/* build page vector */
- 	nr_pages = calc_pages_for(0, len);
- 	pages = kmalloc(sizeof(*pages) * nr_pages, GFP_KERNEL);
--	ret = -ENOMEM;
--	if (!pages)
--		goto out;
-+	if (!pages) {
-+		ret = -ENOMEM;
-+		goto out_put;
-+	}
- 	for (i = 0; i < nr_pages; ++i) {
- 		page = list_entry(page_list->prev, struct page, lru);
- 		BUG_ON(PageLocked(page));
-@@ -379,6 +407,12 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
- 	if (ret < 0)
- 		goto out_pages;
- 	ceph_osdc_put_request(req);
-+
-+	/* After adding locked pages to page cache, the inode holds cache cap.
-+	 * So we can drop our cap refs. */
-+	if (got)
-+		ceph_put_cap_refs(ci, got);
-+
- 	return nr_pages;
- 
- out_pages:
-@@ -387,8 +421,11 @@ static int start_read(struct inode *inode, struct list_head *page_list, int max)
- 		unlock_page(pages[i]);
- 	}
- 	ceph_put_page_vector(pages, nr_pages, false);
--out:
-+out_put:
- 	ceph_osdc_put_request(req);
-+out:
-+	if (got)
-+		ceph_put_cap_refs(ci, got);
- 	return ret;
- }
- 
-@@ -425,7 +462,6 @@ static int ceph_readpages(struct file *file, struct address_space *mapping,
- 		rc = start_read(inode, page_list, max);
- 		if (rc < 0)
- 			goto out;
--		BUG_ON(rc == 0);
- 	}
- out:
- 	ceph_fscache_readpages_cancel(inode, page_list);
-@@ -1372,9 +1408,11 @@ static int ceph_filemap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
- 	     inode, off, (size_t)PAGE_SIZE, ceph_cap_string(got));
- 
- 	if ((got & (CEPH_CAP_FILE_CACHE | CEPH_CAP_FILE_LAZYIO)) ||
--	    ci->i_inline_version == CEPH_INLINE_NONE)
-+	    ci->i_inline_version == CEPH_INLINE_NONE) {
-+		current->journal_info = vma->vm_file;
- 		ret = filemap_fault(vma, vmf);
--	else
-+		current->journal_info = NULL;
-+	} else
- 		ret = -EAGAIN;
- 
- 	dout("filemap_fault %p %llu~%zd dropping cap refs on %s ret %d\n",
-diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
-index f3f21105b860..03951f90ecf7 100644
---- a/fs/ceph/caps.c
-+++ b/fs/ceph/caps.c
-@@ -2479,6 +2479,27 @@ static void check_max_size(struct inode *inode, loff_t endoff)
- 		ceph_check_caps(ci, CHECK_CAPS_AUTHONLY, NULL);
- }
- 
-+int ceph_try_get_caps(struct ceph_inode_info *ci, int need, int want, int *got)
-+{
-+	int ret, err = 0;
-+
-+	BUG_ON(need & ~CEPH_CAP_FILE_RD);
-+	BUG_ON(want & ~(CEPH_CAP_FILE_CACHE|CEPH_CAP_FILE_LAZYIO));
-+	ret = ceph_pool_perm_check(ci, need);
-+	if (ret < 0)
-+		return ret;
-+
-+	ret = try_get_cap_refs(ci, need, want, 0, true, got, &err);
-+	if (ret) {
-+		if (err == -EAGAIN) {
-+			ret = 0;
-+		} else if (err < 0) {
-+			ret = err;
-+		}
-+	}
-+	return ret;
-+}
-+
- /*
-  * Wait for caps, and take cap references.  If we can't get a WR cap
-  * due to a small max_size, make sure we check_max_size (and possibly
-diff --git a/fs/ceph/file.c b/fs/ceph/file.c
-index f995e3528a33..ca3f630db90f 100644
---- a/fs/ceph/file.c
-+++ b/fs/ceph/file.c
-@@ -1249,8 +1249,9 @@ static ssize_t ceph_read_iter(struct kiocb *iocb, struct iov_iter *to)
- 		dout("aio_read %p %llx.%llx %llu~%u got cap refs on %s\n",
- 		     inode, ceph_vinop(inode), iocb->ki_pos, (unsigned)len,
- 		     ceph_cap_string(got));
--
-+		current->journal_info = filp;
- 		ret = generic_file_read_iter(iocb, to);
-+		current->journal_info = NULL;
- 	}
- 	dout("aio_read %p %llx.%llx dropping cap refs on %s = %d\n",
- 	     inode, ceph_vinop(inode), ceph_cap_string(got), (int)ret);
-diff --git a/fs/ceph/super.h b/fs/ceph/super.h
-index 3e3fa9163059..622d5dd9f616 100644
---- a/fs/ceph/super.h
-+++ b/fs/ceph/super.h
-@@ -905,6 +905,8 @@ extern int ceph_encode_dentry_release(void **p, struct dentry *dn,
- 
- extern int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
- 			 loff_t endoff, int *got, struct page **pinned_page);
-+extern int ceph_try_get_caps(struct ceph_inode_info *ci,
-+			     int need, int want, int *got);
- 
- /* for counting open files by mode */
- extern void __ceph_get_fmode(struct ceph_inode_info *ci, int mode);
--- 
-2.28.0
-
-
-From 7ad6de43deda083f1eab1e9a5cc48166e4ee52f5 Mon Sep 17 00:00:00 2001
-From: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
-Date: Tue, 14 Mar 2017 16:06:45 +0100
-Subject: [PATCH 08/10] cpu/hotplug: Serialize callback invocations proper
-
-commit dc434e056fe1dada20df7ba07f32739d3a701adf upstream.
-
-The setup/remove_state/instance() functions in the hotplug core code are
-serialized against concurrent CPU hotplug, but unfortunately not serialized
-against themself.
-
-As a consequence a concurrent invocation of these function results in
-corruption of the callback machinery because two instances try to invoke
-callbacks on remote cpus at the same time. This results in missing callback
-invocations and initiator threads waiting forever on the completion.
-
-The obvious solution to replace get_cpu_online() with cpu_hotplug_begin()
-is not possible because at least one callsite calls into these functions
-from a get_online_cpu() locked region.
-
-Extend the protection scope of the cpuhp_state_mutex from solely protecting
-the state arrays to cover the callback invocation machinery as well.
-
-Fixes: 5b7aa87e0482 ("cpu/hotplug: Implement setup/removal interface")
-Reported-and-tested-by: Bart Van Assche <Bart.VanAssche@sandisk.com>
-Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
-Cc: hpa@zytor.com
-Cc: mingo@kernel.org
-Cc: akpm@linux-foundation.org
-Cc: torvalds@linux-foundation.org
-Link: http://lkml.kernel.org/r/20170314150645.g4tdyoszlcbajmna@linutronix.de
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/cpu.c | 17 +++++++++--------
- 1 file changed, 9 insertions(+), 8 deletions(-)
-
+ 	if (isalarm(ctx))
 diff --git a/kernel/cpu.c b/kernel/cpu.c
 index 217fd2e7f435..99c6c568bc55 100644
 --- a/kernel/cpu.c
@@ -1151,70 +902,3 @@ index 217fd2e7f435..99c6c568bc55 100644
  	put_online_cpus();
  }
  EXPORT_SYMBOL(__cpuhp_remove_state);
--- 
-2.28.0
-
-
-From a0d50c80a29e13a56f9830d0b4bc6e333fc09da2 Mon Sep 17 00:00:00 2001
-From: Adrian Salido <salidoa@google.com>
-Date: Thu, 27 Apr 2017 10:32:55 -0700
-Subject: [PATCH 09/10] dm ioctl: prevent stack leak in dm ioctl call
-
-commit 4617f564c06117c7d1b611be49521a4430042287 upstream.
-
-When calling a dm ioctl that doesn't process any data
-(IOCTL_FLAGS_NO_PARAMS), the contents of the data field in struct
-dm_ioctl are left initialized.  Current code is incorrectly extending
-the size of data copied back to user, causing the contents of kernel
-stack to be leaked to user.  Fix by only copying contents before data
-and allow the functions processing the ioctl to override.
-
-Signed-off-by: Adrian Salido <salidoa@google.com>
-Reviewed-by: Alasdair G Kergon <agk@redhat.com>
-Signed-off-by: Mike Snitzer <snitzer@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/md/dm-ioctl.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/md/dm-ioctl.c b/drivers/md/dm-ioctl.c
-index 966eb4b61aed..a68c650aad11 100644
---- a/drivers/md/dm-ioctl.c
-+++ b/drivers/md/dm-ioctl.c
-@@ -1847,7 +1847,7 @@ static int ctl_ioctl(uint command, struct dm_ioctl __user *user)
- 	if (r)
- 		goto out;
- 
--	param->data_size = sizeof(*param);
-+	param->data_size = offsetof(struct dm_ioctl, data);
- 	r = fn(param, input_param_size);
- 
- 	if (unlikely(param->flags & DM_BUFFER_FULL_FLAG) &&
--- 
-2.28.0
-
-
-From 89f3b8d5f264d5dab9818c6667c71e3cc55b13f5 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Mon, 8 May 2017 07:48:32 +0200
-Subject: [PATCH 10/10] Linux 4.9.27
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index c09679c1a70d..35d6b4e76264 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 9
--SUBLEVEL = 26
-+SUBLEVEL = 27
- EXTRAVERSION =
- NAME = Roaring Lionus
- 
--- 
-2.28.0
-

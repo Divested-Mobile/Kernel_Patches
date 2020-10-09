@@ -1,304 +1,55 @@
-From 5170d210efe44e947abecd60fd0805e970add4fc Mon Sep 17 00:00:00 2001
-From: Liping Zhang <zlpnobody@gmail.com>
-Date: Sat, 25 Mar 2017 16:35:29 +0800
-Subject: [PATCH 01/28] netfilter: nf_ct_ext: fix possible panic after
- nf_ct_extend_unregister
-
-commit 9c3f3794926a997b1cab6c42480ff300efa2d162 upstream.
-
-If one cpu is doing nf_ct_extend_unregister while another cpu is doing
-__nf_ct_ext_add_length, then we may hit BUG_ON(t == NULL). Moreover,
-there's no synchronize_rcu invocation after set nf_ct_ext_types[id] to
-NULL, so it's possible that we may access invalid pointer.
-
-But actually, most of the ct extends are built-in, so the problem listed
-above will not happen. However, there are two exceptions: NF_CT_EXT_NAT
-and NF_CT_EXT_SYNPROXY.
-
-For _EXT_NAT, the panic will not happen, since adding the nat extend and
-unregistering the nat extend are located in the same file(nf_nat_core.c),
-this means that after the nat module is removed, we cannot add the nat
-extend too.
-
-For _EXT_SYNPROXY, synproxy extend may be added by init_conntrack, while
-synproxy extend unregister will be done by synproxy_core_exit. So after
-nf_synproxy_core.ko is removed, we may still try to add the synproxy
-extend, then kernel panic may happen.
-
-I know it's very hard to reproduce this issue, but I can play a tricky
-game to make it happen very easily :)
-
-Step 1. Enable SYNPROXY for tcp dport 1234 at FORWARD hook:
-  # iptables -I FORWARD -p tcp --dport 1234 -j SYNPROXY
-Step 2. Queue the syn packet to the userspace at raw table OUTPUT hook.
-        Also note, in the userspace we only add a 20s' delay, then
-        reinject the syn packet to the kernel:
-  # iptables -t raw -I OUTPUT -p tcp --syn -j NFQUEUE --queue-num 1
-Step 3. Using "nc 2.2.2.2 1234" to connect the server.
-Step 4. Now remove the nf_synproxy_core.ko quickly:
-  # iptables -F FORWARD
-  # rmmod ipt_SYNPROXY
-  # rmmod nf_synproxy_core
-Step 5. After 20s' delay, the syn packet is reinjected to the kernel.
-
-Now you will see the panic like this:
-  kernel BUG at net/netfilter/nf_conntrack_extend.c:91!
-  Call Trace:
-   ? __nf_ct_ext_add_length+0x53/0x3c0 [nf_conntrack]
-   init_conntrack+0x12b/0x600 [nf_conntrack]
-   nf_conntrack_in+0x4cc/0x580 [nf_conntrack]
-   ipv4_conntrack_local+0x48/0x50 [nf_conntrack_ipv4]
-   nf_reinject+0x104/0x270
-   nfqnl_recv_verdict+0x3e1/0x5f9 [nfnetlink_queue]
-   ? nfqnl_recv_verdict+0x5/0x5f9 [nfnetlink_queue]
-   ? nla_parse+0xa0/0x100
-   nfnetlink_rcv_msg+0x175/0x6a9 [nfnetlink]
-   [...]
-
-One possible solution is to make NF_CT_EXT_SYNPROXY extend built-in, i.e.
-introduce nf_conntrack_synproxy.c and only do ct extend register and
-unregister in it, similar to nf_conntrack_timeout.c.
-
-But having such a obscure restriction of nf_ct_extend_unregister is not a
-good idea, so we should invoke synchronize_rcu after set nf_ct_ext_types
-to NULL, and check the NULL pointer when do __nf_ct_ext_add_length. Then
-it will be easier if we add new ct extend in the future.
-
-Last, we use kfree_rcu to free nf_ct_ext, so rcu_barrier() is unnecessary
-anymore, remove it too.
-
-Signed-off-by: Liping Zhang <zlpnobody@gmail.com>
-Acked-by: Florian Westphal <fw@strlen.de>
-Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
-Cc: Stefan Bader <stefan.bader@canonical.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/netfilter/nf_conntrack_extend.c | 13 ++++++++++---
- 1 file changed, 10 insertions(+), 3 deletions(-)
-
-diff --git a/net/netfilter/nf_conntrack_extend.c b/net/netfilter/nf_conntrack_extend.c
-index 02bcf00c2492..008299b7f78f 100644
---- a/net/netfilter/nf_conntrack_extend.c
-+++ b/net/netfilter/nf_conntrack_extend.c
-@@ -53,7 +53,11 @@ nf_ct_ext_create(struct nf_ct_ext **ext, enum nf_ct_ext_id id,
+diff --git a/Makefile b/Makefile
+index 3e95dfdbe572..ccd6d91f616e 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 9
+-SUBLEVEL = 44
++SUBLEVEL = 45
+ EXTRAVERSION =
+ NAME = Roaring Lionus
  
- 	rcu_read_lock();
- 	t = rcu_dereference(nf_ct_ext_types[id]);
--	BUG_ON(t == NULL);
-+	if (!t) {
-+		rcu_read_unlock();
-+		return NULL;
-+	}
-+
- 	off = ALIGN(sizeof(struct nf_ct_ext), t->align);
- 	len = off + t->len + var_alloc_len;
- 	alloc_size = t->alloc_size + var_alloc_len;
-@@ -88,7 +92,10 @@ void *__nf_ct_ext_add_length(struct nf_conn *ct, enum nf_ct_ext_id id,
+diff --git a/arch/arm64/include/asm/elf.h b/arch/arm64/include/asm/elf.h
+index afa23b057def..1fb023076dfc 100644
+--- a/arch/arm64/include/asm/elf.h
++++ b/arch/arm64/include/asm/elf.h
+@@ -114,10 +114,10 @@
  
- 	rcu_read_lock();
- 	t = rcu_dereference(nf_ct_ext_types[id]);
--	BUG_ON(t == NULL);
-+	if (!t) {
-+		rcu_read_unlock();
-+		return NULL;
-+	}
+ /*
+  * This is the base location for PIE (ET_DYN with INTERP) loads. On
+- * 64-bit, this is raised to 4GB to leave the entire 32-bit address
++ * 64-bit, this is above 4GB to leave the entire 32-bit address
+  * space open for things that want to use the area for 32-bit pointers.
+  */
+-#define ELF_ET_DYN_BASE		0x100000000UL
++#define ELF_ET_DYN_BASE		(2 * TASK_SIZE_64 / 3)
  
- 	newoff = ALIGN(old->len, t->align);
- 	newlen = newoff + t->len + var_alloc_len;
-@@ -175,6 +182,6 @@ void nf_ct_extend_unregister(struct nf_ct_ext_type *type)
- 	RCU_INIT_POINTER(nf_ct_ext_types[type->id], NULL);
- 	update_alloc_size(type);
- 	mutex_unlock(&nf_ct_ext_type_mutex);
--	rcu_barrier(); /* Wait for completion of call_rcu()'s */
-+	synchronize_rcu();
- }
- EXPORT_SYMBOL_GPL(nf_ct_extend_unregister);
--- 
-2.28.0
-
-
-From adcfbb2d9e386517db84ac56fa3e4abd56db75b3 Mon Sep 17 00:00:00 2001
-From: Jan Kara <jack@suse.cz>
-Date: Tue, 15 Aug 2017 13:00:36 +0200
-Subject: [PATCH 02/28] audit: Fix use after free in audit_remove_watch_rule()
-
-commit d76036ab47eafa6ce52b69482e91ca3ba337d6d6 upstream.
-
-audit_remove_watch_rule() drops watch's reference to parent but then
-continues to work with it. That is not safe as parent can get freed once
-we drop our reference. The following is a trivial reproducer:
-
-mount -o loop image /mnt
-touch /mnt/file
-auditctl -w /mnt/file -p wax
-umount /mnt
-auditctl -D
-<crash in fsnotify_destroy_mark()>
-
-Grab our own reference in audit_remove_watch_rule() earlier to make sure
-mark does not get freed under us.
-
-Reported-by: Tony Jones <tonyj@suse.de>
-Signed-off-by: Jan Kara <jack@suse.cz>
-Tested-by: Tony Jones <tonyj@suse.de>
-Signed-off-by: Paul Moore <paul@paul-moore.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/audit_watch.c | 12 +++++++-----
- 1 file changed, 7 insertions(+), 5 deletions(-)
-
-diff --git a/kernel/audit_watch.c b/kernel/audit_watch.c
-index 0d302a87f21b..690e1e3c59f7 100644
---- a/kernel/audit_watch.c
-+++ b/kernel/audit_watch.c
-@@ -457,13 +457,15 @@ void audit_remove_watch_rule(struct audit_krule *krule)
- 	list_del(&krule->rlist);
+ #ifndef __ASSEMBLY__
  
- 	if (list_empty(&watch->rules)) {
-+		/*
-+		 * audit_remove_watch() drops our reference to 'parent' which
-+		 * can get freed. Grab our own reference to be safe.
-+		 */
-+		audit_get_parent(parent);
- 		audit_remove_watch(watch);
--
--		if (list_empty(&parent->watches)) {
--			audit_get_parent(parent);
-+		if (list_empty(&parent->watches))
- 			fsnotify_destroy_mark(&parent->mark, audit_watch_group);
--			audit_put_parent(parent);
--		}
-+		audit_put_parent(parent);
- 	}
- }
+diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
+index b249c2fb99c8..1c141d50fbc6 100644
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@ -359,7 +359,8 @@ void enable_kernel_vsx(void)
  
--- 
-2.28.0
-
-
-From 93f5a0318aae53541a4c53eca444917755b15a40 Mon Sep 17 00:00:00 2001
-From: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
-Date: Sat, 12 Aug 2017 23:36:47 +0200
-Subject: [PATCH 03/28] parisc: pci memory bar assignment fails with 64bit
- kernels on dino/cujo
-
-commit 4098116039911e8870d84c975e2ec22dab65a909 upstream.
-
-For 64bit kernels the lmmio_space_offset of the host bridge window
-isn't set correctly on systems with dino/cujo PCI host bridges.
-This leads to not assigned memory bars and failing drivers, which
-need to use these bars.
-
-Signed-off-by: Thomas Bogendoerfer <tsbogend@alpha.franken.de>
-Acked-by: Helge Deller <deller@gmx.de>
-Signed-off-by: Helge Deller <deller@gmx.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/parisc/dino.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/parisc/dino.c b/drivers/parisc/dino.c
-index 5c63b920b471..ed92c1254cff 100644
---- a/drivers/parisc/dino.c
-+++ b/drivers/parisc/dino.c
-@@ -956,7 +956,7 @@ static int __init dino_probe(struct parisc_device *dev)
+ 	cpumsr = msr_check_and_set(MSR_FP|MSR_VEC|MSR_VSX);
  
- 	dino_dev->hba.dev = dev;
- 	dino_dev->hba.base_addr = ioremap_nocache(hpa, 4096);
--	dino_dev->hba.lmmio_space_offset = 0;	/* CPU addrs == bus addrs */
-+	dino_dev->hba.lmmio_space_offset = PCI_F_EXTEND;
- 	spin_lock_init(&dino_dev->dinosaur_pen);
- 	dino_dev->hba.iommu = ccio_get_iommu(dev);
- 
--- 
-2.28.0
-
-
-From 24e7f540245d555f6bcd930a677f8f9056028853 Mon Sep 17 00:00:00 2001
-From: Herbert Xu <herbert@gondor.apana.org.au>
-Date: Wed, 2 Aug 2017 16:40:47 +0800
-Subject: [PATCH 04/28] crypto: ixp4xx - Fix error handling path in
- 'aead_perform()'
-
-commit 28389575a8cf933a5f3c378556b9f4d3cce0efd2 upstream.
-
-In commit 0f987e25cb8a, the source processing has been moved in front of
-the destination processing, but the error handling path has not been
-modified accordingly.
-Free resources in the correct order to avoid some leaks.
-
-Fixes: 0f987e25cb8a ("crypto: ixp4xx - Fix false lastlen uninitialised warning")
-Reported-by: Christophe JAILLET <christophe.jaillet@wanadoo.fr>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Reviewed-by: Arnd Bergmann <arnd@arndb.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/crypto/ixp4xx_crypto.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/crypto/ixp4xx_crypto.c b/drivers/crypto/ixp4xx_crypto.c
-index 7868765a70c5..b54af97a20bb 100644
---- a/drivers/crypto/ixp4xx_crypto.c
-+++ b/drivers/crypto/ixp4xx_crypto.c
-@@ -1074,7 +1074,7 @@ static int aead_perform(struct aead_request *req, int encrypt,
- 		req_ctx->hmac_virt = dma_pool_alloc(buffer_pool, flags,
- 				&crypt->icv_rev_aes);
- 		if (unlikely(!req_ctx->hmac_virt))
--			goto free_buf_src;
-+			goto free_buf_dst;
- 		if (!encrypt) {
- 			scatterwalk_map_and_copy(req_ctx->hmac_virt,
- 				req->src, cryptlen, authsize, 0);
-@@ -1089,10 +1089,10 @@ static int aead_perform(struct aead_request *req, int encrypt,
- 	BUG_ON(qmgr_stat_overflow(SEND_QID));
- 	return -EINPROGRESS;
- 
--free_buf_src:
--	free_buf_chain(dev, req_ctx->src, crypt->src_buf);
- free_buf_dst:
- 	free_buf_chain(dev, req_ctx->dst, crypt->dst_buf);
-+free_buf_src:
-+	free_buf_chain(dev, req_ctx->src, crypt->src_buf);
- 	crypt->ctl_flags = CTL_FLAG_UNUSED;
- 	return -ENOMEM;
- }
--- 
-2.28.0
-
-
-From c3e8a12e701c587759e3f1d1e9fb8fc262eb5a26 Mon Sep 17 00:00:00 2001
-From: "megha.dey@linux.intel.com" <megha.dey@linux.intel.com>
-Date: Wed, 2 Aug 2017 13:49:09 -0700
-Subject: [PATCH 05/28] crypto: x86/sha1 - Fix reads beyond the number of
- blocks passed
-
-commit 8861249c740fc4af9ddc5aee321eafefb960d7c6 upstream.
-
-It was reported that the sha1 AVX2 function(sha1_transform_avx2) is
-reading ahead beyond its intended data, and causing a crash if the next
-block is beyond page boundary:
-http://marc.info/?l=linux-crypto-vger&m=149373371023377
-
-This patch makes sure that there is no overflow for any buffer length.
-
-It passes the tests written by Jan Stancek that revealed this problem:
-https://github.com/jstancek/sha1-avx2-crash
-
-I have re-enabled sha1-avx2 by reverting commit
-b82ce24426a4071da9529d726057e4e642948667
-
-Fixes: b82ce24426a4 ("crypto: sha1-ssse3 - Disable avx2")
-Originally-by: Ilya Albrekht <ilya.albrekht@intel.com>
-Tested-by: Jan Stancek <jstancek@redhat.com>
-Signed-off-by: Megha Dey <megha.dey@linux.intel.com>
-Reported-by: Jan Stancek <jstancek@redhat.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/crypto/sha1_avx2_x86_64_asm.S | 67 ++++++++++++++------------
- arch/x86/crypto/sha1_ssse3_glue.c      |  2 +-
- 2 files changed, 37 insertions(+), 32 deletions(-)
-
+-	if (current->thread.regs && (current->thread.regs->msr & MSR_VSX)) {
++	if (current->thread.regs &&
++	    (current->thread.regs->msr & (MSR_VSX|MSR_VEC|MSR_FP))) {
+ 		check_if_tm_restore_required(current);
+ 		/*
+ 		 * If a thread has already been reclaimed then the
+@@ -383,7 +384,7 @@ void flush_vsx_to_thread(struct task_struct *tsk)
+ {
+ 	if (tsk->thread.regs) {
+ 		preempt_disable();
+-		if (tsk->thread.regs->msr & MSR_VSX) {
++		if (tsk->thread.regs->msr & (MSR_VSX|MSR_VEC|MSR_FP)) {
+ 			BUG_ON(tsk != current);
+ 			giveup_vsx(tsk);
+ 		}
 diff --git a/arch/x86/crypto/sha1_avx2_x86_64_asm.S b/arch/x86/crypto/sha1_avx2_x86_64_asm.S
 index 1cd792db15ef..1eab79c9ac48 100644
 --- a/arch/x86/crypto/sha1_avx2_x86_64_asm.S
@@ -476,383 +227,233 @@ index f960a043cdeb..fc61739150e7 100644
  		&& boot_cpu_has(X86_FEATURE_BMI1)
  		&& boot_cpu_has(X86_FEATURE_BMI2))
  		return true;
--- 
-2.28.0
-
-
-From 5dd141e0e9855daca44b3bf8dcbf92494f9c7bf8 Mon Sep 17 00:00:00 2001
-From: Kai-Heng Feng <kai.heng.feng@canonical.com>
-Date: Mon, 14 Aug 2017 20:11:26 -0700
-Subject: [PATCH 06/28] Input: elan_i2c - add ELAN0608 to the ACPI table
-
-commit 1874064eed0502bd9bef7be8023757b0c4f26883 upstream.
-
-Similar to commit 722c5ac708b4f ("Input: elan_i2c - add ELAN0605 to the
-ACPI table"), ELAN0608 should be handled by elan_i2c.
-
-This touchpad can be found in Lenovo ideapad 320-14IKB.
-
-BugLink: https://bugs.launchpad.net/bugs/1708852
-
-Signed-off-by: Kai-Heng Feng <kai.heng.feng@canonical.com>
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/mouse/elan_i2c_core.c | 1 +
- 1 file changed, 1 insertion(+)
-
+diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
+index ef766a358b37..e7b0e7ff4c58 100644
+--- a/arch/x86/entry/entry_64.S
++++ b/arch/x86/entry/entry_64.S
+@@ -1215,6 +1215,8 @@ ENTRY(nmi)
+ 	 * other IST entries.
+ 	 */
+ 
++	ASM_CLAC
++
+ 	/* Use %rdx as our temp variable throughout */
+ 	pushq	%rdx
+ 
+diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
+index c152db2ab687..b31761ecce63 100644
+--- a/arch/x86/include/asm/elf.h
++++ b/arch/x86/include/asm/elf.h
+@@ -247,11 +247,11 @@ extern int force_personality32;
+ 
+ /*
+  * This is the base location for PIE (ET_DYN with INTERP) loads. On
+- * 64-bit, this is raised to 4GB to leave the entire 32-bit address
++ * 64-bit, this is above 4GB to leave the entire 32-bit address
+  * space open for things that want to use the area for 32-bit pointers.
+  */
+ #define ELF_ET_DYN_BASE		(mmap_is_ia32() ? 0x000400000UL : \
+-						  0x100000000UL)
++						  (TASK_SIZE / 3 * 2))
+ 
+ /* This yields a mask that user programs can use to figure out what
+    instruction set this CPU supports.  This could be done in user space,
+diff --git a/block/blk-mq-pci.c b/block/blk-mq-pci.c
+index 966c2169762e..ee9d3d958fbe 100644
+--- a/block/blk-mq-pci.c
++++ b/block/blk-mq-pci.c
+@@ -36,12 +36,18 @@ int blk_mq_pci_map_queues(struct blk_mq_tag_set *set, struct pci_dev *pdev)
+ 	for (queue = 0; queue < set->nr_hw_queues; queue++) {
+ 		mask = pci_irq_get_affinity(pdev, queue);
+ 		if (!mask)
+-			return -EINVAL;
++			goto fallback;
+ 
+ 		for_each_cpu(cpu, mask)
+ 			set->mq_map[cpu] = queue;
+ 	}
+ 
+ 	return 0;
++
++fallback:
++	WARN_ON_ONCE(set->nr_hw_queues > 1);
++	for_each_possible_cpu(cpu)
++		set->mq_map[cpu] = 0;
++	return 0;
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_pci_map_queues);
+diff --git a/drivers/block/xen-blkfront.c b/drivers/block/xen-blkfront.c
+index 9908597c5209..f11d62de2272 100644
+--- a/drivers/block/xen-blkfront.c
++++ b/drivers/block/xen-blkfront.c
+@@ -2112,9 +2112,9 @@ static int blkfront_resume(struct xenbus_device *dev)
+ 			/*
+ 			 * Get the bios in the request so we can re-queue them.
+ 			 */
+-			if (req_op(shadow[i].request) == REQ_OP_FLUSH ||
+-			    req_op(shadow[i].request) == REQ_OP_DISCARD ||
+-			    req_op(shadow[i].request) == REQ_OP_SECURE_ERASE ||
++			if (req_op(shadow[j].request) == REQ_OP_FLUSH ||
++			    req_op(shadow[j].request) == REQ_OP_DISCARD ||
++			    req_op(shadow[j].request) == REQ_OP_SECURE_ERASE ||
+ 			    shadow[j].request->cmd_flags & REQ_FUA) {
+ 				/*
+ 				 * Flush operations don't contain bios, so
+diff --git a/drivers/crypto/ixp4xx_crypto.c b/drivers/crypto/ixp4xx_crypto.c
+index 7868765a70c5..b54af97a20bb 100644
+--- a/drivers/crypto/ixp4xx_crypto.c
++++ b/drivers/crypto/ixp4xx_crypto.c
+@@ -1074,7 +1074,7 @@ static int aead_perform(struct aead_request *req, int encrypt,
+ 		req_ctx->hmac_virt = dma_pool_alloc(buffer_pool, flags,
+ 				&crypt->icv_rev_aes);
+ 		if (unlikely(!req_ctx->hmac_virt))
+-			goto free_buf_src;
++			goto free_buf_dst;
+ 		if (!encrypt) {
+ 			scatterwalk_map_and_copy(req_ctx->hmac_virt,
+ 				req->src, cryptlen, authsize, 0);
+@@ -1089,10 +1089,10 @@ static int aead_perform(struct aead_request *req, int encrypt,
+ 	BUG_ON(qmgr_stat_overflow(SEND_QID));
+ 	return -EINPROGRESS;
+ 
+-free_buf_src:
+-	free_buf_chain(dev, req_ctx->src, crypt->src_buf);
+ free_buf_dst:
+ 	free_buf_chain(dev, req_ctx->dst, crypt->dst_buf);
++free_buf_src:
++	free_buf_chain(dev, req_ctx->src, crypt->src_buf);
+ 	crypt->ctl_flags = CTL_FLAG_UNUSED;
+ 	return -ENOMEM;
+ }
 diff --git a/drivers/input/mouse/elan_i2c_core.c b/drivers/input/mouse/elan_i2c_core.c
-index da5458dfb1e3..d5309d0a0482 100644
+index da5458dfb1e3..98d4e515587a 100644
 --- a/drivers/input/mouse/elan_i2c_core.c
 +++ b/drivers/input/mouse/elan_i2c_core.c
-@@ -1235,6 +1235,7 @@ static const struct acpi_device_id elan_acpi_id[] = {
+@@ -1235,6 +1235,10 @@ static const struct acpi_device_id elan_acpi_id[] = {
  	{ "ELAN0100", 0 },
  	{ "ELAN0600", 0 },
  	{ "ELAN0605", 0 },
 +	{ "ELAN0608", 0 },
- 	{ "ELAN1000", 0 },
- 	{ }
- };
--- 
-2.28.0
-
-
-From 3f7292106d0bda25ef52a3342fb74b84b04f3585 Mon Sep 17 00:00:00 2001
-From: KT Liao <kt.liao@emc.com.tw>
-Date: Mon, 14 Aug 2017 20:11:59 -0700
-Subject: [PATCH 07/28] Input: elan_i2c - Add antoher Lenovo ACPI ID for
- upcoming Lenovo NB
-
-commit 76988690402dde2880bfe06ecccf381d48ba8e1c upstream.
-
-Add 2 new IDs (ELAN0609 and ELAN060B) to the list of ACPI IDs that should
-be handled by the driver.
-
-Signed-off-by: KT Liao <kt.liao@emc.com.tw>
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/mouse/elan_i2c_core.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/drivers/input/mouse/elan_i2c_core.c b/drivers/input/mouse/elan_i2c_core.c
-index d5309d0a0482..98d4e515587a 100644
---- a/drivers/input/mouse/elan_i2c_core.c
-+++ b/drivers/input/mouse/elan_i2c_core.c
-@@ -1236,6 +1236,9 @@ static const struct acpi_device_id elan_acpi_id[] = {
- 	{ "ELAN0600", 0 },
- 	{ "ELAN0605", 0 },
- 	{ "ELAN0608", 0 },
 +	{ "ELAN0605", 0 },
 +	{ "ELAN0609", 0 },
 +	{ "ELAN060B", 0 },
  	{ "ELAN1000", 0 },
  	{ }
  };
--- 
-2.28.0
-
-
-From bafb25c5050caa96625df0430d2a80072183f4cf Mon Sep 17 00:00:00 2001
-From: Daniel Mentz <danielmentz@google.com>
-Date: Mon, 14 Aug 2017 14:46:01 -0700
-Subject: [PATCH 08/28] ALSA: seq: 2nd attempt at fixing race creating a queue
-
-commit 7e1d90f60a0d501c8503e636942ca704a454d910 upstream.
-
-commit 4842e98f26dd80be3623c4714a244ba52ea096a8 ("ALSA: seq: Fix race at
-creating a queue") attempted to fix a race reported by syzkaller. That
-fix has been described as follows:
-
-"
-When a sequencer queue is created in snd_seq_queue_alloc(),it adds the
-new queue element to the public list before referencing it.  Thus the
-queue might be deleted before the call of snd_seq_queue_use(), and it
-results in the use-after-free error, as spotted by syzkaller.
-
-The fix is to reference the queue object at the right time.
-"
-
-Even with that fix in place, syzkaller reported a use-after-free error.
-It specifically pointed to the last instruction "return q->queue" in
-snd_seq_queue_alloc(). The pointer q is being used after kfree() has
-been called on it.
-
-It turned out that there is still a small window where a race can
-happen. The window opens at
-snd_seq_ioctl_create_queue()->snd_seq_queue_alloc()->queue_list_add()
-and closes at
-snd_seq_ioctl_create_queue()->queueptr()->snd_use_lock_use(). Between
-these two calls, a different thread could delete the queue and possibly
-re-create a different queue in the same location in queue_list.
-
-This change prevents this situation by calling snd_use_lock_use() from
-snd_seq_queue_alloc() prior to calling queue_list_add(). It is then the
-caller's responsibility to call snd_use_lock_free(&q->use_lock).
-
-Fixes: 4842e98f26dd ("ALSA: seq: Fix race at creating a queue")
-Reported-by: Dmitry Vyukov <dvyukov@google.com>
-Signed-off-by: Daniel Mentz <danielmentz@google.com>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/seq/seq_clientmgr.c | 13 ++++---------
- sound/core/seq/seq_queue.c     | 14 +++++++++-----
- sound/core/seq/seq_queue.h     |  2 +-
- 3 files changed, 14 insertions(+), 15 deletions(-)
-
-diff --git a/sound/core/seq/seq_clientmgr.c b/sound/core/seq/seq_clientmgr.c
-index f3b1d7f50b81..67c4c68ce041 100644
---- a/sound/core/seq/seq_clientmgr.c
-+++ b/sound/core/seq/seq_clientmgr.c
-@@ -1502,16 +1502,11 @@ static int snd_seq_ioctl_unsubscribe_port(struct snd_seq_client *client,
- static int snd_seq_ioctl_create_queue(struct snd_seq_client *client, void *arg)
- {
- 	struct snd_seq_queue_info *info = arg;
--	int result;
- 	struct snd_seq_queue *q;
+diff --git a/drivers/irqchip/irq-atmel-aic-common.c b/drivers/irqchip/irq-atmel-aic-common.c
+index 28b26c80f4cf..056507099725 100644
+--- a/drivers/irqchip/irq-atmel-aic-common.c
++++ b/drivers/irqchip/irq-atmel-aic-common.c
+@@ -142,9 +142,9 @@ void __init aic_common_rtc_irq_fixup(struct device_node *root)
+ 	struct device_node *np;
+ 	void __iomem *regs;
  
--	result = snd_seq_queue_alloc(client->number, info->locked, info->flags);
--	if (result < 0)
--		return result;
--
--	q = queueptr(result);
--	if (q == NULL)
--		return -EINVAL;
-+	q = snd_seq_queue_alloc(client->number, info->locked, info->flags);
-+	if (IS_ERR(q))
-+		return PTR_ERR(q);
+-	np = of_find_compatible_node(root, NULL, "atmel,at91rm9200-rtc");
++	np = of_find_compatible_node(NULL, NULL, "atmel,at91rm9200-rtc");
+ 	if (!np)
+-		np = of_find_compatible_node(root, NULL,
++		np = of_find_compatible_node(NULL, NULL,
+ 					     "atmel,at91sam9x5-rtc");
  
- 	info->queue = q->queue;
- 	info->locked = q->locked;
-@@ -1521,7 +1516,7 @@ static int snd_seq_ioctl_create_queue(struct snd_seq_client *client, void *arg)
- 	if (!info->name[0])
- 		snprintf(info->name, sizeof(info->name), "Queue-%d", q->queue);
- 	strlcpy(q->name, info->name, sizeof(q->name));
--	queuefree(q);
-+	snd_use_lock_free(&q->use_lock);
+ 	if (!np)
+@@ -196,7 +196,6 @@ static void __init aic_common_irq_fixup(const struct of_device_id *matches)
+ 		return;
  
- 	return 0;
- }
-diff --git a/sound/core/seq/seq_queue.c b/sound/core/seq/seq_queue.c
-index 450c5187eecb..79e0c5604ef8 100644
---- a/sound/core/seq/seq_queue.c
-+++ b/sound/core/seq/seq_queue.c
-@@ -184,22 +184,26 @@ void __exit snd_seq_queues_delete(void)
- static void queue_use(struct snd_seq_queue *queue, int client, int use);
+ 	match = of_match_node(matches, root);
+-	of_node_put(root);
  
- /* allocate a new queue -
-- * return queue index value or negative value for error
-+ * return pointer to new queue or ERR_PTR(-errno) for error
-+ * The new queue's use_lock is set to 1. It is the caller's responsibility to
-+ * call snd_use_lock_free(&q->use_lock).
+ 	if (match) {
+ 		void (*fixup)(struct device_node *) = match->data;
+diff --git a/drivers/net/usb/qmi_wwan.c b/drivers/net/usb/qmi_wwan.c
+index 2f260c63c383..49a27dc46e5e 100644
+--- a/drivers/net/usb/qmi_wwan.c
++++ b/drivers/net/usb/qmi_wwan.c
+@@ -876,6 +876,7 @@ static const struct usb_device_id products[] = {
+ 	{QMI_FIXED_INTF(0x19d2, 0x1428, 2)},	/* Telewell TW-LTE 4G v2 */
+ 	{QMI_FIXED_INTF(0x19d2, 0x2002, 4)},	/* ZTE (Vodafone) K3765-Z */
+ 	{QMI_FIXED_INTF(0x2001, 0x7e19, 4)},	/* D-Link DWM-221 B1 */
++	{QMI_FIXED_INTF(0x2001, 0x7e35, 4)},	/* D-Link DWM-222 */
+ 	{QMI_FIXED_INTF(0x0f3d, 0x68a2, 8)},    /* Sierra Wireless MC7700 */
+ 	{QMI_FIXED_INTF(0x114f, 0x68a2, 8)},    /* Sierra Wireless MC7750 */
+ 	{QMI_FIXED_INTF(0x1199, 0x68a2, 8)},	/* Sierra Wireless MC7710 in QMI mode */
+diff --git a/drivers/parisc/dino.c b/drivers/parisc/dino.c
+index 5c63b920b471..ed92c1254cff 100644
+--- a/drivers/parisc/dino.c
++++ b/drivers/parisc/dino.c
+@@ -956,7 +956,7 @@ static int __init dino_probe(struct parisc_device *dev)
+ 
+ 	dino_dev->hba.dev = dev;
+ 	dino_dev->hba.base_addr = ioremap_nocache(hpa, 4096);
+-	dino_dev->hba.lmmio_space_offset = 0;	/* CPU addrs == bus addrs */
++	dino_dev->hba.lmmio_space_offset = PCI_F_EXTEND;
+ 	spin_lock_init(&dino_dev->dinosaur_pen);
+ 	dino_dev->hba.iommu = ccio_get_iommu(dev);
+ 
+diff --git a/drivers/usb/core/usb-acpi.c b/drivers/usb/core/usb-acpi.c
+index 2776cfe64c09..ef9cf4a21afe 100644
+--- a/drivers/usb/core/usb-acpi.c
++++ b/drivers/usb/core/usb-acpi.c
+@@ -127,6 +127,22 @@ static enum usb_port_connect_type usb_acpi_get_connect_type(acpi_handle handle,
   */
--int snd_seq_queue_alloc(int client, int locked, unsigned int info_flags)
-+struct snd_seq_queue *snd_seq_queue_alloc(int client, int locked, unsigned int info_flags)
+ #define USB_ACPI_LOCATION_VALID (1 << 31)
+ 
++static struct acpi_device *usb_acpi_find_port(struct acpi_device *parent,
++					      int raw)
++{
++	struct acpi_device *adev;
++
++	if (!parent)
++		return NULL;
++
++	list_for_each_entry(adev, &parent->children, node) {
++		if (acpi_device_adr(adev) == raw)
++			return adev;
++	}
++
++	return acpi_find_child_device(parent, raw, false);
++}
++
+ static struct acpi_device *usb_acpi_find_companion(struct device *dev)
  {
- 	struct snd_seq_queue *q;
+ 	struct usb_device *udev;
+@@ -174,8 +190,10 @@ static struct acpi_device *usb_acpi_find_companion(struct device *dev)
+ 			int raw;
  
- 	q = queue_new(client, locked);
- 	if (q == NULL)
--		return -ENOMEM;
-+		return ERR_PTR(-ENOMEM);
- 	q->info_flags = info_flags;
- 	queue_use(q, client, 1);
-+	snd_use_lock_use(&q->use_lock);
- 	if (queue_list_add(q) < 0) {
-+		snd_use_lock_free(&q->use_lock);
- 		queue_delete(q);
--		return -ENOMEM;
-+		return ERR_PTR(-ENOMEM);
- 	}
--	return q->queue;
-+	return q;
- }
+ 			raw = usb_hcd_find_raw_port_number(hcd, port1);
+-			adev = acpi_find_child_device(ACPI_COMPANION(&udev->dev),
+-					raw, false);
++
++			adev = usb_acpi_find_port(ACPI_COMPANION(&udev->dev),
++						  raw);
++
+ 			if (!adev)
+ 				return NULL;
+ 		} else {
+@@ -186,7 +204,9 @@ static struct acpi_device *usb_acpi_find_companion(struct device *dev)
+ 				return NULL;
  
- /* delete a queue - queue must be owned by the client */
-diff --git a/sound/core/seq/seq_queue.h b/sound/core/seq/seq_queue.h
-index 30c8111477f6..719093489a2c 100644
---- a/sound/core/seq/seq_queue.h
-+++ b/sound/core/seq/seq_queue.h
-@@ -71,7 +71,7 @@ void snd_seq_queues_delete(void);
+ 			acpi_bus_get_device(parent_handle, &adev);
+-			adev = acpi_find_child_device(adev, port1, false);
++
++			adev = usb_acpi_find_port(adev, port1);
++
+ 			if (!adev)
+ 				return NULL;
+ 		}
+diff --git a/drivers/xen/biomerge.c b/drivers/xen/biomerge.c
+index 4da69dbf7dca..1bdd02a6d6ac 100644
+--- a/drivers/xen/biomerge.c
++++ b/drivers/xen/biomerge.c
+@@ -10,8 +10,7 @@ bool xen_biovec_phys_mergeable(const struct bio_vec *vec1,
+ 	unsigned long bfn1 = pfn_to_bfn(page_to_pfn(vec1->bv_page));
+ 	unsigned long bfn2 = pfn_to_bfn(page_to_pfn(vec2->bv_page));
  
- 
- /* create new queue (constructor) */
--int snd_seq_queue_alloc(int client, int locked, unsigned int flags);
-+struct snd_seq_queue *snd_seq_queue_alloc(int client, int locked, unsigned int flags);
- 
- /* delete queue (destructor) */
- int snd_seq_queue_delete(int client, int queueid);
--- 
-2.28.0
-
-
-From f39f086d541f8cef13977fe51308ab805e14b3c3 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Mon, 14 Aug 2017 14:35:50 +0200
-Subject: [PATCH 09/28] ALSA: usb-audio: Apply sample rate quirk to Sennheiser
- headset
-
-commit a8e800fe0f68bc28ce309914f47e432742b865ed upstream.
-
-A Senheisser headset requires the typical sample-rate quirk for
-avoiding spurious errors from inquiring the current sample rate like:
- usb 1-1: 2:1: cannot get freq at ep 0x4
- usb 1-1: 3:1: cannot get freq at ep 0x83
-
-The USB ID 1395:740a has to be added to the entries in
-snd_usb_get_sample_rate_quirk().
-
-Bugzilla: https://bugzilla.suse.com/show_bug.cgi?id=1052580
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/quirks.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
-index eb4b9f7a571e..95c2749ac8a3 100644
---- a/sound/usb/quirks.c
-+++ b/sound/usb/quirks.c
-@@ -1142,6 +1142,7 @@ bool snd_usb_get_sample_rate_quirk(struct snd_usb_audio *chip)
- 	case USB_ID(0x0556, 0x0014): /* Phoenix Audio TMX320VC */
- 	case USB_ID(0x05A3, 0x9420): /* ELP HD USB Camera */
- 	case USB_ID(0x074D, 0x3553): /* Outlaw RR2150 (Micronas UAC3553B) */
-+	case USB_ID(0x1395, 0x740a): /* Sennheiser DECT */
- 	case USB_ID(0x1901, 0x0191): /* GE B850V3 CP2114 audio interface */
- 	case USB_ID(0x1de7, 0x0013): /* Phoenix Audio MT202exe */
- 	case USB_ID(0x1de7, 0x0014): /* Phoenix Audio TMX320 */
--- 
-2.28.0
-
-
-From d3e6e5956687eacc1c462e8dd6f3c66a2b6e8c1b Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Wed, 16 Aug 2017 14:18:37 +0200
-Subject: [PATCH 10/28] ALSA: usb-audio: Add mute TLV for playback volumes on
- C-Media devices
-
-commit 0f174b3525a43bd51f9397394763925e0ebe7bc7 upstream.
-
-C-Media devices (at least some models) mute the playback stream when
-volumes are set to the minimum value.  But this isn't informed via TLV
-and the user-space, typically PulseAudio, gets confused as if it's
-still played in a low volume.
-
-This patch adds the new flag, min_mute, to struct usb_mixer_elem_info
-for indicating that the mixer element is with the minimum-mute volume.
-This flag is set for known C-Media devices in
-snd_usb_mixer_fu_apply_quirk() in turn.
-
-Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=196669
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/mixer.c        | 2 ++
- sound/usb/mixer.h        | 1 +
- sound/usb/mixer_quirks.c | 6 ++++++
- 3 files changed, 9 insertions(+)
-
-diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
-index 4703caea56b2..d09c28c1deaf 100644
---- a/sound/usb/mixer.c
-+++ b/sound/usb/mixer.c
-@@ -542,6 +542,8 @@ int snd_usb_mixer_vol_tlv(struct snd_kcontrol *kcontrol, int op_flag,
- 
- 	if (size < sizeof(scale))
- 		return -ENOMEM;
-+	if (cval->min_mute)
-+		scale[0] = SNDRV_CTL_TLVT_DB_MINMAX_MUTE;
- 	scale[2] = cval->dBmin;
- 	scale[3] = cval->dBmax;
- 	if (copy_to_user(_tlv, scale, sizeof(scale)))
-diff --git a/sound/usb/mixer.h b/sound/usb/mixer.h
-index 3417ef347e40..2b4b067646ab 100644
---- a/sound/usb/mixer.h
-+++ b/sound/usb/mixer.h
-@@ -64,6 +64,7 @@ struct usb_mixer_elem_info {
- 	int cached;
- 	int cache_val[MAX_CHANNELS];
- 	u8 initialized;
-+	u8 min_mute;
- 	void *private_data;
- };
- 
-diff --git a/sound/usb/mixer_quirks.c b/sound/usb/mixer_quirks.c
-index 04991b009132..5d2fc5f58bfe 100644
---- a/sound/usb/mixer_quirks.c
-+++ b/sound/usb/mixer_quirks.c
-@@ -1873,6 +1873,12 @@ void snd_usb_mixer_fu_apply_quirk(struct usb_mixer_interface *mixer,
- 		if (unitid == 7 && cval->control == UAC_FU_VOLUME)
- 			snd_dragonfly_quirk_db_scale(mixer, cval, kctl);
- 		break;
-+	/* lowest playback value is muted on C-Media devices */
-+	case USB_ID(0x0d8c, 0x000c):
-+	case USB_ID(0x0d8c, 0x0014):
-+		if (strstr(kctl->id.name, "Playback"))
-+			cval->min_mute = 1;
-+		break;
- 	}
- }
- 
--- 
-2.28.0
-
-
-From 87395eeb28e58a60e89b24d067a5968e88096ead Mon Sep 17 00:00:00 2001
-From: Pavel Tatashin <pasha.tatashin@oracle.com>
-Date: Fri, 18 Aug 2017 15:16:05 -0700
-Subject: [PATCH 11/28] mm: discard memblock data later
-
-commit 3010f876500f9ba921afaeccec30c45ca6584dc8 upstream.
-
-There is existing use after free bug when deferred struct pages are
-enabled:
-
-The memblock_add() allocates memory for the memory array if more than
-128 entries are needed.  See comment in e820__memblock_setup():
-
-  * The bootstrap memblock region count maximum is 128 entries
-  * (INIT_MEMBLOCK_REGIONS), but EFI might pass us more E820 entries
-  * than that - so allow memblock resizing.
-
-This memblock memory is freed here:
-        free_low_memory_core_early()
-
-We access the freed memblock.memory later in boot when deferred pages
-are initialized in this path:
-
-        deferred_init_memmap()
-                for_each_mem_pfn_range()
-                  __next_mem_pfn_range()
-                    type = &memblock.memory;
-
-One possible explanation for why this use-after-free hasn't been hit
-before is that the limit of INIT_MEMBLOCK_REGIONS has never been
-exceeded at least on systems where deferred struct pages were enabled.
-
-Tested by reducing INIT_MEMBLOCK_REGIONS down to 4 from the current 128,
-and verifying in qemu that this code is getting excuted and that the
-freed pages are sane.
-
-Link: http://lkml.kernel.org/r/1502485554-318703-2-git-send-email-pasha.tatashin@oracle.com
-Fixes: 7e18adb4f80b ("mm: meminit: initialise remaining struct pages in parallel with kswapd")
-Signed-off-by: Pavel Tatashin <pasha.tatashin@oracle.com>
-Reviewed-by: Steven Sistare <steven.sistare@oracle.com>
-Reviewed-by: Daniel Jordan <daniel.m.jordan@oracle.com>
-Reviewed-by: Bob Picco <bob.picco@oracle.com>
-Acked-by: Michal Hocko <mhocko@suse.com>
-Cc: Mel Gorman <mgorman@techsingularity.net>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/memblock.h |  6 ++++--
- mm/memblock.c            | 38 +++++++++++++++++---------------------
- mm/nobootmem.c           | 16 ----------------
- mm/page_alloc.c          |  4 ++++
- 4 files changed, 25 insertions(+), 39 deletions(-)
-
+-	return __BIOVEC_PHYS_MERGEABLE(vec1, vec2) &&
+-		((bfn1 == bfn2) || ((bfn1+1) == bfn2));
++	return bfn1 + PFN_DOWN(vec1->bv_offset + vec1->bv_len) == bfn2;
+ #else
+ 	/*
+ 	 * XXX: Add support for merging bio_vec when using different page
 diff --git a/include/linux/memblock.h b/include/linux/memblock.h
 index e8fba68e5d03..4024af00b137 100644
 --- a/include/linux/memblock.h
@@ -884,943 +485,6 @@ index e8fba68e5d03..4024af00b137 100644
  /**
   * for_each_mem_range - iterate through memblock areas from type_a and not
   * included in type_b. Or just type_a if type_b is NULL.
-diff --git a/mm/memblock.c b/mm/memblock.c
-index 68849d0ead09..ccec42c12ba8 100644
---- a/mm/memblock.c
-+++ b/mm/memblock.c
-@@ -297,31 +297,27 @@ static void __init_memblock memblock_remove_region(struct memblock_type *type, u
- }
- 
- #ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
--
--phys_addr_t __init_memblock get_allocated_memblock_reserved_regions_info(
--					phys_addr_t *addr)
--{
--	if (memblock.reserved.regions == memblock_reserved_init_regions)
--		return 0;
--
--	*addr = __pa(memblock.reserved.regions);
--
--	return PAGE_ALIGN(sizeof(struct memblock_region) *
--			  memblock.reserved.max);
--}
--
--phys_addr_t __init_memblock get_allocated_memblock_memory_regions_info(
--					phys_addr_t *addr)
-+/**
-+ * Discard memory and reserved arrays if they were allocated
-+ */
-+void __init memblock_discard(void)
- {
--	if (memblock.memory.regions == memblock_memory_init_regions)
--		return 0;
-+	phys_addr_t addr, size;
- 
--	*addr = __pa(memblock.memory.regions);
-+	if (memblock.reserved.regions != memblock_reserved_init_regions) {
-+		addr = __pa(memblock.reserved.regions);
-+		size = PAGE_ALIGN(sizeof(struct memblock_region) *
-+				  memblock.reserved.max);
-+		__memblock_free_late(addr, size);
-+	}
- 
--	return PAGE_ALIGN(sizeof(struct memblock_region) *
--			  memblock.memory.max);
-+	if (memblock.memory.regions == memblock_memory_init_regions) {
-+		addr = __pa(memblock.memory.regions);
-+		size = PAGE_ALIGN(sizeof(struct memblock_region) *
-+				  memblock.memory.max);
-+		__memblock_free_late(addr, size);
-+	}
- }
--
- #endif
- 
- /**
-diff --git a/mm/nobootmem.c b/mm/nobootmem.c
-index 487dad610731..ab998125f04d 100644
---- a/mm/nobootmem.c
-+++ b/mm/nobootmem.c
-@@ -146,22 +146,6 @@ static unsigned long __init free_low_memory_core_early(void)
- 				NULL)
- 		count += __free_memory_core(start, end);
- 
--#ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
--	{
--		phys_addr_t size;
--
--		/* Free memblock.reserved array if it was allocated */
--		size = get_allocated_memblock_reserved_regions_info(&start);
--		if (size)
--			count += __free_memory_core(start, start + size);
--
--		/* Free memblock.memory array if it was allocated */
--		size = get_allocated_memblock_memory_regions_info(&start);
--		if (size)
--			count += __free_memory_core(start, start + size);
--	}
--#endif
--
- 	return count;
- }
- 
-diff --git a/mm/page_alloc.c b/mm/page_alloc.c
-index 9419aa4e5441..2abf8d5f0ad4 100644
---- a/mm/page_alloc.c
-+++ b/mm/page_alloc.c
-@@ -1587,6 +1587,10 @@ void __init page_alloc_init_late(void)
- 	/* Reinit limits that are based on free pages after the kernel is up */
- 	files_maxfiles_init();
- #endif
-+#ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
-+	/* Discard memblock private memory */
-+	memblock_discard();
-+#endif
- 
- 	for_each_populated_zone(zone)
- 		set_zone_contiguous(zone);
--- 
-2.28.0
-
-
-From 59ee25d09fd523c57a911d50760bcc162a5f585f Mon Sep 17 00:00:00 2001
-From: Michal Hocko <mhocko@suse.com>
-Date: Fri, 18 Aug 2017 15:16:12 -0700
-Subject: [PATCH 12/28] mm: fix double mmap_sem unlock on MMF_UNSTABLE enforced
- SIGBUS
-
-commit 5b53a6ea886700a128b697a6fe8375340dea2c30 upstream.
-
-Tetsuo Handa has noticed that MMF_UNSTABLE SIGBUS path in
-handle_mm_fault causes a lockdep splat
-
-  Out of memory: Kill process 1056 (a.out) score 603 or sacrifice child
-  Killed process 1056 (a.out) total-vm:4268108kB, anon-rss:2246048kB, file-rss:0kB, shmem-rss:0kB
-  a.out (1169) used greatest stack depth: 11664 bytes left
-  DEBUG_LOCKS_WARN_ON(depth <= 0)
-  ------------[ cut here ]------------
-  WARNING: CPU: 6 PID: 1339 at kernel/locking/lockdep.c:3617 lock_release+0x172/0x1e0
-  CPU: 6 PID: 1339 Comm: a.out Not tainted 4.13.0-rc3-next-20170803+ #142
-  Hardware name: VMware, Inc. VMware Virtual Platform/440BX Desktop Reference Platform, BIOS 6.00 07/02/2015
-  RIP: 0010:lock_release+0x172/0x1e0
-  Call Trace:
-     up_read+0x1a/0x40
-     __do_page_fault+0x28e/0x4c0
-     do_page_fault+0x30/0x80
-     page_fault+0x28/0x30
-
-The reason is that the page fault path might have dropped the mmap_sem
-and returned with VM_FAULT_RETRY.  MMF_UNSTABLE check however rewrites
-the error path to VM_FAULT_SIGBUS and we always expect mmap_sem taken in
-that path.  Fix this by taking mmap_sem when VM_FAULT_RETRY is held in
-the MMF_UNSTABLE path.
-
-We cannot simply add VM_FAULT_SIGBUS to the existing error code because
-all arch specific page fault handlers and g-u-p would have to learn a
-new error code combination.
-
-Link: http://lkml.kernel.org/r/20170807113839.16695-2-mhocko@kernel.org
-Fixes: 3f70dc38cec2 ("mm: make sure that kthreads will not refault oom reaped memory")
-Reported-by: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
-Signed-off-by: Michal Hocko <mhocko@suse.com>
-Acked-by: David Rientjes <rientjes@google.com>
-Cc: Andrea Argangeli <andrea@kernel.org>
-Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
-Cc: Oleg Nesterov <oleg@redhat.com>
-Cc: Wenwei Tao <wenwei.tww@alibaba-inc.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/memory.c | 12 +++++++++++-
- 1 file changed, 11 insertions(+), 1 deletion(-)
-
-diff --git a/mm/memory.c b/mm/memory.c
-index 9bf3da0d0e14..d064caff9d7d 100644
---- a/mm/memory.c
-+++ b/mm/memory.c
-@@ -3635,8 +3635,18 @@ int handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
- 	 * further.
- 	 */
- 	if (unlikely((current->flags & PF_KTHREAD) && !(ret & VM_FAULT_ERROR)
--				&& test_bit(MMF_UNSTABLE, &vma->vm_mm->flags)))
-+				&& test_bit(MMF_UNSTABLE, &vma->vm_mm->flags))) {
-+
-+		/*
-+		 * We are going to enforce SIGBUS but the PF path might have
-+		 * dropped the mmap_sem already so take it again so that
-+		 * we do not break expectations of all arch specific PF paths
-+		 * and g-u-p
-+		 */
-+		if (ret & VM_FAULT_RETRY)
-+			down_read(&vma->vm_mm->mmap_sem);
- 		ret = VM_FAULT_SIGBUS;
-+	}
- 
- 	return ret;
- }
--- 
-2.28.0
-
-
-From 91105f2c621ef0b3c40d6725475b6896eb06f954 Mon Sep 17 00:00:00 2001
-From: zhong jiang <zhongjiang@huawei.com>
-Date: Fri, 18 Aug 2017 15:16:24 -0700
-Subject: [PATCH 13/28] mm/mempolicy: fix use after free when calling
- get_mempolicy
-
-commit 73223e4e2e3867ebf033a5a8eb2e5df0158ccc99 upstream.
-
-I hit a use after free issue when executing trinity and repoduced it
-with KASAN enabled.  The related call trace is as follows.
-
-  BUG: KASan: use after free in SyS_get_mempolicy+0x3c8/0x960 at addr ffff8801f582d766
-  Read of size 2 by task syz-executor1/798
-
-  INFO: Allocated in mpol_new.part.2+0x74/0x160 age=3 cpu=1 pid=799
-     __slab_alloc+0x768/0x970
-     kmem_cache_alloc+0x2e7/0x450
-     mpol_new.part.2+0x74/0x160
-     mpol_new+0x66/0x80
-     SyS_mbind+0x267/0x9f0
-     system_call_fastpath+0x16/0x1b
-  INFO: Freed in __mpol_put+0x2b/0x40 age=4 cpu=1 pid=799
-     __slab_free+0x495/0x8e0
-     kmem_cache_free+0x2f3/0x4c0
-     __mpol_put+0x2b/0x40
-     SyS_mbind+0x383/0x9f0
-     system_call_fastpath+0x16/0x1b
-  INFO: Slab 0xffffea0009cb8dc0 objects=23 used=8 fp=0xffff8801f582de40 flags=0x200000000004080
-  INFO: Object 0xffff8801f582d760 @offset=5984 fp=0xffff8801f582d600
-
-  Bytes b4 ffff8801f582d750: ae 01 ff ff 00 00 00 00 5a 5a 5a 5a 5a 5a 5a 5a  ........ZZZZZZZZ
-  Object ffff8801f582d760: 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b 6b  kkkkkkkkkkkkkkkk
-  Object ffff8801f582d770: 6b 6b 6b 6b 6b 6b 6b a5                          kkkkkkk.
-  Redzone ffff8801f582d778: bb bb bb bb bb bb bb bb                          ........
-  Padding ffff8801f582d8b8: 5a 5a 5a 5a 5a 5a 5a 5a                          ZZZZZZZZ
-  Memory state around the buggy address:
-  ffff8801f582d600: fb fb fb fc fc fc fc fc fc fc fc fc fc fc fc fc
-  ffff8801f582d680: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
-  >ffff8801f582d700: fc fc fc fc fc fc fc fc fc fc fc fc fb fb fb fc
-
-!shared memory policy is not protected against parallel removal by other
-thread which is normally protected by the mmap_sem.  do_get_mempolicy,
-however, drops the lock midway while we can still access it later.
-
-Early premature up_read is a historical artifact from times when
-put_user was called in this path see https://lwn.net/Articles/124754/
-but that is gone since 8bccd85ffbaf ("[PATCH] Implement sys_* do_*
-layering in the memory policy layer.").  but when we have the the
-current mempolicy ref count model.  The issue was introduced
-accordingly.
-
-Fix the issue by removing the premature release.
-
-Link: http://lkml.kernel.org/r/1502950924-27521-1-git-send-email-zhongjiang@huawei.com
-Signed-off-by: zhong jiang <zhongjiang@huawei.com>
-Acked-by: Michal Hocko <mhocko@suse.com>
-Cc: Minchan Kim <minchan@kernel.org>
-Cc: Vlastimil Babka <vbabka@suse.cz>
-Cc: David Rientjes <rientjes@google.com>
-Cc: Mel Gorman <mgorman@techsingularity.net>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/mempolicy.c | 5 -----
- 1 file changed, 5 deletions(-)
-
-diff --git a/mm/mempolicy.c b/mm/mempolicy.c
-index 23471526d424..a8ab5e73dc61 100644
---- a/mm/mempolicy.c
-+++ b/mm/mempolicy.c
-@@ -926,11 +926,6 @@ static long do_get_mempolicy(int *policy, nodemask_t *nmask,
- 		*policy |= (pol->flags & MPOL_MODE_FLAGS);
- 	}
- 
--	if (vma) {
--		up_read(&current->mm->mmap_sem);
--		vma = NULL;
--	}
--
- 	err = 0;
- 	if (nmask) {
- 		if (mpol_store_user_nodemask(pol)) {
--- 
-2.28.0
-
-
-From 1f2347a095ced10b2054fece0319801097cd852f Mon Sep 17 00:00:00 2001
-From: Kees Cook <keescook@chromium.org>
-Date: Fri, 18 Aug 2017 15:16:31 -0700
-Subject: [PATCH 14/28] mm: revert x86_64 and arm64 ELF_ET_DYN_BASE base
- changes
-
-commit c715b72c1ba406f133217b509044c38d8e714a37 upstream.
-
-Moving the x86_64 and arm64 PIE base from 0x555555554000 to 0x000100000000
-broke AddressSanitizer.  This is a partial revert of:
-
-  eab09532d400 ("binfmt_elf: use ELF_ET_DYN_BASE only for PIE")
-  02445990a96e ("arm64: move ELF_ET_DYN_BASE to 4GB / 4MB")
-
-The AddressSanitizer tool has hard-coded expectations about where
-executable mappings are loaded.
-
-The motivation for changing the PIE base in the above commits was to
-avoid the Stack-Clash CVEs that allowed executable mappings to get too
-close to heap and stack.  This was mainly a problem on 32-bit, but the
-64-bit bases were moved too, in an effort to proactively protect those
-systems (proofs of concept do exist that show 64-bit collisions, but
-other recent changes to fix stack accounting and setuid behaviors will
-minimize the impact).
-
-The new 32-bit PIE base is fine for ASan (since it matches the ET_EXEC
-base), so only the 64-bit PIE base needs to be reverted to let x86 and
-arm64 ASan binaries run again.  Future changes to the 64-bit PIE base on
-these architectures can be made optional once a more dynamic method for
-dealing with AddressSanitizer is found.  (e.g.  always loading PIE into
-the mmap region for marked binaries.)
-
-Link: http://lkml.kernel.org/r/20170807201542.GA21271@beast
-Fixes: eab09532d400 ("binfmt_elf: use ELF_ET_DYN_BASE only for PIE")
-Fixes: 02445990a96e ("arm64: move ELF_ET_DYN_BASE to 4GB / 4MB")
-Signed-off-by: Kees Cook <keescook@chromium.org>
-Reported-by: Kostya Serebryany <kcc@google.com>
-Acked-by: Will Deacon <will.deacon@arm.com>
-Cc: Ingo Molnar <mingo@elte.hu>
-Cc: "H. Peter Anvin" <hpa@zytor.com>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm64/include/asm/elf.h | 4 ++--
- arch/x86/include/asm/elf.h   | 4 ++--
- 2 files changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/arch/arm64/include/asm/elf.h b/arch/arm64/include/asm/elf.h
-index afa23b057def..1fb023076dfc 100644
---- a/arch/arm64/include/asm/elf.h
-+++ b/arch/arm64/include/asm/elf.h
-@@ -114,10 +114,10 @@
- 
- /*
-  * This is the base location for PIE (ET_DYN with INTERP) loads. On
-- * 64-bit, this is raised to 4GB to leave the entire 32-bit address
-+ * 64-bit, this is above 4GB to leave the entire 32-bit address
-  * space open for things that want to use the area for 32-bit pointers.
-  */
--#define ELF_ET_DYN_BASE		0x100000000UL
-+#define ELF_ET_DYN_BASE		(2 * TASK_SIZE_64 / 3)
- 
- #ifndef __ASSEMBLY__
- 
-diff --git a/arch/x86/include/asm/elf.h b/arch/x86/include/asm/elf.h
-index c152db2ab687..b31761ecce63 100644
---- a/arch/x86/include/asm/elf.h
-+++ b/arch/x86/include/asm/elf.h
-@@ -247,11 +247,11 @@ extern int force_personality32;
- 
- /*
-  * This is the base location for PIE (ET_DYN with INTERP) loads. On
-- * 64-bit, this is raised to 4GB to leave the entire 32-bit address
-+ * 64-bit, this is above 4GB to leave the entire 32-bit address
-  * space open for things that want to use the area for 32-bit pointers.
-  */
- #define ELF_ET_DYN_BASE		(mmap_is_ia32() ? 0x000400000UL : \
--						  0x100000000UL)
-+						  (TASK_SIZE / 3 * 2))
- 
- /* This yields a mask that user programs can use to figure out what
-    instruction set this CPU supports.  This could be done in user space,
--- 
-2.28.0
-
-
-From 6c7f3756d072050d612e5c5c04108f90f1985435 Mon Sep 17 00:00:00 2001
-From: Roger Pau Monne <roger.pau@citrix.com>
-Date: Tue, 18 Jul 2017 15:01:00 +0100
-Subject: [PATCH 15/28] xen: fix bio vec merging
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 462cdace790ac2ed6aad1b19c9c0af0143b6aab0 upstream.
-
-The current test for bio vec merging is not fully accurate and can be
-tricked into merging bios when certain grant combinations are used.
-The result of these malicious bio merges is a bio that extends past
-the memory page used by any of the originating bios.
-
-Take into account the following scenario, where a guest creates two
-grant references that point to the same mfn, ie: grant 1 -> mfn A,
-grant 2 -> mfn A.
-
-These references are then used in a PV block request, and mapped by
-the backend domain, thus obtaining two different pfns that point to
-the same mfn, pfn B -> mfn A, pfn C -> mfn A.
-
-If those grants happen to be used in two consecutive sectors of a disk
-IO operation becoming two different bios in the backend domain, the
-checks in xen_biovec_phys_mergeable will succeed, because bfn1 == bfn2
-(they both point to the same mfn). However due to the bio merging,
-the backend domain will end up with a bio that expands past mfn A into
-mfn A + 1.
-
-Fix this by making sure the check in xen_biovec_phys_mergeable takes
-into account the offset and the length of the bio, this basically
-replicates whats done in __BIOVEC_PHYS_MERGEABLE using mfns (bus
-addresses). While there also remove the usage of
-__BIOVEC_PHYS_MERGEABLE, since that's already checked by the callers
-of xen_biovec_phys_mergeable.
-
-Reported-by: "Jan H. Schönherr" <jschoenh@amazon.de>
-Signed-off-by: Roger Pau Monné <roger.pau@citrix.com>
-Reviewed-by: Juergen Gross <jgross@suse.com>
-Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/xen/biomerge.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
-diff --git a/drivers/xen/biomerge.c b/drivers/xen/biomerge.c
-index 4da69dbf7dca..1bdd02a6d6ac 100644
---- a/drivers/xen/biomerge.c
-+++ b/drivers/xen/biomerge.c
-@@ -10,8 +10,7 @@ bool xen_biovec_phys_mergeable(const struct bio_vec *vec1,
- 	unsigned long bfn1 = pfn_to_bfn(page_to_pfn(vec1->bv_page));
- 	unsigned long bfn2 = pfn_to_bfn(page_to_pfn(vec2->bv_page));
- 
--	return __BIOVEC_PHYS_MERGEABLE(vec1, vec2) &&
--		((bfn1 == bfn2) || ((bfn1+1) == bfn2));
-+	return bfn1 + PFN_DOWN(vec1->bv_offset + vec1->bv_len) == bfn2;
- #else
- 	/*
- 	 * XXX: Add support for merging bio_vec when using different page
--- 
-2.28.0
-
-
-From d8c20af0085898f9c818dd599b0afb0d0c99dab2 Mon Sep 17 00:00:00 2001
-From: Christoph Hellwig <hch@lst.de>
-Date: Thu, 17 Aug 2017 12:24:47 +0200
-Subject: [PATCH 16/28] blk-mq-pci: add a fallback when pci_irq_get_affinity
- returns NULL
-
-commit c005390374957baacbc38eef96ea360559510aa7 upstream.
-
-While pci_irq_get_affinity should never fail for SMP kernel that
-implement the affinity mapping, it will always return NULL in the
-UP case, so provide a fallback mapping of all queues to CPU 0 in
-that case.
-
-Signed-off-by: Christoph Hellwig <hch@lst.de>
-Reviewed-by: Omar Sandoval <osandov@fb.com>
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- block/blk-mq-pci.c | 8 +++++++-
- 1 file changed, 7 insertions(+), 1 deletion(-)
-
-diff --git a/block/blk-mq-pci.c b/block/blk-mq-pci.c
-index 966c2169762e..ee9d3d958fbe 100644
---- a/block/blk-mq-pci.c
-+++ b/block/blk-mq-pci.c
-@@ -36,12 +36,18 @@ int blk_mq_pci_map_queues(struct blk_mq_tag_set *set, struct pci_dev *pdev)
- 	for (queue = 0; queue < set->nr_hw_queues; queue++) {
- 		mask = pci_irq_get_affinity(pdev, queue);
- 		if (!mask)
--			return -EINVAL;
-+			goto fallback;
- 
- 		for_each_cpu(cpu, mask)
- 			set->mq_map[cpu] = queue;
- 	}
- 
- 	return 0;
-+
-+fallback:
-+	WARN_ON_ONCE(set->nr_hw_queues > 1);
-+	for_each_possible_cpu(cpu)
-+		set->mq_map[cpu] = 0;
-+	return 0;
- }
- EXPORT_SYMBOL_GPL(blk_mq_pci_map_queues);
--- 
-2.28.0
-
-
-From 7672f118604781747e65c9a3d8f7fa79ada80fe4 Mon Sep 17 00:00:00 2001
-From: Benjamin Herrenschmidt <benh@kernel.crashing.org>
-Date: Wed, 16 Aug 2017 16:01:14 +1000
-Subject: [PATCH 17/28] powerpc: Fix VSX enabling/flushing to also test MSR_FP
- and MSR_VEC
-
-commit 5a69aec945d27e78abac9fd032533d3aaebf7c1e upstream.
-
-VSX uses a combination of the old vector registers, the old FP
-registers and new "second halves" of the FP registers.
-
-Thus when we need to see the VSX state in the thread struct
-(flush_vsx_to_thread()) or when we'll use the VSX in the kernel
-(enable_kernel_vsx()) we need to ensure they are all flushed into
-the thread struct if either of them is individually enabled.
-
-Unfortunately we only tested if the whole VSX was enabled, not if they
-were individually enabled.
-
-Fixes: 72cd7b44bc99 ("powerpc: Uncomment and make enable_kernel_vsx() routine available")
-Signed-off-by: Benjamin Herrenschmidt <benh@kernel.crashing.org>
-Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/kernel/process.c | 5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
-
-diff --git a/arch/powerpc/kernel/process.c b/arch/powerpc/kernel/process.c
-index b249c2fb99c8..1c141d50fbc6 100644
---- a/arch/powerpc/kernel/process.c
-+++ b/arch/powerpc/kernel/process.c
-@@ -359,7 +359,8 @@ void enable_kernel_vsx(void)
- 
- 	cpumsr = msr_check_and_set(MSR_FP|MSR_VEC|MSR_VSX);
- 
--	if (current->thread.regs && (current->thread.regs->msr & MSR_VSX)) {
-+	if (current->thread.regs &&
-+	    (current->thread.regs->msr & (MSR_VSX|MSR_VEC|MSR_FP))) {
- 		check_if_tm_restore_required(current);
- 		/*
- 		 * If a thread has already been reclaimed then the
-@@ -383,7 +384,7 @@ void flush_vsx_to_thread(struct task_struct *tsk)
- {
- 	if (tsk->thread.regs) {
- 		preempt_disable();
--		if (tsk->thread.regs->msr & MSR_VSX) {
-+		if (tsk->thread.regs->msr & (MSR_VSX|MSR_VEC|MSR_FP)) {
- 			BUG_ON(tsk != current);
- 			giveup_vsx(tsk);
- 		}
--- 
-2.28.0
-
-
-From 1581d704e97d66a03fd7727bd1a9e561aff2acc5 Mon Sep 17 00:00:00 2001
-From: Munehisa Kamata <kamatam@amazon.com>
-Date: Wed, 9 Aug 2017 15:31:40 -0700
-Subject: [PATCH 18/28] xen-blkfront: use a right index when checking requests
-
-commit b15bd8cb37598afb2963f7eb9e2de468d2d60a2f upstream.
-
-Since commit d05d7f40791c ("Merge branch 'for-4.8/core' of
-git://git.kernel.dk/linux-block") and 3fc9d690936f ("Merge branch
-'for-4.8/drivers' of git://git.kernel.dk/linux-block"), blkfront_resume()
-has been using an index for iterating ring_info to check request when
-iterating blk_shadow in an inner loop. This seems to have been
-accidentally introduced during the massive rewrite of the block layer
-macros in the commits.
-
-This may cause crash like this:
-
-[11798.057074] BUG: unable to handle kernel NULL pointer dereference at 0000000000000048
-[11798.058832] IP: [<ffffffff814411fa>] blkfront_resume+0x10a/0x610
-....
-[11798.061063] Call Trace:
-[11798.061063]  [<ffffffff8139ce93>] xenbus_dev_resume+0x53/0x140
-[11798.061063]  [<ffffffff8139ce40>] ? xenbus_dev_probe+0x150/0x150
-[11798.061063]  [<ffffffff813f359e>] dpm_run_callback+0x3e/0x110
-[11798.061063]  [<ffffffff813f3a08>] device_resume+0x88/0x190
-[11798.061063]  [<ffffffff813f4cc0>] dpm_resume+0x100/0x2d0
-[11798.061063]  [<ffffffff813f5221>] dpm_resume_end+0x11/0x20
-[11798.061063]  [<ffffffff813950a8>] do_suspend+0xe8/0x1a0
-[11798.061063]  [<ffffffff813954bd>] shutdown_handler+0xfd/0x130
-[11798.061063]  [<ffffffff8139aba0>] ? split+0x110/0x110
-[11798.061063]  [<ffffffff8139ac26>] xenwatch_thread+0x86/0x120
-[11798.061063]  [<ffffffff810b4570>] ? prepare_to_wait_event+0x110/0x110
-[11798.061063]  [<ffffffff8108fe57>] kthread+0xd7/0xf0
-[11798.061063]  [<ffffffff811da811>] ? kfree+0x121/0x170
-[11798.061063]  [<ffffffff8108fd80>] ? kthread_park+0x60/0x60
-[11798.061063]  [<ffffffff810863b0>] ?  call_usermodehelper_exec_work+0xb0/0xb0
-[11798.061063]  [<ffffffff810864ea>] ?  call_usermodehelper_exec_async+0x13a/0x140
-[11798.061063]  [<ffffffff81534a45>] ret_from_fork+0x25/0x30
-
-Use the right index in the inner loop.
-
-Fixes: d05d7f40791c ("Merge branch 'for-4.8/core' of git://git.kernel.dk/linux-block")
-Fixes: 3fc9d690936f ("Merge branch 'for-4.8/drivers' of git://git.kernel.dk/linux-block")
-Signed-off-by: Munehisa Kamata <kamatam@amazon.com>
-Reviewed-by: Thomas Friebel <friebelt@amazon.de>
-Reviewed-by: Eduardo Valentin <eduval@amazon.com>
-Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
-Cc: Juergen Gross <jgross@suse.com>
-Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
-Reviewed-by: Roger Pau Monne <roger.pau@citrix.com>
-Cc: xen-devel@lists.xenproject.org
-Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/block/xen-blkfront.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/block/xen-blkfront.c b/drivers/block/xen-blkfront.c
-index 9908597c5209..f11d62de2272 100644
---- a/drivers/block/xen-blkfront.c
-+++ b/drivers/block/xen-blkfront.c
-@@ -2112,9 +2112,9 @@ static int blkfront_resume(struct xenbus_device *dev)
- 			/*
- 			 * Get the bios in the request so we can re-queue them.
- 			 */
--			if (req_op(shadow[i].request) == REQ_OP_FLUSH ||
--			    req_op(shadow[i].request) == REQ_OP_DISCARD ||
--			    req_op(shadow[i].request) == REQ_OP_SECURE_ERASE ||
-+			if (req_op(shadow[j].request) == REQ_OP_FLUSH ||
-+			    req_op(shadow[j].request) == REQ_OP_DISCARD ||
-+			    req_op(shadow[j].request) == REQ_OP_SECURE_ERASE ||
- 			    shadow[j].request->cmd_flags & REQ_FUA) {
- 				/*
- 				 * Flush operations don't contain bios, so
--- 
-2.28.0
-
-
-From 10d5bf2f6928e3d333cbf82d970d4a057686f9f9 Mon Sep 17 00:00:00 2001
-From: Andy Lutomirski <luto@kernel.org>
-Date: Mon, 7 Aug 2017 19:43:13 -0700
-Subject: [PATCH 19/28] x86/asm/64: Clear AC on NMI entries
-
-commit e93c17301ac55321fc18e0f8316e924e58a83c8c upstream.
-
-This closes a hole in our SMAP implementation.
-
-This patch comes from grsecurity. Good catch!
-
-Signed-off-by: Andy Lutomirski <luto@kernel.org>
-Cc: Borislav Petkov <bp@alien8.de>
-Cc: Brian Gerst <brgerst@gmail.com>
-Cc: Denys Vlasenko <dvlasenk@redhat.com>
-Cc: H. Peter Anvin <hpa@zytor.com>
-Cc: Josh Poimboeuf <jpoimboe@redhat.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Link: http://lkml.kernel.org/r/314cc9f294e8f14ed85485727556ad4f15bb1659.1502159503.git.luto@kernel.org
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/entry/entry_64.S | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/arch/x86/entry/entry_64.S b/arch/x86/entry/entry_64.S
-index ef766a358b37..e7b0e7ff4c58 100644
---- a/arch/x86/entry/entry_64.S
-+++ b/arch/x86/entry/entry_64.S
-@@ -1215,6 +1215,8 @@ ENTRY(nmi)
- 	 * other IST entries.
- 	 */
- 
-+	ASM_CLAC
-+
- 	/* Use %rdx as our temp variable throughout */
- 	pushq	%rdx
- 
--- 
-2.28.0
-
-
-From 665d2009a4afb647b16b2fcfc0ae86a8c7daa23a Mon Sep 17 00:00:00 2001
-From: Boris Brezillon <boris.brezillon@free-electrons.com>
-Date: Tue, 4 Jul 2017 11:10:39 +0200
-Subject: [PATCH 20/28] irqchip/atmel-aic: Fix unbalanced of_node_put() in
- aic_common_irq_fixup()
-
-commit 469bcef53c546bb792aa66303933272991b7831d upstream.
-
-aic_common_irq_fixup() is calling twice of_node_put() on the same node
-thus leading to an unbalanced refcount on the root node.
-
-Signed-off-by: Boris Brezillon <boris.brezillon@free-electrons.com>
-Reported-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
-Fixes: b2f579b58e93 ("irqchip: atmel-aic: Add irq fixup infrastructure")
-Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/irqchip/irq-atmel-aic-common.c | 1 -
- 1 file changed, 1 deletion(-)
-
-diff --git a/drivers/irqchip/irq-atmel-aic-common.c b/drivers/irqchip/irq-atmel-aic-common.c
-index 28b26c80f4cf..7c5a43488d27 100644
---- a/drivers/irqchip/irq-atmel-aic-common.c
-+++ b/drivers/irqchip/irq-atmel-aic-common.c
-@@ -196,7 +196,6 @@ static void __init aic_common_irq_fixup(const struct of_device_id *matches)
- 		return;
- 
- 	match = of_match_node(matches, root);
--	of_node_put(root);
- 
- 	if (match) {
- 		void (*fixup)(struct device_node *) = match->data;
--- 
-2.28.0
-
-
-From 4691f1ca6fad3877a4887041d1ad5eb58117b4a2 Mon Sep 17 00:00:00 2001
-From: Boris Brezillon <boris.brezillon@free-electrons.com>
-Date: Tue, 4 Jul 2017 11:10:40 +0200
-Subject: [PATCH 21/28] irqchip/atmel-aic: Fix unbalanced refcount in
- aic_common_rtc_irq_fixup()
-
-commit 277867ade8262583f4280cadbe90e0031a3706a7 upstream.
-
-of_find_compatible_node() is calling of_node_put() on its first argument
-thus leading to an unbalanced of_node_get/put() issue if the node has not
-been retained before that.
-
-Instead of passing the root node, pass NULL, which does exactly the same:
-iterate over all DT nodes, starting from the root node.
-
-Signed-off-by: Boris Brezillon <boris.brezillon@free-electrons.com>
-Reported-by: Alexandre Belloni <alexandre.belloni@free-electrons.com>
-Fixes: 3d61467f9bab ("irqchip: atmel-aic: Implement RTC irq fixup")
-Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/irqchip/irq-atmel-aic-common.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/irqchip/irq-atmel-aic-common.c b/drivers/irqchip/irq-atmel-aic-common.c
-index 7c5a43488d27..056507099725 100644
---- a/drivers/irqchip/irq-atmel-aic-common.c
-+++ b/drivers/irqchip/irq-atmel-aic-common.c
-@@ -142,9 +142,9 @@ void __init aic_common_rtc_irq_fixup(struct device_node *root)
- 	struct device_node *np;
- 	void __iomem *regs;
- 
--	np = of_find_compatible_node(root, NULL, "atmel,at91rm9200-rtc");
-+	np = of_find_compatible_node(NULL, NULL, "atmel,at91rm9200-rtc");
- 	if (!np)
--		np = of_find_compatible_node(root, NULL,
-+		np = of_find_compatible_node(NULL, NULL,
- 					     "atmel,at91sam9x5-rtc");
- 
- 	if (!np)
--- 
-2.28.0
-
-
-From 762ac49ccecece82aad47bb4bd661791fafac2e5 Mon Sep 17 00:00:00 2001
-From: Marc Zyngier <marc.zyngier@arm.com>
-Date: Fri, 18 Aug 2017 10:53:45 +0100
-Subject: [PATCH 22/28] genirq: Restore trigger settings in irq_modify_status()
-
-commit e8f241893dfbbebe2813c01eac54f263e6a5e59c upstream.
-
-irq_modify_status starts by clearing the trigger settings from
-irq_data before applying the new settings, but doesn't restore them,
-leaving them to IRQ_TYPE_NONE.
-
-That's pretty confusing to the potential request_irq() that could
-follow. Instead, snapshot the settings before clearing them, and restore
-them if the irq_modify_status() invocation was not changing the trigger.
-
-Fixes: 1e2a7d78499e ("irqdomain: Don't set type when mapping an IRQ")
-Reported-and-tested-by: jeffy <jeffy.chen@rock-chips.com>
-Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Cc: Jon Hunter <jonathanh@nvidia.com>
-Link: http://lkml.kernel.org/r/20170818095345.12378-1-marc.zyngier@arm.com
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/irq/chip.c | 10 ++++++++--
- 1 file changed, 8 insertions(+), 2 deletions(-)
-
-diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
-index 077c87f40f4d..f30110e1b8c9 100644
---- a/kernel/irq/chip.c
-+++ b/kernel/irq/chip.c
-@@ -895,13 +895,15 @@ EXPORT_SYMBOL_GPL(irq_set_chip_and_handler_name);
- 
- void irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set)
- {
--	unsigned long flags;
-+	unsigned long flags, trigger, tmp;
- 	struct irq_desc *desc = irq_get_desc_lock(irq, &flags, 0);
- 
- 	if (!desc)
- 		return;
- 	irq_settings_clr_and_set(desc, clr, set);
- 
-+	trigger = irqd_get_trigger_type(&desc->irq_data);
-+
- 	irqd_clear(&desc->irq_data, IRQD_NO_BALANCING | IRQD_PER_CPU |
- 		   IRQD_TRIGGER_MASK | IRQD_LEVEL | IRQD_MOVE_PCNTXT);
- 	if (irq_settings_has_no_balance_set(desc))
-@@ -913,7 +915,11 @@ void irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set)
- 	if (irq_settings_is_level(desc))
- 		irqd_set(&desc->irq_data, IRQD_LEVEL);
- 
--	irqd_set(&desc->irq_data, irq_settings_get_trigger_mask(desc));
-+	tmp = irq_settings_get_trigger_mask(desc);
-+	if (tmp != IRQ_TYPE_NONE)
-+		trigger = tmp;
-+
-+	irqd_set(&desc->irq_data, trigger);
- 
- 	irq_put_desc_unlock(desc, flags);
- }
--- 
-2.28.0
-
-
-From f9497d51259faf7f6ecfed393a2a75879926b77a Mon Sep 17 00:00:00 2001
-From: Alexey Dobriyan <adobriyan@gmail.com>
-Date: Sat, 19 Aug 2017 12:57:51 +0300
-Subject: [PATCH 23/28] genirq/ipi: Fixup checks against nr_cpu_ids
-
-commit 8fbbe2d7cc478d1544f41f2271787c993c23a4f6 upstream.
-
-Valid CPU ids are [0, nr_cpu_ids-1] inclusive.
-
-Fixes: 3b8e29a82dd1 ("genirq: Implement ipi_send_mask/single()")
-Fixes: f9bce791ae2a ("genirq: Add a new function to get IPI reverse mapping")
-Signed-off-by: Alexey Dobriyan <adobriyan@gmail.com>
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Link: http://lkml.kernel.org/r/20170819095751.GB27864@avx2
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/irq/ipi.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/kernel/irq/ipi.c b/kernel/irq/ipi.c
-index 1a9abc1c8ea0..259a22aa9934 100644
---- a/kernel/irq/ipi.c
-+++ b/kernel/irq/ipi.c
-@@ -165,7 +165,7 @@ irq_hw_number_t ipi_get_hwirq(unsigned int irq, unsigned int cpu)
- 	struct irq_data *data = irq_get_irq_data(irq);
- 	struct cpumask *ipimask = data ? irq_data_get_affinity_mask(data) : NULL;
- 
--	if (!data || !ipimask || cpu > nr_cpu_ids)
-+	if (!data || !ipimask || cpu >= nr_cpu_ids)
- 		return INVALID_HWIRQ;
- 
- 	if (!cpumask_test_cpu(cpu, ipimask))
-@@ -195,7 +195,7 @@ static int ipi_send_verify(struct irq_chip *chip, struct irq_data *data,
- 	if (!chip->ipi_send_single && !chip->ipi_send_mask)
- 		return -EINVAL;
- 
--	if (cpu > nr_cpu_ids)
-+	if (cpu >= nr_cpu_ids)
- 		return -EINVAL;
- 
- 	if (dest) {
--- 
-2.28.0
-
-
-From 61332dc598c3f223678b2d7192ccf3472c544799 Mon Sep 17 00:00:00 2001
-From: Linus Torvalds <torvalds@linux-foundation.org>
-Date: Sun, 20 Aug 2017 13:26:27 -0700
-Subject: [PATCH 24/28] Sanitize 'move_pages()' permission checks
-
-commit 197e7e521384a23b9e585178f3f11c9fa08274b9 upstream.
-
-The 'move_paghes()' system call was introduced long long ago with the
-same permission checks as for sending a signal (except using
-CAP_SYS_NICE instead of CAP_SYS_KILL for the overriding capability).
-
-That turns out to not be a great choice - while the system call really
-only moves physical page allocations around (and you need other
-capabilities to do a lot of it), you can check the return value to map
-out some the virtual address choices and defeat ASLR of a binary that
-still shares your uid.
-
-So change the access checks to the more common 'ptrace_may_access()'
-model instead.
-
-This tightens the access checks for the uid, and also effectively
-changes the CAP_SYS_NICE check to CAP_SYS_PTRACE, but it's unlikely that
-anybody really _uses_ this legacy system call any more (we hav ebetter
-NUMA placement models these days), so I expect nobody to notice.
-
-Famous last words.
-
-Reported-by: Otto Ebeling <otto.ebeling@iki.fi>
-Acked-by: Eric W. Biederman <ebiederm@xmission.com>
-Cc: Willy Tarreau <w@1wt.eu>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/migrate.c | 11 +++--------
- 1 file changed, 3 insertions(+), 8 deletions(-)
-
-diff --git a/mm/migrate.c b/mm/migrate.c
-index 6850f62998cd..821623fc7091 100644
---- a/mm/migrate.c
-+++ b/mm/migrate.c
-@@ -40,6 +40,7 @@
- #include <linux/mmu_notifier.h>
- #include <linux/page_idle.h>
- #include <linux/page_owner.h>
-+#include <linux/ptrace.h>
- 
- #include <asm/tlbflush.h>
- 
-@@ -1663,7 +1664,6 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
- 		const int __user *, nodes,
- 		int __user *, status, int, flags)
- {
--	const struct cred *cred = current_cred(), *tcred;
- 	struct task_struct *task;
- 	struct mm_struct *mm;
- 	int err;
-@@ -1687,14 +1687,9 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
- 
- 	/*
- 	 * Check if this process has the right to modify the specified
--	 * process. The right exists if the process has administrative
--	 * capabilities, superuser privileges or the same
--	 * userid as the target process.
-+	 * process. Use the regular "ptrace_may_access()" checks.
- 	 */
--	tcred = __task_cred(task);
--	if (!uid_eq(cred->euid, tcred->suid) && !uid_eq(cred->euid, tcred->uid) &&
--	    !uid_eq(cred->uid,  tcred->suid) && !uid_eq(cred->uid,  tcred->uid) &&
--	    !capable(CAP_SYS_NICE)) {
-+	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)) {
- 		rcu_read_unlock();
- 		err = -EPERM;
- 		goto out;
--- 
-2.28.0
-
-
-From 322cd32623653c0f860d2fc9789fa5b7ac7b09ae Mon Sep 17 00:00:00 2001
-From: Oleg Nesterov <oleg@redhat.com>
-Date: Mon, 21 Aug 2017 17:35:02 +0200
-Subject: [PATCH 25/28] pids: make task_tgid_nr_ns() safe
-
-commit dd1c1f2f2028a7b851f701fc6a8ebe39dcb95e7c upstream.
-
-This was reported many times, and this was even mentioned in commit
-52ee2dfdd4f5 ("pids: refactor vnr/nr_ns helpers to make them safe") but
-somehow nobody bothered to fix the obvious problem: task_tgid_nr_ns() is
-not safe because task->group_leader points to nowhere after the exiting
-task passes exit_notify(), rcu_read_lock() can not help.
-
-We really need to change __unhash_process() to nullify group_leader,
-parent, and real_parent, but this needs some cleanups.  Until then we
-can turn task_tgid_nr_ns() into another user of __task_pid_nr_ns() and
-fix the problem.
-
-Reported-by: Troy Kensinger <tkensinger@google.com>
-Signed-off-by: Oleg Nesterov <oleg@redhat.com>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/pid.h   |  4 +++-
- include/linux/sched.h | 50 +++++++++++++++++++++++--------------------
- kernel/pid.c          | 11 ++++------
- 3 files changed, 34 insertions(+), 31 deletions(-)
-
 diff --git a/include/linux/pid.h b/include/linux/pid.h
 index 23705a53abba..97b745ddece5 100644
 --- a/include/linux/pid.h
@@ -1906,6 +570,87 @@ index 14f58cf06054..a4d0afc009a7 100644
  /* obsolete, do not use */
  static inline pid_t task_pgrp_nr(struct task_struct *tsk)
  {
+diff --git a/kernel/audit_watch.c b/kernel/audit_watch.c
+index 0d302a87f21b..690e1e3c59f7 100644
+--- a/kernel/audit_watch.c
++++ b/kernel/audit_watch.c
+@@ -457,13 +457,15 @@ void audit_remove_watch_rule(struct audit_krule *krule)
+ 	list_del(&krule->rlist);
+ 
+ 	if (list_empty(&watch->rules)) {
++		/*
++		 * audit_remove_watch() drops our reference to 'parent' which
++		 * can get freed. Grab our own reference to be safe.
++		 */
++		audit_get_parent(parent);
+ 		audit_remove_watch(watch);
+-
+-		if (list_empty(&parent->watches)) {
+-			audit_get_parent(parent);
++		if (list_empty(&parent->watches))
+ 			fsnotify_destroy_mark(&parent->mark, audit_watch_group);
+-			audit_put_parent(parent);
+-		}
++		audit_put_parent(parent);
+ 	}
+ }
+ 
+diff --git a/kernel/irq/chip.c b/kernel/irq/chip.c
+index 077c87f40f4d..f30110e1b8c9 100644
+--- a/kernel/irq/chip.c
++++ b/kernel/irq/chip.c
+@@ -895,13 +895,15 @@ EXPORT_SYMBOL_GPL(irq_set_chip_and_handler_name);
+ 
+ void irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set)
+ {
+-	unsigned long flags;
++	unsigned long flags, trigger, tmp;
+ 	struct irq_desc *desc = irq_get_desc_lock(irq, &flags, 0);
+ 
+ 	if (!desc)
+ 		return;
+ 	irq_settings_clr_and_set(desc, clr, set);
+ 
++	trigger = irqd_get_trigger_type(&desc->irq_data);
++
+ 	irqd_clear(&desc->irq_data, IRQD_NO_BALANCING | IRQD_PER_CPU |
+ 		   IRQD_TRIGGER_MASK | IRQD_LEVEL | IRQD_MOVE_PCNTXT);
+ 	if (irq_settings_has_no_balance_set(desc))
+@@ -913,7 +915,11 @@ void irq_modify_status(unsigned int irq, unsigned long clr, unsigned long set)
+ 	if (irq_settings_is_level(desc))
+ 		irqd_set(&desc->irq_data, IRQD_LEVEL);
+ 
+-	irqd_set(&desc->irq_data, irq_settings_get_trigger_mask(desc));
++	tmp = irq_settings_get_trigger_mask(desc);
++	if (tmp != IRQ_TYPE_NONE)
++		trigger = tmp;
++
++	irqd_set(&desc->irq_data, trigger);
+ 
+ 	irq_put_desc_unlock(desc, flags);
+ }
+diff --git a/kernel/irq/ipi.c b/kernel/irq/ipi.c
+index 1a9abc1c8ea0..259a22aa9934 100644
+--- a/kernel/irq/ipi.c
++++ b/kernel/irq/ipi.c
+@@ -165,7 +165,7 @@ irq_hw_number_t ipi_get_hwirq(unsigned int irq, unsigned int cpu)
+ 	struct irq_data *data = irq_get_irq_data(irq);
+ 	struct cpumask *ipimask = data ? irq_data_get_affinity_mask(data) : NULL;
+ 
+-	if (!data || !ipimask || cpu > nr_cpu_ids)
++	if (!data || !ipimask || cpu >= nr_cpu_ids)
+ 		return INVALID_HWIRQ;
+ 
+ 	if (!cpumask_test_cpu(cpu, ipimask))
+@@ -195,7 +195,7 @@ static int ipi_send_verify(struct irq_chip *chip, struct irq_data *data,
+ 	if (!chip->ipi_send_single && !chip->ipi_send_mask)
+ 		return -EINVAL;
+ 
+-	if (cpu > nr_cpu_ids)
++	if (cpu >= nr_cpu_ids)
+ 		return -EINVAL;
+ 
+ 	if (dest) {
 diff --git a/kernel/pid.c b/kernel/pid.c
 index f66162f2359b..693a64385d59 100644
 --- a/kernel/pid.c
@@ -1936,155 +681,348 @@ index f66162f2359b..693a64385d59 100644
  struct pid_namespace *task_active_pid_ns(struct task_struct *tsk)
  {
  	return ns_of_pid(task_pid(tsk));
--- 
-2.28.0
-
-
-From edfe57b2f44a6fa0d02a411fa61425d6b2e4f032 Mon Sep 17 00:00:00 2001
-From: Mathias Nyman <mathias.nyman@linux.intel.com>
-Date: Fri, 2 Jun 2017 16:36:26 +0300
-Subject: [PATCH 26/28] usb: optimize acpi companion search for usb port
- devices
-
-commit ed18c5fa945768a9bec994e786edbbbc7695acf6 upstream.
-
-This optimization significantly reduces xhci driver load time.
-
-In ACPI tables the acpi companion port devices are children of
-the hub device. The port devices are identified by their port number
-returned by the ACPI _ADR method.
-_ADR 0 is reserved for the root hub device.
-
-The current implementation to find a acpi companion port device
-loops through all acpi port devices under that parent hub, evaluating
-their _ADR method each time a new port device is added.
-
-for a xHC controller with 25 ports under its roothub it
-will end up invoking ACPI bytecode 625 times before all ports
-are ready, making it really slow.
-
-The _ADR values are already read and cached earler. So instead of
-running the bytecode again we can check the cached _ADR value first,
-and then fall back to the old way.
-
-As one of the more significant changes, the xhci load time on
-Intel kabylake reduced by 70%, (28ms) from
-initcall xhci_pci_init+0x0/0x49 returned 0 after 39537 usecs
-to
-initcall xhci_pci_init+0x0/0x49 returned 0 after 11270 usecs
-
-Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/core/usb-acpi.c | 26 +++++++++++++++++++++++---
- 1 file changed, 23 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/usb/core/usb-acpi.c b/drivers/usb/core/usb-acpi.c
-index 2776cfe64c09..ef9cf4a21afe 100644
---- a/drivers/usb/core/usb-acpi.c
-+++ b/drivers/usb/core/usb-acpi.c
-@@ -127,6 +127,22 @@ static enum usb_port_connect_type usb_acpi_get_connect_type(acpi_handle handle,
-  */
- #define USB_ACPI_LOCATION_VALID (1 << 31)
+diff --git a/mm/memblock.c b/mm/memblock.c
+index 68849d0ead09..ccec42c12ba8 100644
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -297,31 +297,27 @@ static void __init_memblock memblock_remove_region(struct memblock_type *type, u
+ }
  
-+static struct acpi_device *usb_acpi_find_port(struct acpi_device *parent,
-+					      int raw)
-+{
-+	struct acpi_device *adev;
+ #ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
+-
+-phys_addr_t __init_memblock get_allocated_memblock_reserved_regions_info(
+-					phys_addr_t *addr)
+-{
+-	if (memblock.reserved.regions == memblock_reserved_init_regions)
+-		return 0;
+-
+-	*addr = __pa(memblock.reserved.regions);
+-
+-	return PAGE_ALIGN(sizeof(struct memblock_region) *
+-			  memblock.reserved.max);
+-}
+-
+-phys_addr_t __init_memblock get_allocated_memblock_memory_regions_info(
+-					phys_addr_t *addr)
++/**
++ * Discard memory and reserved arrays if they were allocated
++ */
++void __init memblock_discard(void)
+ {
+-	if (memblock.memory.regions == memblock_memory_init_regions)
+-		return 0;
++	phys_addr_t addr, size;
+ 
+-	*addr = __pa(memblock.memory.regions);
++	if (memblock.reserved.regions != memblock_reserved_init_regions) {
++		addr = __pa(memblock.reserved.regions);
++		size = PAGE_ALIGN(sizeof(struct memblock_region) *
++				  memblock.reserved.max);
++		__memblock_free_late(addr, size);
++	}
+ 
+-	return PAGE_ALIGN(sizeof(struct memblock_region) *
+-			  memblock.memory.max);
++	if (memblock.memory.regions == memblock_memory_init_regions) {
++		addr = __pa(memblock.memory.regions);
++		size = PAGE_ALIGN(sizeof(struct memblock_region) *
++				  memblock.memory.max);
++		__memblock_free_late(addr, size);
++	}
+ }
+-
+ #endif
+ 
+ /**
+diff --git a/mm/memory.c b/mm/memory.c
+index 9bf3da0d0e14..d064caff9d7d 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3635,8 +3635,18 @@ int handle_mm_fault(struct vm_area_struct *vma, unsigned long address,
+ 	 * further.
+ 	 */
+ 	if (unlikely((current->flags & PF_KTHREAD) && !(ret & VM_FAULT_ERROR)
+-				&& test_bit(MMF_UNSTABLE, &vma->vm_mm->flags)))
++				&& test_bit(MMF_UNSTABLE, &vma->vm_mm->flags))) {
 +
-+	if (!parent)
++		/*
++		 * We are going to enforce SIGBUS but the PF path might have
++		 * dropped the mmap_sem already so take it again so that
++		 * we do not break expectations of all arch specific PF paths
++		 * and g-u-p
++		 */
++		if (ret & VM_FAULT_RETRY)
++			down_read(&vma->vm_mm->mmap_sem);
+ 		ret = VM_FAULT_SIGBUS;
++	}
+ 
+ 	return ret;
+ }
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index 23471526d424..a8ab5e73dc61 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -926,11 +926,6 @@ static long do_get_mempolicy(int *policy, nodemask_t *nmask,
+ 		*policy |= (pol->flags & MPOL_MODE_FLAGS);
+ 	}
+ 
+-	if (vma) {
+-		up_read(&current->mm->mmap_sem);
+-		vma = NULL;
+-	}
+-
+ 	err = 0;
+ 	if (nmask) {
+ 		if (mpol_store_user_nodemask(pol)) {
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 6850f62998cd..821623fc7091 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -40,6 +40,7 @@
+ #include <linux/mmu_notifier.h>
+ #include <linux/page_idle.h>
+ #include <linux/page_owner.h>
++#include <linux/ptrace.h>
+ 
+ #include <asm/tlbflush.h>
+ 
+@@ -1663,7 +1664,6 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
+ 		const int __user *, nodes,
+ 		int __user *, status, int, flags)
+ {
+-	const struct cred *cred = current_cred(), *tcred;
+ 	struct task_struct *task;
+ 	struct mm_struct *mm;
+ 	int err;
+@@ -1687,14 +1687,9 @@ SYSCALL_DEFINE6(move_pages, pid_t, pid, unsigned long, nr_pages,
+ 
+ 	/*
+ 	 * Check if this process has the right to modify the specified
+-	 * process. The right exists if the process has administrative
+-	 * capabilities, superuser privileges or the same
+-	 * userid as the target process.
++	 * process. Use the regular "ptrace_may_access()" checks.
+ 	 */
+-	tcred = __task_cred(task);
+-	if (!uid_eq(cred->euid, tcred->suid) && !uid_eq(cred->euid, tcred->uid) &&
+-	    !uid_eq(cred->uid,  tcred->suid) && !uid_eq(cred->uid,  tcred->uid) &&
+-	    !capable(CAP_SYS_NICE)) {
++	if (!ptrace_may_access(task, PTRACE_MODE_READ_REALCREDS)) {
+ 		rcu_read_unlock();
+ 		err = -EPERM;
+ 		goto out;
+diff --git a/mm/nobootmem.c b/mm/nobootmem.c
+index 487dad610731..ab998125f04d 100644
+--- a/mm/nobootmem.c
++++ b/mm/nobootmem.c
+@@ -146,22 +146,6 @@ static unsigned long __init free_low_memory_core_early(void)
+ 				NULL)
+ 		count += __free_memory_core(start, end);
+ 
+-#ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
+-	{
+-		phys_addr_t size;
+-
+-		/* Free memblock.reserved array if it was allocated */
+-		size = get_allocated_memblock_reserved_regions_info(&start);
+-		if (size)
+-			count += __free_memory_core(start, start + size);
+-
+-		/* Free memblock.memory array if it was allocated */
+-		size = get_allocated_memblock_memory_regions_info(&start);
+-		if (size)
+-			count += __free_memory_core(start, start + size);
+-	}
+-#endif
+-
+ 	return count;
+ }
+ 
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 9419aa4e5441..2abf8d5f0ad4 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -1587,6 +1587,10 @@ void __init page_alloc_init_late(void)
+ 	/* Reinit limits that are based on free pages after the kernel is up */
+ 	files_maxfiles_init();
+ #endif
++#ifdef CONFIG_ARCH_DISCARD_MEMBLOCK
++	/* Discard memblock private memory */
++	memblock_discard();
++#endif
+ 
+ 	for_each_populated_zone(zone)
+ 		set_zone_contiguous(zone);
+diff --git a/net/netfilter/nf_conntrack_extend.c b/net/netfilter/nf_conntrack_extend.c
+index 02bcf00c2492..008299b7f78f 100644
+--- a/net/netfilter/nf_conntrack_extend.c
++++ b/net/netfilter/nf_conntrack_extend.c
+@@ -53,7 +53,11 @@ nf_ct_ext_create(struct nf_ct_ext **ext, enum nf_ct_ext_id id,
+ 
+ 	rcu_read_lock();
+ 	t = rcu_dereference(nf_ct_ext_types[id]);
+-	BUG_ON(t == NULL);
++	if (!t) {
++		rcu_read_unlock();
 +		return NULL;
-+
-+	list_for_each_entry(adev, &parent->children, node) {
-+		if (acpi_device_adr(adev) == raw)
-+			return adev;
 +	}
 +
-+	return acpi_find_child_device(parent, raw, false);
-+}
-+
- static struct acpi_device *usb_acpi_find_companion(struct device *dev)
+ 	off = ALIGN(sizeof(struct nf_ct_ext), t->align);
+ 	len = off + t->len + var_alloc_len;
+ 	alloc_size = t->alloc_size + var_alloc_len;
+@@ -88,7 +92,10 @@ void *__nf_ct_ext_add_length(struct nf_conn *ct, enum nf_ct_ext_id id,
+ 
+ 	rcu_read_lock();
+ 	t = rcu_dereference(nf_ct_ext_types[id]);
+-	BUG_ON(t == NULL);
++	if (!t) {
++		rcu_read_unlock();
++		return NULL;
++	}
+ 
+ 	newoff = ALIGN(old->len, t->align);
+ 	newlen = newoff + t->len + var_alloc_len;
+@@ -175,6 +182,6 @@ void nf_ct_extend_unregister(struct nf_ct_ext_type *type)
+ 	RCU_INIT_POINTER(nf_ct_ext_types[type->id], NULL);
+ 	update_alloc_size(type);
+ 	mutex_unlock(&nf_ct_ext_type_mutex);
+-	rcu_barrier(); /* Wait for completion of call_rcu()'s */
++	synchronize_rcu();
+ }
+ EXPORT_SYMBOL_GPL(nf_ct_extend_unregister);
+diff --git a/sound/core/seq/seq_clientmgr.c b/sound/core/seq/seq_clientmgr.c
+index f3b1d7f50b81..67c4c68ce041 100644
+--- a/sound/core/seq/seq_clientmgr.c
++++ b/sound/core/seq/seq_clientmgr.c
+@@ -1502,16 +1502,11 @@ static int snd_seq_ioctl_unsubscribe_port(struct snd_seq_client *client,
+ static int snd_seq_ioctl_create_queue(struct snd_seq_client *client, void *arg)
  {
- 	struct usb_device *udev;
-@@ -174,8 +190,10 @@ static struct acpi_device *usb_acpi_find_companion(struct device *dev)
- 			int raw;
+ 	struct snd_seq_queue_info *info = arg;
+-	int result;
+ 	struct snd_seq_queue *q;
  
- 			raw = usb_hcd_find_raw_port_number(hcd, port1);
--			adev = acpi_find_child_device(ACPI_COMPANION(&udev->dev),
--					raw, false);
-+
-+			adev = usb_acpi_find_port(ACPI_COMPANION(&udev->dev),
-+						  raw);
-+
- 			if (!adev)
- 				return NULL;
- 		} else {
-@@ -186,7 +204,9 @@ static struct acpi_device *usb_acpi_find_companion(struct device *dev)
- 				return NULL;
+-	result = snd_seq_queue_alloc(client->number, info->locked, info->flags);
+-	if (result < 0)
+-		return result;
+-
+-	q = queueptr(result);
+-	if (q == NULL)
+-		return -EINVAL;
++	q = snd_seq_queue_alloc(client->number, info->locked, info->flags);
++	if (IS_ERR(q))
++		return PTR_ERR(q);
  
- 			acpi_bus_get_device(parent_handle, &adev);
--			adev = acpi_find_child_device(adev, port1, false);
-+
-+			adev = usb_acpi_find_port(adev, port1);
-+
- 			if (!adev)
- 				return NULL;
- 		}
--- 
-2.28.0
-
-
-From 083d423b1f8abfc064a3aae14d46c28b7539656d Mon Sep 17 00:00:00 2001
-From: Hector Martin <marcan@marcan.st>
-Date: Wed, 2 Aug 2017 00:45:44 +0900
-Subject: [PATCH 27/28] usb: qmi_wwan: add D-Link DWM-222 device ID
-
-commit bed9ff165960921303a100228585f2d1691b42eb upstream.
-
-Signed-off-by: Hector Martin <marcan@marcan.st>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/usb/qmi_wwan.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/net/usb/qmi_wwan.c b/drivers/net/usb/qmi_wwan.c
-index 2f260c63c383..49a27dc46e5e 100644
---- a/drivers/net/usb/qmi_wwan.c
-+++ b/drivers/net/usb/qmi_wwan.c
-@@ -876,6 +876,7 @@ static const struct usb_device_id products[] = {
- 	{QMI_FIXED_INTF(0x19d2, 0x1428, 2)},	/* Telewell TW-LTE 4G v2 */
- 	{QMI_FIXED_INTF(0x19d2, 0x2002, 4)},	/* ZTE (Vodafone) K3765-Z */
- 	{QMI_FIXED_INTF(0x2001, 0x7e19, 4)},	/* D-Link DWM-221 B1 */
-+	{QMI_FIXED_INTF(0x2001, 0x7e35, 4)},	/* D-Link DWM-222 */
- 	{QMI_FIXED_INTF(0x0f3d, 0x68a2, 8)},    /* Sierra Wireless MC7700 */
- 	{QMI_FIXED_INTF(0x114f, 0x68a2, 8)},    /* Sierra Wireless MC7750 */
- 	{QMI_FIXED_INTF(0x1199, 0x68a2, 8)},	/* Sierra Wireless MC7710 in QMI mode */
--- 
-2.28.0
-
-
-From 4b904b22bc906d5867933b8132ae4d7f31d7645d Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Thu, 24 Aug 2017 17:12:55 -0700
-Subject: [PATCH 28/28] Linux 4.9.45
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 3e95dfdbe572..ccd6d91f616e 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 9
--SUBLEVEL = 44
-+SUBLEVEL = 45
- EXTRAVERSION =
- NAME = Roaring Lionus
+ 	info->queue = q->queue;
+ 	info->locked = q->locked;
+@@ -1521,7 +1516,7 @@ static int snd_seq_ioctl_create_queue(struct snd_seq_client *client, void *arg)
+ 	if (!info->name[0])
+ 		snprintf(info->name, sizeof(info->name), "Queue-%d", q->queue);
+ 	strlcpy(q->name, info->name, sizeof(q->name));
+-	queuefree(q);
++	snd_use_lock_free(&q->use_lock);
  
--- 
-2.28.0
-
+ 	return 0;
+ }
+diff --git a/sound/core/seq/seq_queue.c b/sound/core/seq/seq_queue.c
+index 450c5187eecb..79e0c5604ef8 100644
+--- a/sound/core/seq/seq_queue.c
++++ b/sound/core/seq/seq_queue.c
+@@ -184,22 +184,26 @@ void __exit snd_seq_queues_delete(void)
+ static void queue_use(struct snd_seq_queue *queue, int client, int use);
+ 
+ /* allocate a new queue -
+- * return queue index value or negative value for error
++ * return pointer to new queue or ERR_PTR(-errno) for error
++ * The new queue's use_lock is set to 1. It is the caller's responsibility to
++ * call snd_use_lock_free(&q->use_lock).
+  */
+-int snd_seq_queue_alloc(int client, int locked, unsigned int info_flags)
++struct snd_seq_queue *snd_seq_queue_alloc(int client, int locked, unsigned int info_flags)
+ {
+ 	struct snd_seq_queue *q;
+ 
+ 	q = queue_new(client, locked);
+ 	if (q == NULL)
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
+ 	q->info_flags = info_flags;
+ 	queue_use(q, client, 1);
++	snd_use_lock_use(&q->use_lock);
+ 	if (queue_list_add(q) < 0) {
++		snd_use_lock_free(&q->use_lock);
+ 		queue_delete(q);
+-		return -ENOMEM;
++		return ERR_PTR(-ENOMEM);
+ 	}
+-	return q->queue;
++	return q;
+ }
+ 
+ /* delete a queue - queue must be owned by the client */
+diff --git a/sound/core/seq/seq_queue.h b/sound/core/seq/seq_queue.h
+index 30c8111477f6..719093489a2c 100644
+--- a/sound/core/seq/seq_queue.h
++++ b/sound/core/seq/seq_queue.h
+@@ -71,7 +71,7 @@ void snd_seq_queues_delete(void);
+ 
+ 
+ /* create new queue (constructor) */
+-int snd_seq_queue_alloc(int client, int locked, unsigned int flags);
++struct snd_seq_queue *snd_seq_queue_alloc(int client, int locked, unsigned int flags);
+ 
+ /* delete queue (destructor) */
+ int snd_seq_queue_delete(int client, int queueid);
+diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
+index 4703caea56b2..d09c28c1deaf 100644
+--- a/sound/usb/mixer.c
++++ b/sound/usb/mixer.c
+@@ -542,6 +542,8 @@ int snd_usb_mixer_vol_tlv(struct snd_kcontrol *kcontrol, int op_flag,
+ 
+ 	if (size < sizeof(scale))
+ 		return -ENOMEM;
++	if (cval->min_mute)
++		scale[0] = SNDRV_CTL_TLVT_DB_MINMAX_MUTE;
+ 	scale[2] = cval->dBmin;
+ 	scale[3] = cval->dBmax;
+ 	if (copy_to_user(_tlv, scale, sizeof(scale)))
+diff --git a/sound/usb/mixer.h b/sound/usb/mixer.h
+index 3417ef347e40..2b4b067646ab 100644
+--- a/sound/usb/mixer.h
++++ b/sound/usb/mixer.h
+@@ -64,6 +64,7 @@ struct usb_mixer_elem_info {
+ 	int cached;
+ 	int cache_val[MAX_CHANNELS];
+ 	u8 initialized;
++	u8 min_mute;
+ 	void *private_data;
+ };
+ 
+diff --git a/sound/usb/mixer_quirks.c b/sound/usb/mixer_quirks.c
+index 04991b009132..5d2fc5f58bfe 100644
+--- a/sound/usb/mixer_quirks.c
++++ b/sound/usb/mixer_quirks.c
+@@ -1873,6 +1873,12 @@ void snd_usb_mixer_fu_apply_quirk(struct usb_mixer_interface *mixer,
+ 		if (unitid == 7 && cval->control == UAC_FU_VOLUME)
+ 			snd_dragonfly_quirk_db_scale(mixer, cval, kctl);
+ 		break;
++	/* lowest playback value is muted on C-Media devices */
++	case USB_ID(0x0d8c, 0x000c):
++	case USB_ID(0x0d8c, 0x0014):
++		if (strstr(kctl->id.name, "Playback"))
++			cval->min_mute = 1;
++		break;
+ 	}
+ }
+ 
+diff --git a/sound/usb/quirks.c b/sound/usb/quirks.c
+index eb4b9f7a571e..95c2749ac8a3 100644
+--- a/sound/usb/quirks.c
++++ b/sound/usb/quirks.c
+@@ -1142,6 +1142,7 @@ bool snd_usb_get_sample_rate_quirk(struct snd_usb_audio *chip)
+ 	case USB_ID(0x0556, 0x0014): /* Phoenix Audio TMX320VC */
+ 	case USB_ID(0x05A3, 0x9420): /* ELP HD USB Camera */
+ 	case USB_ID(0x074D, 0x3553): /* Outlaw RR2150 (Micronas UAC3553B) */
++	case USB_ID(0x1395, 0x740a): /* Sennheiser DECT */
+ 	case USB_ID(0x1901, 0x0191): /* GE B850V3 CP2114 audio interface */
+ 	case USB_ID(0x1de7, 0x0013): /* Phoenix Audio MT202exe */
+ 	case USB_ID(0x1de7, 0x0014): /* Phoenix Audio TMX320 */

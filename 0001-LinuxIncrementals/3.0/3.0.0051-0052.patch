@@ -1,28 +1,208 @@
-From a699cd395b19aa262fbffcbe79aec1c57238e489 Mon Sep 17 00:00:00 2001
-From: Felix Fietkau <nbd@openwrt.org>
-Date: Fri, 26 Oct 2012 00:31:11 +0200
-Subject: [PATCH 01/41] ath9k: fix stale pointers potentially causing access to
- free'd skbs
-
-commit 8c6e30936a7893a85f6222084f0f26aceb81137a upstream.
-
-bf->bf_next is only while buffers are chained as part of an A-MPDU
-in the tx queue. When a tid queue is flushed (e.g. on tearing down
-an aggregation session), frames can be enqueued again as normal
-transmission, without bf_next being cleared. This can lead to the
-old pointer being dereferenced again later.
-
-This patch might fix crashes and "Failed to stop TX DMA!" messages.
-
-Signed-off-by: Felix Fietkau <nbd@openwrt.org>
-Signed-off-by: John W. Linville <linville@tuxdriver.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/ath/ath9k/xmit.c | 2 ++
- 1 file changed, 2 insertions(+)
-
+diff --git a/Makefile b/Makefile
+index 9ec465b..1dbdc46 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 0
+-SUBLEVEL = 51
++SUBLEVEL = 52
+ EXTRAVERSION =
+ NAME = Sneaky Weasel
+ 
+diff --git a/drivers/gpu/drm/drm_fops.c b/drivers/gpu/drm/drm_fops.c
+index c42e12c..72fa601 100644
+--- a/drivers/gpu/drm/drm_fops.c
++++ b/drivers/gpu/drm/drm_fops.c
+@@ -135,8 +135,11 @@ int drm_open(struct inode *inode, struct file *filp)
+ 	retcode = drm_open_helper(inode, filp, dev);
+ 	if (!retcode) {
+ 		atomic_inc(&dev->counts[_DRM_STAT_OPENS]);
+-		if (!dev->open_count++)
++		if (!dev->open_count++) {
+ 			retcode = drm_setup(dev);
++			if (retcode)
++				dev->open_count--;
++		}
+ 	}
+ 	if (!retcode) {
+ 		mutex_lock(&dev->struct_mutex);
+diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
+index 47bf5e1..58b54ff 100644
+--- a/drivers/gpu/drm/i915/intel_drv.h
++++ b/drivers/gpu/drm/i915/intel_drv.h
+@@ -204,7 +204,7 @@ struct dip_infoframe {
+ 			uint16_t bottom_bar_start;
+ 			uint16_t left_bar_end;
+ 			uint16_t right_bar_start;
+-		} avi;
++		} __attribute__ ((packed)) avi;
+ 		uint8_t payload[27];
+ 	} __attribute__ ((packed)) body;
+ } __attribute__((packed));
+diff --git a/drivers/gpu/drm/i915/intel_sdvo.c b/drivers/gpu/drm/i915/intel_sdvo.c
+index c901060..d1141e8 100644
+--- a/drivers/gpu/drm/i915/intel_sdvo.c
++++ b/drivers/gpu/drm/i915/intel_sdvo.c
+@@ -861,31 +861,38 @@ static void intel_sdvo_dump_hdmi_buf(struct intel_sdvo *intel_sdvo)
+ }
+ #endif
+ 
+-static bool intel_sdvo_set_avi_infoframe(struct intel_sdvo *intel_sdvo)
++static bool intel_sdvo_write_infoframe(struct intel_sdvo *intel_sdvo,
++				       unsigned if_index, uint8_t tx_rate,
++				       uint8_t *data, unsigned length)
+ {
+-	struct dip_infoframe avi_if = {
+-		.type = DIP_TYPE_AVI,
+-		.ver = DIP_VERSION_AVI,
+-		.len = DIP_LEN_AVI,
+-	};
+-	uint8_t tx_rate = SDVO_HBUF_TX_VSYNC;
+-	uint8_t set_buf_index[2] = { 1, 0 };
+-	uint64_t *data = (uint64_t *)&avi_if;
+-	unsigned i;
+-
+-	intel_dip_infoframe_csum(&avi_if);
++	uint8_t set_buf_index[2] = { if_index, 0 };
++	uint8_t hbuf_size, tmp[8];
++	int i;
+ 
+ 	if (!intel_sdvo_set_value(intel_sdvo,
+ 				  SDVO_CMD_SET_HBUF_INDEX,
+ 				  set_buf_index, 2))
+ 		return false;
+ 
+-	for (i = 0; i < sizeof(avi_if); i += 8) {
++	if (!intel_sdvo_get_value(intel_sdvo, SDVO_CMD_GET_HBUF_INFO,
++				  &hbuf_size, 1))
++		return false;
++
++	/* Buffer size is 0 based, hooray! */
++	hbuf_size++;
++
++	DRM_DEBUG_KMS("writing sdvo hbuf: %i, hbuf_size %i, hbuf_size: %i\n",
++		      if_index, length, hbuf_size);
++
++	for (i = 0; i < hbuf_size; i += 8) {
++		memset(tmp, 0, 8);
++		if (i < length)
++			memcpy(tmp, data + i, min_t(unsigned, 8, length - i));
++
+ 		if (!intel_sdvo_set_value(intel_sdvo,
+ 					  SDVO_CMD_SET_HBUF_DATA,
+-					  data, 8))
++					  tmp, 8))
+ 			return false;
+-		data++;
+ 	}
+ 
+ 	return intel_sdvo_set_value(intel_sdvo,
+@@ -893,6 +900,28 @@ static bool intel_sdvo_set_avi_infoframe(struct intel_sdvo *intel_sdvo)
+ 				    &tx_rate, 1);
+ }
+ 
++static bool intel_sdvo_set_avi_infoframe(struct intel_sdvo *intel_sdvo)
++{
++	struct dip_infoframe avi_if = {
++		.type = DIP_TYPE_AVI,
++		.ver = DIP_VERSION_AVI,
++		.len = DIP_LEN_AVI,
++	};
++	uint8_t sdvo_data[4 + sizeof(avi_if.body.avi)];
++
++	intel_dip_infoframe_csum(&avi_if);
++
++	/* sdvo spec says that the ecc is handled by the hw, and it looks like
++	 * we must not send the ecc field, either. */
++	memcpy(sdvo_data, &avi_if, 3);
++	sdvo_data[3] = avi_if.checksum;
++	memcpy(&sdvo_data[4], &avi_if.body, sizeof(avi_if.body.avi));
++
++	return intel_sdvo_write_infoframe(intel_sdvo, SDVO_HBUF_INDEX_AVI_IF,
++					  SDVO_HBUF_TX_VSYNC,
++					  sdvo_data, sizeof(sdvo_data));
++}
++
+ static bool intel_sdvo_set_tv_format(struct intel_sdvo *intel_sdvo)
+ {
+ 	struct intel_sdvo_tv_format format;
+diff --git a/drivers/gpu/drm/i915/intel_sdvo_regs.h b/drivers/gpu/drm/i915/intel_sdvo_regs.h
+index c5c8ddf..50bebc3 100644
+--- a/drivers/gpu/drm/i915/intel_sdvo_regs.h
++++ b/drivers/gpu/drm/i915/intel_sdvo_regs.h
+@@ -708,6 +708,8 @@ struct intel_sdvo_enhancements_arg {
+ #define SDVO_CMD_SET_AUDIO_STAT		0x91
+ #define SDVO_CMD_GET_AUDIO_STAT		0x92
+ #define SDVO_CMD_SET_HBUF_INDEX		0x93
++  #define SDVO_HBUF_INDEX_ELD		0
++  #define SDVO_HBUF_INDEX_AVI_IF	1
+ #define SDVO_CMD_GET_HBUF_INDEX		0x94
+ #define SDVO_CMD_GET_HBUF_INFO		0x95
+ #define SDVO_CMD_SET_HBUF_AV_SPLIT	0x96
+diff --git a/drivers/gpu/drm/radeon/radeon_legacy_encoders.c b/drivers/gpu/drm/radeon/radeon_legacy_encoders.c
+index 3ad3cc6..8165953 100644
+--- a/drivers/gpu/drm/radeon/radeon_legacy_encoders.c
++++ b/drivers/gpu/drm/radeon/radeon_legacy_encoders.c
+@@ -650,6 +650,7 @@ static enum drm_connector_status radeon_legacy_primary_dac_detect(struct drm_enc
+ 	tmp |= RADEON_DAC_RANGE_CNTL_PS2 | RADEON_DAC_CMP_EN;
+ 	WREG32(RADEON_DAC_CNTL, tmp);
+ 
++	tmp = dac_macro_cntl;
+ 	tmp &= ~(RADEON_DAC_PDWN_R |
+ 		 RADEON_DAC_PDWN_G |
+ 		 RADEON_DAC_PDWN_B);
+diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+index 8b8c85c..55d4b29 100644
+--- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
++++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
+@@ -858,6 +858,11 @@ static void vmw_pm_complete(struct device *kdev)
+ 	struct drm_device *dev = pci_get_drvdata(pdev);
+ 	struct vmw_private *dev_priv = vmw_priv(dev);
+ 
++	mutex_lock(&dev_priv->hw_mutex);
++	vmw_write(dev_priv, SVGA_REG_ID, SVGA_ID_2);
++	(void) vmw_read(dev_priv, SVGA_REG_ID);
++	mutex_unlock(&dev_priv->hw_mutex);
++
+ 	/**
+ 	 * Reclaim 3d reference held by fbdev and potentially
+ 	 * start fifo.
+diff --git a/drivers/hwmon/w83627ehf.c b/drivers/hwmon/w83627ehf.c
+index e51b582..1198a6e 100644
+--- a/drivers/hwmon/w83627ehf.c
++++ b/drivers/hwmon/w83627ehf.c
+@@ -1834,6 +1834,7 @@ static int __devinit w83627ehf_probe(struct platform_device *pdev)
+ 	mutex_init(&data->lock);
+ 	mutex_init(&data->update_lock);
+ 	data->name = w83627ehf_device_names[sio_data->kind];
++	data->bank = 0xff;		/* Force initial bank selection */
+ 	platform_set_drvdata(pdev, data);
+ 
+ 	/* 627EHG and 627EHF have 10 voltage inputs; 627DHG and 667HG have 9 */
+diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
+index dd225fc..8063729 100644
+--- a/drivers/net/usb/usbnet.c
++++ b/drivers/net/usb/usbnet.c
+@@ -1149,6 +1149,7 @@ netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
+ 		usb_anchor_urb(urb, &dev->deferred);
+ 		/* no use to process more packets */
+ 		netif_stop_queue(net);
++		usb_put_urb(urb);
+ 		spin_unlock_irqrestore(&dev->txq.lock, flags);
+ 		netdev_dbg(dev->net, "Delaying transmission for resumption\n");
+ 		goto deferred;
+@@ -1290,6 +1291,8 @@ void usbnet_disconnect (struct usb_interface *intf)
+ 
+ 	cancel_work_sync(&dev->kevent);
+ 
++	usb_scuttle_anchored_urbs(&dev->deferred);
++
+ 	if (dev->driver_info->unbind)
+ 		dev->driver_info->unbind (dev, intf);
+ 
 diff --git a/drivers/net/wireless/ath/ath9k/xmit.c b/drivers/net/wireless/ath/ath9k/xmit.c
-index 33443bcaa8d9..6f6f1002e5db 100644
+index 33443bc..6f6f100 100644
 --- a/drivers/net/wireless/ath/ath9k/xmit.c
 +++ b/drivers/net/wireless/ath/ath9k/xmit.c
 @@ -272,6 +272,7 @@ static struct ath_buf *ath_tx_get_buffer(struct ath_softc *sc)
@@ -41,33 +221,8 @@ index 33443bcaa8d9..6f6f1002e5db 100644
  	bf->bf_lastbf = bf;
  	fi = get_frame_info(bf->bf_mpdu);
  	ath_buf_set_rate(sc, bf, fi->framelen);
--- 
-2.28.0
-
-
-From 4a7dfa5ea7f7a4736ba9425cbd343d0eb18f521f Mon Sep 17 00:00:00 2001
-From: Stanislaw Gruszka <sgruszka@redhat.com>
-Date: Thu, 25 Oct 2012 09:51:39 +0200
-Subject: [PATCH 02/41] rt2800: validate step value for temperature
- compensation
-
-commit bf7e1abe434ba9e22e8dc04a4cba4ab504b788b8 upstream.
-
-Some hardware has correct (!= 0xff) value of tssi_bounds[4] in the
-EEPROM, but step is equal to 0xff. This results on ridiculous delta
-calculations and completely broke TX power settings.
-
-Reported-and-tested-by: Pavel Lucik <pavel.lucik@gmail.com>
-Signed-off-by: Stanislaw Gruszka <sgruszka@redhat.com>
-Acked-by: Ivo van Doorn <IvDoorn@gmail.com>
-Signed-off-by: John W. Linville <linville@tuxdriver.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/rt2x00/rt2800lib.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
 diff --git a/drivers/net/wireless/rt2x00/rt2800lib.c b/drivers/net/wireless/rt2x00/rt2800lib.c
-index e6e174caec89..d44ce307e93d 100644
+index e6e174c..d44ce30 100644
 --- a/drivers/net/wireless/rt2x00/rt2800lib.c
 +++ b/drivers/net/wireless/rt2x00/rt2800lib.c
 @@ -1935,7 +1935,7 @@ static int rt2800_get_gain_calibration_delta(struct rt2x00_dev *rt2x00dev)
@@ -79,33 +234,30 @@ index e6e174caec89..d44ce307e93d 100644
  		return 0;
  
  	/*
--- 
-2.28.0
-
-
-From f100fdf3a97be683cf57802a566cfe0cce89fc7a Mon Sep 17 00:00:00 2001
-From: Roland Dreier <roland@purestorage.com>
-Date: Wed, 31 Oct 2012 09:16:44 -0700
-Subject: [PATCH 03/41] target: Don't return success from module_init() if
- setup fails
-
-commit 0d0f9dfb31e0a6c92063e235417b42df185b3275 upstream.
-
-If the call to core_dev_release_virtual_lun0() fails, then nothing
-sets ret to anything other than 0, so even though everything is
-torn down and freed, target_core_init_configfs() will seem to succeed
-and the module will be loaded.  Fix this by passing the return value
-on up the chain.
-
-Signed-off-by: Roland Dreier <roland@purestorage.com>
-Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/target/target_core_configfs.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
+diff --git a/drivers/pci/intel-iommu.c b/drivers/pci/intel-iommu.c
+index 0ec8930..0b4dbcd 100644
+--- a/drivers/pci/intel-iommu.c
++++ b/drivers/pci/intel-iommu.c
+@@ -3573,6 +3573,8 @@ static void domain_remove_one_dev_info(struct dmar_domain *domain,
+ 			found = 1;
+ 	}
+ 
++	spin_unlock_irqrestore(&device_domain_lock, flags);
++
+ 	if (found == 0) {
+ 		unsigned long tmp_flags;
+ 		spin_lock_irqsave(&domain->iommu_lock, tmp_flags);
+@@ -3589,8 +3591,6 @@ static void domain_remove_one_dev_info(struct dmar_domain *domain,
+ 			spin_unlock_irqrestore(&iommu->lock, tmp_flags);
+ 		}
+ 	}
+-
+-	spin_unlock_irqrestore(&device_domain_lock, flags);
+ }
+ 
+ static void vm_domain_remove_all_dev_info(struct dmar_domain *domain)
 diff --git a/drivers/target/target_core_configfs.c b/drivers/target/target_core_configfs.c
-index 25c1f49a7d8b..26f4d5b2cbe4 100644
+index 25c1f49..26f4d5b 100644
 --- a/drivers/target/target_core_configfs.c
 +++ b/drivers/target/target_core_configfs.c
 @@ -3234,7 +3234,8 @@ static int __init target_core_init_configfs(void)
@@ -118,358 +270,65 @@ index 25c1f49a7d8b..26f4d5b2cbe4 100644
  		goto out;
  
  	return 0;
--- 
-2.28.0
-
-
-From 58bca02682d3df9975ccabae2196f6aefcfeda3d Mon Sep 17 00:00:00 2001
-From: Felix Fietkau <nbd@openwrt.org>
-Date: Wed, 17 Oct 2012 13:56:19 +0200
-Subject: [PATCH 04/41] cfg80211: fix antenna gain handling
-
-commit c4a9fafc77a5318f5ed26c509bbcddf03e18c201 upstream.
-
-No driver initializes chan->max_antenna_gain to something sensible, and
-the only place where it is being used right now is inside ath9k. This
-leads to ath9k potentially using less tx power than it can use, which can
-decrease performance/range in some rare cases.
-
-Rather than going through every single driver, this patch initializes
-chan->orig_mag in wiphy_register(), ignoring whatever value the driver
-left in there. If a driver for some reason wishes to limit it independent
-from regulatory rulesets, it can do so internally.
-
-Signed-off-by: Felix Fietkau <nbd@openwrt.org>
-Signed-off-by: Johannes Berg <johannes.berg@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/wireless/core.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
-diff --git a/net/wireless/core.c b/net/wireless/core.c
-index 498c760a1d2a..12c80ccecb2c 100644
---- a/net/wireless/core.c
-+++ b/net/wireless/core.c
-@@ -544,8 +544,7 @@ int wiphy_register(struct wiphy *wiphy)
- 		for (i = 0; i < sband->n_channels; i++) {
- 			sband->channels[i].orig_flags =
- 				sband->channels[i].flags;
--			sband->channels[i].orig_mag =
--				sband->channels[i].max_antenna_gain;
-+			sband->channels[i].orig_mag = INT_MAX;
- 			sband->channels[i].orig_mpwr =
- 				sband->channels[i].max_power;
- 			sband->channels[i].band = band;
--- 
-2.28.0
-
-
-From 4bdd5ed8d955d712e77bbabb42e9a3c4c50a47df Mon Sep 17 00:00:00 2001
-From: Johannes Berg <johannes.berg@intel.com>
-Date: Thu, 25 Oct 2012 21:51:59 +0200
-Subject: [PATCH 05/41] wireless: drop invalid mesh address extension frames
-
-commit 7dd111e8ee10cc6816669eabcad3334447673236 upstream.
-
-The mesh header can have address extension by a 4th
-or a 5th and 6th address, but never both. Drop such
-frames in 802.11 -> 802.3 conversion along with any
-frames that have the wrong extension.
-
-Reviewed-by: Javier Cardona <javier@cozybit.com>
-Signed-off-by: Johannes Berg <johannes.berg@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/wireless/util.c | 11 ++++++-----
- 1 file changed, 6 insertions(+), 5 deletions(-)
-
-diff --git a/net/wireless/util.c b/net/wireless/util.c
-index 18e22bef386d..a0004a45c179 100644
---- a/net/wireless/util.c
-+++ b/net/wireless/util.c
-@@ -298,18 +298,15 @@ EXPORT_SYMBOL(ieee80211_get_hdrlen_from_skb);
- static int ieee80211_get_mesh_hdrlen(struct ieee80211s_hdr *meshhdr)
+diff --git a/drivers/usb/serial/mos7840.c b/drivers/usb/serial/mos7840.c
+index 2d34dfd..995e56c 100644
+--- a/drivers/usb/serial/mos7840.c
++++ b/drivers/usb/serial/mos7840.c
+@@ -2586,7 +2586,6 @@ error:
+ static void mos7840_disconnect(struct usb_serial *serial)
  {
- 	int ae = meshhdr->flags & MESH_FLAGS_AE;
--	/* 7.1.3.5a.2 */
-+	/* 802.11-2012, 8.2.4.7.3 */
- 	switch (ae) {
-+	default:
- 	case 0:
- 		return 6;
- 	case MESH_FLAGS_AE_A4:
- 		return 12;
- 	case MESH_FLAGS_AE_A5_A6:
- 		return 18;
--	case (MESH_FLAGS_AE_A4 | MESH_FLAGS_AE_A5_A6):
--		return 24;
--	default:
--		return 6;
- 	}
- }
+ 	int i;
+-	unsigned long flags;
+ 	struct moschip_port *mos7840_port;
+ 	dbg("%s", " disconnect :entering..........");
  
-@@ -359,6 +356,8 @@ int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
- 			/* make sure meshdr->flags is on the linear part */
- 			if (!pskb_may_pull(skb, hdrlen + 1))
- 				return -1;
-+			if (meshdr->flags & MESH_FLAGS_AE_A4)
-+				return -1;
- 			if (meshdr->flags & MESH_FLAGS_AE_A5_A6) {
- 				skb_copy_bits(skb, hdrlen +
- 					offsetof(struct ieee80211s_hdr, eaddr1),
-@@ -383,6 +382,8 @@ int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
- 			/* make sure meshdr->flags is on the linear part */
- 			if (!pskb_may_pull(skb, hdrlen + 1))
- 				return -1;
-+			if (meshdr->flags & MESH_FLAGS_AE_A5_A6)
-+				return -1;
- 			if (meshdr->flags & MESH_FLAGS_AE_A4)
- 				skb_copy_bits(skb, hdrlen +
- 					offsetof(struct ieee80211s_hdr, eaddr1),
--- 
-2.28.0
-
-
-From 6f8acfdc74e6b117623f84de77c4822656f95c53 Mon Sep 17 00:00:00 2001
-From: Javier Cardona <javier@cozybit.com>
-Date: Thu, 25 Oct 2012 11:10:18 -0700
-Subject: [PATCH 06/41] mac80211: don't inspect Sequence Control field on
- control frames
-
-commit f7fbf70ee9db6da6033ae50d100e017ac1f26555 upstream.
-
-Per IEEE Std. 802.11-2012, Sec 8.2.4.4.1, the sequence Control field is
-not present in control frames.  We noticed this problem when processing
-Block Ack Requests.
-
-Signed-off-by: Javier Cardona <javier@cozybit.com>
-Signed-off-by: Javier Lopez <jlopex@cozybit.com>
-Signed-off-by: Johannes Berg <johannes.berg@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/mac80211/rx.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
-index 667f55905767..10437a1fa0f5 100644
---- a/net/mac80211/rx.c
-+++ b/net/mac80211/rx.c
-@@ -1352,6 +1352,10 @@ ieee80211_rx_h_defragment(struct ieee80211_rx_data *rx)
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 462a006..9515bc5 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -1100,7 +1100,7 @@ static int nfs_lookup_revalidate(struct dentry *dentry, struct nameidata *nd)
+ 	struct nfs_fattr *fattr = NULL;
+ 	int error;
  
- 	hdr = (struct ieee80211_hdr *)rx->skb->data;
- 	fc = hdr->frame_control;
-+
-+	if (ieee80211_is_ctl(fc))
-+		return RX_CONTINUE;
-+
- 	sc = le16_to_cpu(hdr->seq_ctrl);
- 	frag = sc & IEEE80211_SCTL_FRAG;
+-	if (nd->flags & LOOKUP_RCU)
++	if (nd && (nd->flags & LOOKUP_RCU))
+ 		return -ECHILD;
  
--- 
-2.28.0
-
-
-From 2dda2bb41abe27bdfab30234d56320339a411b3d Mon Sep 17 00:00:00 2001
-From: Egbert Eich <eich@suse.de>
-Date: Wed, 24 Oct 2012 18:29:49 +0200
-Subject: [PATCH 07/41] DRM/Radeon: Fix Load Detection on legacy primary DAC.
-
-commit 83325d072185899b706de2956170b246585aaec9 upstream.
-
-An uninitialized variable led to broken load detection.
-
-Signed-off-by: Egbert Eich <eich@suse.de>
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/radeon/radeon_legacy_encoders.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/gpu/drm/radeon/radeon_legacy_encoders.c b/drivers/gpu/drm/radeon/radeon_legacy_encoders.c
-index 3ad3cc62d573..816595396015 100644
---- a/drivers/gpu/drm/radeon/radeon_legacy_encoders.c
-+++ b/drivers/gpu/drm/radeon/radeon_legacy_encoders.c
-@@ -650,6 +650,7 @@ static enum drm_connector_status radeon_legacy_primary_dac_detect(struct drm_enc
- 	tmp |= RADEON_DAC_RANGE_CNTL_PS2 | RADEON_DAC_CMP_EN;
- 	WREG32(RADEON_DAC_CNTL, tmp);
+ 	parent = dget_parent(dentry);
+@@ -1498,7 +1498,7 @@ static int nfs_open_revalidate(struct dentry *dentry, struct nameidata *nd)
+ 	struct nfs_open_context *ctx;
+ 	int openflags, ret = 0;
  
-+	tmp = dac_macro_cntl;
- 	tmp &= ~(RADEON_DAC_PDWN_R |
- 		 RADEON_DAC_PDWN_G |
- 		 RADEON_DAC_PDWN_B);
--- 
-2.28.0
-
-
-From 03938ad82dcc45ecc5695ed14f7869b06b233b8d Mon Sep 17 00:00:00 2001
-From: Johannes Berg <johannes.berg@intel.com>
-Date: Fri, 26 Oct 2012 00:33:36 +0200
-Subject: [PATCH 08/41] mac80211: check management frame header length
-
-commit 4a4f1a5808c8bb0b72a4f6e5904c53fb8c9cd966 upstream.
-
-Due to pskb_may_pull() checking the skb length, all
-non-management frames are checked on input whether
-their 802.11 header is fully present. Also add that
-check for management frames and remove a check that
-is now duplicate. This prevents accessing skb data
-beyond the frame end.
-
-Signed-off-by: Johannes Berg <johannes.berg@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/mac80211/rx.c | 12 ++++++++----
- 1 file changed, 8 insertions(+), 4 deletions(-)
-
-diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
-index 10437a1fa0f5..785b6e9976ef 100644
---- a/net/mac80211/rx.c
-+++ b/net/mac80211/rx.c
-@@ -1360,7 +1360,6 @@ ieee80211_rx_h_defragment(struct ieee80211_rx_data *rx)
- 	frag = sc & IEEE80211_SCTL_FRAG;
+-	if (nd->flags & LOOKUP_RCU)
++	if (nd && (nd->flags & LOOKUP_RCU))
+ 		return -ECHILD;
  
- 	if (likely((!ieee80211_has_morefrags(fc) && frag == 0) ||
--		   (rx->skb)->len < 24 ||
- 		   is_multicast_ether_addr(hdr->addr1))) {
- 		/* not fragmented */
+ 	inode = dentry->d_inode;
+diff --git a/fs/nfs/dns_resolve.c b/fs/nfs/dns_resolve.c
+index a6e711a..ee02db5 100644
+--- a/fs/nfs/dns_resolve.c
++++ b/fs/nfs/dns_resolve.c
+@@ -213,7 +213,7 @@ static int nfs_dns_parse(struct cache_detail *cd, char *buf, int buflen)
+ {
+ 	char buf1[NFS_DNS_HOSTNAME_MAXLEN+1];
+ 	struct nfs_dns_ent key, *item;
+-	unsigned long ttl;
++	unsigned int ttl;
+ 	ssize_t len;
+ 	int ret = -EINVAL;
+ 
+@@ -236,7 +236,8 @@ static int nfs_dns_parse(struct cache_detail *cd, char *buf, int buflen)
+ 	key.namelen = len;
+ 	memset(&key.h, 0, sizeof(key.h));
+ 
+-	ttl = get_expiry(&buf);
++	if (get_uint(&buf, &ttl) < 0)
++		goto out;
+ 	if (ttl == 0)
  		goto out;
-@@ -2772,10 +2771,15 @@ static void __ieee80211_rx_handle_packet(struct ieee80211_hw *hw,
- 		     test_bit(SCAN_SW_SCANNING, &local->scanning)))
- 		status->rx_flags |= IEEE80211_RX_IN_SCAN;
- 
--	if (ieee80211_is_mgmt(fc))
--		err = skb_linearize(skb);
--	else
-+	if (ieee80211_is_mgmt(fc)) {
-+		/* drop frame if too short for header */
-+		if (skb->len < ieee80211_hdrlen(fc))
-+			err = -ENOBUFS;
-+		else
-+			err = skb_linearize(skb);
-+	} else {
- 		err = !pskb_may_pull(skb, ieee80211_hdrlen(fc));
-+	}
- 
- 	if (err) {
- 		dev_kfree_skb(skb);
--- 
-2.28.0
-
-
-From 9c750c9809ddeb36dffc376ad26e7864d4c2a259 Mon Sep 17 00:00:00 2001
-From: Antonio Quartulli <ordex@autistici.org>
-Date: Fri, 26 Oct 2012 18:54:25 +0200
-Subject: [PATCH 09/41] mac80211: fix SSID copy on IBSS JOIN
-
-commit badecb001a310408d3473b1fc2ed5aefd0bc92a9 upstream.
-
-The 'ssid' field of the cfg80211_ibss_params is a u8 pointer and
-its length is likely to be less than IEEE80211_MAX_SSID_LEN most
-of the time.
-
-This patch fixes the ssid copy in ieee80211_ibss_join() by using
-the SSID length to prevent it from reading beyond the string.
-
-Signed-off-by: Antonio Quartulli <ordex@autistici.org>
-[rewrapped commit message, small rewording]
-Signed-off-by: Johannes Berg <johannes.berg@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/mac80211/ibss.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/net/mac80211/ibss.c b/net/mac80211/ibss.c
-index 56c24cabf26d..8adcc9e93b01 100644
---- a/net/mac80211/ibss.c
-+++ b/net/mac80211/ibss.c
-@@ -940,7 +940,7 @@ int ieee80211_ibss_join(struct ieee80211_sub_if_data *sdata,
- 	sdata->u.ibss.state = IEEE80211_IBSS_MLME_SEARCH;
- 	sdata->u.ibss.ibss_join_req = jiffies;
- 
--	memcpy(sdata->u.ibss.ssid, params->ssid, IEEE80211_MAX_SSID_LEN);
-+	memcpy(sdata->u.ibss.ssid, params->ssid, params->ssid_len);
- 	sdata->u.ibss.ssid_len = params->ssid_len;
- 
- 	mutex_unlock(&sdata->u.ibss.mtx);
--- 
-2.28.0
-
-
-From e4648b149c10256dbc4d4ce5d1c052e733d224f5 Mon Sep 17 00:00:00 2001
-From: Scott Mayhew <smayhew@redhat.com>
-Date: Tue, 16 Oct 2012 13:22:19 -0400
-Subject: [PATCH 10/41] nfsv3: Make v3 mounts fail with ETIMEDOUTs instead EIO
- on mountd timeouts
-
-commit acce94e68a0f346115fd41cdc298197d2d5a59ad upstream.
-
-In very busy v3 environment, rpc.mountd can respond to the NULL
-procedure but not the MNT procedure in a timely manner causing
-the MNT procedure to time out. The problem is the mount system
-call returns EIO which causes the mount to fail, instead of
-ETIMEDOUT, which would cause the mount to be retried.
-
-This patch sets the RPC_TASK_SOFT|RPC_TASK_TIMEOUT flags to
-the rpc_call_sync() call in nfs_mount() which causes
-ETIMEDOUT to be returned on timed out connections.
-
-Signed-off-by: Steve Dickson <steved@redhat.com>
-Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/nfs/mount_clnt.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/fs/nfs/mount_clnt.c b/fs/nfs/mount_clnt.c
-index d4c2d6b7507e..3d932168333a 100644
---- a/fs/nfs/mount_clnt.c
-+++ b/fs/nfs/mount_clnt.c
-@@ -181,7 +181,7 @@ int nfs_mount(struct nfs_mount_request *info)
- 	else
- 		msg.rpc_proc = &mnt_clnt->cl_procinfo[MOUNTPROC_MNT];
- 
--	status = rpc_call_sync(mnt_clnt, &msg, 0);
-+	status = rpc_call_sync(mnt_clnt, &msg, RPC_TASK_SOFT|RPC_TASK_TIMEOUT);
- 	rpc_shutdown_client(mnt_clnt);
- 
- 	if (status < 0)
--- 
-2.28.0
-
-
-From 6fbd3cdb9365377e3d0fb5b4c86e16d71678103b Mon Sep 17 00:00:00 2001
-From: Ben Hutchings <ben@decadent.org.uk>
-Date: Sun, 21 Oct 2012 19:23:52 +0100
-Subject: [PATCH 11/41] nfs: Show original device name verbatim in
- /proc/*/mount{s,info}
-
-commit 97a54868262da1629a3e65121e65b8e8c4419d9f upstream.
-
-Since commit c7f404b ('vfs: new superblock methods to override
-/proc/*/mount{s,info}'), nfs_path() is used to generate the mounted
-device name reported back to userland.
-
-nfs_path() always generates a trailing slash when the given dentry is
-the root of an NFS mount, but userland may expect the original device
-name to be returned verbatim (as it used to be).  Make this
-canonicalisation optional and change the callers accordingly.
-
-[jrnieder@gmail.com: use flag instead of bool argument]
-Reported-and-tested-by: Chris Hiestand <chiestand@salk.edu>
-Reference: http://bugs.debian.org/669314
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
-Signed-off-by: Jonathan Nieder <jrnieder@gmail.com>
-Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/nfs/internal.h      |  5 +++--
- fs/nfs/namespace.c     | 19 ++++++++++++++-----
- fs/nfs/nfs4namespace.c |  3 ++-
- fs/nfs/super.c         |  2 +-
- 4 files changed, 20 insertions(+), 9 deletions(-)
-
+ 	key.h.expiry_time = ttl + seconds_since_boot();
 diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
-index 4f10d8188ab6..399a505e024e 100644
+index 4f10d81..399a505 100644
 --- a/fs/nfs/internal.h
 +++ b/fs/nfs/internal.h
 @@ -274,8 +274,9 @@ extern void nfs_sb_active(struct super_block *sb);
@@ -492,8 +351,21 @@ index 4f10d8188ab6..399a505e024e 100644
  }
  
  /*
+diff --git a/fs/nfs/mount_clnt.c b/fs/nfs/mount_clnt.c
+index d4c2d6b..3d93216 100644
+--- a/fs/nfs/mount_clnt.c
++++ b/fs/nfs/mount_clnt.c
+@@ -181,7 +181,7 @@ int nfs_mount(struct nfs_mount_request *info)
+ 	else
+ 		msg.rpc_proc = &mnt_clnt->cl_procinfo[MOUNTPROC_MNT];
+ 
+-	status = rpc_call_sync(mnt_clnt, &msg, 0);
++	status = rpc_call_sync(mnt_clnt, &msg, RPC_TASK_SOFT|RPC_TASK_TIMEOUT);
+ 	rpc_shutdown_client(mnt_clnt);
+ 
+ 	if (status < 0)
 diff --git a/fs/nfs/namespace.c b/fs/nfs/namespace.c
-index 1f063bacd285..d6122ef16f41 100644
+index 1f063ba..d6122ef 100644
 --- a/fs/nfs/namespace.c
 +++ b/fs/nfs/namespace.c
 @@ -37,6 +37,7 @@ static struct vfsmount *nfs_do_submount(struct dentry *dentry,
@@ -545,7 +417,7 @@ index 1f063bacd285..d6122ef16f41 100644
  	if (buflen < 0) {
  		spin_unlock(&dentry->d_lock);
 diff --git a/fs/nfs/nfs4namespace.c b/fs/nfs/nfs4namespace.c
-index bb80c49b6533..96f2b67aac30 100644
+index bb80c49..96f2b67 100644
 --- a/fs/nfs/nfs4namespace.c
 +++ b/fs/nfs/nfs4namespace.c
 @@ -57,7 +57,8 @@ Elong:
@@ -558,8 +430,20 @@ index bb80c49b6533..96f2b67aac30 100644
  	if (!IS_ERR(path)) {
  		char *colon = strchr(path, ':');
  		if (colon && colon < limit)
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index c722905..d5d5400 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -4116,6 +4116,7 @@ static void nfs4_locku_done(struct rpc_task *task, void *data)
+ 				nfs_restart_rpc(task,
+ 						 calldata->server->nfs_client);
+ 	}
++	nfs_release_seqid(calldata->arg.seqid);
+ }
+ 
+ static void nfs4_locku_prepare(struct rpc_task *task, void *data)
 diff --git a/fs/nfs/super.c b/fs/nfs/super.c
-index a1f3d6e57f08..23f02232a51d 100644
+index a1f3d6e..23f0223 100644
 --- a/fs/nfs/super.c
 +++ b/fs/nfs/super.c
 @@ -763,7 +763,7 @@ static int nfs_show_devname(struct seq_file *m, struct vfsmount *mnt)
@@ -571,62 +455,8 @@ index a1f3d6e57f08..23f02232a51d 100644
  	if (IS_ERR(devname))
  		err = PTR_ERR(devname);
  	else
--- 
-2.28.0
-
-
-From f354d0c0ca37522c2efcced954ade7cdca479a98 Mon Sep 17 00:00:00 2001
-From: Trond Myklebust <Trond.Myklebust@netapp.com>
-Date: Mon, 29 Oct 2012 18:53:23 -0400
-Subject: [PATCH 12/41] NFSv4: nfs4_locku_done must release the sequence id
-
-commit 2b1bc308f492589f7d49012ed24561534ea2be8c upstream.
-
-If the state recovery machinery is triggered by the call to
-nfs4_async_handle_error() then we can deadlock.
-
-Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/nfs/nfs4proc.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
-index c7229059a669..d5d540016de4 100644
---- a/fs/nfs/nfs4proc.c
-+++ b/fs/nfs/nfs4proc.c
-@@ -4116,6 +4116,7 @@ static void nfs4_locku_done(struct rpc_task *task, void *data)
- 				nfs_restart_rpc(task,
- 						 calldata->server->nfs_client);
- 	}
-+	nfs_release_seqid(calldata->arg.seqid);
- }
- 
- static void nfs4_locku_prepare(struct rpc_task *task, void *data)
--- 
-2.28.0
-
-
-From 110d3a25cc089af6a8b7ddee3f01e65aeb55ae49 Mon Sep 17 00:00:00 2001
-From: "J. Bruce Fields" <bfields@redhat.com>
-Date: Tue, 12 Jun 2012 16:54:16 -0400
-Subject: [PATCH 13/41] nfsd: add get_uint for u32's
-
-commit a007c4c3e943ecc054a806c259d95420a188754b upstream.
-
-I don't think there's a practical difference for the range of values
-these interfaces should see, but it would be safer to be unambiguous.
-
-Signed-off-by: J. Bruce Fields <bfields@redhat.com>
-Cc: Sasha Levin <sasha.levin@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/nfsd/export.c             |  6 +++---
- include/linux/sunrpc/cache.h | 16 ++++++++++++++++
- 2 files changed, 19 insertions(+), 3 deletions(-)
-
 diff --git a/fs/nfsd/export.c b/fs/nfsd/export.c
-index 4b470f6043ec..d7c4f02673d2 100644
+index 4b470f6..d7c4f02 100644
 --- a/fs/nfsd/export.c
 +++ b/fs/nfsd/export.c
 @@ -403,7 +403,7 @@ fsloc_parse(char **mesg, char *buf, struct nfsd4_fs_locations *fsloc)
@@ -656,8 +486,21 @@ index 4b470f6043ec..d7c4f02673d2 100644
  		if (err)
  			return err;
  		/* Only some flags are allowed to differ between flavors: */
+diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
+index b75fd67..6a5a1af 100644
+--- a/fs/xfs/xfs_log_recover.c
++++ b/fs/xfs/xfs_log_recover.c
+@@ -3512,7 +3512,7 @@ xlog_do_recovery_pass(
+ 				 *   - order is important.
+ 				 */
+ 				error = xlog_bread_offset(log, 0,
+-						bblks - split_bblks, hbp,
++						bblks - split_bblks, dbp,
+ 						offset + BBTOB(split_bblks));
+ 				if (error)
+ 					goto bread_err2;
 diff --git a/include/linux/sunrpc/cache.h b/include/linux/sunrpc/cache.h
-index 8d2eef1a8582..28c3be3edc3e 100644
+index 8d2eef1..28c3be3 100644
 --- a/include/linux/sunrpc/cache.h
 +++ b/include/linux/sunrpc/cache.h
 @@ -224,6 +224,22 @@ static inline int get_int(char **bpp, int *anint)
@@ -683,1033 +526,8 @@ index 8d2eef1a8582..28c3be3edc3e 100644
  /*
   * timestamps kept in the cache are expressed in seconds
   * since boot.  This is the best for measuring differences in
--- 
-2.28.0
-
-
-From 095a51831f6e6956b80bd5f921f412a6530f1bc2 Mon Sep 17 00:00:00 2001
-From: NeilBrown <neilb@suse.de>
-Date: Wed, 31 Oct 2012 12:16:01 +1100
-Subject: [PATCH 14/41] NFS: fix bug in legacy DNS resolver.
-
-commit 8d96b10639fb402357b75b055b1e82a65ff95050 upstream.
-
-The DNS resolver's use of the sunrpc cache involves a 'ttl' number
-(relative) rather that a timeout (absolute).  This confused me when
-I wrote
-  commit c5b29f885afe890f953f7f23424045cdad31d3e4
-     "sunrpc: use seconds since boot in expiry cache"
-
-and I managed to break it.  The effect is that any TTL is interpreted
-as 0, and nothing useful gets into the cache.
-
-This patch removes the use of get_expiry() - which really expects an
-expiry time - and uses get_uint() instead, treating the int correctly
-as a ttl.
-
-This fixes a regression that has been present since 2.6.37, causing
-certain NFS accesses in certain environments to incorrectly fail.
-
-Reported-by: Chuck Lever <chuck.lever@oracle.com>
-Tested-by: Chuck Lever <chuck.lever@oracle.com>
-Signed-off-by: NeilBrown <neilb@suse.de>
-Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/nfs/dns_resolve.c | 5 +++--
- 1 file changed, 3 insertions(+), 2 deletions(-)
-
-diff --git a/fs/nfs/dns_resolve.c b/fs/nfs/dns_resolve.c
-index a6e711ad130f..ee02db5dd43c 100644
---- a/fs/nfs/dns_resolve.c
-+++ b/fs/nfs/dns_resolve.c
-@@ -213,7 +213,7 @@ static int nfs_dns_parse(struct cache_detail *cd, char *buf, int buflen)
- {
- 	char buf1[NFS_DNS_HOSTNAME_MAXLEN+1];
- 	struct nfs_dns_ent key, *item;
--	unsigned long ttl;
-+	unsigned int ttl;
- 	ssize_t len;
- 	int ret = -EINVAL;
- 
-@@ -236,7 +236,8 @@ static int nfs_dns_parse(struct cache_detail *cd, char *buf, int buflen)
- 	key.namelen = len;
- 	memset(&key.h, 0, sizeof(key.h));
- 
--	ttl = get_expiry(&buf);
-+	if (get_uint(&buf, &ttl) < 0)
-+		goto out;
- 	if (ttl == 0)
- 		goto out;
- 	key.h.expiry_time = ttl + seconds_since_boot();
--- 
-2.28.0
-
-
-From 4d02840c82b479b4a4c316bd279e1a83649e59ed Mon Sep 17 00:00:00 2001
-From: Trond Myklebust <Trond.Myklebust@netapp.com>
-Date: Wed, 22 Aug 2012 16:08:17 -0400
-Subject: [PATCH 15/41] NFS: Fix Oopses in nfs_lookup_revalidate and
- nfs4_lookup_revalidate
-
-[Fixed upstream as part of 0b728e1911c, but that's a much larger patch,
-this is only the nfs portion backported as needed.]
-
-Fix the following Oops in 3.5.1:
-
- BUG: unable to handle kernel NULL pointer dereference at 0000000000000038
- IP: [<ffffffffa03789cd>] nfs_lookup_revalidate+0x2d/0x480 [nfs]
- PGD 337c63067 PUD 0
- Oops: 0000 [#1] SMP
- CPU 5
- Modules linked in: nfs fscache nfsd lockd nfs_acl auth_rpcgss sunrpc af_packet binfmt_misc cpufreq_conservative cpufreq_userspace cpufreq_powersave dm_mod acpi_cpufreq mperf coretemp gpio_ich kvm_intel joydev kvm ioatdma hid_generic igb lpc_ich i7core_edac edac_core ptp serio_raw dca pcspkr i2c_i801 mfd_core sg pps_core usbhid crc32c_intel microcode button autofs4 uhci_hcd ttm drm_kms_helper drm i2c_algo_bit sysimgblt sysfillrect syscopyarea ehci_hcd usbcore usb_common scsi_dh_rdac scsi_dh_emc scsi_dh_hp_sw scsi_dh_alua scsi_dh edd fan ata_piix thermal processor thermal_sys
-
- Pid: 30431, comm: java Not tainted 3.5.1-2-default #1 Supermicro X8DTT/X8DTT
- RIP: 0010:[<ffffffffa03789cd>]  [<ffffffffa03789cd>] nfs_lookup_revalidate+0x2d/0x480 [nfs]
- RSP: 0018:ffff8801b418bd38  EFLAGS: 00010292
- RAX: 00000000fffffff6 RBX: ffff88032016d800 RCX: 0000000000000020
- RDX: ffffffff00000000 RSI: 0000000000000000 RDI: ffff8801824a7b00
- RBP: ffff8801b418bdf8 R08: 7fffff0034323030 R09: fffffffff04c03ed
- R10: ffff8801824a7b00 R11: 0000000000000002 R12: ffff8801824a7b00
- R13: ffff8801824a7b00 R14: 0000000000000000 R15: ffff8803201725d0
- FS:  00002b53a46cb700(0000) GS:ffff88033fc20000(0000) knlGS:0000000000000000
- CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
- CR2: 0000000000000038 CR3: 000000020a426000 CR4: 00000000000007e0
- DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
- DR3: 0000000000000000 DR6: 00000000ffff0ff0 DR7: 0000000000000400
- Process java (pid: 30431, threadinfo ffff8801b418a000, task ffff8801b5d20600)
- Stack:
-  ffff8801b418be44 ffff88032016d800 ffff8801b418bdf8 0000000000000000
-  ffff8801824a7b00 ffff8801b418bdd7 ffff8803201725d0 ffffffff8116a9c0
-  ffff8801b5c38dc0 0000000000000007 ffff88032016d800 0000000000000000
- Call Trace:
-  [<ffffffff8116a9c0>] lookup_dcache+0x80/0xe0
-  [<ffffffff8116aa43>] __lookup_hash+0x23/0x90
-  [<ffffffff8116b4a5>] lookup_one_len+0xc5/0x100
-  [<ffffffffa03869a3>] nfs_sillyrename+0xe3/0x210 [nfs]
-  [<ffffffff8116cadf>] vfs_unlink.part.25+0x7f/0xe0
-  [<ffffffff8116f22c>] do_unlinkat+0x1ac/0x1d0
-  [<ffffffff815717b9>] system_call_fastpath+0x16/0x1b
-  [<00002b5348b5f527>] 0x2b5348b5f526
- Code: ec 38 b8 f6 ff ff ff 4c 89 64 24 18 4c 89 74 24 28 49 89 fc 48 89 5c 24 08 48 89 6c 24 10 49 89 f6 4c 89 6c 24 20 4c 89 7c 24 30 <f6> 46 38 40 0f 85 d1 00 00 00 e8 c4 c4 df e0 48 8b 58 30 49 89
- RIP  [<ffffffffa03789cd>] nfs_lookup_revalidate+0x2d/0x480 [nfs]
-  RSP <ffff8801b418bd38>
- CR2: 0000000000000038
- ---[ end trace 845113ed191985dd ]---
-
-This Oops affects 3.5 kernels and older, and is due to lookup_one_len()
-calling down to the dentry revalidation code with a NULL pointer
-to struct nameidata.
-
-It is fixed upstream by commit 0b728e1911c (stop passing nameidata *
-to ->d_revalidate())
-
-Reported-by: Richard Ems <richard.ems@cape-horn-eng.com>
-Signed-off-by: Trond Myklebust <Trond.Myklebust@netapp.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/nfs/dir.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
-index 462a00601737..9515bc57734f 100644
---- a/fs/nfs/dir.c
-+++ b/fs/nfs/dir.c
-@@ -1100,7 +1100,7 @@ static int nfs_lookup_revalidate(struct dentry *dentry, struct nameidata *nd)
- 	struct nfs_fattr *fattr = NULL;
- 	int error;
- 
--	if (nd->flags & LOOKUP_RCU)
-+	if (nd && (nd->flags & LOOKUP_RCU))
- 		return -ECHILD;
- 
- 	parent = dget_parent(dentry);
-@@ -1498,7 +1498,7 @@ static int nfs_open_revalidate(struct dentry *dentry, struct nameidata *nd)
- 	struct nfs_open_context *ctx;
- 	int openflags, ret = 0;
- 
--	if (nd->flags & LOOKUP_RCU)
-+	if (nd && (nd->flags & LOOKUP_RCU))
- 		return -ECHILD;
- 
- 	inode = dentry->d_inode;
--- 
-2.28.0
-
-
-From 356c93d57c40513a321380f274560504a0778c6b Mon Sep 17 00:00:00 2001
-From: Ilija Hadzic <ilijahadzic@gmail.com>
-Date: Mon, 29 Oct 2012 17:35:00 +0000
-Subject: [PATCH 16/41] drm: restore open_count if drm_setup fails
-
-commit 0f1cb1bd94a9c967cd4ad3de51cfdabe61eb5dcc upstream.
-
-If drm_setup (called at first open) fails, the whole
-open call has failed, so we should not keep the
-open_count incremented.
-
-Signed-off-by: Ilija Hadzic <ihadzic@research.bell-labs.com>
-Reviewed-by: Thomas Hellstrom <thellstrom@vmware.com>
-Signed-off-by: Dave Airlie <airlied@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/drm_fops.c | 5 ++++-
- 1 file changed, 4 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/gpu/drm/drm_fops.c b/drivers/gpu/drm/drm_fops.c
-index c42e12cc2ddb..72fa601d4c47 100644
---- a/drivers/gpu/drm/drm_fops.c
-+++ b/drivers/gpu/drm/drm_fops.c
-@@ -135,8 +135,11 @@ int drm_open(struct inode *inode, struct file *filp)
- 	retcode = drm_open_helper(inode, filp, dev);
- 	if (!retcode) {
- 		atomic_inc(&dev->counts[_DRM_STAT_OPENS]);
--		if (!dev->open_count++)
-+		if (!dev->open_count++) {
- 			retcode = drm_setup(dev);
-+			if (retcode)
-+				dev->open_count--;
-+		}
- 	}
- 	if (!retcode) {
- 		mutex_lock(&dev->struct_mutex);
--- 
-2.28.0
-
-
-From ec1f5bf6b3a9f42284371d41a7c998c05c49abcb Mon Sep 17 00:00:00 2001
-From: Jean Delvare <khali@linux-fr.org>
-Date: Mon, 5 Nov 2012 21:54:39 +0100
-Subject: [PATCH 17/41] hwmon: (w83627ehf) Force initial bank selection
-
-commit 3300fb4f88688029fff8dfb9ec0734f6e4cba3e7 upstream.
-
-Don't assume bank 0 is selected at device probe time. This may not be
-the case. Force bank selection at first register access to guarantee
-that we read the right registers upon driver loading.
-
-Signed-off-by: Jean Delvare <khali@linux-fr.org>
-Reviewed-by: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/hwmon/w83627ehf.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/hwmon/w83627ehf.c b/drivers/hwmon/w83627ehf.c
-index e51b582bbc58..1198a6e5e8ce 100644
---- a/drivers/hwmon/w83627ehf.c
-+++ b/drivers/hwmon/w83627ehf.c
-@@ -1834,6 +1834,7 @@ static int __devinit w83627ehf_probe(struct platform_device *pdev)
- 	mutex_init(&data->lock);
- 	mutex_init(&data->update_lock);
- 	data->name = w83627ehf_device_names[sio_data->kind];
-+	data->bank = 0xff;		/* Force initial bank selection */
- 	platform_set_drvdata(pdev, data);
- 
- 	/* 627EHG and 627EHF have 10 voltage inputs; 627DHG and 667HG have 9 */
--- 
-2.28.0
-
-
-From 61bc2855cf2e28f7ef3928c04453daa07dfffd9b Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Wed, 7 Nov 2012 12:39:51 +0100
-Subject: [PATCH 18/41] ALSA: PCM: Fix some races at disconnection
-
-commit 9b0573c07f278e9888c352aa9724035c75784ea0 upstream.
-
-Fix races at PCM disconnection:
-- while a PCM device is being opened or closed
-- while the PCM state is being changed without lock in prepare,
-  hw_params, hw_free ops
-
-Reported-by: Matthieu CASTET <matthieu.castet@parrot.com>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/pcm.c        |  7 ++++++-
- sound/core/pcm_native.c | 16 ++++++++++++----
- 2 files changed, 18 insertions(+), 5 deletions(-)
-
-diff --git a/sound/core/pcm.c b/sound/core/pcm.c
-index ee9abb2d9001..1d2561234fa3 100644
---- a/sound/core/pcm.c
-+++ b/sound/core/pcm.c
-@@ -1045,11 +1045,15 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
- 	if (list_empty(&pcm->list))
- 		goto unlock;
- 
-+	mutex_lock(&pcm->open_mutex);
- 	list_del_init(&pcm->list);
- 	for (cidx = 0; cidx < 2; cidx++)
--		for (substream = pcm->streams[cidx].substream; substream; substream = substream->next)
-+		for (substream = pcm->streams[cidx].substream; substream; substream = substream->next) {
-+			snd_pcm_stream_lock_irq(substream);
- 			if (substream->runtime)
- 				substream->runtime->status->state = SNDRV_PCM_STATE_DISCONNECTED;
-+			snd_pcm_stream_unlock_irq(substream);
-+		}
- 	list_for_each_entry(notify, &snd_pcm_notify_list, list) {
- 		notify->n_disconnect(pcm);
- 	}
-@@ -1065,6 +1069,7 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
- 		}
- 		snd_unregister_device(devtype, pcm->card, pcm->device);
- 	}
-+	mutex_unlock(&pcm->open_mutex);
-  unlock:
- 	mutex_unlock(&register_mutex);
- 	return 0;
-diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
-index 1c6be91dfb98..a6380787b7f9 100644
---- a/sound/core/pcm_native.c
-+++ b/sound/core/pcm_native.c
-@@ -368,6 +368,14 @@ static int period_to_usecs(struct snd_pcm_runtime *runtime)
- 	return usecs;
- }
- 
-+static void snd_pcm_set_state(struct snd_pcm_substream *substream, int state)
-+{
-+	snd_pcm_stream_lock_irq(substream);
-+	if (substream->runtime->status->state != SNDRV_PCM_STATE_DISCONNECTED)
-+		substream->runtime->status->state = state;
-+	snd_pcm_stream_unlock_irq(substream);
-+}
-+
- static int snd_pcm_hw_params(struct snd_pcm_substream *substream,
- 			     struct snd_pcm_hw_params *params)
- {
-@@ -451,7 +459,7 @@ static int snd_pcm_hw_params(struct snd_pcm_substream *substream,
- 		runtime->boundary *= 2;
- 
- 	snd_pcm_timer_resolution_change(substream);
--	runtime->status->state = SNDRV_PCM_STATE_SETUP;
-+	snd_pcm_set_state(substream, SNDRV_PCM_STATE_SETUP);
- 
- 	if (pm_qos_request_active(&substream->latency_pm_qos_req))
- 		pm_qos_remove_request(&substream->latency_pm_qos_req);
-@@ -463,7 +471,7 @@ static int snd_pcm_hw_params(struct snd_pcm_substream *substream,
- 	/* hardware might be unusable from this time,
- 	   so we force application to retry to set
- 	   the correct hardware parameter settings */
--	runtime->status->state = SNDRV_PCM_STATE_OPEN;
-+	snd_pcm_set_state(substream, SNDRV_PCM_STATE_OPEN);
- 	if (substream->ops->hw_free != NULL)
- 		substream->ops->hw_free(substream);
- 	return err;
-@@ -511,7 +519,7 @@ static int snd_pcm_hw_free(struct snd_pcm_substream *substream)
- 		return -EBADFD;
- 	if (substream->ops->hw_free)
- 		result = substream->ops->hw_free(substream);
--	runtime->status->state = SNDRV_PCM_STATE_OPEN;
-+	snd_pcm_set_state(substream, SNDRV_PCM_STATE_OPEN);
- 	pm_qos_remove_request(&substream->latency_pm_qos_req);
- 	return result;
- }
-@@ -1319,7 +1327,7 @@ static void snd_pcm_post_prepare(struct snd_pcm_substream *substream, int state)
- {
- 	struct snd_pcm_runtime *runtime = substream->runtime;
- 	runtime->control->appl_ptr = runtime->status->hw_ptr;
--	runtime->status->state = SNDRV_PCM_STATE_PREPARED;
-+	snd_pcm_set_state(substream, SNDRV_PCM_STATE_PREPARED);
- }
- 
- static struct action_ops snd_pcm_action_prepare = {
--- 
-2.28.0
-
-
-From ea7b69a0b6816926e85cedbe5e1b1b8d3e2e5500 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Wed, 7 Nov 2012 12:44:09 +0100
-Subject: [PATCH 19/41] ALSA: usb-audio: Fix races at disconnection
-
-commit 978520b75f0a1ce82b17e1e8186417250de6d545 upstream.
-
-Close some races at disconnection of a USB audio device by adding the
-chip->shutdown_mutex and chip->shutdown check at appropriate places.
-
-The spots to put bandaids are:
-- PCM prepare, hw_params and hw_free
-- where the usb device is accessed for communication or get speed, in
- mixer.c and others; the device speed is now cached in subs->speed
- instead of accessing to chip->dev
-
-The accesses in PCM open and close don't need the mutex protection
-because these are already handled in the core PCM disconnection code.
-
-The autosuspend/autoresume codes are still uncovered by this patch
-because of possible mutex deadlocks.  They'll be covered by the
-upcoming change to rwsem.
-
-Also the mixer codes are untouched, too.  These will be fixed in
-another patch, too.
-
-Reported-by: Matthieu CASTET <matthieu.castet@parrot.com>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/card.h  |  1 +
- sound/usb/mixer.c | 65 +++++++++++++++++++++++++++++++----------------
- sound/usb/pcm.c   | 31 +++++++++++++++++-----
- sound/usb/proc.c  |  4 +--
- sound/usb/urb.c   |  9 ++++---
- 5 files changed, 76 insertions(+), 34 deletions(-)
-
-diff --git a/sound/usb/card.h b/sound/usb/card.h
-index ae4251d5abf7..19b5b5d871dd 100644
---- a/sound/usb/card.h
-+++ b/sound/usb/card.h
-@@ -86,6 +86,7 @@ struct snd_usb_substream {
- 	struct snd_urb_ctx syncurb[SYNC_URBS];	/* sync urb table */
- 	char *syncbuf;				/* sync buffer for all sync URBs */
- 	dma_addr_t sync_dma;			/* DMA address of syncbuf */
-+	unsigned int speed;		/* USB_SPEED_XXX */
- 
- 	u64 formats;			/* format bitmasks (all or'ed) */
- 	unsigned int num_formats;		/* number of supported audio formats (list) */
-diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
-index 9363a8cb9e46..a010cde2eff5 100644
---- a/sound/usb/mixer.c
-+++ b/sound/usb/mixer.c
-@@ -287,25 +287,32 @@ static int get_ctl_value_v1(struct usb_mixer_elem_info *cval, int request, int v
- 	unsigned char buf[2];
- 	int val_len = cval->val_type >= USB_MIXER_S16 ? 2 : 1;
- 	int timeout = 10;
--	int err;
-+	int idx = 0, err;
- 
- 	err = snd_usb_autoresume(cval->mixer->chip);
- 	if (err < 0)
- 		return -EIO;
-+	mutex_lock(&chip->shutdown_mutex);
- 	while (timeout-- > 0) {
-+		if (chip->shutdown)
-+			break;
-+		idx = snd_usb_ctrl_intf(chip) | (cval->id << 8);
- 		if (snd_usb_ctl_msg(chip->dev, usb_rcvctrlpipe(chip->dev, 0), request,
- 				    USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_IN,
--				    validx, snd_usb_ctrl_intf(chip) | (cval->id << 8),
--				    buf, val_len, 100) >= val_len) {
-+				    validx, idx, buf, val_len, 100) >= val_len) {
- 			*value_ret = convert_signed_value(cval, snd_usb_combine_bytes(buf, val_len));
--			snd_usb_autosuspend(cval->mixer->chip);
--			return 0;
-+			err = 0;
-+			goto out;
- 		}
- 	}
--	snd_usb_autosuspend(cval->mixer->chip);
- 	snd_printdd(KERN_ERR "cannot get ctl value: req = %#x, wValue = %#x, wIndex = %#x, type = %d\n",
--		    request, validx, snd_usb_ctrl_intf(chip) | (cval->id << 8), cval->val_type);
--	return -EINVAL;
-+		    request, validx, idx, cval->val_type);
-+	err = -EINVAL;
-+
-+ out:
-+	mutex_unlock(&chip->shutdown_mutex);
-+	snd_usb_autosuspend(cval->mixer->chip);
-+	return err;
- }
- 
- static int get_ctl_value_v2(struct usb_mixer_elem_info *cval, int request, int validx, int *value_ret)
-@@ -313,7 +320,7 @@ static int get_ctl_value_v2(struct usb_mixer_elem_info *cval, int request, int v
- 	struct snd_usb_audio *chip = cval->mixer->chip;
- 	unsigned char buf[2 + 3*sizeof(__u16)]; /* enough space for one range */
- 	unsigned char *val;
--	int ret, size;
-+	int idx = 0, ret, size;
- 	__u8 bRequest;
- 
- 	if (request == UAC_GET_CUR) {
-@@ -330,16 +337,22 @@ static int get_ctl_value_v2(struct usb_mixer_elem_info *cval, int request, int v
- 	if (ret)
- 		goto error;
- 
--	ret = snd_usb_ctl_msg(chip->dev, usb_rcvctrlpipe(chip->dev, 0), bRequest,
-+	mutex_lock(&chip->shutdown_mutex);
-+	if (chip->shutdown)
-+		ret = -ENODEV;
-+	else {
-+		idx = snd_usb_ctrl_intf(chip) | (cval->id << 8);
-+		ret = snd_usb_ctl_msg(chip->dev, usb_rcvctrlpipe(chip->dev, 0), bRequest,
- 			      USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_IN,
--			      validx, snd_usb_ctrl_intf(chip) | (cval->id << 8),
--			      buf, size, 1000);
-+			      validx, idx, buf, size, 1000);
-+	}
-+	mutex_unlock(&chip->shutdown_mutex);
- 	snd_usb_autosuspend(chip);
- 
- 	if (ret < 0) {
- error:
- 		snd_printk(KERN_ERR "cannot get ctl value: req = %#x, wValue = %#x, wIndex = %#x, type = %d\n",
--			   request, validx, snd_usb_ctrl_intf(chip) | (cval->id << 8), cval->val_type);
-+			   request, validx, idx, cval->val_type);
- 		return ret;
- 	}
- 
-@@ -417,7 +430,7 @@ int snd_usb_mixer_set_ctl_value(struct usb_mixer_elem_info *cval,
- {
- 	struct snd_usb_audio *chip = cval->mixer->chip;
- 	unsigned char buf[2];
--	int val_len, err, timeout = 10;
-+	int idx = 0, val_len, err, timeout = 10;
- 
- 	if (cval->mixer->protocol == UAC_VERSION_1) {
- 		val_len = cval->val_type >= USB_MIXER_S16 ? 2 : 1;
-@@ -440,19 +453,27 @@ int snd_usb_mixer_set_ctl_value(struct usb_mixer_elem_info *cval,
- 	err = snd_usb_autoresume(chip);
- 	if (err < 0)
- 		return -EIO;
--	while (timeout-- > 0)
-+	mutex_lock(&chip->shutdown_mutex);
-+	while (timeout-- > 0) {
-+		if (chip->shutdown)
-+			break;
-+		idx = snd_usb_ctrl_intf(chip) | (cval->id << 8);
- 		if (snd_usb_ctl_msg(chip->dev,
- 				    usb_sndctrlpipe(chip->dev, 0), request,
- 				    USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_OUT,
--				    validx, snd_usb_ctrl_intf(chip) | (cval->id << 8),
--				    buf, val_len, 100) >= 0) {
--			snd_usb_autosuspend(chip);
--			return 0;
-+				    validx, idx, buf, val_len, 100) >= 0) {
-+			err = 0;
-+			goto out;
- 		}
--	snd_usb_autosuspend(chip);
-+	}
- 	snd_printdd(KERN_ERR "cannot set ctl value: req = %#x, wValue = %#x, wIndex = %#x, type = %d, data = %#x/%#x\n",
--		    request, validx, snd_usb_ctrl_intf(chip) | (cval->id << 8), cval->val_type, buf[0], buf[1]);
--	return -EINVAL;
-+		    request, validx, idx, cval->val_type, buf[0], buf[1]);
-+	err = -EINVAL;
-+
-+ out:
-+	mutex_unlock(&chip->shutdown_mutex);
-+	snd_usb_autosuspend(chip);
-+	return err;
- }
- 
- static int set_cur_ctl_value(struct usb_mixer_elem_info *cval, int validx, int value)
-diff --git a/sound/usb/pcm.c b/sound/usb/pcm.c
-index 506c0fa679f6..93c896769df7 100644
---- a/sound/usb/pcm.c
-+++ b/sound/usb/pcm.c
-@@ -43,6 +43,8 @@ static snd_pcm_uframes_t snd_usb_pcm_pointer(struct snd_pcm_substream *substream
- 	unsigned int hwptr_done;
- 
- 	subs = (struct snd_usb_substream *)substream->runtime->private_data;
-+	if (subs->stream->chip->shutdown)
-+		return SNDRV_PCM_POS_XRUN;
- 	spin_lock(&subs->lock);
- 	hwptr_done = subs->hwptr_done;
- 	spin_unlock(&subs->lock);
-@@ -347,8 +349,14 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
- 	changed = subs->cur_audiofmt != fmt ||
- 		subs->period_bytes != params_period_bytes(hw_params) ||
- 		subs->cur_rate != rate;
-+
-+	mutex_lock(&subs->stream->chip->shutdown_mutex);
-+	if (subs->stream->chip->shutdown) {
-+		ret = -ENODEV;
-+		goto unlock;
-+	}
- 	if ((ret = set_format(subs, fmt)) < 0)
--		return ret;
-+		goto unlock;
- 
- 	if (subs->cur_rate != rate) {
- 		struct usb_host_interface *alts;
-@@ -357,12 +365,11 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
- 		alts = &iface->altsetting[fmt->altset_idx];
- 		ret = snd_usb_init_sample_rate(subs->stream->chip, subs->interface, alts, fmt, rate);
- 		if (ret < 0)
--			return ret;
-+			goto unlock;
- 		subs->cur_rate = rate;
- 	}
- 
- 	if (changed) {
--		mutex_lock(&subs->stream->chip->shutdown_mutex);
- 		/* format changed */
- 		snd_usb_release_substream_urbs(subs, 0);
- 		/* influenced: period_bytes, channels, rate, format, */
-@@ -370,9 +377,10 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
- 						  params_rate(hw_params),
- 						  snd_pcm_format_physical_width(params_format(hw_params)) *
- 							params_channels(hw_params));
--		mutex_unlock(&subs->stream->chip->shutdown_mutex);
- 	}
- 
-+unlock:
-+	mutex_unlock(&subs->stream->chip->shutdown_mutex);
- 	return ret;
- }
- 
-@@ -403,12 +411,18 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
- {
- 	struct snd_pcm_runtime *runtime = substream->runtime;
- 	struct snd_usb_substream *subs = runtime->private_data;
-+	int ret = 0;
- 
- 	if (! subs->cur_audiofmt) {
- 		snd_printk(KERN_ERR "usbaudio: no format is specified!\n");
- 		return -ENXIO;
- 	}
- 
-+	mutex_lock(&subs->stream->chip->shutdown_mutex);
-+	if (subs->stream->chip->shutdown) {
-+		ret = -ENODEV;
-+		goto unlock;
-+	}
- 	/* some unit conversions in runtime */
- 	subs->maxframesize = bytes_to_frames(runtime, subs->maxpacksize);
- 	subs->curframesize = bytes_to_frames(runtime, subs->curpacksize);
-@@ -419,7 +433,10 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
- 	subs->phase = 0;
- 	runtime->delay = 0;
- 
--	return snd_usb_substream_prepare(subs, runtime);
-+	ret = snd_usb_substream_prepare(subs, runtime);
-+ unlock:
-+	mutex_unlock(&subs->stream->chip->shutdown_mutex);
-+	return ret;
- }
- 
- static struct snd_pcm_hardware snd_usb_hardware =
-@@ -472,7 +489,7 @@ static int hw_check_valid_format(struct snd_usb_substream *subs,
- 		return 0;
- 	}
- 	/* check whether the period time is >= the data packet interval */
--	if (snd_usb_get_speed(subs->dev) != USB_SPEED_FULL) {
-+	if (subs->speed != USB_SPEED_FULL) {
- 		ptime = 125 * (1 << fp->datainterval);
- 		if (ptime > pt->max || (ptime == pt->max && pt->openmax)) {
- 			hwc_debug("   > check: ptime %u > max %u\n", ptime, pt->max);
-@@ -748,7 +765,7 @@ static int setup_hw_info(struct snd_pcm_runtime *runtime, struct snd_usb_substre
- 		return err;
- 
- 	param_period_time_if_needed = SNDRV_PCM_HW_PARAM_PERIOD_TIME;
--	if (snd_usb_get_speed(subs->dev) == USB_SPEED_FULL)
-+	if (subs->speed == USB_SPEED_FULL)
- 		/* full speed devices have fixed data packet interval */
- 		ptmin = 1000;
- 	if (ptmin == 1000)
-diff --git a/sound/usb/proc.c b/sound/usb/proc.c
-index 961c9a250686..aef03db3870d 100644
---- a/sound/usb/proc.c
-+++ b/sound/usb/proc.c
-@@ -107,7 +107,7 @@ static void proc_dump_substream_formats(struct snd_usb_substream *subs, struct s
- 			}
- 			snd_iprintf(buffer, "\n");
- 		}
--		if (snd_usb_get_speed(subs->dev) != USB_SPEED_FULL)
-+		if (subs->speed != USB_SPEED_FULL)
- 			snd_iprintf(buffer, "    Data packet interval: %d us\n",
- 				    125 * (1 << fp->datainterval));
- 		// snd_iprintf(buffer, "    Max Packet Size = %d\n", fp->maxpacksize);
-@@ -128,7 +128,7 @@ static void proc_dump_substream_status(struct snd_usb_substream *subs, struct sn
- 		snd_iprintf(buffer, "]\n");
- 		snd_iprintf(buffer, "    Packet Size = %d\n", subs->curpacksize);
- 		snd_iprintf(buffer, "    Momentary freq = %u Hz (%#x.%04x)\n",
--			    snd_usb_get_speed(subs->dev) == USB_SPEED_FULL
-+			    subs->speed == USB_SPEED_FULL
- 			    ? get_full_speed_hz(subs->freqm)
- 			    : get_high_speed_hz(subs->freqm),
- 			    subs->freqm >> 16, subs->freqm & 0xffff);
-diff --git a/sound/usb/urb.c b/sound/usb/urb.c
-index e184349aee83..887887592a2a 100644
---- a/sound/usb/urb.c
-+++ b/sound/usb/urb.c
-@@ -147,8 +147,10 @@ void snd_usb_release_substream_urbs(struct snd_usb_substream *subs, int force)
- 	int i;
- 
- 	/* stop urbs (to be sure) */
--	deactivate_urbs(subs, force, 1);
--	wait_clear_urbs(subs);
-+	if (!subs->stream->chip->shutdown) {
-+		deactivate_urbs(subs, force, 1);
-+		wait_clear_urbs(subs);
-+	}
- 
- 	for (i = 0; i < MAX_URBS; i++)
- 		release_urb_ctx(&subs->dataurb[i]);
-@@ -870,7 +872,8 @@ void snd_usb_init_substream(struct snd_usb_stream *as,
- 	subs->dev = as->chip->dev;
- 	subs->txfr_quirk = as->chip->txfr_quirk;
- 	subs->ops = audio_urb_ops[stream];
--	if (snd_usb_get_speed(subs->dev) >= USB_SPEED_HIGH)
-+	subs->speed = snd_usb_get_speed(subs->dev);
-+	if (subs->speed >= USB_SPEED_HIGH)
- 		subs->ops.prepare_sync = prepare_capture_sync_urb_hs;
- 
- 	snd_usb_set_pcm_ops(as->pcm, stream);
--- 
-2.28.0
-
-
-From 14565776bea2c57d2f8d1cd7aeee6a0723ac2a05 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Wed, 7 Nov 2012 12:44:10 +0100
-Subject: [PATCH 20/41] ALSA: usb-audio: Use rwsem for disconnect protection
-
-commit 34f3c89fda4fba9fe689db22253ca8db2f5e6386 upstream.
-
-Replace mutex with rwsem for codec->shutdown protection so that
-concurrent accesses are allowed.
-
-Also add the protection to snd_usb_autosuspend() and
-snd_usb_autoresume(), too.
-
-Reported-by: Matthieu CASTET <matthieu.castet@parrot.com>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/card.c     | 12 ++++++++----
- sound/usb/mixer.c    | 12 ++++++------
- sound/usb/pcm.c      | 12 ++++++------
- sound/usb/usbaudio.h |  2 +-
- 4 files changed, 21 insertions(+), 17 deletions(-)
-
-diff --git a/sound/usb/card.c b/sound/usb/card.c
-index 57a8e2d0139f..144f1317e2f4 100644
---- a/sound/usb/card.c
-+++ b/sound/usb/card.c
-@@ -335,7 +335,7 @@ static int snd_usb_audio_create(struct usb_device *dev, int idx,
- 		return -ENOMEM;
- 	}
- 
--	mutex_init(&chip->shutdown_mutex);
-+	init_rwsem(&chip->shutdown_rwsem);
- 	chip->index = idx;
- 	chip->dev = dev;
- 	chip->card = card;
-@@ -555,7 +555,7 @@ static void snd_usb_audio_disconnect(struct usb_device *dev, void *ptr)
- 	chip = ptr;
- 	card = chip->card;
- 	mutex_lock(&register_mutex);
--	mutex_lock(&chip->shutdown_mutex);
-+	down_write(&chip->shutdown_rwsem);
- 	chip->shutdown = 1;
- 	chip->num_interfaces--;
- 	if (chip->num_interfaces <= 0) {
-@@ -573,11 +573,11 @@ static void snd_usb_audio_disconnect(struct usb_device *dev, void *ptr)
- 			snd_usb_mixer_disconnect(p);
- 		}
- 		usb_chip[chip->index] = NULL;
--		mutex_unlock(&chip->shutdown_mutex);
-+		up_write(&chip->shutdown_rwsem);
- 		mutex_unlock(&register_mutex);
- 		snd_card_free_when_closed(card);
- 	} else {
--		mutex_unlock(&chip->shutdown_mutex);
-+		up_write(&chip->shutdown_rwsem);
- 		mutex_unlock(&register_mutex);
- 	}
- }
-@@ -609,16 +609,20 @@ int snd_usb_autoresume(struct snd_usb_audio *chip)
- {
- 	int err = -ENODEV;
- 
-+	down_read(&chip->shutdown_rwsem);
- 	if (!chip->shutdown && !chip->probing)
- 		err = usb_autopm_get_interface(chip->pm_intf);
-+	up_read(&chip->shutdown_rwsem);
- 
- 	return err;
- }
- 
- void snd_usb_autosuspend(struct snd_usb_audio *chip)
- {
-+	down_read(&chip->shutdown_rwsem);
- 	if (!chip->shutdown && !chip->probing)
- 		usb_autopm_put_interface(chip->pm_intf);
-+	up_read(&chip->shutdown_rwsem);
- }
- 
- static int usb_audio_suspend(struct usb_interface *intf, pm_message_t message)
-diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
-index a010cde2eff5..1d369e2bd2e1 100644
---- a/sound/usb/mixer.c
-+++ b/sound/usb/mixer.c
-@@ -292,7 +292,7 @@ static int get_ctl_value_v1(struct usb_mixer_elem_info *cval, int request, int v
- 	err = snd_usb_autoresume(cval->mixer->chip);
- 	if (err < 0)
- 		return -EIO;
--	mutex_lock(&chip->shutdown_mutex);
-+	down_read(&chip->shutdown_rwsem);
- 	while (timeout-- > 0) {
- 		if (chip->shutdown)
- 			break;
-@@ -310,7 +310,7 @@ static int get_ctl_value_v1(struct usb_mixer_elem_info *cval, int request, int v
- 	err = -EINVAL;
- 
-  out:
--	mutex_unlock(&chip->shutdown_mutex);
-+	up_read(&chip->shutdown_rwsem);
- 	snd_usb_autosuspend(cval->mixer->chip);
- 	return err;
- }
-@@ -337,7 +337,7 @@ static int get_ctl_value_v2(struct usb_mixer_elem_info *cval, int request, int v
- 	if (ret)
- 		goto error;
- 
--	mutex_lock(&chip->shutdown_mutex);
-+	down_read(&chip->shutdown_rwsem);
- 	if (chip->shutdown)
- 		ret = -ENODEV;
- 	else {
-@@ -346,7 +346,7 @@ static int get_ctl_value_v2(struct usb_mixer_elem_info *cval, int request, int v
- 			      USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_IN,
- 			      validx, idx, buf, size, 1000);
- 	}
--	mutex_unlock(&chip->shutdown_mutex);
-+	up_read(&chip->shutdown_rwsem);
- 	snd_usb_autosuspend(chip);
- 
- 	if (ret < 0) {
-@@ -453,7 +453,7 @@ int snd_usb_mixer_set_ctl_value(struct usb_mixer_elem_info *cval,
- 	err = snd_usb_autoresume(chip);
- 	if (err < 0)
- 		return -EIO;
--	mutex_lock(&chip->shutdown_mutex);
-+	down_read(&chip->shutdown_rwsem);
- 	while (timeout-- > 0) {
- 		if (chip->shutdown)
- 			break;
-@@ -471,7 +471,7 @@ int snd_usb_mixer_set_ctl_value(struct usb_mixer_elem_info *cval,
- 	err = -EINVAL;
- 
-  out:
--	mutex_unlock(&chip->shutdown_mutex);
-+	up_read(&chip->shutdown_rwsem);
- 	snd_usb_autosuspend(chip);
- 	return err;
- }
-diff --git a/sound/usb/pcm.c b/sound/usb/pcm.c
-index 93c896769df7..e9c47a47b533 100644
---- a/sound/usb/pcm.c
-+++ b/sound/usb/pcm.c
-@@ -350,7 +350,7 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
- 		subs->period_bytes != params_period_bytes(hw_params) ||
- 		subs->cur_rate != rate;
- 
--	mutex_lock(&subs->stream->chip->shutdown_mutex);
-+	down_read(&subs->stream->chip->shutdown_rwsem);
- 	if (subs->stream->chip->shutdown) {
- 		ret = -ENODEV;
- 		goto unlock;
-@@ -380,7 +380,7 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
- 	}
- 
- unlock:
--	mutex_unlock(&subs->stream->chip->shutdown_mutex);
-+	up_read(&subs->stream->chip->shutdown_rwsem);
- 	return ret;
- }
- 
-@@ -396,9 +396,9 @@ static int snd_usb_hw_free(struct snd_pcm_substream *substream)
- 	subs->cur_audiofmt = NULL;
- 	subs->cur_rate = 0;
- 	subs->period_bytes = 0;
--	mutex_lock(&subs->stream->chip->shutdown_mutex);
-+	down_read(&subs->stream->chip->shutdown_rwsem);
- 	snd_usb_release_substream_urbs(subs, 0);
--	mutex_unlock(&subs->stream->chip->shutdown_mutex);
-+	up_read(&subs->stream->chip->shutdown_rwsem);
- 	return snd_pcm_lib_free_vmalloc_buffer(substream);
- }
- 
-@@ -418,7 +418,7 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
- 		return -ENXIO;
- 	}
- 
--	mutex_lock(&subs->stream->chip->shutdown_mutex);
-+	down_read(&subs->stream->chip->shutdown_rwsem);
- 	if (subs->stream->chip->shutdown) {
- 		ret = -ENODEV;
- 		goto unlock;
-@@ -435,7 +435,7 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
- 
- 	ret = snd_usb_substream_prepare(subs, runtime);
-  unlock:
--	mutex_unlock(&subs->stream->chip->shutdown_mutex);
-+	up_read(&subs->stream->chip->shutdown_rwsem);
- 	return ret;
- }
- 
-diff --git a/sound/usb/usbaudio.h b/sound/usb/usbaudio.h
-index 1e79986b5777..d4cc9af9ffef 100644
---- a/sound/usb/usbaudio.h
-+++ b/sound/usb/usbaudio.h
-@@ -36,7 +36,7 @@ struct snd_usb_audio {
- 	struct snd_card *card;
- 	struct usb_interface *pm_intf;
- 	u32 usb_id;
--	struct mutex shutdown_mutex;
-+	struct rw_semaphore shutdown_rwsem;
- 	unsigned int shutdown:1;
- 	unsigned int probing:1;
- 	unsigned int autosuspended:1;	
--- 
-2.28.0
-
-
-From fb434cc26173c2285d48d640c639493bc6a6c5f5 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Wed, 7 Nov 2012 12:44:11 +0100
-Subject: [PATCH 21/41] ALSA: usb-audio: Fix races at disconnection in
- mixer_quirks.c
-
-commit 888ea7d5ac6815ba16b3b3a20f665a92c7af6724 upstream.
-
-Similar like the previous commit, cover with chip->shutdown_rwsem
-and chip->shutdown checks.
-
-Reported-by: Matthieu CASTET <matthieu.castet@parrot.com>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/mixer_quirks.c | 37 +++++++++++++++++++++++++++++++++----
- 1 file changed, 33 insertions(+), 4 deletions(-)
-
-diff --git a/sound/usb/mixer_quirks.c b/sound/usb/mixer_quirks.c
-index 3d0f4873112b..b4c516a76ec2 100644
---- a/sound/usb/mixer_quirks.c
-+++ b/sound/usb/mixer_quirks.c
-@@ -186,6 +186,11 @@ static int snd_audigy2nx_led_put(struct snd_kcontrol *kcontrol, struct snd_ctl_e
- 	if (value > 1)
- 		return -EINVAL;
- 	changed = value != mixer->audigy2nx_leds[index];
-+	down_read(&mixer->chip->shutdown_rwsem);
-+	if (mixer->chip->shutdown) {
-+		err = -ENODEV;
-+		goto out;
-+	}
- 	if (mixer->chip->usb_id == USB_ID(0x041e, 0x3042))
- 		err = snd_usb_ctl_msg(mixer->chip->dev,
- 			      usb_sndctrlpipe(mixer->chip->dev, 0), 0x24,
-@@ -202,6 +207,8 @@ static int snd_audigy2nx_led_put(struct snd_kcontrol *kcontrol, struct snd_ctl_e
- 			      usb_sndctrlpipe(mixer->chip->dev, 0), 0x24,
- 			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_OTHER,
- 			      value, index + 2, NULL, 0, 100);
-+ out:
-+	up_read(&mixer->chip->shutdown_rwsem);
- 	if (err < 0)
- 		return err;
- 	mixer->audigy2nx_leds[index] = value;
-@@ -295,11 +302,16 @@ static void snd_audigy2nx_proc_read(struct snd_info_entry *entry,
- 
- 	for (i = 0; jacks[i].name; ++i) {
- 		snd_iprintf(buffer, "%s: ", jacks[i].name);
--		err = snd_usb_ctl_msg(mixer->chip->dev,
-+		down_read(&mixer->chip->shutdown_rwsem);
-+		if (mixer->chip->shutdown)
-+			err = 0;
-+		else
-+			err = snd_usb_ctl_msg(mixer->chip->dev,
- 				      usb_rcvctrlpipe(mixer->chip->dev, 0),
- 				      UAC_GET_MEM, USB_DIR_IN | USB_TYPE_CLASS |
- 				      USB_RECIP_INTERFACE, 0,
- 				      jacks[i].unitid << 8, buf, 3, 100);
-+		up_read(&mixer->chip->shutdown_rwsem);
- 		if (err == 3 && (buf[0] == 3 || buf[0] == 6))
- 			snd_iprintf(buffer, "%02x %02x\n", buf[1], buf[2]);
- 		else
-@@ -329,10 +341,15 @@ static int snd_xonar_u1_switch_put(struct snd_kcontrol *kcontrol,
- 	else
- 		new_status = old_status & ~0x02;
- 	changed = new_status != old_status;
--	err = snd_usb_ctl_msg(mixer->chip->dev,
-+	down_read(&mixer->chip->shutdown_rwsem);
-+	if (mixer->chip->shutdown)
-+		err = -ENODEV;
-+	else
-+		err = snd_usb_ctl_msg(mixer->chip->dev,
- 			      usb_sndctrlpipe(mixer->chip->dev, 0), 0x08,
- 			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_OTHER,
- 			      50, 0, &new_status, 1, 100);
-+	up_read(&mixer->chip->shutdown_rwsem);
- 	if (err < 0)
- 		return err;
- 	mixer->xonar_u1_status = new_status;
-@@ -371,11 +388,17 @@ static int snd_nativeinstruments_control_get(struct snd_kcontrol *kcontrol,
- 	u8 bRequest = (kcontrol->private_value >> 16) & 0xff;
- 	u16 wIndex = kcontrol->private_value & 0xffff;
- 	u8 tmp;
-+	int ret;
- 
--	int ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), bRequest,
-+	down_read(&mixer->chip->shutdown_rwsem);
-+	if (mixer->chip->shutdown)
-+		ret = -ENODEV;
-+	else
-+		ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), bRequest,
- 				  USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
- 				  0, cpu_to_le16(wIndex),
- 				  &tmp, sizeof(tmp), 1000);
-+	up_read(&mixer->chip->shutdown_rwsem);
- 
- 	if (ret < 0) {
- 		snd_printk(KERN_ERR
-@@ -396,11 +419,17 @@ static int snd_nativeinstruments_control_put(struct snd_kcontrol *kcontrol,
- 	u8 bRequest = (kcontrol->private_value >> 16) & 0xff;
- 	u16 wIndex = kcontrol->private_value & 0xffff;
- 	u16 wValue = ucontrol->value.integer.value[0];
-+	int ret;
- 
--	int ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0), bRequest,
-+	down_read(&mixer->chip->shutdown_rwsem);
-+	if (mixer->chip->shutdown)
-+		ret = -ENODEV;
-+	else
-+		ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0), bRequest,
- 				  USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
- 				  cpu_to_le16(wValue), cpu_to_le16(wIndex),
- 				  NULL, 0, 1000);
-+	up_read(&mixer->chip->shutdown_rwsem);
- 
- 	if (ret < 0) {
- 		snd_printk(KERN_ERR
--- 
-2.28.0
-
-
-From 40edba667959559aa4385a5ec047420fcfeb5f03 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Wed, 7 Nov 2012 12:44:12 +0100
-Subject: [PATCH 22/41] ALSA: Add a reference counter to card instance
-
-commit a0830dbd4e42b38aefdf3fb61ba5019a1a99ea85 upstream.
-
-For more strict protection for wild disconnections, a refcount is
-introduced to the card instance, and let it up/down when an object is
-referred via snd_lookup_*() in the open ops.
-
-The free-after-last-close check is also changed to check this refcount
-instead of the empty list, too.
-
-Reported-by: Matthieu CASTET <matthieu.castet@parrot.com>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/sound/core.h       |  3 +++
- sound/core/control.c       |  3 +++
- sound/core/hwdep.c         |  5 +++-
- sound/core/init.c          | 50 +++++++++++++++++++++++---------------
- sound/core/oss/mixer_oss.c | 10 ++++++--
- sound/core/oss/pcm_oss.c   |  2 ++
- sound/core/pcm_native.c    |  9 +++++--
- sound/core/rawmidi.c       |  6 ++++-
- sound/core/sound.c         | 11 +++++++--
- sound/core/sound_oss.c     | 10 ++++++--
- 10 files changed, 79 insertions(+), 30 deletions(-)
-
 diff --git a/include/sound/core.h b/include/sound/core.h
-index 1fa2407c966f..78c5b4e1e8e2 100644
+index 1fa2407..78c5b4e 100644
 --- a/include/sound/core.h
 +++ b/include/sound/core.h
 @@ -132,6 +132,7 @@ struct snd_card {
@@ -1736,8 +554,376 @@ index 1fa2407c966f..78c5b4e1e8e2 100644
  
  #define snd_card_set_dev(card, devptr) ((card)->dev = (devptr))
  
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 24bc59c..01b3c55 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -716,7 +716,7 @@ static int futex_lock_pi_atomic(u32 __user *uaddr, struct futex_hash_bucket *hb,
+ 				struct futex_pi_state **ps,
+ 				struct task_struct *task, int set_waiters)
+ {
+-	int lock_taken, ret, ownerdied = 0;
++	int lock_taken, ret, force_take = 0;
+ 	u32 uval, newval, curval, vpid = task_pid_vnr(task);
+ 
+ retry:
+@@ -755,17 +755,15 @@ retry:
+ 	newval = curval | FUTEX_WAITERS;
+ 
+ 	/*
+-	 * There are two cases, where a futex might have no owner (the
+-	 * owner TID is 0): OWNER_DIED. We take over the futex in this
+-	 * case. We also do an unconditional take over, when the owner
+-	 * of the futex died.
+-	 *
+-	 * This is safe as we are protected by the hash bucket lock !
++	 * Should we force take the futex? See below.
+ 	 */
+-	if (unlikely(ownerdied || !(curval & FUTEX_TID_MASK))) {
+-		/* Keep the OWNER_DIED bit */
++	if (unlikely(force_take)) {
++		/*
++		 * Keep the OWNER_DIED and the WAITERS bit and set the
++		 * new TID value.
++		 */
+ 		newval = (curval & ~FUTEX_TID_MASK) | vpid;
+-		ownerdied = 0;
++		force_take = 0;
+ 		lock_taken = 1;
+ 	}
+ 
+@@ -775,7 +773,7 @@ retry:
+ 		goto retry;
+ 
+ 	/*
+-	 * We took the lock due to owner died take over.
++	 * We took the lock due to forced take over.
+ 	 */
+ 	if (unlikely(lock_taken))
+ 		return 1;
+@@ -790,20 +788,25 @@ retry:
+ 		switch (ret) {
+ 		case -ESRCH:
+ 			/*
+-			 * No owner found for this futex. Check if the
+-			 * OWNER_DIED bit is set to figure out whether
+-			 * this is a robust futex or not.
++			 * We failed to find an owner for this
++			 * futex. So we have no pi_state to block
++			 * on. This can happen in two cases:
++			 *
++			 * 1) The owner died
++			 * 2) A stale FUTEX_WAITERS bit
++			 *
++			 * Re-read the futex value.
+ 			 */
+ 			if (get_futex_value_locked(&curval, uaddr))
+ 				return -EFAULT;
+ 
+ 			/*
+-			 * We simply start over in case of a robust
+-			 * futex. The code above will take the futex
+-			 * and return happy.
++			 * If the owner died or we have a stale
++			 * WAITERS bit the owner TID in the user space
++			 * futex is 0.
+ 			 */
+-			if (curval & FUTEX_OWNER_DIED) {
+-				ownerdied = 1;
++			if (!(curval & FUTEX_TID_MASK)) {
++				force_take = 1;
+ 				goto retry;
+ 			}
+ 		default:
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index dd3af6c..2c423b6 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -481,14 +481,12 @@ int tcp_ioctl(struct sock *sk, int cmd, unsigned long arg)
+ 			 !tp->urg_data ||
+ 			 before(tp->urg_seq, tp->copied_seq) ||
+ 			 !before(tp->urg_seq, tp->rcv_nxt)) {
+-			struct sk_buff *skb;
+ 
+ 			answ = tp->rcv_nxt - tp->copied_seq;
+ 
+-			/* Subtract 1, if FIN is in queue. */
+-			skb = skb_peek_tail(&sk->sk_receive_queue);
+-			if (answ && skb)
+-				answ -= tcp_hdr(skb)->fin;
++			/* Subtract 1, if FIN was received */
++			if (answ && sock_flag(sk, SOCK_DONE))
++				answ--;
+ 		} else
+ 			answ = tp->urg_seq - tp->copied_seq;
+ 		release_sock(sk);
+diff --git a/net/ipv4/tcp_illinois.c b/net/ipv4/tcp_illinois.c
+index 813b43a..834857f 100644
+--- a/net/ipv4/tcp_illinois.c
++++ b/net/ipv4/tcp_illinois.c
+@@ -313,11 +313,13 @@ static void tcp_illinois_info(struct sock *sk, u32 ext,
+ 			.tcpv_rttcnt = ca->cnt_rtt,
+ 			.tcpv_minrtt = ca->base_rtt,
+ 		};
+-		u64 t = ca->sum_rtt;
+ 
+-		do_div(t, ca->cnt_rtt);
+-		info.tcpv_rtt = t;
++		if (info.tcpv_rttcnt > 0) {
++			u64 t = ca->sum_rtt;
+ 
++			do_div(t, info.tcpv_rttcnt);
++			info.tcpv_rtt = t;
++		}
+ 		nla_put(skb, INET_DIAG_VEGASINFO, sizeof(info), &info);
+ 	}
+ }
+diff --git a/net/ipv6/ndisc.c b/net/ipv6/ndisc.c
+index 10a8d41..31ba78c 100644
+--- a/net/ipv6/ndisc.c
++++ b/net/ipv6/ndisc.c
+@@ -615,7 +615,7 @@ static void ndisc_send_unsol_na(struct net_device *dev)
+ {
+ 	struct inet6_dev *idev;
+ 	struct inet6_ifaddr *ifa;
+-	struct in6_addr mcaddr;
++	struct in6_addr mcaddr = IN6ADDR_LINKLOCAL_ALLNODES_INIT;
+ 
+ 	idev = in6_dev_get(dev);
+ 	if (!idev)
+@@ -623,7 +623,6 @@ static void ndisc_send_unsol_na(struct net_device *dev)
+ 
+ 	read_lock_bh(&idev->lock);
+ 	list_for_each_entry(ifa, &idev->addr_list, if_list) {
+-		addrconf_addr_solict_mult(&ifa->addr, &mcaddr);
+ 		ndisc_send_na(dev, NULL, &mcaddr, &ifa->addr,
+ 			      /*router=*/ !!idev->cnf.forwarding,
+ 			      /*solicited=*/ false, /*override=*/ true,
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 9172568..da056c8 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -171,7 +171,7 @@ static struct dst_ops ip6_dst_blackhole_ops = {
+ };
+ 
+ static const u32 ip6_template_metrics[RTAX_MAX] = {
+-	[RTAX_HOPLIMIT - 1] = 255,
++	[RTAX_HOPLIMIT - 1] = 0,
+ };
+ 
+ static struct rt6_info ip6_null_entry_template = {
+@@ -1068,7 +1068,7 @@ struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
+ 	rt->rt6i_idev     = idev;
+ 	dst_set_neighbour(&rt->dst, neigh);
+ 	atomic_set(&rt->dst.__refcnt, 1);
+-	dst_metric_set(&rt->dst, RTAX_HOPLIMIT, 255);
++	dst_metric_set(&rt->dst, RTAX_HOPLIMIT, 0);
+ 	rt->dst.output  = ip6_output;
+ 
+ 	spin_lock_bh(&icmp6_dst_lock);
+diff --git a/net/l2tp/l2tp_eth.c b/net/l2tp/l2tp_eth.c
+index 2cef50b..64164fb 100644
+--- a/net/l2tp/l2tp_eth.c
++++ b/net/l2tp/l2tp_eth.c
+@@ -269,6 +269,7 @@ static int l2tp_eth_create(struct net *net, u32 tunnel_id, u32 session_id, u32 p
+ 
+ out_del_dev:
+ 	free_netdev(dev);
++	spriv->dev = NULL;
+ out_del_session:
+ 	l2tp_session_delete(session);
+ out:
+diff --git a/net/mac80211/ibss.c b/net/mac80211/ibss.c
+index 56c24ca..8adcc9e 100644
+--- a/net/mac80211/ibss.c
++++ b/net/mac80211/ibss.c
+@@ -940,7 +940,7 @@ int ieee80211_ibss_join(struct ieee80211_sub_if_data *sdata,
+ 	sdata->u.ibss.state = IEEE80211_IBSS_MLME_SEARCH;
+ 	sdata->u.ibss.ibss_join_req = jiffies;
+ 
+-	memcpy(sdata->u.ibss.ssid, params->ssid, IEEE80211_MAX_SSID_LEN);
++	memcpy(sdata->u.ibss.ssid, params->ssid, params->ssid_len);
+ 	sdata->u.ibss.ssid_len = params->ssid_len;
+ 
+ 	mutex_unlock(&sdata->u.ibss.mtx);
+diff --git a/net/mac80211/rx.c b/net/mac80211/rx.c
+index 667f559..785b6e9 100644
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -1352,11 +1352,14 @@ ieee80211_rx_h_defragment(struct ieee80211_rx_data *rx)
+ 
+ 	hdr = (struct ieee80211_hdr *)rx->skb->data;
+ 	fc = hdr->frame_control;
++
++	if (ieee80211_is_ctl(fc))
++		return RX_CONTINUE;
++
+ 	sc = le16_to_cpu(hdr->seq_ctrl);
+ 	frag = sc & IEEE80211_SCTL_FRAG;
+ 
+ 	if (likely((!ieee80211_has_morefrags(fc) && frag == 0) ||
+-		   (rx->skb)->len < 24 ||
+ 		   is_multicast_ether_addr(hdr->addr1))) {
+ 		/* not fragmented */
+ 		goto out;
+@@ -2768,10 +2771,15 @@ static void __ieee80211_rx_handle_packet(struct ieee80211_hw *hw,
+ 		     test_bit(SCAN_SW_SCANNING, &local->scanning)))
+ 		status->rx_flags |= IEEE80211_RX_IN_SCAN;
+ 
+-	if (ieee80211_is_mgmt(fc))
+-		err = skb_linearize(skb);
+-	else
++	if (ieee80211_is_mgmt(fc)) {
++		/* drop frame if too short for header */
++		if (skb->len < ieee80211_hdrlen(fc))
++			err = -ENOBUFS;
++		else
++			err = skb_linearize(skb);
++	} else {
+ 		err = !pskb_may_pull(skb, ieee80211_hdrlen(fc));
++	}
+ 
+ 	if (err) {
+ 		dev_kfree_skb(skb);
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 16a94a3..d29c222 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -137,6 +137,8 @@ static void netlink_destroy_callback(struct netlink_callback *cb);
+ static DEFINE_RWLOCK(nl_table_lock);
+ static atomic_t nl_table_users = ATOMIC_INIT(0);
+ 
++#define nl_deref_protected(X) rcu_dereference_protected(X, lockdep_is_held(&nl_table_lock));
++
+ static ATOMIC_NOTIFIER_HEAD(netlink_chain);
+ 
+ static u32 netlink_group_mask(u32 group)
+@@ -331,6 +333,11 @@ netlink_update_listeners(struct sock *sk)
+ 	struct hlist_node *node;
+ 	unsigned long mask;
+ 	unsigned int i;
++	struct listeners *listeners;
++
++	listeners = nl_deref_protected(tbl->listeners);
++	if (!listeners)
++		return;
+ 
+ 	for (i = 0; i < NLGRPLONGS(tbl->groups); i++) {
+ 		mask = 0;
+@@ -338,7 +345,7 @@ netlink_update_listeners(struct sock *sk)
+ 			if (i < NLGRPLONGS(nlk_sk(sk)->ngroups))
+ 				mask |= nlk_sk(sk)->groups[i];
+ 		}
+-		tbl->listeners->masks[i] = mask;
++		listeners->masks[i] = mask;
+ 	}
+ 	/* this function is only called with the netlink table "grabbed", which
+ 	 * makes sure updates are visible before bind or setsockopt return. */
+@@ -519,7 +526,11 @@ static int netlink_release(struct socket *sock)
+ 	if (netlink_is_kernel(sk)) {
+ 		BUG_ON(nl_table[sk->sk_protocol].registered == 0);
+ 		if (--nl_table[sk->sk_protocol].registered == 0) {
+-			kfree(nl_table[sk->sk_protocol].listeners);
++			struct listeners *old;
++
++			old = nl_deref_protected(nl_table[sk->sk_protocol].listeners);
++			RCU_INIT_POINTER(nl_table[sk->sk_protocol].listeners, NULL);
++			kfree_rcu(old, rcu);
+ 			nl_table[sk->sk_protocol].module = NULL;
+ 			nl_table[sk->sk_protocol].registered = 0;
+ 		}
+@@ -950,7 +961,7 @@ int netlink_has_listeners(struct sock *sk, unsigned int group)
+ 	rcu_read_lock();
+ 	listeners = rcu_dereference(nl_table[sk->sk_protocol].listeners);
+ 
+-	if (group - 1 < nl_table[sk->sk_protocol].groups)
++	if (listeners && group - 1 < nl_table[sk->sk_protocol].groups)
+ 		res = test_bit(group - 1, listeners->masks);
+ 
+ 	rcu_read_unlock();
+@@ -1585,7 +1596,7 @@ int __netlink_change_ngroups(struct sock *sk, unsigned int groups)
+ 		new = kzalloc(sizeof(*new) + NLGRPSZ(groups), GFP_ATOMIC);
+ 		if (!new)
+ 			return -ENOMEM;
+-		old = rcu_dereference_raw(tbl->listeners);
++		old = nl_deref_protected(tbl->listeners);
+ 		memcpy(new->masks, old->masks, NLGRPSZ(tbl->groups));
+ 		rcu_assign_pointer(tbl->listeners, new);
+ 
+diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
+index 6e0f882..edac24a 100644
+--- a/net/sctp/sm_sideeffect.c
++++ b/net/sctp/sm_sideeffect.c
+@@ -1604,8 +1604,9 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
+ 					asoc->outqueue.outstanding_bytes;
+ 			sackh.num_gap_ack_blocks = 0;
+ 			sackh.num_dup_tsns = 0;
++			chunk->subh.sack_hdr = &sackh;
+ 			sctp_add_cmd_sf(commands, SCTP_CMD_PROCESS_SACK,
+-					SCTP_SACKH(&sackh));
++					SCTP_CHUNK(chunk));
+ 			break;
+ 
+ 		case SCTP_CMD_DISCARD_PACKET:
+diff --git a/net/wireless/core.c b/net/wireless/core.c
+index 498c760..12c80cc 100644
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -544,8 +544,7 @@ int wiphy_register(struct wiphy *wiphy)
+ 		for (i = 0; i < sband->n_channels; i++) {
+ 			sband->channels[i].orig_flags =
+ 				sband->channels[i].flags;
+-			sband->channels[i].orig_mag =
+-				sband->channels[i].max_antenna_gain;
++			sband->channels[i].orig_mag = INT_MAX;
+ 			sband->channels[i].orig_mpwr =
+ 				sband->channels[i].max_power;
+ 			sband->channels[i].band = band;
+diff --git a/net/wireless/util.c b/net/wireless/util.c
+index 18e22be..a0004a4 100644
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@ -298,18 +298,15 @@ EXPORT_SYMBOL(ieee80211_get_hdrlen_from_skb);
+ static int ieee80211_get_mesh_hdrlen(struct ieee80211s_hdr *meshhdr)
+ {
+ 	int ae = meshhdr->flags & MESH_FLAGS_AE;
+-	/* 7.1.3.5a.2 */
++	/* 802.11-2012, 8.2.4.7.3 */
+ 	switch (ae) {
++	default:
+ 	case 0:
+ 		return 6;
+ 	case MESH_FLAGS_AE_A4:
+ 		return 12;
+ 	case MESH_FLAGS_AE_A5_A6:
+ 		return 18;
+-	case (MESH_FLAGS_AE_A4 | MESH_FLAGS_AE_A5_A6):
+-		return 24;
+-	default:
+-		return 6;
+ 	}
+ }
+ 
+@@ -359,6 +356,8 @@ int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
+ 			/* make sure meshdr->flags is on the linear part */
+ 			if (!pskb_may_pull(skb, hdrlen + 1))
+ 				return -1;
++			if (meshdr->flags & MESH_FLAGS_AE_A4)
++				return -1;
+ 			if (meshdr->flags & MESH_FLAGS_AE_A5_A6) {
+ 				skb_copy_bits(skb, hdrlen +
+ 					offsetof(struct ieee80211s_hdr, eaddr1),
+@@ -383,6 +382,8 @@ int ieee80211_data_to_8023(struct sk_buff *skb, const u8 *addr,
+ 			/* make sure meshdr->flags is on the linear part */
+ 			if (!pskb_may_pull(skb, hdrlen + 1))
+ 				return -1;
++			if (meshdr->flags & MESH_FLAGS_AE_A5_A6)
++				return -1;
+ 			if (meshdr->flags & MESH_FLAGS_AE_A4)
+ 				skb_copy_bits(skb, hdrlen +
+ 					offsetof(struct ieee80211s_hdr, eaddr1),
 diff --git a/sound/core/control.c b/sound/core/control.c
-index f8c5be464510..520a556d28cc 100644
+index f8c5be4..ce46a9e 100644
 --- a/sound/core/control.c
 +++ b/sound/core/control.c
 @@ -85,6 +85,7 @@ static int snd_ctl_open(struct inode *inode, struct file *file)
@@ -1757,8 +943,17 @@ index f8c5be464510..520a556d28cc 100644
        	return err;
  }
  
+@@ -1360,6 +1363,8 @@ static ssize_t snd_ctl_read(struct file *file, char __user *buffer,
+ 			spin_unlock_irq(&ctl->read_lock);
+ 			schedule();
+ 			remove_wait_queue(&ctl->change_sleep, &wait);
++			if (ctl->card->shutdown)
++				return -ENODEV;
+ 			if (signal_pending(current))
+ 				return -ERESTARTSYS;
+ 			spin_lock_irq(&ctl->read_lock);
 diff --git a/sound/core/hwdep.c b/sound/core/hwdep.c
-index a70ee7f1ed98..dbc3556bae3d 100644
+index a70ee7f..32fb2fe 100644
 --- a/sound/core/hwdep.c
 +++ b/sound/core/hwdep.c
 @@ -99,8 +99,10 @@ static int snd_hwdep_open(struct inode *inode, struct file * file)
@@ -1773,7 +968,18 @@ index a70ee7f1ed98..dbc3556bae3d 100644
  
  	init_waitqueue_entry(&wait, current);
  	add_wait_queue(&hw->open_wait, &wait);
-@@ -147,6 +149,7 @@ static int snd_hwdep_open(struct inode *inode, struct file * file)
+@@ -128,6 +130,10 @@ static int snd_hwdep_open(struct inode *inode, struct file * file)
+ 		mutex_unlock(&hw->open_mutex);
+ 		schedule();
+ 		mutex_lock(&hw->open_mutex);
++		if (hw->card->shutdown) {
++			err = -ENODEV;
++			break;
++		}
+ 		if (signal_pending(current)) {
+ 			err = -ERESTARTSYS;
+ 			break;
+@@ -147,6 +153,7 @@ static int snd_hwdep_open(struct inode *inode, struct file * file)
  	mutex_unlock(&hw->open_mutex);
  	if (err < 0)
  		module_put(hw->card->module);
@@ -1781,8 +987,24 @@ index a70ee7f1ed98..dbc3556bae3d 100644
  	return err;
  }
  
+@@ -451,12 +458,15 @@ static int snd_hwdep_dev_disconnect(struct snd_device *device)
+ 		mutex_unlock(&register_mutex);
+ 		return -EINVAL;
+ 	}
++	mutex_lock(&hwdep->open_mutex);
++	wake_up(&hwdep->open_wait);
+ #ifdef CONFIG_SND_OSSEMUL
+ 	if (hwdep->ossreg)
+ 		snd_unregister_oss_device(hwdep->oss_type, hwdep->card, hwdep->device);
+ #endif
+ 	snd_unregister_device(SNDRV_DEVICE_TYPE_HWDEP, hwdep->card, hwdep->device);
+ 	list_del_init(&hwdep->list);
++	mutex_unlock(&hwdep->open_mutex);
+ 	mutex_unlock(&register_mutex);
+ 	return 0;
+ }
 diff --git a/sound/core/init.c b/sound/core/init.c
-index 2c041bb36ab3..4c3c589b4d21 100644
+index 2c041bb..4c3c589 100644
 --- a/sound/core/init.c
 +++ b/sound/core/init.c
 @@ -211,6 +211,7 @@ int snd_card_create(int idx, const char *xid,
@@ -1888,7 +1110,7 @@ index 2c041bb36ab3..4c3c589b4d21 100644
  }
  
 diff --git a/sound/core/oss/mixer_oss.c b/sound/core/oss/mixer_oss.c
-index d8359cfeca15..5cdd0fe7109e 100644
+index d8359cf..e7c1183 100644
 --- a/sound/core/oss/mixer_oss.c
 +++ b/sound/core/oss/mixer_oss.c
 @@ -51,14 +51,19 @@ static int snd_mixer_oss_open(struct inode *inode, struct file *file)
@@ -1913,19 +1135,41 @@ index d8359cfeca15..5cdd0fe7109e 100644
  		return -ENOMEM;
  	}
  	fmixer->card = card;
-@@ -67,6 +72,7 @@ static int snd_mixer_oss_open(struct inode *inode, struct file *file)
+@@ -67,8 +72,10 @@ static int snd_mixer_oss_open(struct inode *inode, struct file *file)
  	if (!try_module_get(card->module)) {
  		kfree(fmixer);
  		snd_card_file_remove(card, file);
 +		snd_card_unref(card);
  		return -EFAULT;
  	}
++	snd_card_unref(card);
  	return 0;
+ }
+ 
 diff --git a/sound/core/oss/pcm_oss.c b/sound/core/oss/pcm_oss.c
-index 23c34a02894b..ef6414b35ac0 100644
+index 23c34a0..725a161 100644
 --- a/sound/core/oss/pcm_oss.c
 +++ b/sound/core/oss/pcm_oss.c
-@@ -2457,6 +2457,8 @@ static int snd_pcm_oss_open(struct inode *inode, struct file *file)
+@@ -2441,6 +2441,10 @@ static int snd_pcm_oss_open(struct inode *inode, struct file *file)
+ 		mutex_unlock(&pcm->open_mutex);
+ 		schedule();
+ 		mutex_lock(&pcm->open_mutex);
++		if (pcm->card->shutdown) {
++			err = -ENODEV;
++			break;
++		}
+ 		if (signal_pending(current)) {
+ 			err = -ERESTARTSYS;
+ 			break;
+@@ -2450,6 +2454,7 @@ static int snd_pcm_oss_open(struct inode *inode, struct file *file)
+ 	mutex_unlock(&pcm->open_mutex);
+ 	if (err < 0)
+ 		goto __error;
++	snd_card_unref(pcm->card);
+ 	return err;
+ 
+       __error:
+@@ -2457,6 +2462,8 @@ static int snd_pcm_oss_open(struct inode *inode, struct file *file)
        __error2:
        	snd_card_file_remove(pcm->card, file);
        __error1:
@@ -1934,11 +1178,107 @@ index 23c34a02894b..ef6414b35ac0 100644
  	return err;
  }
  
+diff --git a/sound/core/pcm.c b/sound/core/pcm.c
+index ee9abb2..6e86ed5 100644
+--- a/sound/core/pcm.c
++++ b/sound/core/pcm.c
+@@ -1045,11 +1045,19 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
+ 	if (list_empty(&pcm->list))
+ 		goto unlock;
+ 
++	mutex_lock(&pcm->open_mutex);
++	wake_up(&pcm->open_wait);
+ 	list_del_init(&pcm->list);
+ 	for (cidx = 0; cidx < 2; cidx++)
+-		for (substream = pcm->streams[cidx].substream; substream; substream = substream->next)
+-			if (substream->runtime)
++		for (substream = pcm->streams[cidx].substream; substream; substream = substream->next) {
++			snd_pcm_stream_lock_irq(substream);
++			if (substream->runtime) {
+ 				substream->runtime->status->state = SNDRV_PCM_STATE_DISCONNECTED;
++				wake_up(&substream->runtime->sleep);
++				wake_up(&substream->runtime->tsleep);
++			}
++			snd_pcm_stream_unlock_irq(substream);
++		}
+ 	list_for_each_entry(notify, &snd_pcm_notify_list, list) {
+ 		notify->n_disconnect(pcm);
+ 	}
+@@ -1065,6 +1073,7 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
+ 		}
+ 		snd_unregister_device(devtype, pcm->card, pcm->device);
+ 	}
++	mutex_unlock(&pcm->open_mutex);
+  unlock:
+ 	mutex_unlock(&register_mutex);
+ 	return 0;
 diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
-index a6380787b7f9..4a3a5c031311 100644
+index 1c6be91..7393551 100644
 --- a/sound/core/pcm_native.c
 +++ b/sound/core/pcm_native.c
-@@ -1627,6 +1627,7 @@ static int snd_pcm_link(struct snd_pcm_substream *substream, int fd)
+@@ -368,6 +368,14 @@ static int period_to_usecs(struct snd_pcm_runtime *runtime)
+ 	return usecs;
+ }
+ 
++static void snd_pcm_set_state(struct snd_pcm_substream *substream, int state)
++{
++	snd_pcm_stream_lock_irq(substream);
++	if (substream->runtime->status->state != SNDRV_PCM_STATE_DISCONNECTED)
++		substream->runtime->status->state = state;
++	snd_pcm_stream_unlock_irq(substream);
++}
++
+ static int snd_pcm_hw_params(struct snd_pcm_substream *substream,
+ 			     struct snd_pcm_hw_params *params)
+ {
+@@ -451,7 +459,7 @@ static int snd_pcm_hw_params(struct snd_pcm_substream *substream,
+ 		runtime->boundary *= 2;
+ 
+ 	snd_pcm_timer_resolution_change(substream);
+-	runtime->status->state = SNDRV_PCM_STATE_SETUP;
++	snd_pcm_set_state(substream, SNDRV_PCM_STATE_SETUP);
+ 
+ 	if (pm_qos_request_active(&substream->latency_pm_qos_req))
+ 		pm_qos_remove_request(&substream->latency_pm_qos_req);
+@@ -463,7 +471,7 @@ static int snd_pcm_hw_params(struct snd_pcm_substream *substream,
+ 	/* hardware might be unusable from this time,
+ 	   so we force application to retry to set
+ 	   the correct hardware parameter settings */
+-	runtime->status->state = SNDRV_PCM_STATE_OPEN;
++	snd_pcm_set_state(substream, SNDRV_PCM_STATE_OPEN);
+ 	if (substream->ops->hw_free != NULL)
+ 		substream->ops->hw_free(substream);
+ 	return err;
+@@ -511,7 +519,7 @@ static int snd_pcm_hw_free(struct snd_pcm_substream *substream)
+ 		return -EBADFD;
+ 	if (substream->ops->hw_free)
+ 		result = substream->ops->hw_free(substream);
+-	runtime->status->state = SNDRV_PCM_STATE_OPEN;
++	snd_pcm_set_state(substream, SNDRV_PCM_STATE_OPEN);
+ 	pm_qos_remove_request(&substream->latency_pm_qos_req);
+ 	return result;
+ }
+@@ -1319,7 +1327,7 @@ static void snd_pcm_post_prepare(struct snd_pcm_substream *substream, int state)
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	runtime->control->appl_ptr = runtime->status->hw_ptr;
+-	runtime->status->state = SNDRV_PCM_STATE_PREPARED;
++	snd_pcm_set_state(substream, SNDRV_PCM_STATE_PREPARED);
+ }
+ 
+ static struct action_ops snd_pcm_action_prepare = {
+@@ -1499,6 +1507,10 @@ static int snd_pcm_drain(struct snd_pcm_substream *substream,
+ 		down_read(&snd_pcm_link_rwsem);
+ 		snd_pcm_stream_lock_irq(substream);
+ 		remove_wait_queue(&to_check->sleep, &wait);
++		if (card->shutdown) {
++			result = -ENODEV;
++			break;
++		}
+ 		if (tout == 0) {
+ 			if (substream->runtime->status->state == SNDRV_PCM_STATE_SUSPENDED)
+ 				result = -ESTRPIPE;
+@@ -1619,6 +1631,7 @@ static int snd_pcm_link(struct snd_pcm_substream *substream, int fd)
   _end:
  	write_unlock_irq(&snd_pcm_link_rwlock);
  	up_write(&snd_pcm_link_rwsem);
@@ -1946,30 +1286,43 @@ index a6380787b7f9..4a3a5c031311 100644
  	fput(file);
  	return res;
  }
-@@ -2104,7 +2105,9 @@ static int snd_pcm_playback_open(struct inode *inode, struct file *file)
+@@ -2096,7 +2109,10 @@ static int snd_pcm_playback_open(struct inode *inode, struct file *file)
  		return err;
  	pcm = snd_lookup_minor_data(iminor(inode),
  				    SNDRV_DEVICE_TYPE_PCM_PLAYBACK);
 -	return snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_PLAYBACK);
 +	err = snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_PLAYBACK);
-+	snd_card_unref(pcm->card);
++	if (pcm)
++		snd_card_unref(pcm->card);
 +	return err;
  }
  
  static int snd_pcm_capture_open(struct inode *inode, struct file *file)
-@@ -2115,7 +2118,9 @@ static int snd_pcm_capture_open(struct inode *inode, struct file *file)
+@@ -2107,7 +2123,10 @@ static int snd_pcm_capture_open(struct inode *inode, struct file *file)
  		return err;
  	pcm = snd_lookup_minor_data(iminor(inode),
  				    SNDRV_DEVICE_TYPE_PCM_CAPTURE);
 -	return snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_CAPTURE);
 +	err = snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_CAPTURE);
-+	snd_card_unref(pcm->card);
++	if (pcm)
++		snd_card_unref(pcm->card);
 +	return err;
  }
  
  static int snd_pcm_open(struct file *file, struct snd_pcm *pcm, int stream)
+@@ -2145,6 +2164,10 @@ static int snd_pcm_open(struct file *file, struct snd_pcm *pcm, int stream)
+ 		mutex_unlock(&pcm->open_mutex);
+ 		schedule();
+ 		mutex_lock(&pcm->open_mutex);
++		if (pcm->card->shutdown) {
++			err = -ENODEV;
++			break;
++		}
+ 		if (signal_pending(current)) {
+ 			err = -ERESTARTSYS;
+ 			break;
 diff --git a/sound/core/rawmidi.c b/sound/core/rawmidi.c
-index cbbed0db9e56..69935c08d318 100644
+index cbbed0d..cd2c134 100644
 --- a/sound/core/rawmidi.c
 +++ b/sound/core/rawmidi.c
 @@ -394,8 +394,10 @@ static int snd_rawmidi_open(struct inode *inode, struct file *file)
@@ -1984,7 +1337,18 @@ index cbbed0db9e56..69935c08d318 100644
  
  	mutex_lock(&rmidi->open_mutex);
  	card = rmidi->card;
-@@ -455,6 +457,7 @@ static int snd_rawmidi_open(struct inode *inode, struct file *file)
+@@ -437,6 +439,10 @@ static int snd_rawmidi_open(struct inode *inode, struct file *file)
+ 		mutex_unlock(&rmidi->open_mutex);
+ 		schedule();
+ 		mutex_lock(&rmidi->open_mutex);
++		if (rmidi->card->shutdown) {
++			err = -ENODEV;
++			break;
++		}
+ 		if (signal_pending(current)) {
+ 			err = -ERESTARTSYS;
+ 			break;
+@@ -455,6 +461,7 @@ static int snd_rawmidi_open(struct inode *inode, struct file *file)
  #endif
  	file->private_data = rawmidi_file;
  	mutex_unlock(&rmidi->open_mutex);
@@ -1992,7 +1356,7 @@ index cbbed0db9e56..69935c08d318 100644
  	return 0;
  
   __error:
-@@ -462,6 +465,7 @@ static int snd_rawmidi_open(struct inode *inode, struct file *file)
+@@ -462,6 +469,7 @@ static int snd_rawmidi_open(struct inode *inode, struct file *file)
   __error_card:
  	mutex_unlock(&rmidi->open_mutex);
  	module_put(rmidi->card->module);
@@ -2000,8 +1364,55 @@ index cbbed0db9e56..69935c08d318 100644
  	return err;
  }
  
+@@ -1006,6 +1014,8 @@ static ssize_t snd_rawmidi_read(struct file *file, char __user *buf, size_t coun
+ 			spin_unlock_irq(&runtime->lock);
+ 			schedule();
+ 			remove_wait_queue(&runtime->sleep, &wait);
++			if (rfile->rmidi->card->shutdown)
++				return -ENODEV;
+ 			if (signal_pending(current))
+ 				return result > 0 ? result : -ERESTARTSYS;
+ 			if (!runtime->avail)
+@@ -1249,6 +1259,8 @@ static ssize_t snd_rawmidi_write(struct file *file, const char __user *buf,
+ 			spin_unlock_irq(&runtime->lock);
+ 			timeout = schedule_timeout(30 * HZ);
+ 			remove_wait_queue(&runtime->sleep, &wait);
++			if (rfile->rmidi->card->shutdown)
++				return -ENODEV;
+ 			if (signal_pending(current))
+ 				return result > 0 ? result : -ERESTARTSYS;
+ 			if (!runtime->avail && !timeout)
+@@ -1624,9 +1636,20 @@ static int snd_rawmidi_dev_register(struct snd_device *device)
+ static int snd_rawmidi_dev_disconnect(struct snd_device *device)
+ {
+ 	struct snd_rawmidi *rmidi = device->device_data;
++	int dir;
+ 
+ 	mutex_lock(&register_mutex);
++	mutex_lock(&rmidi->open_mutex);
++	wake_up(&rmidi->open_wait);
+ 	list_del_init(&rmidi->list);
++	for (dir = 0; dir < 2; dir++) {
++		struct snd_rawmidi_substream *s;
++		list_for_each_entry(s, &rmidi->streams[dir].substreams, list) {
++			if (s->runtime)
++				wake_up(&s->runtime->sleep);
++		}
++	}
++
+ #ifdef CONFIG_SND_OSSEMUL
+ 	if (rmidi->ossreg) {
+ 		if ((int)rmidi->device == midi_map[rmidi->card->number]) {
+@@ -1641,6 +1664,7 @@ static int snd_rawmidi_dev_disconnect(struct snd_device *device)
+ 	}
+ #endif /* CONFIG_SND_OSSEMUL */
+ 	snd_unregister_device(SNDRV_DEVICE_TYPE_RAWMIDI, rmidi->card, rmidi->device);
++	mutex_unlock(&rmidi->open_mutex);
+ 	mutex_unlock(&register_mutex);
+ 	return 0;
+ }
 diff --git a/sound/core/sound.c b/sound/core/sound.c
-index 1c7a3efe1778..b235aaa3a1bf 100644
+index 1c7a3ef..e9b79b5 100644
 --- a/sound/core/sound.c
 +++ b/sound/core/sound.c
 @@ -99,6 +99,10 @@ static void snd_request_other(int minor)
@@ -2023,7 +1434,7 @@ index 1c7a3efe1778..b235aaa3a1bf 100644
 +	if (mreg && mreg->type == type) {
  		private_data = mreg->private_data;
 -	else
-+		if (mreg->card_ptr)
++		if (private_data && mreg->card_ptr)
 +			atomic_inc(&mreg->card_ptr->refcount);
 +	} else
  		private_data = NULL;
@@ -2038,7 +1449,7 @@ index 1c7a3efe1778..b235aaa3a1bf 100644
  #ifdef CONFIG_SND_DYNAMIC_MINORS
  	minor = snd_find_free_minor(type);
 diff --git a/sound/core/sound_oss.c b/sound/core/sound_oss.c
-index 0c164e5e4322..cdeae29f43fb 100644
+index 0c164e5..b6ff6d6 100644
 --- a/sound/core/sound_oss.c
 +++ b/sound/core/sound_oss.c
 @@ -39,6 +39,9 @@
@@ -2059,7 +1470,7 @@ index 0c164e5e4322..cdeae29f43fb 100644
 +	if (mreg && mreg->type == type) {
  		private_data = mreg->private_data;
 -	else
-+		if (mreg->card_ptr)
++		if (private_data && mreg->card_ptr)
 +			atomic_inc(&mreg->card_ptr->refcount);
 +	} else
  		private_data = NULL;
@@ -2073,1558 +1484,26 @@ index 0c164e5e4322..cdeae29f43fb 100644
  	mutex_lock(&sound_oss_mutex);
  	snd_oss_minors[minor] = preg;
  	minor_unit = SNDRV_MINOR_OSS_DEVICE(minor);
--- 
-2.28.0
-
-
-From 8a7173c58c8a1e25d7b2d572f045da837bb373bf Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Wed, 7 Nov 2012 12:44:13 +0100
-Subject: [PATCH 23/41] ALSA: Avoid endless sleep after disconnect
-
-commit 0914f7961babbf28aaa2f19b453951fb4841c03f upstream.
-
-When disconnect callback is called, each component should wake up
-sleepers and check card->shutdown flag for avoiding the endless sleep
-blocking the proper resource release.
-
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/control.c     |  2 ++
- sound/core/hwdep.c       |  7 +++++++
- sound/core/oss/pcm_oss.c |  4 ++++
- sound/core/pcm.c         |  6 +++++-
- sound/core/pcm_native.c  |  8 ++++++++
- sound/core/rawmidi.c     | 20 ++++++++++++++++++++
- 6 files changed, 46 insertions(+), 1 deletion(-)
-
-diff --git a/sound/core/control.c b/sound/core/control.c
-index 520a556d28cc..ce46a9ef8563 100644
---- a/sound/core/control.c
-+++ b/sound/core/control.c
-@@ -1363,6 +1363,8 @@ static ssize_t snd_ctl_read(struct file *file, char __user *buffer,
- 			spin_unlock_irq(&ctl->read_lock);
- 			schedule();
- 			remove_wait_queue(&ctl->change_sleep, &wait);
-+			if (ctl->card->shutdown)
-+				return -ENODEV;
- 			if (signal_pending(current))
- 				return -ERESTARTSYS;
- 			spin_lock_irq(&ctl->read_lock);
-diff --git a/sound/core/hwdep.c b/sound/core/hwdep.c
-index dbc3556bae3d..32fb2feb35b3 100644
---- a/sound/core/hwdep.c
-+++ b/sound/core/hwdep.c
-@@ -130,6 +130,10 @@ static int snd_hwdep_open(struct inode *inode, struct file * file)
- 		mutex_unlock(&hw->open_mutex);
- 		schedule();
- 		mutex_lock(&hw->open_mutex);
-+		if (hw->card->shutdown) {
-+			err = -ENODEV;
-+			break;
-+		}
- 		if (signal_pending(current)) {
- 			err = -ERESTARTSYS;
- 			break;
-@@ -454,12 +458,15 @@ static int snd_hwdep_dev_disconnect(struct snd_device *device)
- 		mutex_unlock(&register_mutex);
- 		return -EINVAL;
- 	}
-+	mutex_lock(&hwdep->open_mutex);
-+	wake_up(&hwdep->open_wait);
- #ifdef CONFIG_SND_OSSEMUL
- 	if (hwdep->ossreg)
- 		snd_unregister_oss_device(hwdep->oss_type, hwdep->card, hwdep->device);
- #endif
- 	snd_unregister_device(SNDRV_DEVICE_TYPE_HWDEP, hwdep->card, hwdep->device);
- 	list_del_init(&hwdep->list);
-+	mutex_unlock(&hwdep->open_mutex);
- 	mutex_unlock(&register_mutex);
- 	return 0;
- }
-diff --git a/sound/core/oss/pcm_oss.c b/sound/core/oss/pcm_oss.c
-index ef6414b35ac0..ea757241f47b 100644
---- a/sound/core/oss/pcm_oss.c
-+++ b/sound/core/oss/pcm_oss.c
-@@ -2441,6 +2441,10 @@ static int snd_pcm_oss_open(struct inode *inode, struct file *file)
- 		mutex_unlock(&pcm->open_mutex);
- 		schedule();
- 		mutex_lock(&pcm->open_mutex);
-+		if (pcm->card->shutdown) {
-+			err = -ENODEV;
-+			break;
-+		}
- 		if (signal_pending(current)) {
- 			err = -ERESTARTSYS;
- 			break;
-diff --git a/sound/core/pcm.c b/sound/core/pcm.c
-index 1d2561234fa3..6e86ed51938f 100644
---- a/sound/core/pcm.c
-+++ b/sound/core/pcm.c
-@@ -1046,12 +1046,16 @@ static int snd_pcm_dev_disconnect(struct snd_device *device)
- 		goto unlock;
- 
- 	mutex_lock(&pcm->open_mutex);
-+	wake_up(&pcm->open_wait);
- 	list_del_init(&pcm->list);
- 	for (cidx = 0; cidx < 2; cidx++)
- 		for (substream = pcm->streams[cidx].substream; substream; substream = substream->next) {
- 			snd_pcm_stream_lock_irq(substream);
--			if (substream->runtime)
-+			if (substream->runtime) {
- 				substream->runtime->status->state = SNDRV_PCM_STATE_DISCONNECTED;
-+				wake_up(&substream->runtime->sleep);
-+				wake_up(&substream->runtime->tsleep);
-+			}
- 			snd_pcm_stream_unlock_irq(substream);
- 		}
- 	list_for_each_entry(notify, &snd_pcm_notify_list, list) {
-diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
-index 4a3a5c031311..c8e5a6b6c756 100644
---- a/sound/core/pcm_native.c
-+++ b/sound/core/pcm_native.c
-@@ -1507,6 +1507,10 @@ static int snd_pcm_drain(struct snd_pcm_substream *substream,
- 		down_read(&snd_pcm_link_rwsem);
- 		snd_pcm_stream_lock_irq(substream);
- 		remove_wait_queue(&to_check->sleep, &wait);
-+		if (card->shutdown) {
-+			result = -ENODEV;
-+			break;
-+		}
- 		if (tout == 0) {
- 			if (substream->runtime->status->state == SNDRV_PCM_STATE_SUSPENDED)
- 				result = -ESTRPIPE;
-@@ -2158,6 +2162,10 @@ static int snd_pcm_open(struct file *file, struct snd_pcm *pcm, int stream)
- 		mutex_unlock(&pcm->open_mutex);
- 		schedule();
- 		mutex_lock(&pcm->open_mutex);
-+		if (pcm->card->shutdown) {
-+			err = -ENODEV;
-+			break;
-+		}
- 		if (signal_pending(current)) {
- 			err = -ERESTARTSYS;
- 			break;
-diff --git a/sound/core/rawmidi.c b/sound/core/rawmidi.c
-index 69935c08d318..cd2c13421a0f 100644
---- a/sound/core/rawmidi.c
-+++ b/sound/core/rawmidi.c
-@@ -439,6 +439,10 @@ static int snd_rawmidi_open(struct inode *inode, struct file *file)
- 		mutex_unlock(&rmidi->open_mutex);
- 		schedule();
- 		mutex_lock(&rmidi->open_mutex);
-+		if (rmidi->card->shutdown) {
-+			err = -ENODEV;
-+			break;
-+		}
- 		if (signal_pending(current)) {
- 			err = -ERESTARTSYS;
- 			break;
-@@ -1010,6 +1014,8 @@ static ssize_t snd_rawmidi_read(struct file *file, char __user *buf, size_t coun
- 			spin_unlock_irq(&runtime->lock);
- 			schedule();
- 			remove_wait_queue(&runtime->sleep, &wait);
-+			if (rfile->rmidi->card->shutdown)
-+				return -ENODEV;
- 			if (signal_pending(current))
- 				return result > 0 ? result : -ERESTARTSYS;
- 			if (!runtime->avail)
-@@ -1253,6 +1259,8 @@ static ssize_t snd_rawmidi_write(struct file *file, const char __user *buf,
- 			spin_unlock_irq(&runtime->lock);
- 			timeout = schedule_timeout(30 * HZ);
- 			remove_wait_queue(&runtime->sleep, &wait);
-+			if (rfile->rmidi->card->shutdown)
-+				return -ENODEV;
- 			if (signal_pending(current))
- 				return result > 0 ? result : -ERESTARTSYS;
- 			if (!runtime->avail && !timeout)
-@@ -1628,9 +1636,20 @@ static int snd_rawmidi_dev_register(struct snd_device *device)
- static int snd_rawmidi_dev_disconnect(struct snd_device *device)
- {
- 	struct snd_rawmidi *rmidi = device->device_data;
-+	int dir;
- 
- 	mutex_lock(&register_mutex);
-+	mutex_lock(&rmidi->open_mutex);
-+	wake_up(&rmidi->open_wait);
- 	list_del_init(&rmidi->list);
-+	for (dir = 0; dir < 2; dir++) {
-+		struct snd_rawmidi_substream *s;
-+		list_for_each_entry(s, &rmidi->streams[dir].substreams, list) {
-+			if (s->runtime)
-+				wake_up(&s->runtime->sleep);
-+		}
-+	}
-+
- #ifdef CONFIG_SND_OSSEMUL
- 	if (rmidi->ossreg) {
- 		if ((int)rmidi->device == midi_map[rmidi->card->number]) {
-@@ -1645,6 +1664,7 @@ static int snd_rawmidi_dev_disconnect(struct snd_device *device)
- 	}
- #endif /* CONFIG_SND_OSSEMUL */
- 	snd_unregister_device(SNDRV_DEVICE_TYPE_RAWMIDI, rmidi->card, rmidi->device);
-+	mutex_unlock(&rmidi->open_mutex);
- 	mutex_unlock(&register_mutex);
- 	return 0;
- }
--- 
-2.28.0
-
-
-From b23270416da409bd4e637a5acbe31a1126235fb6 Mon Sep 17 00:00:00 2001
-From: Zijie Pan <zijie.pan@6wind.com>
-Date: Mon, 15 Oct 2012 03:56:39 +0000
-Subject: [PATCH 24/41] sctp: fix call to SCTP_CMD_PROCESS_SACK in
- sctp_cmd_interpreter()
-
-[ Upstream commit f6e80abeab928b7c47cc1fbf53df13b4398a2bec ]
-
-Bug introduced by commit edfee0339e681a784ebacec7e8c2dc97dc6d2839
-(sctp: check src addr when processing SACK to update transport state)
-
-Signed-off-by: Zijie Pan <zijie.pan@6wind.com>
-Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
-Acked-by: Vlad Yasevich <vyasevich@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/sctp/sm_sideeffect.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/net/sctp/sm_sideeffect.c b/net/sctp/sm_sideeffect.c
-index 6e0f88295aaf..edac24a12843 100644
---- a/net/sctp/sm_sideeffect.c
-+++ b/net/sctp/sm_sideeffect.c
-@@ -1604,8 +1604,9 @@ static int sctp_cmd_interpreter(sctp_event_t event_type,
- 					asoc->outqueue.outstanding_bytes;
- 			sackh.num_gap_ack_blocks = 0;
- 			sackh.num_dup_tsns = 0;
-+			chunk->subh.sack_hdr = &sackh;
- 			sctp_add_cmd_sf(commands, SCTP_CMD_PROCESS_SACK,
--					SCTP_SACKH(&sackh));
-+					SCTP_CHUNK(chunk));
- 			break;
- 
- 		case SCTP_CMD_DISCARD_PACKET:
--- 
-2.28.0
-
-
-From fdc00abab6858f9da6a40e03c831c252b4f419bd Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Thu, 18 Oct 2012 03:21:55 +0000
-Subject: [PATCH 25/41] netlink: use kfree_rcu() in netlink_release()
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-[ Upstream commit 6d772ac5578f711d1ce7b03535d1c95bffb21dff ]
-
-On some suspend/resume operations involving wimax device, we have
-noticed some intermittent memory corruptions in netlink code.
-
-Stéphane Marchesin tracked this corruption in netlink_update_listeners()
-and suggested a patch.
-
-It appears netlink_release() should use kfree_rcu() instead of kfree()
-for the listeners structure as it may be used by other cpus using RCU
-protection.
-
-netlink_release() must set to NULL the listeners pointer when
-it is about to be freed.
-
-Also have to protect netlink_update_listeners() and
-netlink_has_listeners() if listeners is NULL.
-
-Add a nl_deref_protected() lockdep helper to properly document which
-locks protects us.
-
-Reported-by: Jonathan Kliegman <kliegs@google.com>
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Cc: Stéphane Marchesin <marcheu@google.com>
-Cc: Sam Leffler <sleffler@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/netlink/af_netlink.c | 19 +++++++++++++++----
- 1 file changed, 15 insertions(+), 4 deletions(-)
-
-diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
-index 16a94a31c357..d29c22254f6b 100644
---- a/net/netlink/af_netlink.c
-+++ b/net/netlink/af_netlink.c
-@@ -137,6 +137,8 @@ static void netlink_destroy_callback(struct netlink_callback *cb);
- static DEFINE_RWLOCK(nl_table_lock);
- static atomic_t nl_table_users = ATOMIC_INIT(0);
- 
-+#define nl_deref_protected(X) rcu_dereference_protected(X, lockdep_is_held(&nl_table_lock));
-+
- static ATOMIC_NOTIFIER_HEAD(netlink_chain);
- 
- static u32 netlink_group_mask(u32 group)
-@@ -331,6 +333,11 @@ netlink_update_listeners(struct sock *sk)
- 	struct hlist_node *node;
- 	unsigned long mask;
- 	unsigned int i;
-+	struct listeners *listeners;
-+
-+	listeners = nl_deref_protected(tbl->listeners);
-+	if (!listeners)
-+		return;
- 
- 	for (i = 0; i < NLGRPLONGS(tbl->groups); i++) {
- 		mask = 0;
-@@ -338,7 +345,7 @@ netlink_update_listeners(struct sock *sk)
- 			if (i < NLGRPLONGS(nlk_sk(sk)->ngroups))
- 				mask |= nlk_sk(sk)->groups[i];
- 		}
--		tbl->listeners->masks[i] = mask;
-+		listeners->masks[i] = mask;
- 	}
- 	/* this function is only called with the netlink table "grabbed", which
- 	 * makes sure updates are visible before bind or setsockopt return. */
-@@ -519,7 +526,11 @@ static int netlink_release(struct socket *sock)
- 	if (netlink_is_kernel(sk)) {
- 		BUG_ON(nl_table[sk->sk_protocol].registered == 0);
- 		if (--nl_table[sk->sk_protocol].registered == 0) {
--			kfree(nl_table[sk->sk_protocol].listeners);
-+			struct listeners *old;
-+
-+			old = nl_deref_protected(nl_table[sk->sk_protocol].listeners);
-+			RCU_INIT_POINTER(nl_table[sk->sk_protocol].listeners, NULL);
-+			kfree_rcu(old, rcu);
- 			nl_table[sk->sk_protocol].module = NULL;
- 			nl_table[sk->sk_protocol].registered = 0;
- 		}
-@@ -950,7 +961,7 @@ int netlink_has_listeners(struct sock *sk, unsigned int group)
- 	rcu_read_lock();
- 	listeners = rcu_dereference(nl_table[sk->sk_protocol].listeners);
- 
--	if (group - 1 < nl_table[sk->sk_protocol].groups)
-+	if (listeners && group - 1 < nl_table[sk->sk_protocol].groups)
- 		res = test_bit(group - 1, listeners->masks);
- 
- 	rcu_read_unlock();
-@@ -1585,7 +1596,7 @@ int __netlink_change_ngroups(struct sock *sk, unsigned int groups)
- 		new = kzalloc(sizeof(*new) + NLGRPSZ(groups), GFP_ATOMIC);
- 		if (!new)
- 			return -ENOMEM;
--		old = rcu_dereference_raw(tbl->listeners);
-+		old = nl_deref_protected(tbl->listeners);
- 		memcpy(new->masks, old->masks, NLGRPSZ(tbl->groups));
- 		rcu_assign_pointer(tbl->listeners, new);
- 
--- 
-2.28.0
-
-
-From 3297d60d4ebc83a4dc6c44abad18d181c6680b9e Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Thu, 18 Oct 2012 09:14:12 +0000
-Subject: [PATCH 26/41] tcp: fix FIONREAD/SIOCINQ
-
-[ Upstream commit a3374c42aa5f7237e87ff3b0622018636b0c847e ]
-
-tcp_ioctl() tries to take into account if tcp socket received a FIN
-to report correct number bytes in receive queue.
-
-But its flaky because if the application ate the last skb,
-we return 1 instead of 0.
-
-Correct way to detect that FIN was received is to test SOCK_DONE.
-
-Reported-by: Elliot Hughes <enh@google.com>
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Cc: Neal Cardwell <ncardwell@google.com>
-Cc: Tom Herbert <therbert@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/tcp.c | 8 +++-----
- 1 file changed, 3 insertions(+), 5 deletions(-)
-
-diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
-index dd3af6c6ee0a..2c423b660e52 100644
---- a/net/ipv4/tcp.c
-+++ b/net/ipv4/tcp.c
-@@ -481,14 +481,12 @@ int tcp_ioctl(struct sock *sk, int cmd, unsigned long arg)
- 			 !tp->urg_data ||
- 			 before(tp->urg_seq, tp->copied_seq) ||
- 			 !before(tp->urg_seq, tp->rcv_nxt)) {
--			struct sk_buff *skb;
- 
- 			answ = tp->rcv_nxt - tp->copied_seq;
- 
--			/* Subtract 1, if FIN is in queue. */
--			skb = skb_peek_tail(&sk->sk_receive_queue);
--			if (answ && skb)
--				answ -= tcp_hdr(skb)->fin;
-+			/* Subtract 1, if FIN was received */
-+			if (answ && sock_flag(sk, SOCK_DONE))
-+				answ--;
- 		} else
- 			answ = tp->urg_seq - tp->copied_seq;
- 		release_sock(sk);
--- 
-2.28.0
-
-
-From db138ef294594d3721dae6409d9e13d6ebf3df39 Mon Sep 17 00:00:00 2001
-From: Li RongQing <roy.qing.li@gmail.com>
-Date: Wed, 24 Oct 2012 14:01:18 +0800
-Subject: [PATCH 27/41] ipv6: Set default hoplimit as zero.
-
-[ Upstream commit 14edd87dc67311556f1254a8f29cf4dd6cb5b7d1 ]
-
-Commit a02e4b7dae4551(Demark default hoplimit as zero) only changes the
-hoplimit checking condition and default value in ip6_dst_hoplimit, not
-zeros all hoplimit default value.
-
-Keep the zeroing ip6_template_metrics[RTAX_HOPLIMIT - 1] to force it as
-const, cause as a37e6e344910(net: force dst_default_metrics to const
-section)
-
-Signed-off-by: Li RongQing <roy.qing.li@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/route.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/net/ipv6/route.c b/net/ipv6/route.c
-index 917256826f84..da056c8917ed 100644
---- a/net/ipv6/route.c
-+++ b/net/ipv6/route.c
-@@ -171,7 +171,7 @@ static struct dst_ops ip6_dst_blackhole_ops = {
- };
- 
- static const u32 ip6_template_metrics[RTAX_MAX] = {
--	[RTAX_HOPLIMIT - 1] = 255,
-+	[RTAX_HOPLIMIT - 1] = 0,
- };
- 
- static struct rt6_info ip6_null_entry_template = {
-@@ -1068,7 +1068,7 @@ struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
- 	rt->rt6i_idev     = idev;
- 	dst_set_neighbour(&rt->dst, neigh);
- 	atomic_set(&rt->dst.__refcnt, 1);
--	dst_metric_set(&rt->dst, RTAX_HOPLIMIT, 255);
-+	dst_metric_set(&rt->dst, RTAX_HOPLIMIT, 0);
- 	rt->dst.output  = ip6_output;
- 
- 	spin_lock_bh(&icmp6_dst_lock);
--- 
-2.28.0
-
-
-From 690bfe52ce0784e7a24ae8a37929580b6bd65bc9 Mon Sep 17 00:00:00 2001
-From: Hemant Kumar <hemantk@codeaurora.org>
-Date: Thu, 25 Oct 2012 18:17:54 +0000
-Subject: [PATCH 28/41] net: usb: Fix memory leak on Tx data path
-
-[ Upstream commit 39707c2a3ba5011038b363f84d37c8a98d2d9db1 ]
-
-Driver anchors the tx urbs and defers the urb submission if
-a transmit request comes when the interface is suspended.
-Anchoring urb increments the urb reference count. These
-deferred urbs are later accessed by calling usb_get_from_anchor()
-for submission during interface resume. usb_get_from_anchor()
-unanchors the urb but urb reference count remains same.
-This causes the urb reference count to remain non-zero
-after usb_free_urb() gets called and urb never gets freed.
-Hence call usb_put_urb() after anchoring the urb to properly
-balance the reference count for these deferred urbs. Also,
-unanchor these deferred urbs during disconnect, to free them
-up.
-
-Signed-off-by: Hemant Kumar <hemantk@codeaurora.org>
-Acked-by: Oliver Neukum <oneukum@suse.de>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/usb/usbnet.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/drivers/net/usb/usbnet.c b/drivers/net/usb/usbnet.c
-index dd225fc65a8e..806372952782 100644
---- a/drivers/net/usb/usbnet.c
-+++ b/drivers/net/usb/usbnet.c
-@@ -1149,6 +1149,7 @@ netdev_tx_t usbnet_start_xmit (struct sk_buff *skb,
- 		usb_anchor_urb(urb, &dev->deferred);
- 		/* no use to process more packets */
- 		netif_stop_queue(net);
-+		usb_put_urb(urb);
- 		spin_unlock_irqrestore(&dev->txq.lock, flags);
- 		netdev_dbg(dev->net, "Delaying transmission for resumption\n");
- 		goto deferred;
-@@ -1290,6 +1291,8 @@ void usbnet_disconnect (struct usb_interface *intf)
- 
- 	cancel_work_sync(&dev->kevent);
- 
-+	usb_scuttle_anchored_urbs(&dev->deferred);
-+
- 	if (dev->driver_info->unbind)
- 		dev->driver_info->unbind (dev, intf);
- 
--- 
-2.28.0
-
-
-From 798c7dba9071df9cdd935da16066e1a17580d9ee Mon Sep 17 00:00:00 2001
-From: Jesper Dangaard Brouer <brouer@redhat.com>
-Date: Wed, 31 Oct 2012 02:45:32 +0000
-Subject: [PATCH 29/41] net: fix divide by zero in tcp algorithm illinois
-
-[ Upstream commit 8f363b77ee4fbf7c3bbcf5ec2c5ca482d396d664 ]
-
-Reading TCP stats when using TCP Illinois congestion control algorithm
-can cause a divide by zero kernel oops.
-
-The division by zero occur in tcp_illinois_info() at:
- do_div(t, ca->cnt_rtt);
-where ca->cnt_rtt can become zero (when rtt_reset is called)
-
-Steps to Reproduce:
- 1. Register tcp_illinois:
-     # sysctl -w net.ipv4.tcp_congestion_control=illinois
- 2. Monitor internal TCP information via command "ss -i"
-     # watch -d ss -i
- 3. Establish new TCP conn to machine
-
-Either it fails at the initial conn, or else it needs to wait
-for a loss or a reset.
-
-This is only related to reading stats.  The function avg_delay() also
-performs the same divide, but is guarded with a (ca->cnt_rtt > 0) at its
-calling point in update_params().  Thus, simply fix tcp_illinois_info().
-
-Function tcp_illinois_info() / get_info() is called without
-socket lock.  Thus, eliminate any race condition on ca->cnt_rtt
-by using a local stack variable.  Simply reuse info.tcpv_rttcnt,
-as its already set to ca->cnt_rtt.
-Function avg_delay() is not affected by this race condition, as
-its called with the socket lock.
-
-Cc: Petr Matousek <pmatouse@redhat.com>
-Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
-Acked-by: Eric Dumazet <edumazet@google.com>
-Acked-by: Stephen Hemminger <shemminger@vyatta.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/tcp_illinois.c | 8 +++++---
- 1 file changed, 5 insertions(+), 3 deletions(-)
-
-diff --git a/net/ipv4/tcp_illinois.c b/net/ipv4/tcp_illinois.c
-index 813b43a76fec..834857f3c871 100644
---- a/net/ipv4/tcp_illinois.c
-+++ b/net/ipv4/tcp_illinois.c
-@@ -313,11 +313,13 @@ static void tcp_illinois_info(struct sock *sk, u32 ext,
- 			.tcpv_rttcnt = ca->cnt_rtt,
- 			.tcpv_minrtt = ca->base_rtt,
- 		};
--		u64 t = ca->sum_rtt;
- 
--		do_div(t, ca->cnt_rtt);
--		info.tcpv_rtt = t;
-+		if (info.tcpv_rttcnt > 0) {
-+			u64 t = ca->sum_rtt;
- 
-+			do_div(t, info.tcpv_rttcnt);
-+			info.tcpv_rtt = t;
-+		}
- 		nla_put(skb, INET_DIAG_VEGASINFO, sizeof(info), &info);
- 	}
- }
--- 
-2.28.0
-
-
-From 5a3e425d67aab6b6f0b3bd3fb372b8044b8e981b Mon Sep 17 00:00:00 2001
-From: Tom Parkin <tparkin@katalix.com>
-Date: Mon, 29 Oct 2012 23:41:48 +0000
-Subject: [PATCH 30/41] l2tp: fix oops in l2tp_eth_create() error path
-
-[ Upstream commit 789336360e0a2aeb9750c16ab704a02cbe035e9e ]
-
-When creating an L2TPv3 Ethernet session, if register_netdev() should fail for
-any reason (for example, automatic naming for "l2tpeth%d" interfaces hits the
-32k-interface limit), the netdev is freed in the error path.  However, the
-l2tp_eth_sess structure's dev pointer is left uncleared, and this results in
-l2tp_eth_delete() then attempting to unregister the same netdev later in the
-session teardown.  This results in an oops.
-
-To avoid this, clear the session dev pointer in the error path.
-
-Signed-off-by: Tom Parkin <tparkin@katalix.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/l2tp/l2tp_eth.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/net/l2tp/l2tp_eth.c b/net/l2tp/l2tp_eth.c
-index 2cef50b5fc67..64164fbf6c51 100644
---- a/net/l2tp/l2tp_eth.c
-+++ b/net/l2tp/l2tp_eth.c
-@@ -269,6 +269,7 @@ static int l2tp_eth_create(struct net *net, u32 tunnel_id, u32 session_id, u32 p
- 
- out_del_dev:
- 	free_netdev(dev);
-+	spriv->dev = NULL;
- out_del_session:
- 	l2tp_session_delete(session);
- out:
--- 
-2.28.0
-
-
-From 2e570a4eeaf48f9a8302a0f71ff96ff9d0b723f6 Mon Sep 17 00:00:00 2001
-From: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Date: Tue, 6 Nov 2012 16:18:41 +0000
-Subject: [PATCH 31/41] ipv6: send unsolicited neighbour advertisements to
- all-nodes
-
-[ Upstream commit 60713a0ca7fd6651b951cc1b4dbd528d1fc0281b ]
-
-As documented in RFC4861 (Neighbor Discovery for IP version 6) 7.2.6.,
-unsolicited neighbour advertisements should be sent to the all-nodes
-multicast address.
-
-Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/ndisc.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
-diff --git a/net/ipv6/ndisc.c b/net/ipv6/ndisc.c
-index 10a8d411707e..31ba78cdec18 100644
---- a/net/ipv6/ndisc.c
-+++ b/net/ipv6/ndisc.c
-@@ -615,7 +615,7 @@ static void ndisc_send_unsol_na(struct net_device *dev)
- {
- 	struct inet6_dev *idev;
- 	struct inet6_ifaddr *ifa;
--	struct in6_addr mcaddr;
-+	struct in6_addr mcaddr = IN6ADDR_LINKLOCAL_ALLNODES_INIT;
- 
- 	idev = in6_dev_get(dev);
- 	if (!idev)
-@@ -623,7 +623,6 @@ static void ndisc_send_unsol_na(struct net_device *dev)
- 
- 	read_lock_bh(&idev->lock);
- 	list_for_each_entry(ifa, &idev->addr_list, if_list) {
--		addrconf_addr_solict_mult(&ifa->addr, &mcaddr);
- 		ndisc_send_na(dev, NULL, &mcaddr, &ifa->addr,
- 			      /*router=*/ !!idev->cnf.forwarding,
- 			      /*solicited=*/ false, /*override=*/ true,
--- 
-2.28.0
-
-
-From 2f56580d924c9283292d10567fb7744d9c0fd2b2 Mon Sep 17 00:00:00 2001
-From: Thomas Gleixner <tglx@linutronix.de>
-Date: Tue, 23 Oct 2012 22:29:38 +0200
-Subject: [PATCH 32/41] futex: Handle futex_pi OWNER_DIED take over correctly
-
-commit 59fa6245192159ab5e1e17b8e31f15afa9cff4bf upstream.
-
-Siddhesh analyzed a failure in the take over of pi futexes in case the
-owner died and provided a workaround.
-See: http://sourceware.org/bugzilla/show_bug.cgi?id=14076
-
-The detailed problem analysis shows:
-
-Futex F is initialized with PTHREAD_PRIO_INHERIT and
-PTHREAD_MUTEX_ROBUST_NP attributes.
-
-T1 lock_futex_pi(F);
-
-T2 lock_futex_pi(F);
-   --> T2 blocks on the futex and creates pi_state which is associated
-       to T1.
-
-T1 exits
-   --> exit_robust_list() runs
-       --> Futex F userspace value TID field is set to 0 and
-           FUTEX_OWNER_DIED bit is set.
-
-T3 lock_futex_pi(F);
-   --> Succeeds due to the check for F's userspace TID field == 0
-   --> Claims ownership of the futex and sets its own TID into the
-       userspace TID field of futex F
-   --> returns to user space
-
-T1 --> exit_pi_state_list()
-       --> Transfers pi_state to waiter T2 and wakes T2 via
-       	   rt_mutex_unlock(&pi_state->mutex)
-
-T2 --> acquires pi_state->mutex and gains real ownership of the
-       pi_state
-   --> Claims ownership of the futex and sets its own TID into the
-       userspace TID field of futex F
-   --> returns to user space
-
-T3 --> observes inconsistent state
-
-This problem is independent of UP/SMP, preemptible/non preemptible
-kernels, or process shared vs. private. The only difference is that
-certain configurations are more likely to expose it.
-
-So as Siddhesh correctly analyzed the following check in
-futex_lock_pi_atomic() is the culprit:
-
-	if (unlikely(ownerdied || !(curval & FUTEX_TID_MASK))) {
-
-We check the userspace value for a TID value of 0 and take over the
-futex unconditionally if that's true.
-
-AFAICT this check is there as it is correct for a different corner
-case of futexes: the WAITERS bit became stale.
-
-Now the proposed change
-
--	if (unlikely(ownerdied || !(curval & FUTEX_TID_MASK))) {
-+       if (unlikely(ownerdied ||
-+                       !(curval & (FUTEX_TID_MASK | FUTEX_WAITERS)))) {
-
-solves the problem, but it's not obvious why and it wreckages the
-"stale WAITERS bit" case.
-
-What happens is, that due to the WAITERS bit being set (T2 is blocked
-on that futex) it enforces T3 to go through lookup_pi_state(), which
-in the above case returns an existing pi_state and therefor forces T3
-to legitimately fight with T2 over the ownership of the pi_state (via
-pi_state->mutex). Probelm solved!
-
-Though that does not work for the "WAITERS bit is stale" problem
-because if lookup_pi_state() does not find existing pi_state it
-returns -ERSCH (due to TID == 0) which causes futex_lock_pi() to
-return -ESRCH to user space because the OWNER_DIED bit is not set.
-
-Now there is a different solution to that problem. Do not look at the
-user space value at all and enforce a lookup of possibly available
-pi_state. If pi_state can be found, then the new incoming locker T3
-blocks on that pi_state and legitimately races with T2 to acquire the
-rt_mutex and the pi_state and therefor the proper ownership of the
-user space futex.
-
-lookup_pi_state() has the correct order of checks. It first tries to
-find a pi_state associated with the user space futex and only if that
-fails it checks for futex TID value = 0. If no pi_state is available
-nothing can create new state at that point because this happens with
-the hash bucket lock held.
-
-So the above scenario changes to:
-
-T1 lock_futex_pi(F);
-
-T2 lock_futex_pi(F);
-   --> T2 blocks on the futex and creates pi_state which is associated
-       to T1.
-
-T1 exits
-   --> exit_robust_list() runs
-       --> Futex F userspace value TID field is set to 0 and
-           FUTEX_OWNER_DIED bit is set.
-
-T3 lock_futex_pi(F);
-   --> Finds pi_state and blocks on pi_state->rt_mutex
-
-T1 --> exit_pi_state_list()
-       --> Transfers pi_state to waiter T2 and wakes it via
-       	   rt_mutex_unlock(&pi_state->mutex)
-
-T2 --> acquires pi_state->mutex and gains ownership of the pi_state
-   --> Claims ownership of the futex and sets its own TID into the
-       userspace TID field of futex F
-   --> returns to user space
-
-This covers all gazillion points on which T3 might come in between
-T1's exit_robust_list() clearing the TID field and T2 fixing it up. It
-also solves the "WAITERS bit stale" problem by forcing the take over.
-
-Another benefit of changing the code this way is that it makes it less
-dependent on untrusted user space values and therefor minimizes the
-possible wreckage which might be inflicted.
-
-As usual after staring for too long at the futex code my brain hurts
-so much that I really want to ditch that whole optimization of
-avoiding the syscall for the non contended case for PI futexes and rip
-out the maze of corner case handling code. Unfortunately we can't as
-user space relies on that existing behaviour, but at least thinking
-about it helps me to preserve my mental sanity. Maybe we should
-nevertheless :)
-
-Reported-and-tested-by: Siddhesh Poyarekar <siddhesh.poyarekar@gmail.com>
-Link: http://lkml.kernel.org/r/alpine.LFD.2.02.1210232138540.2756@ionos
-Acked-by: Darren Hart <dvhart@linux.intel.com>
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/futex.c | 41 ++++++++++++++++++++++-------------------
- 1 file changed, 22 insertions(+), 19 deletions(-)
-
-diff --git a/kernel/futex.c b/kernel/futex.c
-index 24bc59c8867f..01b3c5597f5c 100644
---- a/kernel/futex.c
-+++ b/kernel/futex.c
-@@ -716,7 +716,7 @@ static int futex_lock_pi_atomic(u32 __user *uaddr, struct futex_hash_bucket *hb,
- 				struct futex_pi_state **ps,
- 				struct task_struct *task, int set_waiters)
- {
--	int lock_taken, ret, ownerdied = 0;
-+	int lock_taken, ret, force_take = 0;
- 	u32 uval, newval, curval, vpid = task_pid_vnr(task);
- 
- retry:
-@@ -755,17 +755,15 @@ retry:
- 	newval = curval | FUTEX_WAITERS;
- 
- 	/*
--	 * There are two cases, where a futex might have no owner (the
--	 * owner TID is 0): OWNER_DIED. We take over the futex in this
--	 * case. We also do an unconditional take over, when the owner
--	 * of the futex died.
--	 *
--	 * This is safe as we are protected by the hash bucket lock !
-+	 * Should we force take the futex? See below.
- 	 */
--	if (unlikely(ownerdied || !(curval & FUTEX_TID_MASK))) {
--		/* Keep the OWNER_DIED bit */
-+	if (unlikely(force_take)) {
-+		/*
-+		 * Keep the OWNER_DIED and the WAITERS bit and set the
-+		 * new TID value.
-+		 */
- 		newval = (curval & ~FUTEX_TID_MASK) | vpid;
--		ownerdied = 0;
-+		force_take = 0;
- 		lock_taken = 1;
- 	}
- 
-@@ -775,7 +773,7 @@ retry:
- 		goto retry;
- 
- 	/*
--	 * We took the lock due to owner died take over.
-+	 * We took the lock due to forced take over.
- 	 */
- 	if (unlikely(lock_taken))
- 		return 1;
-@@ -790,20 +788,25 @@ retry:
- 		switch (ret) {
- 		case -ESRCH:
- 			/*
--			 * No owner found for this futex. Check if the
--			 * OWNER_DIED bit is set to figure out whether
--			 * this is a robust futex or not.
-+			 * We failed to find an owner for this
-+			 * futex. So we have no pi_state to block
-+			 * on. This can happen in two cases:
-+			 *
-+			 * 1) The owner died
-+			 * 2) A stale FUTEX_WAITERS bit
-+			 *
-+			 * Re-read the futex value.
- 			 */
- 			if (get_futex_value_locked(&curval, uaddr))
- 				return -EFAULT;
- 
- 			/*
--			 * We simply start over in case of a robust
--			 * futex. The code above will take the futex
--			 * and return happy.
-+			 * If the owner died or we have a stale
-+			 * WAITERS bit the owner TID in the user space
-+			 * futex is 0.
- 			 */
--			if (curval & FUTEX_OWNER_DIED) {
--				ownerdied = 1;
-+			if (!(curval & FUTEX_TID_MASK)) {
-+				force_take = 1;
- 				goto retry;
- 			}
- 		default:
--- 
-2.28.0
-
-
-From d18edec7ace955fad9948eb3ee71d34f79d377ca Mon Sep 17 00:00:00 2001
-From: Thomas Hellstrom <thellstrom@vmware.com>
-Date: Fri, 9 Nov 2012 10:05:57 +0100
-Subject: [PATCH 33/41] drm/vmwgfx: Fix hibernation device reset
-
-commit 95e8f6a21996c4cc2c4574b231c6e858b749dce3 upstream.
-
-The device would not reset properly when resuming from hibernation.
-
-Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
-Reviewed-by: Brian Paul <brianp@vmware.com>
-Reviewed-by: Dmitry Torokhov <dtor@vmware.com>
-Cc: linux-graphics-maintainer@vmware.com
-Signed-off-by: Dave Airlie <airlied@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/vmwgfx/vmwgfx_drv.c | 5 +++++
- 1 file changed, 5 insertions(+)
-
-diff --git a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
-index 8b8c85c0e18b..55d4b29330fa 100644
---- a/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
-+++ b/drivers/gpu/drm/vmwgfx/vmwgfx_drv.c
-@@ -858,6 +858,11 @@ static void vmw_pm_complete(struct device *kdev)
- 	struct drm_device *dev = pci_get_drvdata(pdev);
- 	struct vmw_private *dev_priv = vmw_priv(dev);
- 
-+	mutex_lock(&dev_priv->hw_mutex);
-+	vmw_write(dev_priv, SVGA_REG_ID, SVGA_ID_2);
-+	(void) vmw_read(dev_priv, SVGA_REG_ID);
-+	mutex_unlock(&dev_priv->hw_mutex);
-+
- 	/**
- 	 * Reclaim 3d reference held by fbdev and potentially
- 	 * start fifo.
--- 
-2.28.0
-
-
-From 9615dee441f72d194234455ed30660c145260973 Mon Sep 17 00:00:00 2001
-From: Daniel Vetter <daniel.vetter@ffwll.ch>
-Date: Sat, 12 May 2012 20:22:00 +0200
-Subject: [PATCH 34/41] drm/i915: fixup infoframe support for sdvo
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 81014b9d0b55fb0b48f26cd2a943359750d532db upstream.
-
-At least the worst offenders:
-- SDVO specifies that the encoder should compute the ecc. Testing also
-  shows that we must not send the ecc field, so copy the dip_infoframe
-  struct to a temporay place and avoid the ecc field. This way the avi
-  infoframe is exactly 17 bytes long, which agrees with what the spec
-  mandates as a minimal storage capacity (with the ecc field it would
-  be 18 bytes).
-- Only 17 when sending the avi infoframe. The SDVO spec explicitly
-  says that sending more data than what the device announces results
-  in undefined behaviour.
-- Add __attribute__((packed)) to the avi and spd infoframes, for
-  otherwise they're wrongly aligned. Noticed because the avi infoframe
-  ended up being 18 bytes large instead of 17. We haven't noticed this
-  yet because we don't use the uint16_t fields yet (which are the only
-  ones that would be wrongly aligned).
-
-This regression has been introduce by
-
-3c17fe4b8f40a112a85758a9ab2aebf772bdd647 is the first bad commit
-commit 3c17fe4b8f40a112a85758a9ab2aebf772bdd647
-Author: David Härdeman <david@hardeman.nu>
-Date:   Fri Sep 24 21:44:32 2010 +0200
-
-    i915: enable AVI infoframe for intel_hdmi.c [v4]
-
-Patch tested on my g33 with a sdvo hdmi adaptor.
-
-Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=25732
-Tested-by: Peter Ross <pross@xvid.org> (G35 SDVO-HDMI)
-Reviewed-by: Eugeni Dodonov <eugeni.dodonov@intel.com>
-Signed-Off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
-Cc: Ben Hutchings <ben@decadent.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/i915/intel_drv.h  |  2 +-
- drivers/gpu/drm/i915/intel_sdvo.c | 11 +++++++++--
- 2 files changed, 10 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/gpu/drm/i915/intel_drv.h b/drivers/gpu/drm/i915/intel_drv.h
-index 47bf5e15f03e..58b54ff36108 100644
---- a/drivers/gpu/drm/i915/intel_drv.h
-+++ b/drivers/gpu/drm/i915/intel_drv.h
-@@ -204,7 +204,7 @@ struct dip_infoframe {
- 			uint16_t bottom_bar_start;
- 			uint16_t left_bar_end;
- 			uint16_t right_bar_start;
--		} avi;
-+		} __attribute__ ((packed)) avi;
- 		uint8_t payload[27];
- 	} __attribute__ ((packed)) body;
- } __attribute__((packed));
-diff --git a/drivers/gpu/drm/i915/intel_sdvo.c b/drivers/gpu/drm/i915/intel_sdvo.c
-index c90106074743..5a370f1f11f6 100644
---- a/drivers/gpu/drm/i915/intel_sdvo.c
-+++ b/drivers/gpu/drm/i915/intel_sdvo.c
-@@ -870,17 +870,24 @@ static bool intel_sdvo_set_avi_infoframe(struct intel_sdvo *intel_sdvo)
- 	};
- 	uint8_t tx_rate = SDVO_HBUF_TX_VSYNC;
- 	uint8_t set_buf_index[2] = { 1, 0 };
--	uint64_t *data = (uint64_t *)&avi_if;
-+	uint8_t sdvo_data[4 + sizeof(avi_if.body.avi)];
-+	uint64_t *data = (uint64_t *)sdvo_data;
- 	unsigned i;
- 
- 	intel_dip_infoframe_csum(&avi_if);
- 
-+	/* sdvo spec says that the ecc is handled by the hw, and it looks like
-+	 * we must not send the ecc field, either. */
-+	memcpy(sdvo_data, &avi_if, 3);
-+	sdvo_data[3] = avi_if.checksum;
-+	memcpy(&sdvo_data[4], &avi_if.body, sizeof(avi_if.body.avi));
-+
- 	if (!intel_sdvo_set_value(intel_sdvo,
- 				  SDVO_CMD_SET_HBUF_INDEX,
- 				  set_buf_index, 2))
- 		return false;
- 
--	for (i = 0; i < sizeof(avi_if); i += 8) {
-+	for (i = 0; i < sizeof(sdvo_data); i += 8) {
- 		if (!intel_sdvo_set_value(intel_sdvo,
- 					  SDVO_CMD_SET_HBUF_DATA,
- 					  data, 8))
--- 
-2.28.0
-
-
-From b7832d49e5e0f4be7328efb271f097d39f61804a Mon Sep 17 00:00:00 2001
-From: Daniel Vetter <daniel.vetter@ffwll.ch>
-Date: Sun, 21 Oct 2012 12:52:39 +0200
-Subject: [PATCH 35/41] drm/i915: clear the entire sdvo infoframe buffer
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit b6e0e543f75729f207b9c72b0162ae61170635b2 upstream.
-
-Like in the case of native hdmi, which is fixed already in
-
-commit adf00b26d18e1b3570451296e03bcb20e4798cdd
-Author: Paulo Zanoni <paulo.r.zanoni@intel.com>
-Date:   Tue Sep 25 13:23:34 2012 -0300
-
-    drm/i915: make sure we write all the DIP data bytes
-
-we need to clear the entire sdvo buffer to avoid upsetting the
-display.
-
-Since infoframe buffer writing is now a bit more elaborate, extract it
-into it's own function. This will be useful if we ever get around to
-properly update the ELD for sdvo. Also #define proper names for the
-two buffer indexes with fixed usage.
-
-v2: Cite the right commit above, spotted by Paulo Zanoni.
-
-v3: I'm too stupid to paste the right commit.
-
-v4: Ben Hutchings noticed that I've failed to handle an underflow in
-my loop logic, breaking it for i >= length + 8. Since I've just lost C
-programmer license, use his solution. Also, make the frustrated 0-base
-buffer size a notch more clear.
-
-Reported-and-tested-by: Jürg Billeter <j@bitron.ch>
-Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=25732
-Cc: Paulo Zanoni <przanoni@gmail.com>
-Cc: Ben Hutchings <ben@decadent.org.uk>
-Reviewed-by: Rodrigo Vivi <rodrigo.vivi@gmail.com>
-Signed-off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/i915/intel_sdvo.c      | 62 +++++++++++++++++---------
- drivers/gpu/drm/i915/intel_sdvo_regs.h |  2 +
- 2 files changed, 44 insertions(+), 20 deletions(-)
-
-diff --git a/drivers/gpu/drm/i915/intel_sdvo.c b/drivers/gpu/drm/i915/intel_sdvo.c
-index 5a370f1f11f6..d1141e83356d 100644
---- a/drivers/gpu/drm/i915/intel_sdvo.c
-+++ b/drivers/gpu/drm/i915/intel_sdvo.c
-@@ -861,6 +861,45 @@ static void intel_sdvo_dump_hdmi_buf(struct intel_sdvo *intel_sdvo)
- }
- #endif
- 
-+static bool intel_sdvo_write_infoframe(struct intel_sdvo *intel_sdvo,
-+				       unsigned if_index, uint8_t tx_rate,
-+				       uint8_t *data, unsigned length)
-+{
-+	uint8_t set_buf_index[2] = { if_index, 0 };
-+	uint8_t hbuf_size, tmp[8];
-+	int i;
-+
-+	if (!intel_sdvo_set_value(intel_sdvo,
-+				  SDVO_CMD_SET_HBUF_INDEX,
-+				  set_buf_index, 2))
-+		return false;
-+
-+	if (!intel_sdvo_get_value(intel_sdvo, SDVO_CMD_GET_HBUF_INFO,
-+				  &hbuf_size, 1))
-+		return false;
-+
-+	/* Buffer size is 0 based, hooray! */
-+	hbuf_size++;
-+
-+	DRM_DEBUG_KMS("writing sdvo hbuf: %i, hbuf_size %i, hbuf_size: %i\n",
-+		      if_index, length, hbuf_size);
-+
-+	for (i = 0; i < hbuf_size; i += 8) {
-+		memset(tmp, 0, 8);
-+		if (i < length)
-+			memcpy(tmp, data + i, min_t(unsigned, 8, length - i));
-+
-+		if (!intel_sdvo_set_value(intel_sdvo,
-+					  SDVO_CMD_SET_HBUF_DATA,
-+					  tmp, 8))
-+			return false;
-+	}
-+
-+	return intel_sdvo_set_value(intel_sdvo,
-+				    SDVO_CMD_SET_HBUF_TXRATE,
-+				    &tx_rate, 1);
-+}
-+
- static bool intel_sdvo_set_avi_infoframe(struct intel_sdvo *intel_sdvo)
- {
- 	struct dip_infoframe avi_if = {
-@@ -868,11 +907,7 @@ static bool intel_sdvo_set_avi_infoframe(struct intel_sdvo *intel_sdvo)
- 		.ver = DIP_VERSION_AVI,
- 		.len = DIP_LEN_AVI,
- 	};
--	uint8_t tx_rate = SDVO_HBUF_TX_VSYNC;
--	uint8_t set_buf_index[2] = { 1, 0 };
- 	uint8_t sdvo_data[4 + sizeof(avi_if.body.avi)];
--	uint64_t *data = (uint64_t *)sdvo_data;
--	unsigned i;
- 
- 	intel_dip_infoframe_csum(&avi_if);
- 
-@@ -882,22 +917,9 @@ static bool intel_sdvo_set_avi_infoframe(struct intel_sdvo *intel_sdvo)
- 	sdvo_data[3] = avi_if.checksum;
- 	memcpy(&sdvo_data[4], &avi_if.body, sizeof(avi_if.body.avi));
- 
--	if (!intel_sdvo_set_value(intel_sdvo,
--				  SDVO_CMD_SET_HBUF_INDEX,
--				  set_buf_index, 2))
--		return false;
--
--	for (i = 0; i < sizeof(sdvo_data); i += 8) {
--		if (!intel_sdvo_set_value(intel_sdvo,
--					  SDVO_CMD_SET_HBUF_DATA,
--					  data, 8))
--			return false;
--		data++;
--	}
--
--	return intel_sdvo_set_value(intel_sdvo,
--				    SDVO_CMD_SET_HBUF_TXRATE,
--				    &tx_rate, 1);
-+	return intel_sdvo_write_infoframe(intel_sdvo, SDVO_HBUF_INDEX_AVI_IF,
-+					  SDVO_HBUF_TX_VSYNC,
-+					  sdvo_data, sizeof(sdvo_data));
- }
- 
- static bool intel_sdvo_set_tv_format(struct intel_sdvo *intel_sdvo)
-diff --git a/drivers/gpu/drm/i915/intel_sdvo_regs.h b/drivers/gpu/drm/i915/intel_sdvo_regs.h
-index c5c8ddf2c1ad..50bebc36404e 100644
---- a/drivers/gpu/drm/i915/intel_sdvo_regs.h
-+++ b/drivers/gpu/drm/i915/intel_sdvo_regs.h
-@@ -708,6 +708,8 @@ struct intel_sdvo_enhancements_arg {
- #define SDVO_CMD_SET_AUDIO_STAT		0x91
- #define SDVO_CMD_GET_AUDIO_STAT		0x92
- #define SDVO_CMD_SET_HBUF_INDEX		0x93
-+  #define SDVO_HBUF_INDEX_ELD		0
-+  #define SDVO_HBUF_INDEX_AVI_IF	1
- #define SDVO_CMD_GET_HBUF_INDEX		0x94
- #define SDVO_CMD_GET_HBUF_INFO		0x95
- #define SDVO_CMD_SET_HBUF_AV_SPLIT	0x96
--- 
-2.28.0
-
-
-From 87725c35384baf9b6fbea6342807aab7071b0462 Mon Sep 17 00:00:00 2001
-From: Johan Hovold <jhovold@gmail.com>
-Date: Thu, 8 Nov 2012 18:28:59 +0100
-Subject: [PATCH 36/41] USB: mos7840: remove unused variable
-
-Fix warning about unused variable introduced by commit e681b66f2e19fa
-("USB: mos7840: remove invalid disconnect handling") upstream.
-
-A subsequent fix which removed the disconnect function got rid of the
-warning but that one was only backported to v3.6.
-
-Reported-by: Jiri Slaby <jslaby@suse.cz>
-Signed-off-by: Johan Hovold <jhovold@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/serial/mos7840.c | 1 -
- 1 file changed, 1 deletion(-)
-
-diff --git a/drivers/usb/serial/mos7840.c b/drivers/usb/serial/mos7840.c
-index 2d34dfd6af46..995e56c93bf8 100644
---- a/drivers/usb/serial/mos7840.c
-+++ b/drivers/usb/serial/mos7840.c
-@@ -2586,7 +2586,6 @@ error:
- static void mos7840_disconnect(struct usb_serial *serial)
- {
- 	int i;
--	unsigned long flags;
- 	struct moschip_port *mos7840_port;
- 	dbg("%s", " disconnect :entering..........");
- 
--- 
-2.28.0
-
-
-From 11b34bb13aebb075ba47e3a292443ab3cd9638f7 Mon Sep 17 00:00:00 2001
-From: Dave Chinner <dchinner@redhat.com>
-Date: Fri, 2 Nov 2012 11:38:44 +1100
-Subject: [PATCH 37/41] xfs: fix reading of wrapped log data
-
-commit 6ce377afd1755eae5c93410ca9a1121dfead7b87 upstream.
-
-Commit 4439647 ("xfs: reset buffer pointers before freeing them") in
-3.0-rc1 introduced a regression when recovering log buffers that
-wrapped around the end of log. The second part of the log buffer at
-the start of the physical log was being read into the header buffer
-rather than the data buffer, and hence recovery was seeing garbage
-in the data buffer when it got to the region of the log buffer that
-was incorrectly read.
-
-Reported-by: Torsten Kaiser <just.for.lkml@googlemail.com>
-Signed-off-by: Dave Chinner <dchinner@redhat.com>
-Reviewed-by: Christoph Hellwig <hch@lst.de>
-Reviewed-by: Mark Tinguely <tinguely@sgi.com>
-Signed-off-by: Ben Myers <bpm@sgi.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/xfs/xfs_log_recover.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/fs/xfs/xfs_log_recover.c b/fs/xfs/xfs_log_recover.c
-index b75fd67ca376..6a5a1af82493 100644
---- a/fs/xfs/xfs_log_recover.c
-+++ b/fs/xfs/xfs_log_recover.c
-@@ -3512,7 +3512,7 @@ xlog_do_recovery_pass(
- 				 *   - order is important.
- 				 */
- 				error = xlog_bread_offset(log, 0,
--						bblks - split_bblks, hbp,
-+						bblks - split_bblks, dbp,
- 						offset + BBTOB(split_bblks));
- 				if (error)
- 					goto bread_err2;
--- 
-2.28.0
-
-
-From 919609d3cba52431b16501a63e6a5d45266a25c6 Mon Sep 17 00:00:00 2001
-From: Roland Dreier <roland@purestorage.com>
-Date: Wed, 20 Jul 2011 06:22:21 -0700
-Subject: [PATCH 38/41] intel-iommu: Fix AB-BA lockdep report
-
-commit 3e7abe2556b583e87dabda3e0e6178a67b20d06f upstream.
-
-When unbinding a device so that I could pass it through to a KVM VM, I
-got the lockdep report below.  It looks like a legitimate lock
-ordering problem:
-
- - domain_context_mapping_one() takes iommu->lock and calls
-   iommu_support_dev_iotlb(), which takes device_domain_lock (inside
-   iommu->lock).
-
- - domain_remove_one_dev_info() starts by taking device_domain_lock
-   then takes iommu->lock inside it (near the end of the function).
-
-So this is the classic AB-BA deadlock.  It looks like a safe fix is to
-simply release device_domain_lock a bit earlier, since as far as I can
-tell, it doesn't protect any of the stuff accessed at the end of
-domain_remove_one_dev_info() anyway.
-
-BTW, the use of device_domain_lock looks a bit unsafe to me... it's
-at least not obvious to me why we aren't vulnerable to the race below:
-
-  iommu_support_dev_iotlb()
-                                          domain_remove_dev_info()
-
-  lock device_domain_lock
-    find info
-  unlock device_domain_lock
-
-                                          lock device_domain_lock
-                                            find same info
-                                          unlock device_domain_lock
-
-                                          free_devinfo_mem(info)
-
-  do stuff with info after it's free
-
-However I don't understand the locking here well enough to know if
-this is a real problem, let alone what the best fix is.
-
-Anyway here's the full lockdep output that prompted all of this:
-
-     =======================================================
-     [ INFO: possible circular locking dependency detected ]
-     2.6.39.1+ #1
-     -------------------------------------------------------
-     bash/13954 is trying to acquire lock:
-      (&(&iommu->lock)->rlock){......}, at: [<ffffffff812f6421>] domain_remove_one_dev_info+0x121/0x230
-
-     but task is already holding lock:
-      (device_domain_lock){-.-...}, at: [<ffffffff812f6508>] domain_remove_one_dev_info+0x208/0x230
-
-     which lock already depends on the new lock.
-
-     the existing dependency chain (in reverse order) is:
-
-     -> #1 (device_domain_lock){-.-...}:
-            [<ffffffff8109ca9d>] lock_acquire+0x9d/0x130
-            [<ffffffff81571475>] _raw_spin_lock_irqsave+0x55/0xa0
-            [<ffffffff812f8350>] domain_context_mapping_one+0x600/0x750
-            [<ffffffff812f84df>] domain_context_mapping+0x3f/0x120
-            [<ffffffff812f9175>] iommu_prepare_identity_map+0x1c5/0x1e0
-            [<ffffffff81ccf1ca>] intel_iommu_init+0x88e/0xb5e
-            [<ffffffff81cab204>] pci_iommu_init+0x16/0x41
-            [<ffffffff81002165>] do_one_initcall+0x45/0x190
-            [<ffffffff81ca3d3f>] kernel_init+0xe3/0x168
-            [<ffffffff8157ac24>] kernel_thread_helper+0x4/0x10
-
-     -> #0 (&(&iommu->lock)->rlock){......}:
-            [<ffffffff8109bf3e>] __lock_acquire+0x195e/0x1e10
-            [<ffffffff8109ca9d>] lock_acquire+0x9d/0x130
-            [<ffffffff81571475>] _raw_spin_lock_irqsave+0x55/0xa0
-            [<ffffffff812f6421>] domain_remove_one_dev_info+0x121/0x230
-            [<ffffffff812f8b42>] device_notifier+0x72/0x90
-            [<ffffffff8157555c>] notifier_call_chain+0x8c/0xc0
-            [<ffffffff81089768>] __blocking_notifier_call_chain+0x78/0xb0
-            [<ffffffff810897b6>] blocking_notifier_call_chain+0x16/0x20
-            [<ffffffff81373a5c>] __device_release_driver+0xbc/0xe0
-            [<ffffffff81373ccf>] device_release_driver+0x2f/0x50
-            [<ffffffff81372ee3>] driver_unbind+0xa3/0xc0
-            [<ffffffff813724ac>] drv_attr_store+0x2c/0x30
-            [<ffffffff811e4506>] sysfs_write_file+0xe6/0x170
-            [<ffffffff8117569e>] vfs_write+0xce/0x190
-            [<ffffffff811759e4>] sys_write+0x54/0xa0
-            [<ffffffff81579a82>] system_call_fastpath+0x16/0x1b
-
-     other info that might help us debug this:
-
-     6 locks held by bash/13954:
-      #0:  (&buffer->mutex){+.+.+.}, at: [<ffffffff811e4464>] sysfs_write_file+0x44/0x170
-      #1:  (s_active#3){++++.+}, at: [<ffffffff811e44ed>] sysfs_write_file+0xcd/0x170
-      #2:  (&__lockdep_no_validate__){+.+.+.}, at: [<ffffffff81372edb>] driver_unbind+0x9b/0xc0
-      #3:  (&__lockdep_no_validate__){+.+.+.}, at: [<ffffffff81373cc7>] device_release_driver+0x27/0x50
-      #4:  (&(&priv->bus_notifier)->rwsem){.+.+.+}, at: [<ffffffff8108974f>] __blocking_notifier_call_chain+0x5f/0xb0
-      #5:  (device_domain_lock){-.-...}, at: [<ffffffff812f6508>] domain_remove_one_dev_info+0x208/0x230
-
-     stack backtrace:
-     Pid: 13954, comm: bash Not tainted 2.6.39.1+ #1
-     Call Trace:
-      [<ffffffff810993a7>] print_circular_bug+0xf7/0x100
-      [<ffffffff8109bf3e>] __lock_acquire+0x195e/0x1e10
-      [<ffffffff810972bd>] ? trace_hardirqs_off+0xd/0x10
-      [<ffffffff8109d57d>] ? trace_hardirqs_on_caller+0x13d/0x180
-      [<ffffffff8109ca9d>] lock_acquire+0x9d/0x130
-      [<ffffffff812f6421>] ? domain_remove_one_dev_info+0x121/0x230
-      [<ffffffff81571475>] _raw_spin_lock_irqsave+0x55/0xa0
-      [<ffffffff812f6421>] ? domain_remove_one_dev_info+0x121/0x230
-      [<ffffffff810972bd>] ? trace_hardirqs_off+0xd/0x10
-      [<ffffffff812f6421>] domain_remove_one_dev_info+0x121/0x230
-      [<ffffffff812f8b42>] device_notifier+0x72/0x90
-      [<ffffffff8157555c>] notifier_call_chain+0x8c/0xc0
-      [<ffffffff81089768>] __blocking_notifier_call_chain+0x78/0xb0
-      [<ffffffff810897b6>] blocking_notifier_call_chain+0x16/0x20
-      [<ffffffff81373a5c>] __device_release_driver+0xbc/0xe0
-      [<ffffffff81373ccf>] device_release_driver+0x2f/0x50
-      [<ffffffff81372ee3>] driver_unbind+0xa3/0xc0
-      [<ffffffff813724ac>] drv_attr_store+0x2c/0x30
-      [<ffffffff811e4506>] sysfs_write_file+0xe6/0x170
-      [<ffffffff8117569e>] vfs_write+0xce/0x190
-      [<ffffffff811759e4>] sys_write+0x54/0xa0
-      [<ffffffff81579a82>] system_call_fastpath+0x16/0x1b
-
-Signed-off-by: Roland Dreier <roland@purestorage.com>
-Signed-off-by: David Woodhouse <David.Woodhouse@intel.com>
-Cc: Steven Rostedt <rostedt@goodmis.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/pci/intel-iommu.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/pci/intel-iommu.c b/drivers/pci/intel-iommu.c
-index 0ec8930f31b8..0b4dbcdb0cc0 100644
---- a/drivers/pci/intel-iommu.c
-+++ b/drivers/pci/intel-iommu.c
-@@ -3573,6 +3573,8 @@ static void domain_remove_one_dev_info(struct dmar_domain *domain,
- 			found = 1;
- 	}
- 
-+	spin_unlock_irqrestore(&device_domain_lock, flags);
-+
- 	if (found == 0) {
- 		unsigned long tmp_flags;
- 		spin_lock_irqsave(&domain->iommu_lock, tmp_flags);
-@@ -3589,8 +3591,6 @@ static void domain_remove_one_dev_info(struct dmar_domain *domain,
- 			spin_unlock_irqrestore(&iommu->lock, tmp_flags);
- 		}
- 	}
--
--	spin_unlock_irqrestore(&device_domain_lock, flags);
- }
- 
- static void vm_domain_remove_all_dev_info(struct dmar_domain *domain)
--- 
-2.28.0
-
-
-From aaf238baf31e14cb1c111815193c3a78770b1873 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Thu, 8 Nov 2012 14:36:18 +0100
-Subject: [PATCH 39/41] ALSA: Fix card refcount unbalance
-
-commit 8bb4d9ce08b0a92ca174e41d92c180328f86173f upstream.
-
-There are uncovered cases whether the card refcount introduced by the
-commit a0830dbd isn't properly increased or decreased:
-- OSS PCM and mixer success paths
-- When lookup function gets NULL
-
-This patch fixes these places.
-
-Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=50251
-
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/core/oss/mixer_oss.c | 1 +
- sound/core/oss/pcm_oss.c   | 1 +
- sound/core/pcm_native.c    | 6 ++++--
- sound/core/sound.c         | 2 +-
- sound/core/sound_oss.c     | 2 +-
- 5 files changed, 8 insertions(+), 4 deletions(-)
-
-diff --git a/sound/core/oss/mixer_oss.c b/sound/core/oss/mixer_oss.c
-index 5cdd0fe7109e..e7c118389015 100644
---- a/sound/core/oss/mixer_oss.c
-+++ b/sound/core/oss/mixer_oss.c
-@@ -75,6 +75,7 @@ static int snd_mixer_oss_open(struct inode *inode, struct file *file)
- 		snd_card_unref(card);
- 		return -EFAULT;
- 	}
-+	snd_card_unref(card);
- 	return 0;
- }
- 
-diff --git a/sound/core/oss/pcm_oss.c b/sound/core/oss/pcm_oss.c
-index ea757241f47b..725a16135988 100644
---- a/sound/core/oss/pcm_oss.c
-+++ b/sound/core/oss/pcm_oss.c
-@@ -2454,6 +2454,7 @@ static int snd_pcm_oss_open(struct inode *inode, struct file *file)
- 	mutex_unlock(&pcm->open_mutex);
- 	if (err < 0)
- 		goto __error;
-+	snd_card_unref(pcm->card);
- 	return err;
- 
-       __error:
-diff --git a/sound/core/pcm_native.c b/sound/core/pcm_native.c
-index c8e5a6b6c756..7393551a8c47 100644
---- a/sound/core/pcm_native.c
-+++ b/sound/core/pcm_native.c
-@@ -2110,7 +2110,8 @@ static int snd_pcm_playback_open(struct inode *inode, struct file *file)
- 	pcm = snd_lookup_minor_data(iminor(inode),
- 				    SNDRV_DEVICE_TYPE_PCM_PLAYBACK);
- 	err = snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_PLAYBACK);
--	snd_card_unref(pcm->card);
-+	if (pcm)
-+		snd_card_unref(pcm->card);
- 	return err;
- }
- 
-@@ -2123,7 +2124,8 @@ static int snd_pcm_capture_open(struct inode *inode, struct file *file)
- 	pcm = snd_lookup_minor_data(iminor(inode),
- 				    SNDRV_DEVICE_TYPE_PCM_CAPTURE);
- 	err = snd_pcm_open(file, pcm, SNDRV_PCM_STREAM_CAPTURE);
--	snd_card_unref(pcm->card);
-+	if (pcm)
-+		snd_card_unref(pcm->card);
- 	return err;
- }
- 
-diff --git a/sound/core/sound.c b/sound/core/sound.c
-index b235aaa3a1bf..e9b79b531082 100644
---- a/sound/core/sound.c
-+++ b/sound/core/sound.c
-@@ -115,7 +115,7 @@ void *snd_lookup_minor_data(unsigned int minor, int type)
- 	mreg = snd_minors[minor];
- 	if (mreg && mreg->type == type) {
- 		private_data = mreg->private_data;
--		if (mreg->card_ptr)
-+		if (private_data && mreg->card_ptr)
- 			atomic_inc(&mreg->card_ptr->refcount);
- 	} else
- 		private_data = NULL;
-diff --git a/sound/core/sound_oss.c b/sound/core/sound_oss.c
-index cdeae29f43fb..b6ff6d6349f0 100644
---- a/sound/core/sound_oss.c
-+++ b/sound/core/sound_oss.c
-@@ -53,7 +53,7 @@ void *snd_lookup_oss_minor_data(unsigned int minor, int type)
- 	mreg = snd_oss_minors[minor];
- 	if (mreg && mreg->type == type) {
- 		private_data = mreg->private_data;
--		if (mreg->card_ptr)
-+		if (private_data && mreg->card_ptr)
- 			atomic_inc(&mreg->card_ptr->refcount);
- 	} else
- 		private_data = NULL;
--- 
-2.28.0
-
-
-From 093371484195393366f3407465b6f6c53eefdc57 Mon Sep 17 00:00:00 2001
-From: Takashi Iwai <tiwai@suse.de>
-Date: Tue, 13 Nov 2012 11:22:48 +0100
-Subject: [PATCH 40/41] ALSA: usb-audio: Fix mutex deadlock at disconnection
-
-commit 10e44239f67d0b6fb74006e61a7e883b8075247a upstream.
-
-The recent change for USB-audio disconnection race fixes introduced a
-mutex deadlock again.  There is a circular dependency between
-chip->shutdown_rwsem and pcm->open_mutex, depicted like below, when a
-device is opened during the disconnection operation:
-
-A. snd_usb_audio_disconnect() ->
-     card.c::register_mutex ->
-       chip->shutdown_rwsem (write) ->
-         snd_card_disconnect() ->
-           pcm.c::register_mutex ->
-             pcm->open_mutex
-
-B. snd_pcm_open() ->
-     pcm->open_mutex ->
-       snd_usb_pcm_open() ->
-         chip->shutdown_rwsem (read)
-
-Since the chip->shutdown_rwsem protection in the case A is required
-only for turning on the chip->shutdown flag and it doesn't have to be
-taken for the whole operation, we can reduce its window in
-snd_usb_audio_disconnect().
-
-Reported-by: Jiri Slaby <jslaby@suse.cz>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/card.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
 diff --git a/sound/usb/card.c b/sound/usb/card.c
-index 144f1317e2f4..8d0a3c145e61 100644
+index 57a8e2d..8d0a3c1 100644
 --- a/sound/usb/card.c
 +++ b/sound/usb/card.c
+@@ -335,7 +335,7 @@ static int snd_usb_audio_create(struct usb_device *dev, int idx,
+ 		return -ENOMEM;
+ 	}
+ 
+-	mutex_init(&chip->shutdown_mutex);
++	init_rwsem(&chip->shutdown_rwsem);
+ 	chip->index = idx;
+ 	chip->dev = dev;
+ 	chip->card = card;
 @@ -554,9 +554,11 @@ static void snd_usb_audio_disconnect(struct usb_device *dev, void *ptr)
  
  	chip = ptr;
  	card = chip->card;
 -	mutex_lock(&register_mutex);
- 	down_write(&chip->shutdown_rwsem);
+-	mutex_lock(&chip->shutdown_mutex);
++	down_write(&chip->shutdown_rwsem);
  	chip->shutdown = 1;
 +	up_write(&chip->shutdown_rwsem);
 +
@@ -3636,39 +1515,446 @@ index 144f1317e2f4..8d0a3c145e61 100644
  			snd_usb_mixer_disconnect(p);
  		}
  		usb_chip[chip->index] = NULL;
--		up_write(&chip->shutdown_rwsem);
+-		mutex_unlock(&chip->shutdown_mutex);
  		mutex_unlock(&register_mutex);
  		snd_card_free_when_closed(card);
  	} else {
--		up_write(&chip->shutdown_rwsem);
+-		mutex_unlock(&chip->shutdown_mutex);
  		mutex_unlock(&register_mutex);
  	}
  }
--- 
-2.28.0
-
-
-From 89d2d133c6947c04a8ab539b997f266535beaafe Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sat, 17 Nov 2012 13:14:48 -0800
-Subject: [PATCH 41/41] Linux 3.0.52
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 9ec465ba6345..1dbdc46ea17d 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 0
--SUBLEVEL = 51
-+SUBLEVEL = 52
- EXTRAVERSION =
- NAME = Sneaky Weasel
+@@ -609,16 +609,20 @@ int snd_usb_autoresume(struct snd_usb_audio *chip)
+ {
+ 	int err = -ENODEV;
  
--- 
-2.28.0
-
++	down_read(&chip->shutdown_rwsem);
+ 	if (!chip->shutdown && !chip->probing)
+ 		err = usb_autopm_get_interface(chip->pm_intf);
++	up_read(&chip->shutdown_rwsem);
+ 
+ 	return err;
+ }
+ 
+ void snd_usb_autosuspend(struct snd_usb_audio *chip)
+ {
++	down_read(&chip->shutdown_rwsem);
+ 	if (!chip->shutdown && !chip->probing)
+ 		usb_autopm_put_interface(chip->pm_intf);
++	up_read(&chip->shutdown_rwsem);
+ }
+ 
+ static int usb_audio_suspend(struct usb_interface *intf, pm_message_t message)
+diff --git a/sound/usb/card.h b/sound/usb/card.h
+index ae4251d..19b5b5d 100644
+--- a/sound/usb/card.h
++++ b/sound/usb/card.h
+@@ -86,6 +86,7 @@ struct snd_usb_substream {
+ 	struct snd_urb_ctx syncurb[SYNC_URBS];	/* sync urb table */
+ 	char *syncbuf;				/* sync buffer for all sync URBs */
+ 	dma_addr_t sync_dma;			/* DMA address of syncbuf */
++	unsigned int speed;		/* USB_SPEED_XXX */
+ 
+ 	u64 formats;			/* format bitmasks (all or'ed) */
+ 	unsigned int num_formats;		/* number of supported audio formats (list) */
+diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
+index 9363a8c..1d369e2 100644
+--- a/sound/usb/mixer.c
++++ b/sound/usb/mixer.c
+@@ -287,25 +287,32 @@ static int get_ctl_value_v1(struct usb_mixer_elem_info *cval, int request, int v
+ 	unsigned char buf[2];
+ 	int val_len = cval->val_type >= USB_MIXER_S16 ? 2 : 1;
+ 	int timeout = 10;
+-	int err;
++	int idx = 0, err;
+ 
+ 	err = snd_usb_autoresume(cval->mixer->chip);
+ 	if (err < 0)
+ 		return -EIO;
++	down_read(&chip->shutdown_rwsem);
+ 	while (timeout-- > 0) {
++		if (chip->shutdown)
++			break;
++		idx = snd_usb_ctrl_intf(chip) | (cval->id << 8);
+ 		if (snd_usb_ctl_msg(chip->dev, usb_rcvctrlpipe(chip->dev, 0), request,
+ 				    USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_IN,
+-				    validx, snd_usb_ctrl_intf(chip) | (cval->id << 8),
+-				    buf, val_len, 100) >= val_len) {
++				    validx, idx, buf, val_len, 100) >= val_len) {
+ 			*value_ret = convert_signed_value(cval, snd_usb_combine_bytes(buf, val_len));
+-			snd_usb_autosuspend(cval->mixer->chip);
+-			return 0;
++			err = 0;
++			goto out;
+ 		}
+ 	}
+-	snd_usb_autosuspend(cval->mixer->chip);
+ 	snd_printdd(KERN_ERR "cannot get ctl value: req = %#x, wValue = %#x, wIndex = %#x, type = %d\n",
+-		    request, validx, snd_usb_ctrl_intf(chip) | (cval->id << 8), cval->val_type);
+-	return -EINVAL;
++		    request, validx, idx, cval->val_type);
++	err = -EINVAL;
++
++ out:
++	up_read(&chip->shutdown_rwsem);
++	snd_usb_autosuspend(cval->mixer->chip);
++	return err;
+ }
+ 
+ static int get_ctl_value_v2(struct usb_mixer_elem_info *cval, int request, int validx, int *value_ret)
+@@ -313,7 +320,7 @@ static int get_ctl_value_v2(struct usb_mixer_elem_info *cval, int request, int v
+ 	struct snd_usb_audio *chip = cval->mixer->chip;
+ 	unsigned char buf[2 + 3*sizeof(__u16)]; /* enough space for one range */
+ 	unsigned char *val;
+-	int ret, size;
++	int idx = 0, ret, size;
+ 	__u8 bRequest;
+ 
+ 	if (request == UAC_GET_CUR) {
+@@ -330,16 +337,22 @@ static int get_ctl_value_v2(struct usb_mixer_elem_info *cval, int request, int v
+ 	if (ret)
+ 		goto error;
+ 
+-	ret = snd_usb_ctl_msg(chip->dev, usb_rcvctrlpipe(chip->dev, 0), bRequest,
++	down_read(&chip->shutdown_rwsem);
++	if (chip->shutdown)
++		ret = -ENODEV;
++	else {
++		idx = snd_usb_ctrl_intf(chip) | (cval->id << 8);
++		ret = snd_usb_ctl_msg(chip->dev, usb_rcvctrlpipe(chip->dev, 0), bRequest,
+ 			      USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_IN,
+-			      validx, snd_usb_ctrl_intf(chip) | (cval->id << 8),
+-			      buf, size, 1000);
++			      validx, idx, buf, size, 1000);
++	}
++	up_read(&chip->shutdown_rwsem);
+ 	snd_usb_autosuspend(chip);
+ 
+ 	if (ret < 0) {
+ error:
+ 		snd_printk(KERN_ERR "cannot get ctl value: req = %#x, wValue = %#x, wIndex = %#x, type = %d\n",
+-			   request, validx, snd_usb_ctrl_intf(chip) | (cval->id << 8), cval->val_type);
++			   request, validx, idx, cval->val_type);
+ 		return ret;
+ 	}
+ 
+@@ -417,7 +430,7 @@ int snd_usb_mixer_set_ctl_value(struct usb_mixer_elem_info *cval,
+ {
+ 	struct snd_usb_audio *chip = cval->mixer->chip;
+ 	unsigned char buf[2];
+-	int val_len, err, timeout = 10;
++	int idx = 0, val_len, err, timeout = 10;
+ 
+ 	if (cval->mixer->protocol == UAC_VERSION_1) {
+ 		val_len = cval->val_type >= USB_MIXER_S16 ? 2 : 1;
+@@ -440,19 +453,27 @@ int snd_usb_mixer_set_ctl_value(struct usb_mixer_elem_info *cval,
+ 	err = snd_usb_autoresume(chip);
+ 	if (err < 0)
+ 		return -EIO;
+-	while (timeout-- > 0)
++	down_read(&chip->shutdown_rwsem);
++	while (timeout-- > 0) {
++		if (chip->shutdown)
++			break;
++		idx = snd_usb_ctrl_intf(chip) | (cval->id << 8);
+ 		if (snd_usb_ctl_msg(chip->dev,
+ 				    usb_sndctrlpipe(chip->dev, 0), request,
+ 				    USB_RECIP_INTERFACE | USB_TYPE_CLASS | USB_DIR_OUT,
+-				    validx, snd_usb_ctrl_intf(chip) | (cval->id << 8),
+-				    buf, val_len, 100) >= 0) {
+-			snd_usb_autosuspend(chip);
+-			return 0;
++				    validx, idx, buf, val_len, 100) >= 0) {
++			err = 0;
++			goto out;
+ 		}
+-	snd_usb_autosuspend(chip);
++	}
+ 	snd_printdd(KERN_ERR "cannot set ctl value: req = %#x, wValue = %#x, wIndex = %#x, type = %d, data = %#x/%#x\n",
+-		    request, validx, snd_usb_ctrl_intf(chip) | (cval->id << 8), cval->val_type, buf[0], buf[1]);
+-	return -EINVAL;
++		    request, validx, idx, cval->val_type, buf[0], buf[1]);
++	err = -EINVAL;
++
++ out:
++	up_read(&chip->shutdown_rwsem);
++	snd_usb_autosuspend(chip);
++	return err;
+ }
+ 
+ static int set_cur_ctl_value(struct usb_mixer_elem_info *cval, int validx, int value)
+diff --git a/sound/usb/mixer_quirks.c b/sound/usb/mixer_quirks.c
+index 3d0f487..b4c516a 100644
+--- a/sound/usb/mixer_quirks.c
++++ b/sound/usb/mixer_quirks.c
+@@ -186,6 +186,11 @@ static int snd_audigy2nx_led_put(struct snd_kcontrol *kcontrol, struct snd_ctl_e
+ 	if (value > 1)
+ 		return -EINVAL;
+ 	changed = value != mixer->audigy2nx_leds[index];
++	down_read(&mixer->chip->shutdown_rwsem);
++	if (mixer->chip->shutdown) {
++		err = -ENODEV;
++		goto out;
++	}
+ 	if (mixer->chip->usb_id == USB_ID(0x041e, 0x3042))
+ 		err = snd_usb_ctl_msg(mixer->chip->dev,
+ 			      usb_sndctrlpipe(mixer->chip->dev, 0), 0x24,
+@@ -202,6 +207,8 @@ static int snd_audigy2nx_led_put(struct snd_kcontrol *kcontrol, struct snd_ctl_e
+ 			      usb_sndctrlpipe(mixer->chip->dev, 0), 0x24,
+ 			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_OTHER,
+ 			      value, index + 2, NULL, 0, 100);
++ out:
++	up_read(&mixer->chip->shutdown_rwsem);
+ 	if (err < 0)
+ 		return err;
+ 	mixer->audigy2nx_leds[index] = value;
+@@ -295,11 +302,16 @@ static void snd_audigy2nx_proc_read(struct snd_info_entry *entry,
+ 
+ 	for (i = 0; jacks[i].name; ++i) {
+ 		snd_iprintf(buffer, "%s: ", jacks[i].name);
+-		err = snd_usb_ctl_msg(mixer->chip->dev,
++		down_read(&mixer->chip->shutdown_rwsem);
++		if (mixer->chip->shutdown)
++			err = 0;
++		else
++			err = snd_usb_ctl_msg(mixer->chip->dev,
+ 				      usb_rcvctrlpipe(mixer->chip->dev, 0),
+ 				      UAC_GET_MEM, USB_DIR_IN | USB_TYPE_CLASS |
+ 				      USB_RECIP_INTERFACE, 0,
+ 				      jacks[i].unitid << 8, buf, 3, 100);
++		up_read(&mixer->chip->shutdown_rwsem);
+ 		if (err == 3 && (buf[0] == 3 || buf[0] == 6))
+ 			snd_iprintf(buffer, "%02x %02x\n", buf[1], buf[2]);
+ 		else
+@@ -329,10 +341,15 @@ static int snd_xonar_u1_switch_put(struct snd_kcontrol *kcontrol,
+ 	else
+ 		new_status = old_status & ~0x02;
+ 	changed = new_status != old_status;
+-	err = snd_usb_ctl_msg(mixer->chip->dev,
++	down_read(&mixer->chip->shutdown_rwsem);
++	if (mixer->chip->shutdown)
++		err = -ENODEV;
++	else
++		err = snd_usb_ctl_msg(mixer->chip->dev,
+ 			      usb_sndctrlpipe(mixer->chip->dev, 0), 0x08,
+ 			      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_OTHER,
+ 			      50, 0, &new_status, 1, 100);
++	up_read(&mixer->chip->shutdown_rwsem);
+ 	if (err < 0)
+ 		return err;
+ 	mixer->xonar_u1_status = new_status;
+@@ -371,11 +388,17 @@ static int snd_nativeinstruments_control_get(struct snd_kcontrol *kcontrol,
+ 	u8 bRequest = (kcontrol->private_value >> 16) & 0xff;
+ 	u16 wIndex = kcontrol->private_value & 0xffff;
+ 	u8 tmp;
++	int ret;
+ 
+-	int ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), bRequest,
++	down_read(&mixer->chip->shutdown_rwsem);
++	if (mixer->chip->shutdown)
++		ret = -ENODEV;
++	else
++		ret = usb_control_msg(dev, usb_rcvctrlpipe(dev, 0), bRequest,
+ 				  USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN,
+ 				  0, cpu_to_le16(wIndex),
+ 				  &tmp, sizeof(tmp), 1000);
++	up_read(&mixer->chip->shutdown_rwsem);
+ 
+ 	if (ret < 0) {
+ 		snd_printk(KERN_ERR
+@@ -396,11 +419,17 @@ static int snd_nativeinstruments_control_put(struct snd_kcontrol *kcontrol,
+ 	u8 bRequest = (kcontrol->private_value >> 16) & 0xff;
+ 	u16 wIndex = kcontrol->private_value & 0xffff;
+ 	u16 wValue = ucontrol->value.integer.value[0];
++	int ret;
+ 
+-	int ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0), bRequest,
++	down_read(&mixer->chip->shutdown_rwsem);
++	if (mixer->chip->shutdown)
++		ret = -ENODEV;
++	else
++		ret = usb_control_msg(dev, usb_sndctrlpipe(dev, 0), bRequest,
+ 				  USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
+ 				  cpu_to_le16(wValue), cpu_to_le16(wIndex),
+ 				  NULL, 0, 1000);
++	up_read(&mixer->chip->shutdown_rwsem);
+ 
+ 	if (ret < 0) {
+ 		snd_printk(KERN_ERR
+diff --git a/sound/usb/pcm.c b/sound/usb/pcm.c
+index 506c0fa..e9c47a4 100644
+--- a/sound/usb/pcm.c
++++ b/sound/usb/pcm.c
+@@ -43,6 +43,8 @@ static snd_pcm_uframes_t snd_usb_pcm_pointer(struct snd_pcm_substream *substream
+ 	unsigned int hwptr_done;
+ 
+ 	subs = (struct snd_usb_substream *)substream->runtime->private_data;
++	if (subs->stream->chip->shutdown)
++		return SNDRV_PCM_POS_XRUN;
+ 	spin_lock(&subs->lock);
+ 	hwptr_done = subs->hwptr_done;
+ 	spin_unlock(&subs->lock);
+@@ -347,8 +349,14 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
+ 	changed = subs->cur_audiofmt != fmt ||
+ 		subs->period_bytes != params_period_bytes(hw_params) ||
+ 		subs->cur_rate != rate;
++
++	down_read(&subs->stream->chip->shutdown_rwsem);
++	if (subs->stream->chip->shutdown) {
++		ret = -ENODEV;
++		goto unlock;
++	}
+ 	if ((ret = set_format(subs, fmt)) < 0)
+-		return ret;
++		goto unlock;
+ 
+ 	if (subs->cur_rate != rate) {
+ 		struct usb_host_interface *alts;
+@@ -357,12 +365,11 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
+ 		alts = &iface->altsetting[fmt->altset_idx];
+ 		ret = snd_usb_init_sample_rate(subs->stream->chip, subs->interface, alts, fmt, rate);
+ 		if (ret < 0)
+-			return ret;
++			goto unlock;
+ 		subs->cur_rate = rate;
+ 	}
+ 
+ 	if (changed) {
+-		mutex_lock(&subs->stream->chip->shutdown_mutex);
+ 		/* format changed */
+ 		snd_usb_release_substream_urbs(subs, 0);
+ 		/* influenced: period_bytes, channels, rate, format, */
+@@ -370,9 +377,10 @@ static int snd_usb_hw_params(struct snd_pcm_substream *substream,
+ 						  params_rate(hw_params),
+ 						  snd_pcm_format_physical_width(params_format(hw_params)) *
+ 							params_channels(hw_params));
+-		mutex_unlock(&subs->stream->chip->shutdown_mutex);
+ 	}
+ 
++unlock:
++	up_read(&subs->stream->chip->shutdown_rwsem);
+ 	return ret;
+ }
+ 
+@@ -388,9 +396,9 @@ static int snd_usb_hw_free(struct snd_pcm_substream *substream)
+ 	subs->cur_audiofmt = NULL;
+ 	subs->cur_rate = 0;
+ 	subs->period_bytes = 0;
+-	mutex_lock(&subs->stream->chip->shutdown_mutex);
++	down_read(&subs->stream->chip->shutdown_rwsem);
+ 	snd_usb_release_substream_urbs(subs, 0);
+-	mutex_unlock(&subs->stream->chip->shutdown_mutex);
++	up_read(&subs->stream->chip->shutdown_rwsem);
+ 	return snd_pcm_lib_free_vmalloc_buffer(substream);
+ }
+ 
+@@ -403,12 +411,18 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_pcm_runtime *runtime = substream->runtime;
+ 	struct snd_usb_substream *subs = runtime->private_data;
++	int ret = 0;
+ 
+ 	if (! subs->cur_audiofmt) {
+ 		snd_printk(KERN_ERR "usbaudio: no format is specified!\n");
+ 		return -ENXIO;
+ 	}
+ 
++	down_read(&subs->stream->chip->shutdown_rwsem);
++	if (subs->stream->chip->shutdown) {
++		ret = -ENODEV;
++		goto unlock;
++	}
+ 	/* some unit conversions in runtime */
+ 	subs->maxframesize = bytes_to_frames(runtime, subs->maxpacksize);
+ 	subs->curframesize = bytes_to_frames(runtime, subs->curpacksize);
+@@ -419,7 +433,10 @@ static int snd_usb_pcm_prepare(struct snd_pcm_substream *substream)
+ 	subs->phase = 0;
+ 	runtime->delay = 0;
+ 
+-	return snd_usb_substream_prepare(subs, runtime);
++	ret = snd_usb_substream_prepare(subs, runtime);
++ unlock:
++	up_read(&subs->stream->chip->shutdown_rwsem);
++	return ret;
+ }
+ 
+ static struct snd_pcm_hardware snd_usb_hardware =
+@@ -472,7 +489,7 @@ static int hw_check_valid_format(struct snd_usb_substream *subs,
+ 		return 0;
+ 	}
+ 	/* check whether the period time is >= the data packet interval */
+-	if (snd_usb_get_speed(subs->dev) != USB_SPEED_FULL) {
++	if (subs->speed != USB_SPEED_FULL) {
+ 		ptime = 125 * (1 << fp->datainterval);
+ 		if (ptime > pt->max || (ptime == pt->max && pt->openmax)) {
+ 			hwc_debug("   > check: ptime %u > max %u\n", ptime, pt->max);
+@@ -748,7 +765,7 @@ static int setup_hw_info(struct snd_pcm_runtime *runtime, struct snd_usb_substre
+ 		return err;
+ 
+ 	param_period_time_if_needed = SNDRV_PCM_HW_PARAM_PERIOD_TIME;
+-	if (snd_usb_get_speed(subs->dev) == USB_SPEED_FULL)
++	if (subs->speed == USB_SPEED_FULL)
+ 		/* full speed devices have fixed data packet interval */
+ 		ptmin = 1000;
+ 	if (ptmin == 1000)
+diff --git a/sound/usb/proc.c b/sound/usb/proc.c
+index 961c9a2..aef03db 100644
+--- a/sound/usb/proc.c
++++ b/sound/usb/proc.c
+@@ -107,7 +107,7 @@ static void proc_dump_substream_formats(struct snd_usb_substream *subs, struct s
+ 			}
+ 			snd_iprintf(buffer, "\n");
+ 		}
+-		if (snd_usb_get_speed(subs->dev) != USB_SPEED_FULL)
++		if (subs->speed != USB_SPEED_FULL)
+ 			snd_iprintf(buffer, "    Data packet interval: %d us\n",
+ 				    125 * (1 << fp->datainterval));
+ 		// snd_iprintf(buffer, "    Max Packet Size = %d\n", fp->maxpacksize);
+@@ -128,7 +128,7 @@ static void proc_dump_substream_status(struct snd_usb_substream *subs, struct sn
+ 		snd_iprintf(buffer, "]\n");
+ 		snd_iprintf(buffer, "    Packet Size = %d\n", subs->curpacksize);
+ 		snd_iprintf(buffer, "    Momentary freq = %u Hz (%#x.%04x)\n",
+-			    snd_usb_get_speed(subs->dev) == USB_SPEED_FULL
++			    subs->speed == USB_SPEED_FULL
+ 			    ? get_full_speed_hz(subs->freqm)
+ 			    : get_high_speed_hz(subs->freqm),
+ 			    subs->freqm >> 16, subs->freqm & 0xffff);
+diff --git a/sound/usb/urb.c b/sound/usb/urb.c
+index e184349..8878875 100644
+--- a/sound/usb/urb.c
++++ b/sound/usb/urb.c
+@@ -147,8 +147,10 @@ void snd_usb_release_substream_urbs(struct snd_usb_substream *subs, int force)
+ 	int i;
+ 
+ 	/* stop urbs (to be sure) */
+-	deactivate_urbs(subs, force, 1);
+-	wait_clear_urbs(subs);
++	if (!subs->stream->chip->shutdown) {
++		deactivate_urbs(subs, force, 1);
++		wait_clear_urbs(subs);
++	}
+ 
+ 	for (i = 0; i < MAX_URBS; i++)
+ 		release_urb_ctx(&subs->dataurb[i]);
+@@ -870,7 +872,8 @@ void snd_usb_init_substream(struct snd_usb_stream *as,
+ 	subs->dev = as->chip->dev;
+ 	subs->txfr_quirk = as->chip->txfr_quirk;
+ 	subs->ops = audio_urb_ops[stream];
+-	if (snd_usb_get_speed(subs->dev) >= USB_SPEED_HIGH)
++	subs->speed = snd_usb_get_speed(subs->dev);
++	if (subs->speed >= USB_SPEED_HIGH)
+ 		subs->ops.prepare_sync = prepare_capture_sync_urb_hs;
+ 
+ 	snd_usb_set_pcm_ops(as->pcm, stream);
+diff --git a/sound/usb/usbaudio.h b/sound/usb/usbaudio.h
+index 1e79986..d4cc9af 100644
+--- a/sound/usb/usbaudio.h
++++ b/sound/usb/usbaudio.h
+@@ -36,7 +36,7 @@ struct snd_usb_audio {
+ 	struct snd_card *card;
+ 	struct usb_interface *pm_intf;
+ 	u32 usb_id;
+-	struct mutex shutdown_mutex;
++	struct rw_semaphore shutdown_rwsem;
+ 	unsigned int shutdown:1;
+ 	unsigned int probing:1;
+ 	unsigned int autosuspended:1;	

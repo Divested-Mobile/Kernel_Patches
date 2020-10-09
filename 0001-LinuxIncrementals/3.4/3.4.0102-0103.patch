@@ -1,70 +1,431 @@
-From ad52eef552c7896ec6024ee72fc126167fe5c4e2 Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Mon, 2 Jun 2014 05:26:03 -0700
-Subject: [PATCH 01/24] inetpeer: get rid of ip_id_count
-
-[ Upstream commit 73f156a6e8c1074ac6327e0abd1169e95eb66463 ]
-
-Ideally, we would need to generate IP ID using a per destination IP
-generator.
-
-linux kernels used inet_peer cache for this purpose, but this had a huge
-cost on servers disabling MTU discovery.
-
-1) each inet_peer struct consumes 192 bytes
-
-2) inetpeer cache uses a binary tree of inet_peer structs,
-   with a nominal size of ~66000 elements under load.
-
-3) lookups in this tree are hitting a lot of cache lines, as tree depth
-   is about 20.
-
-4) If server deals with many tcp flows, we have a high probability of
-   not finding the inet_peer, allocating a fresh one, inserting it in
-   the tree with same initial ip_id_count, (cf secure_ip_id())
-
-5) We garbage collect inet_peer aggressively.
-
-IP ID generation do not have to be 'perfect'
-
-Goal is trying to avoid duplicates in a short period of time,
-so that reassembly units have a chance to complete reassembly of
-fragments belonging to one message before receiving other fragments
-with a recycled ID.
-
-We simply use an array of generators, and a Jenkin hash using the dst IP
-as a key.
-
-ipv6_select_ident() is put back into net/ipv6/ip6_output.c where it
-belongs (it is only used from this file)
-
-secure_ip_id() and secure_ipv6_id() no longer are needed.
-
-Rename ip_select_ident_more() to ip_select_ident_segs() to avoid
-unnecessary decrement/increment of the number of segments.
-
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ppp/pptp.c          |  2 +-
- include/net/inetpeer.h          | 14 ++-------
- include/net/ip.h                | 40 +++++++++++++----------
- include/net/ipip.h              |  2 +-
- include/net/ipv6.h              |  9 ++++--
- include/net/secure_seq.h        |  2 --
- net/core/secure_seq.c           | 23 --------------
- net/ipv4/igmp.c                 |  4 +--
- net/ipv4/inetpeer.c             | 18 -----------
- net/ipv4/ip_output.c            |  7 ++---
- net/ipv4/ipmr.c                 |  2 +-
- net/ipv4/raw.c                  |  2 +-
- net/ipv4/route.c                | 56 +++++++++++----------------------
- net/ipv4/xfrm4_mode_tunnel.c    |  2 +-
- net/ipv6/ip6_output.c           | 23 ++++++--------
- net/netfilter/ipvs/ip_vs_xmit.c |  2 +-
- 16 files changed, 71 insertions(+), 137 deletions(-)
-
+diff --git a/Makefile b/Makefile
+index dd03fa5777a0..36f0913bd1d6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 4
+-SUBLEVEL = 102
++SUBLEVEL = 103
+ EXTRAVERSION =
+ NAME = Saber-toothed Squirrel
+ 
+diff --git a/arch/sparc/include/asm/pgtable_64.h b/arch/sparc/include/asm/pgtable_64.h
+index 656de8bc0ed6..cd24caf1732d 100644
+--- a/arch/sparc/include/asm/pgtable_64.h
++++ b/arch/sparc/include/asm/pgtable_64.h
+@@ -24,7 +24,8 @@
+ 
+ /* The kernel image occupies 0x4000000 to 0x6000000 (4MB --> 96MB).
+  * The page copy blockops can use 0x6000000 to 0x8000000.
+- * The TSB is mapped in the 0x8000000 to 0xa000000 range.
++ * The 8K TSB is mapped in the 0x8000000 to 0x8400000 range.
++ * The 4M TSB is mapped in the 0x8400000 to 0x8800000 range.
+  * The PROM resides in an area spanning 0xf0000000 to 0x100000000.
+  * The vmalloc area spans 0x100000000 to 0x200000000.
+  * Since modules need to be in the lowest 32-bits of the address space,
+@@ -33,7 +34,8 @@
+  * 0x400000000.
+  */
+ #define	TLBTEMP_BASE		_AC(0x0000000006000000,UL)
+-#define	TSBMAP_BASE		_AC(0x0000000008000000,UL)
++#define	TSBMAP_8K_BASE		_AC(0x0000000008000000,UL)
++#define	TSBMAP_4M_BASE		_AC(0x0000000008400000,UL)
+ #define MODULES_VADDR		_AC(0x0000000010000000,UL)
+ #define MODULES_LEN		_AC(0x00000000e0000000,UL)
+ #define MODULES_END		_AC(0x00000000f0000000,UL)
+diff --git a/arch/sparc/include/asm/tlbflush_64.h b/arch/sparc/include/asm/tlbflush_64.h
+index f0d6a9700f4c..1a4bb971e06d 100644
+--- a/arch/sparc/include/asm/tlbflush_64.h
++++ b/arch/sparc/include/asm/tlbflush_64.h
+@@ -35,6 +35,8 @@ static inline void flush_tlb_range(struct vm_area_struct *vma,
+ {
+ }
+ 
++void flush_tlb_kernel_range(unsigned long start, unsigned long end);
++
+ #define __HAVE_ARCH_ENTER_LAZY_MMU_MODE
+ 
+ extern void flush_tlb_pending(void);
+@@ -49,11 +51,6 @@ extern void __flush_tlb_kernel_range(unsigned long start, unsigned long end);
+ 
+ #ifndef CONFIG_SMP
+ 
+-#define flush_tlb_kernel_range(start,end) \
+-do {	flush_tsb_kernel_range(start,end); \
+-	__flush_tlb_kernel_range(start,end); \
+-} while (0)
+-
+ static inline void global_flush_tlb_page(struct mm_struct *mm, unsigned long vaddr)
+ {
+ 	__flush_tlb_page(CTX_HWBITS(mm->context), vaddr);
+@@ -64,11 +61,6 @@ static inline void global_flush_tlb_page(struct mm_struct *mm, unsigned long vad
+ extern void smp_flush_tlb_kernel_range(unsigned long start, unsigned long end);
+ extern void smp_flush_tlb_page(struct mm_struct *mm, unsigned long vaddr);
+ 
+-#define flush_tlb_kernel_range(start, end) \
+-do {	flush_tsb_kernel_range(start,end); \
+-	smp_flush_tlb_kernel_range(start, end); \
+-} while (0)
+-
+ #define global_flush_tlb_page(mm, vaddr) \
+ 	smp_flush_tlb_page(mm, vaddr)
+ 
+diff --git a/arch/sparc/kernel/ldc.c b/arch/sparc/kernel/ldc.c
+index 435e406fdec3..1beaf60a5f78 100644
+--- a/arch/sparc/kernel/ldc.c
++++ b/arch/sparc/kernel/ldc.c
+@@ -1339,7 +1339,7 @@ int ldc_connect(struct ldc_channel *lp)
+ 	if (!(lp->flags & LDC_FLAG_ALLOCED_QUEUES) ||
+ 	    !(lp->flags & LDC_FLAG_REGISTERED_QUEUES) ||
+ 	    lp->hs_state != LDC_HS_OPEN)
+-		err = -EINVAL;
++		err = ((lp->hs_state > LDC_HS_OPEN) ? 0 : -EINVAL);
+ 	else
+ 		err = start_handshake(lp);
+ 
+diff --git a/arch/sparc/kernel/smp_64.c b/arch/sparc/kernel/smp_64.c
+index bb2886ac1df3..bbf7e955cb19 100644
+--- a/arch/sparc/kernel/smp_64.c
++++ b/arch/sparc/kernel/smp_64.c
+@@ -151,7 +151,7 @@ void cpu_panic(void)
+ #define NUM_ROUNDS	64	/* magic value */
+ #define NUM_ITERS	5	/* likewise */
+ 
+-static DEFINE_SPINLOCK(itc_sync_lock);
++static DEFINE_RAW_SPINLOCK(itc_sync_lock);
+ static unsigned long go[SLAVE + 1];
+ 
+ #define DEBUG_TICK_SYNC	0
+@@ -259,7 +259,7 @@ static void smp_synchronize_one_tick(int cpu)
+ 	go[MASTER] = 0;
+ 	membar_safe("#StoreLoad");
+ 
+-	spin_lock_irqsave(&itc_sync_lock, flags);
++	raw_spin_lock_irqsave(&itc_sync_lock, flags);
+ 	{
+ 		for (i = 0; i < NUM_ROUNDS*NUM_ITERS; i++) {
+ 			while (!go[MASTER])
+@@ -270,7 +270,7 @@ static void smp_synchronize_one_tick(int cpu)
+ 			membar_safe("#StoreLoad");
+ 		}
+ 	}
+-	spin_unlock_irqrestore(&itc_sync_lock, flags);
++	raw_spin_unlock_irqrestore(&itc_sync_lock, flags);
+ }
+ 
+ #if defined(CONFIG_SUN_LDOMS) && defined(CONFIG_HOTPLUG_CPU)
+diff --git a/arch/sparc/kernel/sys32.S b/arch/sparc/kernel/sys32.S
+index d97f3eb72e06..085c60fd4b6b 100644
+--- a/arch/sparc/kernel/sys32.S
++++ b/arch/sparc/kernel/sys32.S
+@@ -87,7 +87,7 @@ SIGN1(sys32_io_submit, compat_sys_io_submit, %o1)
+ SIGN1(sys32_mq_open, compat_sys_mq_open, %o1)
+ SIGN1(sys32_select, compat_sys_select, %o0)
+ SIGN1(sys32_mkdir, sys_mkdir, %o1)
+-SIGN3(sys32_futex, compat_sys_futex, %o1, %o2, %o5)
++SIGN1(sys32_futex, compat_sys_futex, %o1)
+ SIGN1(sys32_sysfs, compat_sys_sysfs, %o0)
+ SIGN2(sys32_sendfile, compat_sys_sendfile, %o0, %o1)
+ SIGN2(sys32_sendfile64, compat_sys_sendfile64, %o0, %o1)
+diff --git a/arch/sparc/kernel/unaligned_64.c b/arch/sparc/kernel/unaligned_64.c
+index dae85bc2eda5..a3c3a5bcd126 100644
+--- a/arch/sparc/kernel/unaligned_64.c
++++ b/arch/sparc/kernel/unaligned_64.c
+@@ -156,17 +156,23 @@ static unsigned long *fetch_reg_addr(unsigned int reg, struct pt_regs *regs)
+ unsigned long compute_effective_address(struct pt_regs *regs,
+ 					unsigned int insn, unsigned int rd)
+ {
++	int from_kernel = (regs->tstate & TSTATE_PRIV) != 0;
+ 	unsigned int rs1 = (insn >> 14) & 0x1f;
+ 	unsigned int rs2 = insn & 0x1f;
+-	int from_kernel = (regs->tstate & TSTATE_PRIV) != 0;
++	unsigned long addr;
+ 
+ 	if (insn & 0x2000) {
+ 		maybe_flush_windows(rs1, 0, rd, from_kernel);
+-		return (fetch_reg(rs1, regs) + sign_extend_imm13(insn));
++		addr = (fetch_reg(rs1, regs) + sign_extend_imm13(insn));
+ 	} else {
+ 		maybe_flush_windows(rs1, rs2, rd, from_kernel);
+-		return (fetch_reg(rs1, regs) + fetch_reg(rs2, regs));
++		addr = (fetch_reg(rs1, regs) + fetch_reg(rs2, regs));
+ 	}
++
++	if (!from_kernel && test_thread_flag(TIF_32BIT))
++		addr &= 0xffffffff;
++
++	return addr;
+ }
+ 
+ /* This is just to make gcc think die_if_kernel does return... */
+diff --git a/arch/sparc/lib/NG2memcpy.S b/arch/sparc/lib/NG2memcpy.S
+index 0aed75653b50..e993fc8d7c66 100644
+--- a/arch/sparc/lib/NG2memcpy.S
++++ b/arch/sparc/lib/NG2memcpy.S
+@@ -236,6 +236,7 @@ FUNC_NAME:	/* %o0=dst, %o1=src, %o2=len */
+ 	 */
+ 	VISEntryHalf
+ 
++	membar		#Sync
+ 	alignaddr	%o1, %g0, %g0
+ 
+ 	add		%o1, (64 - 1), %o4
+diff --git a/arch/sparc/math-emu/math_32.c b/arch/sparc/math-emu/math_32.c
+index aa4d55b0bdf0..5ce8f2f64604 100644
+--- a/arch/sparc/math-emu/math_32.c
++++ b/arch/sparc/math-emu/math_32.c
+@@ -499,7 +499,7 @@ static int do_one_mathemu(u32 insn, unsigned long *pfsr, unsigned long *fregs)
+ 		case 0: fsr = *pfsr;
+ 			if (IR == -1) IR = 2;
+ 			/* fcc is always fcc0 */
+-			fsr &= ~0xc00; fsr |= (IR << 10); break;
++			fsr &= ~0xc00; fsr |= (IR << 10);
+ 			*pfsr = fsr;
+ 			break;
+ 		case 1: rd->s = IR; break;
+diff --git a/arch/sparc/mm/fault_64.c b/arch/sparc/mm/fault_64.c
+index 1fe0429b6314..1387acafc62c 100644
+--- a/arch/sparc/mm/fault_64.c
++++ b/arch/sparc/mm/fault_64.c
+@@ -95,38 +95,51 @@ static unsigned int get_user_insn(unsigned long tpc)
+ 	pte_t *ptep, pte;
+ 	unsigned long pa;
+ 	u32 insn = 0;
+-	unsigned long pstate;
+ 
+-	if (pgd_none(*pgdp))
+-		goto outret;
++	if (pgd_none(*pgdp) || unlikely(pgd_bad(*pgdp)))
++		goto out;
+ 	pudp = pud_offset(pgdp, tpc);
+-	if (pud_none(*pudp))
+-		goto outret;
+-	pmdp = pmd_offset(pudp, tpc);
+-	if (pmd_none(*pmdp))
+-		goto outret;
+-
+-	/* This disables preemption for us as well. */
+-	__asm__ __volatile__("rdpr %%pstate, %0" : "=r" (pstate));
+-	__asm__ __volatile__("wrpr %0, %1, %%pstate"
+-				: : "r" (pstate), "i" (PSTATE_IE));
+-	ptep = pte_offset_map(pmdp, tpc);
+-	pte = *ptep;
+-	if (!pte_present(pte))
++	if (pud_none(*pudp) || unlikely(pud_bad(*pudp)))
+ 		goto out;
+ 
+-	pa  = (pte_pfn(pte) << PAGE_SHIFT);
+-	pa += (tpc & ~PAGE_MASK);
+-
+-	/* Use phys bypass so we don't pollute dtlb/dcache. */
+-	__asm__ __volatile__("lduwa [%1] %2, %0"
+-			     : "=r" (insn)
+-			     : "r" (pa), "i" (ASI_PHYS_USE_EC));
++	/* This disables preemption for us as well. */
++	local_irq_disable();
+ 
++	pmdp = pmd_offset(pudp, tpc);
++	if (pmd_none(*pmdp) || unlikely(pmd_bad(*pmdp)))
++		goto out_irq_enable;
++
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
++	if (pmd_trans_huge(*pmdp)) {
++		if (pmd_trans_splitting(*pmdp))
++			goto out_irq_enable;
++
++		pa  = pmd_pfn(*pmdp) << PAGE_SHIFT;
++		pa += tpc & ~HPAGE_MASK;
++
++		/* Use phys bypass so we don't pollute dtlb/dcache. */
++		__asm__ __volatile__("lduwa [%1] %2, %0"
++				     : "=r" (insn)
++				     : "r" (pa), "i" (ASI_PHYS_USE_EC));
++	} else
++#endif
++	{
++		ptep = pte_offset_map(pmdp, tpc);
++		pte = *ptep;
++		if (pte_present(pte)) {
++			pa  = (pte_pfn(pte) << PAGE_SHIFT);
++			pa += (tpc & ~PAGE_MASK);
++
++			/* Use phys bypass so we don't pollute dtlb/dcache. */
++			__asm__ __volatile__("lduwa [%1] %2, %0"
++					     : "=r" (insn)
++					     : "r" (pa), "i" (ASI_PHYS_USE_EC));
++		}
++		pte_unmap(ptep);
++	}
++out_irq_enable:
++	local_irq_enable();
+ out:
+-	pte_unmap(ptep);
+-	__asm__ __volatile__("wrpr %0, 0x0, %%pstate" : : "r" (pstate));
+-outret:
+ 	return insn;
+ }
+ 
+@@ -154,7 +167,8 @@ show_signal_msg(struct pt_regs *regs, int sig, int code,
+ extern unsigned long compute_effective_address(struct pt_regs *, unsigned int, unsigned int);
+ 
+ static void do_fault_siginfo(int code, int sig, struct pt_regs *regs,
+-			     unsigned int insn, int fault_code)
++			     unsigned long fault_addr, unsigned int insn,
++			     int fault_code)
+ {
+ 	unsigned long addr;
+ 	siginfo_t info;
+@@ -162,10 +176,18 @@ static void do_fault_siginfo(int code, int sig, struct pt_regs *regs,
+ 	info.si_code = code;
+ 	info.si_signo = sig;
+ 	info.si_errno = 0;
+-	if (fault_code & FAULT_CODE_ITLB)
++	if (fault_code & FAULT_CODE_ITLB) {
+ 		addr = regs->tpc;
+-	else
+-		addr = compute_effective_address(regs, insn, 0);
++	} else {
++		/* If we were able to probe the faulting instruction, use it
++		 * to compute a precise fault address.  Otherwise use the fault
++		 * time provided address which may only have page granularity.
++		 */
++		if (insn)
++			addr = compute_effective_address(regs, insn, 0);
++		else
++			addr = fault_addr;
++	}
+ 	info.si_addr = (void __user *) addr;
+ 	info.si_trapno = 0;
+ 
+@@ -240,7 +262,7 @@ static void __kprobes do_kernel_fault(struct pt_regs *regs, int si_code,
+ 		/* The si_code was set to make clear whether
+ 		 * this was a SEGV_MAPERR or SEGV_ACCERR fault.
+ 		 */
+-		do_fault_siginfo(si_code, SIGSEGV, regs, insn, fault_code);
++		do_fault_siginfo(si_code, SIGSEGV, regs, address, insn, fault_code);
+ 		return;
+ 	}
+ 
+@@ -260,18 +282,6 @@ static void noinline __kprobes bogus_32bit_fault_tpc(struct pt_regs *regs)
+ 	show_regs(regs);
+ }
+ 
+-static void noinline __kprobes bogus_32bit_fault_address(struct pt_regs *regs,
+-							 unsigned long addr)
+-{
+-	static int times;
+-
+-	if (times++ < 10)
+-		printk(KERN_ERR "FAULT[%s:%d]: 32-bit process "
+-		       "reports 64-bit fault address [%lx]\n",
+-		       current->comm, current->pid, addr);
+-	show_regs(regs);
+-}
+-
+ asmlinkage void __kprobes do_sparc64_fault(struct pt_regs *regs)
+ {
+ 	struct mm_struct *mm = current->mm;
+@@ -300,10 +310,8 @@ asmlinkage void __kprobes do_sparc64_fault(struct pt_regs *regs)
+ 				goto intr_or_no_mm;
+ 			}
+ 		}
+-		if (unlikely((address >> 32) != 0)) {
+-			bogus_32bit_fault_address(regs, address);
++		if (unlikely((address >> 32) != 0))
+ 			goto intr_or_no_mm;
+-		}
+ 	}
+ 
+ 	if (regs->tstate & TSTATE_PRIV) {
+@@ -515,7 +523,7 @@ do_sigbus:
+ 	 * Send a sigbus, regardless of whether we were in kernel
+ 	 * or user mode.
+ 	 */
+-	do_fault_siginfo(BUS_ADRERR, SIGBUS, regs, insn, fault_code);
++	do_fault_siginfo(BUS_ADRERR, SIGBUS, regs, address, insn, fault_code);
+ 
+ 	/* Kernel mode? Handle exceptions or die */
+ 	if (regs->tstate & TSTATE_PRIV)
+diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
+index 7f8238f4f954..7eb24bddf268 100644
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -308,6 +308,10 @@ void update_mmu_cache(struct vm_area_struct *vma, unsigned long address, pte_t *
+ 	tsb_index = MM_TSB_BASE;
+ 	tsb_hash_shift = PAGE_SHIFT;
+ 
++	/* Don't insert a non-valid PTE into the TSB, we'll deadlock.  */
++	if (!(pte_val(pte) & _PAGE_VALID))
++		return;
++
+ 	spin_lock_irqsave(&mm->context.lock, flags);
+ 
+ #ifdef CONFIG_HUGETLB_PAGE
+@@ -2417,3 +2421,26 @@ void __flush_tlb_all(void)
+ 	__asm__ __volatile__("wrpr	%0, 0, %%pstate"
+ 			     : : "r" (pstate));
+ }
++
++#ifdef CONFIG_SMP
++#define do_flush_tlb_kernel_range	smp_flush_tlb_kernel_range
++#else
++#define do_flush_tlb_kernel_range	__flush_tlb_kernel_range
++#endif
++
++void flush_tlb_kernel_range(unsigned long start, unsigned long end)
++{
++	if (start < HI_OBP_ADDRESS && end > LOW_OBP_ADDRESS) {
++		if (start < LOW_OBP_ADDRESS) {
++			flush_tsb_kernel_range(start, LOW_OBP_ADDRESS);
++			do_flush_tlb_kernel_range(start, LOW_OBP_ADDRESS);
++		}
++		if (end > HI_OBP_ADDRESS) {
++			flush_tsb_kernel_range(end, HI_OBP_ADDRESS);
++			do_flush_tlb_kernel_range(end, HI_OBP_ADDRESS);
++		}
++	} else {
++		flush_tsb_kernel_range(start, end);
++		do_flush_tlb_kernel_range(start, end);
++	}
++}
+diff --git a/arch/sparc/mm/tsb.c b/arch/sparc/mm/tsb.c
+index f4e84f3440dd..41530193e6d6 100644
+--- a/arch/sparc/mm/tsb.c
++++ b/arch/sparc/mm/tsb.c
+@@ -150,7 +150,19 @@ static void setup_tsb_params(struct mm_struct *mm, unsigned long tsb_idx, unsign
+ 	mm->context.tsb_block[tsb_idx].tsb_nentries =
+ 		tsb_bytes / sizeof(struct tsb);
+ 
+-	base = TSBMAP_BASE;
++	switch (tsb_idx) {
++	case MM_TSB_BASE:
++		base = TSBMAP_8K_BASE;
++		break;
++#if defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE)
++	case MM_TSB_HUGE:
++		base = TSBMAP_4M_BASE;
++		break;
++#endif
++	default:
++		BUG();
++	}
++
+ 	tte = pgprot_val(PAGE_KERNEL_LOCKED);
+ 	tsb_paddr = __pa(mm->context.tsb_block[tsb_idx].tsb);
+ 	BUG_ON(tsb_paddr & (tsb_bytes - 1UL));
+diff --git a/drivers/net/macvlan.c b/drivers/net/macvlan.c
+index c4bb95b051f3..6749acf6f3f4 100644
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@ -455,6 +455,7 @@ static int macvlan_init(struct net_device *dev)
+ 				  (lowerdev->state & MACVLAN_STATE_MASK);
+ 	dev->features 		= lowerdev->features & MACVLAN_FEATURES;
+ 	dev->features		|= NETIF_F_LLTX;
++	dev->vlan_features	= lowerdev->vlan_features & MACVLAN_FEATURES;
+ 	dev->gso_max_size	= lowerdev->gso_max_size;
+ 	dev->iflink		= lowerdev->ifindex;
+ 	dev->hard_header_len	= lowerdev->hard_header_len;
 diff --git a/drivers/net/ppp/pptp.c b/drivers/net/ppp/pptp.c
 index 8327cc596c34..9f047a04215e 100644
 --- a/drivers/net/ppp/pptp.c
@@ -78,6 +439,76 @@ index 8327cc596c34..9f047a04215e 100644
  	ip_send_check(iph);
  
  	ip_local_out(skb);
+diff --git a/drivers/sbus/char/bbc_envctrl.c b/drivers/sbus/char/bbc_envctrl.c
+index 160e7510aca6..0787b9756165 100644
+--- a/drivers/sbus/char/bbc_envctrl.c
++++ b/drivers/sbus/char/bbc_envctrl.c
+@@ -452,6 +452,9 @@ static void attach_one_temp(struct bbc_i2c_bus *bp, struct platform_device *op,
+ 	if (!tp)
+ 		return;
+ 
++	INIT_LIST_HEAD(&tp->bp_list);
++	INIT_LIST_HEAD(&tp->glob_list);
++
+ 	tp->client = bbc_i2c_attach(bp, op);
+ 	if (!tp->client) {
+ 		kfree(tp);
+@@ -497,6 +500,9 @@ static void attach_one_fan(struct bbc_i2c_bus *bp, struct platform_device *op,
+ 	if (!fp)
+ 		return;
+ 
++	INIT_LIST_HEAD(&fp->bp_list);
++	INIT_LIST_HEAD(&fp->glob_list);
++
+ 	fp->client = bbc_i2c_attach(bp, op);
+ 	if (!fp->client) {
+ 		kfree(fp);
+diff --git a/drivers/sbus/char/bbc_i2c.c b/drivers/sbus/char/bbc_i2c.c
+index 542668292900..7179f72b11ea 100644
+--- a/drivers/sbus/char/bbc_i2c.c
++++ b/drivers/sbus/char/bbc_i2c.c
+@@ -301,13 +301,18 @@ static struct bbc_i2c_bus * __init attach_one_i2c(struct platform_device *op, in
+ 	if (!bp)
+ 		return NULL;
+ 
++	INIT_LIST_HEAD(&bp->temps);
++	INIT_LIST_HEAD(&bp->fans);
++
+ 	bp->i2c_control_regs = of_ioremap(&op->resource[0], 0, 0x2, "bbc_i2c_regs");
+ 	if (!bp->i2c_control_regs)
+ 		goto fail;
+ 
+-	bp->i2c_bussel_reg = of_ioremap(&op->resource[1], 0, 0x1, "bbc_i2c_bussel");
+-	if (!bp->i2c_bussel_reg)
+-		goto fail;
++	if (op->num_resources == 2) {
++		bp->i2c_bussel_reg = of_ioremap(&op->resource[1], 0, 0x1, "bbc_i2c_bussel");
++		if (!bp->i2c_bussel_reg)
++			goto fail;
++	}
+ 
+ 	bp->waiting = 0;
+ 	init_waitqueue_head(&bp->wq);
+diff --git a/drivers/tty/serial/sunsab.c b/drivers/tty/serial/sunsab.c
+index f0d93eb7e6ec..c9549aa135b2 100644
+--- a/drivers/tty/serial/sunsab.c
++++ b/drivers/tty/serial/sunsab.c
+@@ -157,6 +157,15 @@ receive_chars(struct uart_sunsab_port *up,
+ 	    (up->port.line == up->port.cons->index))
+ 		saw_console_brk = 1;
+ 
++	if (count == 0) {
++		if (unlikely(stat->sreg.isr1 & SAB82532_ISR1_BRK)) {
++			stat->sreg.isr0 &= ~(SAB82532_ISR0_PERR |
++					     SAB82532_ISR0_FERR);
++			up->port.icount.brk++;
++			uart_handle_break(&up->port);
++		}
++	}
++
+ 	for (i = 0; i < count; i++) {
+ 		unsigned char ch = buf[i], flag;
+ 
 diff --git a/include/net/inetpeer.h b/include/net/inetpeer.h
 index 2d643649f0f8..168d30dfe807 100644
 --- a/include/net/inetpeer.h
@@ -121,32 +552,23 @@ index 2d643649f0f8..168d30dfe807 100644
 -
  #endif /* _NET_INETPEER_H */
 diff --git a/include/net/ip.h b/include/net/ip.h
-index 6d6b12f4753c..f70e64b786a3 100644
+index 6d6b12f4753c..34d004892143 100644
 --- a/include/net/ip.h
 +++ b/include/net/ip.h
-@@ -264,9 +264,19 @@ int ip_dont_fragment(struct sock *sk, struct dst_entry *dst)
+@@ -264,9 +264,10 @@ int ip_dont_fragment(struct sock *sk, struct dst_entry *dst)
  		 !(dst_metric_locked(dst, RTAX_MTU)));
  }
  
 -extern void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more);
-+#define IP_IDENTS_SZ 2048u
-+extern atomic_t *ip_idents;
++u32 ip_idents_reserve(u32 hash, int segs);
++void __ip_select_ident(struct iphdr *iph, int segs);
  
 -static inline void ip_select_ident(struct sk_buff *skb, struct dst_entry *dst, struct sock *sk)
-+static inline u32 ip_idents_reserve(u32 hash, int segs)
-+{
-+	atomic_t *id_ptr = ip_idents + hash % IP_IDENTS_SZ;
-+
-+	return atomic_add_return(segs, id_ptr) - segs;
-+}
-+
-+void __ip_select_ident(struct iphdr *iph, int segs);
-+
 +static inline void ip_select_ident_segs(struct sk_buff *skb, struct sock *sk, int segs)
  {
  	struct iphdr *iph = ip_hdr(skb);
  
-@@ -276,24 +286,20 @@ static inline void ip_select_ident(struct sk_buff *skb, struct dst_entry *dst, s
+@@ -276,24 +277,20 @@ static inline void ip_select_ident(struct sk_buff *skb, struct dst_entry *dst, s
  		 * does not change, they drop every other packet in
  		 * a TCP stream using header compression.
  		 */
@@ -234,6 +656,71 @@ index c2e542b27a5a..b1c3d1c63c4e 100644
  extern u32 secure_ipv4_port_ephemeral(__be32 saddr, __be32 daddr, __be16 dport);
  extern u32 secure_ipv6_port_ephemeral(const __be32 *saddr, const __be32 *daddr,
  				      __be16 dport);
+diff --git a/net/compat.c b/net/compat.c
+index 93f542335e19..2c774d889d39 100644
+--- a/net/compat.c
++++ b/net/compat.c
+@@ -85,7 +85,7 @@ int verify_compat_iovec(struct msghdr *kern_msg, struct iovec *kern_iov,
+ {
+ 	int tot_len;
+ 
+-	if (kern_msg->msg_namelen) {
++	if (kern_msg->msg_name && kern_msg->msg_namelen) {
+ 		if (mode == VERIFY_READ) {
+ 			int err = move_addr_to_kernel(kern_msg->msg_name,
+ 						      kern_msg->msg_namelen,
+@@ -93,10 +93,11 @@ int verify_compat_iovec(struct msghdr *kern_msg, struct iovec *kern_iov,
+ 			if (err < 0)
+ 				return err;
+ 		}
+-		if (kern_msg->msg_name)
+-			kern_msg->msg_name = kern_address;
+-	} else
++		kern_msg->msg_name = kern_address;
++	} else {
+ 		kern_msg->msg_name = NULL;
++		kern_msg->msg_namelen = 0;
++	}
+ 
+ 	tot_len = iov_from_user_compat_to_kern(kern_iov,
+ 					  (struct compat_iovec __user *)kern_msg->msg_iov,
+diff --git a/net/core/iovec.c b/net/core/iovec.c
+index 7fd34a56aeb3..d1628b79286b 100644
+--- a/net/core/iovec.c
++++ b/net/core/iovec.c
+@@ -39,7 +39,7 @@ int verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr_storage *a
+ {
+ 	int size, ct, err;
+ 
+-	if (m->msg_namelen) {
++	if (m->msg_name && m->msg_namelen) {
+ 		if (mode == VERIFY_READ) {
+ 			void __user *namep;
+ 			namep = (void __user __force *) m->msg_name;
+@@ -48,10 +48,10 @@ int verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr_storage *a
+ 			if (err < 0)
+ 				return err;
+ 		}
+-		if (m->msg_name)
+-			m->msg_name = address;
++		m->msg_name = address;
+ 	} else {
+ 		m->msg_name = NULL;
++		m->msg_namelen = 0;
+ 	}
+ 
+ 	size = m->msg_iovlen * sizeof(struct iovec);
+@@ -157,6 +157,10 @@ EXPORT_SYMBOL(memcpy_fromiovec);
+ int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
+ 			int offset, int len)
+ {
++	/* No data? Done! */
++	if (len == 0)
++		return 0;
++
+ 	/* Skip over the finished iovecs */
+ 	while (offset >= iov->iov_len) {
+ 		offset -= iov->iov_len;
 diff --git a/net/core/secure_seq.c b/net/core/secure_seq.c
 index 99b2596531bb..6ecbd58418b3 100644
 --- a/net/core/secure_seq.c
@@ -268,6 +755,26 @@ index 99b2596531bb..6ecbd58418b3 100644
  
  __u32 secure_tcp_sequence_number(__be32 saddr, __be32 daddr,
  				 __be16 sport, __be16 dport)
+diff --git a/net/core/skbuff.c b/net/core/skbuff.c
+index 8de819475378..728f49babfe0 100644
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -2748,7 +2748,6 @@ struct sk_buff *skb_segment(struct sk_buff *skb, netdev_features_t features)
+ 		tail = nskb;
+ 
+ 		__copy_skb_header(nskb, skb);
+-		nskb->mac_len = skb->mac_len;
+ 
+ 		/* nskb and skb might have different headroom */
+ 		if (nskb->ip_summed == CHECKSUM_PARTIAL)
+@@ -2758,6 +2757,7 @@ struct sk_buff *skb_segment(struct sk_buff *skb, netdev_features_t features)
+ 		skb_set_network_header(nskb, skb->mac_len);
+ 		nskb->transport_header = (nskb->network_header +
+ 					  skb_network_header_len(skb));
++		skb_reset_mac_len(nskb);
+ 		skb_copy_from_linear_data(skb, nskb->data, doffset);
+ 
+ 		if (fskb != skb_shinfo(skb)->frag_list)
 diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
 index 3f0bb3b3819d..782467708c10 100644
 --- a/net/ipv4/igmp.c
@@ -393,10 +900,10 @@ index 48c6ebcb7fe0..c1b3970caa68 100644
  		iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
  	}
 diff --git a/net/ipv4/route.c b/net/ipv4/route.c
-index 90bc88bbd2a4..2836f563e3c2 100644
+index 90bc88bbd2a4..fd6843371f2e 100644
 --- a/net/ipv4/route.c
 +++ b/net/ipv4/route.c
-@@ -1341,46 +1341,23 @@ void rt_bind_peer(struct rtable *rt, __be32 daddr, int create)
+@@ -1341,46 +1341,53 @@ void rt_bind_peer(struct rtable *rt, __be32 daddr, int create)
  		rt->rt_peer_genid = rt_peer_genid();
  }
  
@@ -406,34 +913,57 @@ index 90bc88bbd2a4..2836f563e3c2 100644
 - * Random ID selection looks a bit dangerous because we have no chances to
 - * select ID being unique in a reasonable period of time.
 - * But broken packet identifier may be better than no packet at all.
-- */
++#define IP_IDENTS_SZ 2048u
++struct ip_ident_bucket {
++	atomic_t	id;
++	u32		stamp32;
++};
++
++static struct ip_ident_bucket *ip_idents __read_mostly;
++
++/* In order to protect privacy, we add a perturbation to identifiers
++ * if one generator is seldom used. This makes hard for an attacker
++ * to infer how many packets were sent between two points in time.
+  */
 -static void ip_select_fb_ident(struct iphdr *iph)
--{
++u32 ip_idents_reserve(u32 hash, int segs)
+ {
 -	static DEFINE_SPINLOCK(ip_fb_id_lock);
 -	static u32 ip_fallback_id;
 -	u32 salt;
-+atomic_t *ip_idents __read_mostly;
-+EXPORT_SYMBOL(ip_idents);
++	struct ip_ident_bucket *bucket = ip_idents + hash % IP_IDENTS_SZ;
++	u32 old = ACCESS_ONCE(bucket->stamp32);
++	u32 now = (u32)jiffies;
++	u32 delta = 0;
++
++	if (old != now && cmpxchg(&bucket->stamp32, old, now) == old) {
++		u64 x = random32();
++
++		x *= (now - old);
++		delta = (u32)(x >> 32);
++	}
  
 -	spin_lock_bh(&ip_fb_id_lock);
 -	salt = secure_ip_id((__force __be32)ip_fallback_id ^ iph->daddr);
 -	iph->id = htons(salt & 0xFFFF);
 -	ip_fallback_id = salt;
 -	spin_unlock_bh(&ip_fb_id_lock);
--}
--
++	return atomic_add_return(segs + delta, &bucket->id) - segs;
+ }
++EXPORT_SYMBOL(ip_idents_reserve);
+ 
 -void __ip_select_ident(struct iphdr *iph, struct dst_entry *dst, int more)
 +void __ip_select_ident(struct iphdr *iph, int segs)
  {
 -	struct rtable *rt = (struct rtable *) dst;
+-
+-	if (rt && !(rt->dst.flags & DST_NOPEER)) {
+-		if (rt->peer == NULL)
+-			rt_bind_peer(rt, rt->rt_dst, 1);
 +	static u32 ip_idents_hashrnd __read_mostly;
 +	static bool hashrnd_initialized = false;
 +	u32 hash, id;
  
--	if (rt && !(rt->dst.flags & DST_NOPEER)) {
--		if (rt->peer == NULL)
--			rt_bind_peer(rt, rt->rt_dst, 1);
--
 -		/* If peer is attached to destination, it is never detached,
 -		   so that we need not to grab a lock to dereference it.
 -		 */
@@ -450,13 +980,16 @@ index 90bc88bbd2a4..2836f563e3c2 100644
 +	}
  
 -	ip_select_fb_ident(iph);
-+	hash = jhash_1word((__force u32)iph->daddr, ip_idents_hashrnd);
++	hash = jhash_3words((__force u32)iph->daddr,
++			    (__force u32)iph->saddr,
++			    iph->protocol,
++			    ip_idents_hashrnd);
 +	id = ip_idents_reserve(hash, segs);
 +	iph->id = htons(id);
  }
  EXPORT_SYMBOL(__ip_select_ident);
  
-@@ -3009,7 +2986,6 @@ static int rt_fill_info(struct net *net,
+@@ -3009,7 +3016,6 @@ static int rt_fill_info(struct net *net,
  	error = rt->dst.error;
  	if (peer) {
  		inet_peer_refcheck(rt->peer);
@@ -464,7 +997,7 @@ index 90bc88bbd2a4..2836f563e3c2 100644
  		if (peer->tcp_ts_stamp) {
  			ts = peer->tcp_ts;
  			tsage = get_seconds() - peer->tcp_ts_stamp;
-@@ -3441,6 +3417,12 @@ int __init ip_rt_init(void)
+@@ -3441,6 +3447,12 @@ int __init ip_rt_init(void)
  {
  	int rc = 0;
  
@@ -477,6 +1010,33 @@ index 90bc88bbd2a4..2836f563e3c2 100644
  #ifdef CONFIG_IP_ROUTE_CLASSID
  	ip_rt_acct = __alloc_percpu(256 * sizeof(struct ip_rt_acct), __alignof__(struct ip_rt_acct));
  	if (!ip_rt_acct)
+diff --git a/net/ipv4/tcp_vegas.c b/net/ipv4/tcp_vegas.c
+index 80fa2bfd7ede..c042e529a11e 100644
+--- a/net/ipv4/tcp_vegas.c
++++ b/net/ipv4/tcp_vegas.c
+@@ -218,7 +218,8 @@ static void tcp_vegas_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ 			 * This is:
+ 			 *     (actual rate in segments) * baseRTT
+ 			 */
+-			target_cwnd = tp->snd_cwnd * vegas->baseRTT / rtt;
++			target_cwnd = (u64)tp->snd_cwnd * vegas->baseRTT;
++			do_div(target_cwnd, rtt);
+ 
+ 			/* Calculate the difference between the window we had,
+ 			 * and the window we would like to have. This quantity
+diff --git a/net/ipv4/tcp_veno.c b/net/ipv4/tcp_veno.c
+index ac43cd747bce..b4d1858be550 100644
+--- a/net/ipv4/tcp_veno.c
++++ b/net/ipv4/tcp_veno.c
+@@ -144,7 +144,7 @@ static void tcp_veno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
+ 
+ 		rtt = veno->minrtt;
+ 
+-		target_cwnd = (tp->snd_cwnd * veno->basertt);
++		target_cwnd = (u64)tp->snd_cwnd * veno->basertt;
+ 		target_cwnd <<= V_PARAM_SHIFT;
+ 		do_div(target_cwnd, rtt);
+ 
 diff --git a/net/ipv4/xfrm4_mode_tunnel.c b/net/ipv4/xfrm4_mode_tunnel.c
 index 938553efbf8e..5531eb2a56a5 100644
 --- a/net/ipv4/xfrm4_mode_tunnel.c
@@ -496,10 +1056,10 @@ index 938553efbf8e..5531eb2a56a5 100644
  	return 0;
  }
 diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index 6225b7cf12b9..7a28466a32c6 100644
+index 6225b7cf12b9..2bf7916c816f 100644
 --- a/net/ipv6/ip6_output.c
 +++ b/net/ipv6/ip6_output.c
-@@ -599,22 +599,17 @@ int ip6_find_1stfragopt(struct sk_buff *skb, u8 **nexthdr)
+@@ -599,22 +599,19 @@ int ip6_find_1stfragopt(struct sk_buff *skb, u8 **nexthdr)
  
  void ipv6_select_ident(struct frag_hdr *fhdr, struct rt6_info *rt)
  {
@@ -526,6 +1086,8 @@ index 6225b7cf12b9..7a28466a32c6 100644
 -	ident = atomic_inc_return(&ipv6_fragmentation_id);
 -	fhdr->identification = htonl(ident);
 +	hash = __ipv6_addr_jhash(&rt->rt6i_dst.addr, ip6_idents_hashrnd);
++	hash = __ipv6_addr_jhash(&rt->rt6i_src.addr, hash);
++
 +	id = ip_idents_reserve(hash, 1);
 +	fhdr->identification = htonl(id);
  }
@@ -544,554 +1106,6 @@ index ec78ab63dd46..559d307163b1 100644
  
  	/* Another hack: avoid icmp_send in ip_fragment */
  	skb->local_df = 1;
--- 
-2.28.0
-
-
-From 509a15a5d6b0cfd3e4e396844615df6335ff4c62 Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Sat, 26 Jul 2014 08:58:10 +0200
-Subject: [PATCH 02/24] ip: make IP identifiers less predictable
-
-[ Upstream commit 04ca6973f7c1a0d8537f2d9906a0cf8e69886d75 ]
-
-In "Counting Packets Sent Between Arbitrary Internet Hosts", Jeffrey and
-Jedidiah describe ways exploiting linux IP identifier generation to
-infer whether two machines are exchanging packets.
-
-With commit 73f156a6e8c1 ("inetpeer: get rid of ip_id_count"), we
-changed IP id generation, but this does not really prevent this
-side-channel technique.
-
-This patch adds a random amount of perturbation so that IP identifiers
-for a given destination [1] are no longer monotonically increasing after
-an idle period.
-
-Note that prandom_u32_max(1) returns 0, so if generator is used at most
-once per jiffy, this patch inserts no hole in the ID suite and do not
-increase collision probability.
-
-This is jiffies based, so in the worst case (HZ=1000), the id can
-rollover after ~65 seconds of idle time, which should be fine.
-
-We also change the hash used in __ip_select_ident() to not only hash
-on daddr, but also saddr and protocol, so that ICMP probes can not be
-used to infer information for other protocols.
-
-For IPv6, adds saddr into the hash as well, but not nexthdr.
-
-If I ping the patched target, we can see ID are now hard to predict.
-
-21:57:11.008086 IP (...)
-    A > target: ICMP echo request, seq 1, length 64
-21:57:11.010752 IP (... id 2081 ...)
-    target > A: ICMP echo reply, seq 1, length 64
-
-21:57:12.013133 IP (...)
-    A > target: ICMP echo request, seq 2, length 64
-21:57:12.015737 IP (... id 3039 ...)
-    target > A: ICMP echo reply, seq 2, length 64
-
-21:57:13.016580 IP (...)
-    A > target: ICMP echo request, seq 3, length 64
-21:57:13.019251 IP (... id 3437 ...)
-    target > A: ICMP echo reply, seq 3, length 64
-
-[1] TCP sessions uses a per flow ID generator not changed by this patch.
-
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Reported-by: Jeffrey Knockel <jeffk@cs.unm.edu>
-Reported-by: Jedidiah R. Crandall <crandall@cs.unm.edu>
-Cc: Willy Tarreau <w@1wt.eu>
-Cc: Hannes Frederic Sowa <hannes@redhat.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/net/ip.h      | 11 +----------
- net/ipv4/route.c      | 36 +++++++++++++++++++++++++++++++++---
- net/ipv6/ip6_output.c |  2 ++
- 3 files changed, 36 insertions(+), 13 deletions(-)
-
-diff --git a/include/net/ip.h b/include/net/ip.h
-index f70e64b786a3..34d004892143 100644
---- a/include/net/ip.h
-+++ b/include/net/ip.h
-@@ -264,16 +264,7 @@ int ip_dont_fragment(struct sock *sk, struct dst_entry *dst)
- 		 !(dst_metric_locked(dst, RTAX_MTU)));
- }
- 
--#define IP_IDENTS_SZ 2048u
--extern atomic_t *ip_idents;
--
--static inline u32 ip_idents_reserve(u32 hash, int segs)
--{
--	atomic_t *id_ptr = ip_idents + hash % IP_IDENTS_SZ;
--
--	return atomic_add_return(segs, id_ptr) - segs;
--}
--
-+u32 ip_idents_reserve(u32 hash, int segs);
- void __ip_select_ident(struct iphdr *iph, int segs);
- 
- static inline void ip_select_ident_segs(struct sk_buff *skb, struct sock *sk, int segs)
-diff --git a/net/ipv4/route.c b/net/ipv4/route.c
-index 2836f563e3c2..fd6843371f2e 100644
---- a/net/ipv4/route.c
-+++ b/net/ipv4/route.c
-@@ -1341,8 +1341,35 @@ void rt_bind_peer(struct rtable *rt, __be32 daddr, int create)
- 		rt->rt_peer_genid = rt_peer_genid();
- }
- 
--atomic_t *ip_idents __read_mostly;
--EXPORT_SYMBOL(ip_idents);
-+#define IP_IDENTS_SZ 2048u
-+struct ip_ident_bucket {
-+	atomic_t	id;
-+	u32		stamp32;
-+};
-+
-+static struct ip_ident_bucket *ip_idents __read_mostly;
-+
-+/* In order to protect privacy, we add a perturbation to identifiers
-+ * if one generator is seldom used. This makes hard for an attacker
-+ * to infer how many packets were sent between two points in time.
-+ */
-+u32 ip_idents_reserve(u32 hash, int segs)
-+{
-+	struct ip_ident_bucket *bucket = ip_idents + hash % IP_IDENTS_SZ;
-+	u32 old = ACCESS_ONCE(bucket->stamp32);
-+	u32 now = (u32)jiffies;
-+	u32 delta = 0;
-+
-+	if (old != now && cmpxchg(&bucket->stamp32, old, now) == old) {
-+		u64 x = random32();
-+
-+		x *= (now - old);
-+		delta = (u32)(x >> 32);
-+	}
-+
-+	return atomic_add_return(segs + delta, &bucket->id) - segs;
-+}
-+EXPORT_SYMBOL(ip_idents_reserve);
- 
- void __ip_select_ident(struct iphdr *iph, int segs)
- {
-@@ -1355,7 +1382,10 @@ void __ip_select_ident(struct iphdr *iph, int segs)
- 		get_random_bytes(&ip_idents_hashrnd, sizeof(ip_idents_hashrnd));
- 	}
- 
--	hash = jhash_1word((__force u32)iph->daddr, ip_idents_hashrnd);
-+	hash = jhash_3words((__force u32)iph->daddr,
-+			    (__force u32)iph->saddr,
-+			    iph->protocol,
-+			    ip_idents_hashrnd);
- 	id = ip_idents_reserve(hash, segs);
- 	iph->id = htons(id);
- }
-diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index 7a28466a32c6..2bf7916c816f 100644
---- a/net/ipv6/ip6_output.c
-+++ b/net/ipv6/ip6_output.c
-@@ -608,6 +608,8 @@ void ipv6_select_ident(struct frag_hdr *fhdr, struct rt6_info *rt)
- 		get_random_bytes(&ip6_idents_hashrnd, sizeof(ip6_idents_hashrnd));
- 	}
- 	hash = __ipv6_addr_jhash(&rt->rt6i_dst.addr, ip6_idents_hashrnd);
-+	hash = __ipv6_addr_jhash(&rt->rt6i_src.addr, hash);
-+
- 	id = ip_idents_reserve(hash, 1);
- 	fhdr->identification = htonl(id);
- }
--- 
-2.28.0
-
-
-From c28d71cac875c4419cef60e33b5a1f260b0002dc Mon Sep 17 00:00:00 2001
-From: Andrey Ryabinin <ryabinin.a.a@gmail.com>
-Date: Sat, 26 Jul 2014 21:26:58 +0400
-Subject: [PATCH 03/24] net: sendmsg: fix NULL pointer dereference
-
-[ Upstream commit 40eea803c6b2cfaab092f053248cbeab3f368412 ]
-
-Sasha's report:
-	> While fuzzing with trinity inside a KVM tools guest running the latest -next
-	> kernel with the KASAN patchset, I've stumbled on the following spew:
-	>
-	> [ 4448.949424] ==================================================================
-	> [ 4448.951737] AddressSanitizer: user-memory-access on address 0
-	> [ 4448.952988] Read of size 2 by thread T19638:
-	> [ 4448.954510] CPU: 28 PID: 19638 Comm: trinity-c76 Not tainted 3.16.0-rc4-next-20140711-sasha-00046-g07d3099-dirty #813
-	> [ 4448.956823]  ffff88046d86ca40 0000000000000000 ffff880082f37e78 ffff880082f37a40
-	> [ 4448.958233]  ffffffffb6e47068 ffff880082f37a68 ffff880082f37a58 ffffffffb242708d
-	> [ 4448.959552]  0000000000000000 ffff880082f37a88 ffffffffb24255b1 0000000000000000
-	> [ 4448.961266] Call Trace:
-	> [ 4448.963158] dump_stack (lib/dump_stack.c:52)
-	> [ 4448.964244] kasan_report_user_access (mm/kasan/report.c:184)
-	> [ 4448.965507] __asan_load2 (mm/kasan/kasan.c:352)
-	> [ 4448.966482] ? netlink_sendmsg (net/netlink/af_netlink.c:2339)
-	> [ 4448.967541] netlink_sendmsg (net/netlink/af_netlink.c:2339)
-	> [ 4448.968537] ? get_parent_ip (kernel/sched/core.c:2555)
-	> [ 4448.970103] sock_sendmsg (net/socket.c:654)
-	> [ 4448.971584] ? might_fault (mm/memory.c:3741)
-	> [ 4448.972526] ? might_fault (./arch/x86/include/asm/current.h:14 mm/memory.c:3740)
-	> [ 4448.973596] ? verify_iovec (net/core/iovec.c:64)
-	> [ 4448.974522] ___sys_sendmsg (net/socket.c:2096)
-	> [ 4448.975797] ? put_lock_stats.isra.13 (./arch/x86/include/asm/preempt.h:98 kernel/locking/lockdep.c:254)
-	> [ 4448.977030] ? lock_release_holdtime (kernel/locking/lockdep.c:273)
-	> [ 4448.978197] ? lock_release_non_nested (kernel/locking/lockdep.c:3434 (discriminator 1))
-	> [ 4448.979346] ? check_chain_key (kernel/locking/lockdep.c:2188)
-	> [ 4448.980535] __sys_sendmmsg (net/socket.c:2181)
-	> [ 4448.981592] ? trace_hardirqs_on_caller (kernel/locking/lockdep.c:2600)
-	> [ 4448.982773] ? trace_hardirqs_on (kernel/locking/lockdep.c:2607)
-	> [ 4448.984458] ? syscall_trace_enter (arch/x86/kernel/ptrace.c:1500 (discriminator 2))
-	> [ 4448.985621] ? trace_hardirqs_on_caller (kernel/locking/lockdep.c:2600)
-	> [ 4448.986754] SyS_sendmmsg (net/socket.c:2201)
-	> [ 4448.987708] tracesys (arch/x86/kernel/entry_64.S:542)
-	> [ 4448.988929] ==================================================================
-
-This reports means that we've come to netlink_sendmsg() with msg->msg_name == NULL and msg->msg_namelen > 0.
-
-After this report there was no usual "Unable to handle kernel NULL pointer dereference"
-and this gave me a clue that address 0 is mapped and contains valid socket address structure in it.
-
-This bug was introduced in f3d3342602f8bcbf37d7c46641cb9bca7618eb1c
-(net: rework recvmsg handler msg_name and msg_namelen logic).
-Commit message states that:
-	"Set msg->msg_name = NULL if user specified a NULL in msg_name but had a
-	 non-null msg_namelen in verify_iovec/verify_compat_iovec. This doesn't
-	 affect sendto as it would bail out earlier while trying to copy-in the
-	 address."
-But in fact this affects sendto when address 0 is mapped and contains
-socket address structure in it. In such case copy-in address will succeed,
-verify_iovec() function will successfully exit with msg->msg_namelen > 0
-and msg->msg_name == NULL.
-
-This patch fixes it by setting msg_namelen to 0 if msg_name == NULL.
-
-Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Cc: Eric Dumazet <edumazet@google.com>
-Cc: <stable@vger.kernel.org>
-Reported-by: Sasha Levin <sasha.levin@oracle.com>
-Signed-off-by: Andrey Ryabinin <a.ryabinin@samsung.com>
-Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/compat.c     | 9 +++++----
- net/core/iovec.c | 6 +++---
- 2 files changed, 8 insertions(+), 7 deletions(-)
-
-diff --git a/net/compat.c b/net/compat.c
-index 93f542335e19..2c774d889d39 100644
---- a/net/compat.c
-+++ b/net/compat.c
-@@ -85,7 +85,7 @@ int verify_compat_iovec(struct msghdr *kern_msg, struct iovec *kern_iov,
- {
- 	int tot_len;
- 
--	if (kern_msg->msg_namelen) {
-+	if (kern_msg->msg_name && kern_msg->msg_namelen) {
- 		if (mode == VERIFY_READ) {
- 			int err = move_addr_to_kernel(kern_msg->msg_name,
- 						      kern_msg->msg_namelen,
-@@ -93,10 +93,11 @@ int verify_compat_iovec(struct msghdr *kern_msg, struct iovec *kern_iov,
- 			if (err < 0)
- 				return err;
- 		}
--		if (kern_msg->msg_name)
--			kern_msg->msg_name = kern_address;
--	} else
-+		kern_msg->msg_name = kern_address;
-+	} else {
- 		kern_msg->msg_name = NULL;
-+		kern_msg->msg_namelen = 0;
-+	}
- 
- 	tot_len = iov_from_user_compat_to_kern(kern_iov,
- 					  (struct compat_iovec __user *)kern_msg->msg_iov,
-diff --git a/net/core/iovec.c b/net/core/iovec.c
-index 7fd34a56aeb3..4db6bfa04fbe 100644
---- a/net/core/iovec.c
-+++ b/net/core/iovec.c
-@@ -39,7 +39,7 @@ int verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr_storage *a
- {
- 	int size, ct, err;
- 
--	if (m->msg_namelen) {
-+	if (m->msg_name && m->msg_namelen) {
- 		if (mode == VERIFY_READ) {
- 			void __user *namep;
- 			namep = (void __user __force *) m->msg_name;
-@@ -48,10 +48,10 @@ int verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr_storage *a
- 			if (err < 0)
- 				return err;
- 		}
--		if (m->msg_name)
--			m->msg_name = address;
-+		m->msg_name = address;
- 	} else {
- 		m->msg_name = NULL;
-+		m->msg_namelen = 0;
- 	}
- 
- 	size = m->msg_iovlen * sizeof(struct iovec);
--- 
-2.28.0
-
-
-From 1f9480d282a68d14ac2a650ae74063fd889bfdcd Mon Sep 17 00:00:00 2001
-From: Christoph Paasch <christoph.paasch@uclouvain.be>
-Date: Tue, 29 Jul 2014 12:07:27 +0200
-Subject: [PATCH 04/24] tcp: Fix integer-overflows in TCP veno
-
-[ Upstream commit 45a07695bc64b3ab5d6d2215f9677e5b8c05a7d0 ]
-
-In veno we do a multiplication of the cwnd and the rtt. This
-may overflow and thus their result is stored in a u64. However, we first
-need to cast the cwnd so that actually 64-bit arithmetic is done.
-
-A first attempt at fixing 76f1017757aa0 ([TCP]: TCP Veno congestion
-control) was made by 159131149c2 (tcp: Overflow bug in Vegas), but it
-failed to add the required cast in tcp_veno_cong_avoid().
-
-Fixes: 76f1017757aa0 ([TCP]: TCP Veno congestion control)
-Signed-off-by: Christoph Paasch <christoph.paasch@uclouvain.be>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/tcp_veno.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/net/ipv4/tcp_veno.c b/net/ipv4/tcp_veno.c
-index ac43cd747bce..b4d1858be550 100644
---- a/net/ipv4/tcp_veno.c
-+++ b/net/ipv4/tcp_veno.c
-@@ -144,7 +144,7 @@ static void tcp_veno_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
- 
- 		rtt = veno->minrtt;
- 
--		target_cwnd = (tp->snd_cwnd * veno->basertt);
-+		target_cwnd = (u64)tp->snd_cwnd * veno->basertt;
- 		target_cwnd <<= V_PARAM_SHIFT;
- 		do_div(target_cwnd, rtt);
- 
--- 
-2.28.0
-
-
-From 1d06a70abffa9d6bd52cef880105458e432294d4 Mon Sep 17 00:00:00 2001
-From: Christoph Paasch <christoph.paasch@uclouvain.be>
-Date: Tue, 29 Jul 2014 13:40:57 +0200
-Subject: [PATCH 05/24] tcp: Fix integer-overflow in TCP vegas
-
-[ Upstream commit 1f74e613ded11517db90b2bd57e9464d9e0fb161 ]
-
-In vegas we do a multiplication of the cwnd and the rtt. This
-may overflow and thus their result is stored in a u64. However, we first
-need to cast the cwnd so that actually 64-bit arithmetic is done.
-
-Then, we need to do do_div to allow this to be used on 32-bit arches.
-
-Cc: Stephen Hemminger <stephen@networkplumber.org>
-Cc: Neal Cardwell <ncardwell@google.com>
-Cc: Eric Dumazet <eric.dumazet@gmail.com>
-Cc: David Laight <David.Laight@ACULAB.COM>
-Cc: Doug Leith <doug.leith@nuim.ie>
-Fixes: 8d3a564da34e (tcp: tcp_vegas cong avoid fix)
-Signed-off-by: Christoph Paasch <christoph.paasch@uclouvain.be>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/tcp_vegas.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/net/ipv4/tcp_vegas.c b/net/ipv4/tcp_vegas.c
-index 80fa2bfd7ede..c042e529a11e 100644
---- a/net/ipv4/tcp_vegas.c
-+++ b/net/ipv4/tcp_vegas.c
-@@ -218,7 +218,8 @@ static void tcp_vegas_cong_avoid(struct sock *sk, u32 ack, u32 in_flight)
- 			 * This is:
- 			 *     (actual rate in segments) * baseRTT
- 			 */
--			target_cwnd = tp->snd_cwnd * vegas->baseRTT / rtt;
-+			target_cwnd = (u64)tp->snd_cwnd * vegas->baseRTT;
-+			do_div(target_cwnd, rtt);
- 
- 			/* Calculate the difference between the window we had,
- 			 * and the window we would like to have. This quantity
--- 
-2.28.0
-
-
-From 0fd6471aacff6a6eb9c19b8686813cb3ff503466 Mon Sep 17 00:00:00 2001
-From: Daniel Borkmann <dborkman@redhat.com>
-Date: Tue, 22 Jul 2014 15:22:45 +0200
-Subject: [PATCH 06/24] net: sctp: inherit auth_capable on INIT collisions
-
-[ Upstream commit 1be9a950c646c9092fb3618197f7b6bfb50e82aa ]
-
-Jason reported an oops caused by SCTP on his ARM machine with
-SCTP authentication enabled:
-
-Internal error: Oops: 17 [#1] ARM
-CPU: 0 PID: 104 Comm: sctp-test Not tainted 3.13.0-68744-g3632f30c9b20-dirty #1
-task: c6eefa40 ti: c6f52000 task.ti: c6f52000
-PC is at sctp_auth_calculate_hmac+0xc4/0x10c
-LR is at sg_init_table+0x20/0x38
-pc : [<c024bb80>]    lr : [<c00f32dc>]    psr: 40000013
-sp : c6f538e8  ip : 00000000  fp : c6f53924
-r10: c6f50d80  r9 : 00000000  r8 : 00010000
-r7 : 00000000  r6 : c7be4000  r5 : 00000000  r4 : c6f56254
-r3 : c00c8170  r2 : 00000001  r1 : 00000008  r0 : c6f1e660
-Flags: nZcv  IRQs on  FIQs on  Mode SVC_32  ISA ARM  Segment user
-Control: 0005397f  Table: 06f28000  DAC: 00000015
-Process sctp-test (pid: 104, stack limit = 0xc6f521c0)
-Stack: (0xc6f538e8 to 0xc6f54000)
-[...]
-Backtrace:
-[<c024babc>] (sctp_auth_calculate_hmac+0x0/0x10c) from [<c0249af8>] (sctp_packet_transmit+0x33c/0x5c8)
-[<c02497bc>] (sctp_packet_transmit+0x0/0x5c8) from [<c023e96c>] (sctp_outq_flush+0x7fc/0x844)
-[<c023e170>] (sctp_outq_flush+0x0/0x844) from [<c023ef78>] (sctp_outq_uncork+0x24/0x28)
-[<c023ef54>] (sctp_outq_uncork+0x0/0x28) from [<c0234364>] (sctp_side_effects+0x1134/0x1220)
-[<c0233230>] (sctp_side_effects+0x0/0x1220) from [<c02330b0>] (sctp_do_sm+0xac/0xd4)
-[<c0233004>] (sctp_do_sm+0x0/0xd4) from [<c023675c>] (sctp_assoc_bh_rcv+0x118/0x160)
-[<c0236644>] (sctp_assoc_bh_rcv+0x0/0x160) from [<c023d5bc>] (sctp_inq_push+0x6c/0x74)
-[<c023d550>] (sctp_inq_push+0x0/0x74) from [<c024a6b0>] (sctp_rcv+0x7d8/0x888)
-
-While we already had various kind of bugs in that area
-ec0223ec48a9 ("net: sctp: fix sctp_sf_do_5_1D_ce to verify if
-we/peer is AUTH capable") and b14878ccb7fa ("net: sctp: cache
-auth_enable per endpoint"), this one is a bit of a different
-kind.
-
-Giving a bit more background on why SCTP authentication is
-needed can be found in RFC4895:
-
-  SCTP uses 32-bit verification tags to protect itself against
-  blind attackers. These values are not changed during the
-  lifetime of an SCTP association.
-
-  Looking at new SCTP extensions, there is the need to have a
-  method of proving that an SCTP chunk(s) was really sent by
-  the original peer that started the association and not by a
-  malicious attacker.
-
-To cause this bug, we're triggering an INIT collision between
-peers; normal SCTP handshake where both sides intent to
-authenticate packets contains RANDOM; CHUNKS; HMAC-ALGO
-parameters that are being negotiated among peers:
-
-  ---------- INIT[RANDOM; CHUNKS; HMAC-ALGO] ---------->
-  <------- INIT-ACK[RANDOM; CHUNKS; HMAC-ALGO] ---------
-  -------------------- COOKIE-ECHO -------------------->
-  <-------------------- COOKIE-ACK ---------------------
-
-RFC4895 says that each endpoint therefore knows its own random
-number and the peer's random number *after* the association
-has been established. The local and peer's random number along
-with the shared key are then part of the secret used for
-calculating the HMAC in the AUTH chunk.
-
-Now, in our scenario, we have 2 threads with 1 non-blocking
-SEQ_PACKET socket each, setting up common shared SCTP_AUTH_KEY
-and SCTP_AUTH_ACTIVE_KEY properly, and each of them calling
-sctp_bindx(3), listen(2) and connect(2) against each other,
-thus the handshake looks similar to this, e.g.:
-
-  ---------- INIT[RANDOM; CHUNKS; HMAC-ALGO] ---------->
-  <------- INIT-ACK[RANDOM; CHUNKS; HMAC-ALGO] ---------
-  <--------- INIT[RANDOM; CHUNKS; HMAC-ALGO] -----------
-  -------- INIT-ACK[RANDOM; CHUNKS; HMAC-ALGO] -------->
-  ...
-
-Since such collisions can also happen with verification tags,
-the RFC4895 for AUTH rather vaguely says under section 6.1:
-
-  In case of INIT collision, the rules governing the handling
-  of this Random Number follow the same pattern as those for
-  the Verification Tag, as explained in Section 5.2.4 of
-  RFC 2960 [5]. Therefore, each endpoint knows its own Random
-  Number and the peer's Random Number after the association
-  has been established.
-
-In RFC2960, section 5.2.4, we're eventually hitting Action B:
-
-  B) In this case, both sides may be attempting to start an
-     association at about the same time but the peer endpoint
-     started its INIT after responding to the local endpoint's
-     INIT. Thus it may have picked a new Verification Tag not
-     being aware of the previous Tag it had sent this endpoint.
-     The endpoint should stay in or enter the ESTABLISHED
-     state but it MUST update its peer's Verification Tag from
-     the State Cookie, stop any init or cookie timers that may
-     running and send a COOKIE ACK.
-
-In other words, the handling of the Random parameter is the
-same as behavior for the Verification Tag as described in
-Action B of section 5.2.4.
-
-Looking at the code, we exactly hit the sctp_sf_do_dupcook_b()
-case which triggers an SCTP_CMD_UPDATE_ASSOC command to the
-side effect interpreter, and in fact it properly copies over
-peer_{random, hmacs, chunks} parameters from the newly created
-association to update the existing one.
-
-Also, the old asoc_shared_key is being released and based on
-the new params, sctp_auth_asoc_init_active_key() updated.
-However, the issue observed in this case is that the previous
-asoc->peer.auth_capable was 0, and has *not* been updated, so
-that instead of creating a new secret, we're doing an early
-return from the function sctp_auth_asoc_init_active_key()
-leaving asoc->asoc_shared_key as NULL. However, we now have to
-authenticate chunks from the updated chunk list (e.g. COOKIE-ACK).
-
-That in fact causes the server side when responding with ...
-
-  <------------------ AUTH; COOKIE-ACK -----------------
-
-... to trigger a NULL pointer dereference, since in
-sctp_packet_transmit(), it discovers that an AUTH chunk is
-being queued for xmit, and thus it calls sctp_auth_calculate_hmac().
-
-Since the asoc->active_key_id is still inherited from the
-endpoint, and the same as encoded into the chunk, it uses
-asoc->asoc_shared_key, which is still NULL, as an asoc_key
-and dereferences it in ...
-
-  crypto_hash_setkey(desc.tfm, &asoc_key->data[0], asoc_key->len)
-
-... causing an oops. All this happens because sctp_make_cookie_ack()
-called with the *new* association has the peer.auth_capable=1
-and therefore marks the chunk with auth=1 after checking
-sctp_auth_send_cid(), but it is *actually* sent later on over
-the then *updated* association's transport that didn't initialize
-its shared key due to peer.auth_capable=0. Since control chunks
-in that case are not sent by the temporary association which
-are scheduled for deletion, they are issued for xmit via
-SCTP_CMD_REPLY in the interpreter with the context of the
-*updated* association. peer.auth_capable was 0 in the updated
-association (which went from COOKIE_WAIT into ESTABLISHED state),
-since all previous processing that performed sctp_process_init()
-was being done on temporary associations, that we eventually
-throw away each time.
-
-The correct fix is to update to the new peer.auth_capable
-value as well in the collision case via sctp_assoc_update(),
-so that in case the collision migrated from 0 -> 1,
-sctp_auth_asoc_init_active_key() can properly recalculate
-the secret. This therefore fixes the observed server panic.
-
-Fixes: 730fc3d05cd4 ("[SCTP]: Implete SCTP-AUTH parameter processing")
-Reported-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
-Signed-off-by: Daniel Borkmann <dborkman@redhat.com>
-Tested-by: Jason Gunthorpe <jgunthorpe@obsidianresearch.com>
-Cc: Vlad Yasevich <vyasevich@gmail.com>
-Acked-by: Vlad Yasevich <vyasevich@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/sctp/associola.c | 1 +
- 1 file changed, 1 insertion(+)
-
 diff --git a/net/sctp/associola.c b/net/sctp/associola.c
 index 25b207b3ffe4..da54d2922f51 100644
 --- a/net/sctp/associola.c
@@ -1104,209 +1118,6 @@ index 25b207b3ffe4..da54d2922f51 100644
  	asoc->peer.i = new->peer.i;
  	sctp_tsnmap_init(&asoc->peer.tsn_map, SCTP_TSN_MAP_INITIAL,
  			 asoc->peer.i.initial_tsn, GFP_ATOMIC);
--- 
-2.28.0
-
-
-From e2a2802ad1526fbdf1dc989c27ecd203f2de7f5c Mon Sep 17 00:00:00 2001
-From: Vlad Yasevich <vyasevic@redhat.com>
-Date: Thu, 31 Jul 2014 10:30:25 -0400
-Subject: [PATCH 07/24] macvlan: Initialize vlan_features to turn on offload
- support.
-
-[ Upstream commit 081e83a78db9b0ae1f5eabc2dedecc865f509b98 ]
-
-Macvlan devices do not initialize vlan_features.  As a result,
-any vlan devices configured on top of macvlans perform very poorly.
-Initialize vlan_features based on the vlan features of the lower-level
-device.
-
-Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/macvlan.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/net/macvlan.c b/drivers/net/macvlan.c
-index c4bb95b051f3..6749acf6f3f4 100644
---- a/drivers/net/macvlan.c
-+++ b/drivers/net/macvlan.c
-@@ -455,6 +455,7 @@ static int macvlan_init(struct net_device *dev)
- 				  (lowerdev->state & MACVLAN_STATE_MASK);
- 	dev->features 		= lowerdev->features & MACVLAN_FEATURES;
- 	dev->features		|= NETIF_F_LLTX;
-+	dev->vlan_features	= lowerdev->vlan_features & MACVLAN_FEATURES;
- 	dev->gso_max_size	= lowerdev->gso_max_size;
- 	dev->iflink		= lowerdev->ifindex;
- 	dev->hard_header_len	= lowerdev->hard_header_len;
--- 
-2.28.0
-
-
-From 80db1671bd9bf67acf9c3b21350442b4b77e7cc4 Mon Sep 17 00:00:00 2001
-From: Vlad Yasevich <vyasevic@redhat.com>
-Date: Thu, 31 Jul 2014 10:33:06 -0400
-Subject: [PATCH 08/24] net: Correctly set segment mac_len in skb_segment().
-
-[ Upstream commit fcdfe3a7fa4cb74391d42b6a26dc07c20dab1d82 ]
-
-When performing segmentation, the mac_len value is copied right
-out of the original skb.  However, this value is not always set correctly
-(like when the packet is VLAN-tagged) and we'll end up copying a bad
-value.
-
-One way to demonstrate this is to configure a VM which tags
-packets internally and turn off VLAN acceleration on the forwarding
-bridge port.  The packets show up corrupt like this:
-16:18:24.985548 52:54:00:ab:be:25 > 52:54:00:26:ce:a3, ethertype 802.1Q
-(0x8100), length 1518: vlan 100, p 0, ethertype 0x05e0,
-        0x0000:  8cdb 1c7c 8cdb 0064 4006 b59d 0a00 6402 ...|...d@.....d.
-        0x0010:  0a00 6401 9e0d b441 0a5e 64ec 0330 14fa ..d....A.^d..0..
-        0x0020:  29e3 01c9 f871 0000 0101 080a 000a e833)....q.........3
-        0x0030:  000f 8c75 6e65 7470 6572 6600 6e65 7470 ...unetperf.netp
-        0x0040:  6572 6600 6e65 7470 6572 6600 6e65 7470 erf.netperf.netp
-        0x0050:  6572 6600 6e65 7470 6572 6600 6e65 7470 erf.netperf.netp
-        0x0060:  6572 6600 6e65 7470 6572 6600 6e65 7470 erf.netperf.netp
-        ...
-
-This also leads to awful throughput as GSO packets are dropped and
-cause retransmissions.
-
-The solution is to set the mac_len using the values already available
-in then new skb.  We've already adjusted all of the header offset, so we
-might as well correctly figure out the mac_len using skb_reset_mac_len().
-After this change, packets are segmented correctly and performance
-is restored.
-
-CC: Eric Dumazet <edumazet@google.com>
-Signed-off-by: Vlad Yasevich <vyasevic@redhat.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/core/skbuff.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/net/core/skbuff.c b/net/core/skbuff.c
-index 8de819475378..728f49babfe0 100644
---- a/net/core/skbuff.c
-+++ b/net/core/skbuff.c
-@@ -2748,7 +2748,6 @@ struct sk_buff *skb_segment(struct sk_buff *skb, netdev_features_t features)
- 		tail = nskb;
- 
- 		__copy_skb_header(nskb, skb);
--		nskb->mac_len = skb->mac_len;
- 
- 		/* nskb and skb might have different headroom */
- 		if (nskb->ip_summed == CHECKSUM_PARTIAL)
-@@ -2758,6 +2757,7 @@ struct sk_buff *skb_segment(struct sk_buff *skb, netdev_features_t features)
- 		skb_set_network_header(nskb, skb->mac_len);
- 		nskb->transport_header = (nskb->network_header +
- 					  skb_network_header_len(skb));
-+		skb_reset_mac_len(nskb);
- 		skb_copy_from_linear_data(skb, nskb->data, doffset);
- 
- 		if (fskb != skb_shinfo(skb)->frag_list)
--- 
-2.28.0
-
-
-From 8fbbef088e95f015f89cc155a02fe64017905765 Mon Sep 17 00:00:00 2001
-From: Sasha Levin <sasha.levin@oracle.com>
-Date: Thu, 31 Jul 2014 23:00:35 -0400
-Subject: [PATCH 09/24] iovec: make sure the caller actually wants anything in
- memcpy_fromiovecend
-
-[ Upstream commit 06ebb06d49486676272a3c030bfeef4bd969a8e6 ]
-
-Check for cases when the caller requests 0 bytes instead of running off
-and dereferencing potentially invalid iovecs.
-
-Signed-off-by: Sasha Levin <sasha.levin@oracle.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/core/iovec.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/net/core/iovec.c b/net/core/iovec.c
-index 4db6bfa04fbe..d1628b79286b 100644
---- a/net/core/iovec.c
-+++ b/net/core/iovec.c
-@@ -157,6 +157,10 @@ EXPORT_SYMBOL(memcpy_fromiovec);
- int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
- 			int offset, int len)
- {
-+	/* No data? Done! */
-+	if (len == 0)
-+		return 0;
-+
- 	/* Skip over the finished iovecs */
- 	while (offset >= iov->iov_len) {
- 		offset -= iov->iov_len;
--- 
-2.28.0
-
-
-From 5c19acccf5233d73ed6c58440e301ba6828aa0c1 Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Tue, 5 Aug 2014 16:49:52 +0200
-Subject: [PATCH 10/24] sctp: fix possible seqlock seadlock in
- sctp_packet_transmit()
-
-[ Upstream commit 757efd32d5ce31f67193cc0e6a56e4dffcc42fb1 ]
-
-Dave reported following splat, caused by improper use of
-IP_INC_STATS_BH() in process context.
-
-BUG: using __this_cpu_add() in preemptible [00000000] code: trinity-c117/14551
-caller is __this_cpu_preempt_check+0x13/0x20
-CPU: 3 PID: 14551 Comm: trinity-c117 Not tainted 3.16.0+ #33
- ffffffff9ec898f0 0000000047ea7e23 ffff88022d32f7f0 ffffffff9e7ee207
- 0000000000000003 ffff88022d32f818 ffffffff9e397eaa ffff88023ee70b40
- ffff88022d32f970 ffff8801c026d580 ffff88022d32f828 ffffffff9e397ee3
-Call Trace:
- [<ffffffff9e7ee207>] dump_stack+0x4e/0x7a
- [<ffffffff9e397eaa>] check_preemption_disabled+0xfa/0x100
- [<ffffffff9e397ee3>] __this_cpu_preempt_check+0x13/0x20
- [<ffffffffc0839872>] sctp_packet_transmit+0x692/0x710 [sctp]
- [<ffffffffc082a7f2>] sctp_outq_flush+0x2a2/0xc30 [sctp]
- [<ffffffff9e0d985c>] ? mark_held_locks+0x7c/0xb0
- [<ffffffff9e7f8c6d>] ? _raw_spin_unlock_irqrestore+0x5d/0x80
- [<ffffffffc082b99a>] sctp_outq_uncork+0x1a/0x20 [sctp]
- [<ffffffffc081e112>] sctp_cmd_interpreter.isra.23+0x1142/0x13f0 [sctp]
- [<ffffffffc081c86b>] sctp_do_sm+0xdb/0x330 [sctp]
- [<ffffffff9e0b8f1b>] ? preempt_count_sub+0xab/0x100
- [<ffffffffc083b350>] ? sctp_cname+0x70/0x70 [sctp]
- [<ffffffffc08389ca>] sctp_primitive_ASSOCIATE+0x3a/0x50 [sctp]
- [<ffffffffc083358f>] sctp_sendmsg+0x88f/0xe30 [sctp]
- [<ffffffff9e0d673a>] ? lock_release_holdtime.part.28+0x9a/0x160
- [<ffffffff9e0d62ce>] ? put_lock_stats.isra.27+0xe/0x30
- [<ffffffff9e73b624>] inet_sendmsg+0x104/0x220
- [<ffffffff9e73b525>] ? inet_sendmsg+0x5/0x220
- [<ffffffff9e68ac4e>] sock_sendmsg+0x9e/0xe0
- [<ffffffff9e1c0c09>] ? might_fault+0xb9/0xc0
- [<ffffffff9e1c0bae>] ? might_fault+0x5e/0xc0
- [<ffffffff9e68b234>] SYSC_sendto+0x124/0x1c0
- [<ffffffff9e0136b0>] ? syscall_trace_enter+0x250/0x330
- [<ffffffff9e68c3ce>] SyS_sendto+0xe/0x10
- [<ffffffff9e7f9be4>] tracesys+0xdd/0xe2
-
-This is a followup of commits f1d8cba61c3c4b ("inet: fix possible
-seqlock deadlocks") and 7f88c6b23afbd315 ("ipv6: fix possible seqlock
-deadlock in ip6_finish_output2")
-
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Reported-by: Dave Jones <davej@redhat.com>
-Acked-by: Neil Horman <nhorman@tuxdriver.com>
-Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/sctp/output.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
 diff --git a/net/sctp/output.c b/net/sctp/output.c
 index cf3e22c586a6..5bd9aa93139d 100644
 --- a/net/sctp/output.c
@@ -1320,907 +1131,3 @@ index cf3e22c586a6..5bd9aa93139d 100644
  
  	/* FIXME: Returning the 'err' will effect all the associations
  	 * associated with a socket, although only one of the paths of the
--- 
-2.28.0
-
-
-From 0da96858de3417f557410c3e6d585b928394e198 Mon Sep 17 00:00:00 2001
-From: "David S. Miller" <davem@davemloft.net>
-Date: Wed, 30 Apr 2014 19:37:48 -0700
-Subject: [PATCH 11/24] sparc64: Fix argument sign extension for
- compat_sys_futex().
-
-[ Upstream commit aa3449ee9c87d9b7660dd1493248abcc57769e31 ]
-
-Only the second argument, 'op', is signed.
-
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/kernel/sys32.S | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/sparc/kernel/sys32.S b/arch/sparc/kernel/sys32.S
-index d97f3eb72e06..085c60fd4b6b 100644
---- a/arch/sparc/kernel/sys32.S
-+++ b/arch/sparc/kernel/sys32.S
-@@ -87,7 +87,7 @@ SIGN1(sys32_io_submit, compat_sys_io_submit, %o1)
- SIGN1(sys32_mq_open, compat_sys_mq_open, %o1)
- SIGN1(sys32_select, compat_sys_select, %o0)
- SIGN1(sys32_mkdir, sys_mkdir, %o1)
--SIGN3(sys32_futex, compat_sys_futex, %o1, %o2, %o5)
-+SIGN1(sys32_futex, compat_sys_futex, %o1)
- SIGN1(sys32_sysfs, compat_sys_sysfs, %o0)
- SIGN2(sys32_sendfile, compat_sys_sendfile, %o0, %o1)
- SIGN2(sys32_sendfile64, compat_sys_sendfile64, %o0, %o1)
--- 
-2.28.0
-
-
-From 4fdf73fb4a781e9b74e540d251a533fa7b2af8df Mon Sep 17 00:00:00 2001
-From: Kirill Tkhai <tkhai@yandex.ru>
-Date: Thu, 17 Apr 2014 00:45:24 +0400
-Subject: [PATCH 12/24] sparc64: Make itc_sync_lock raw
-
-[ Upstream commit 49b6c01f4c1de3b5e5427ac5aba80f9f6d27837a ]
-
-One more place where we must not be able
-to be preempted or to be interrupted in RT.
-
-Always actually disable interrupts during
-synchronization cycle.
-
-Signed-off-by: Kirill Tkhai <tkhai@yandex.ru>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/kernel/smp_64.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/arch/sparc/kernel/smp_64.c b/arch/sparc/kernel/smp_64.c
-index bb2886ac1df3..bbf7e955cb19 100644
---- a/arch/sparc/kernel/smp_64.c
-+++ b/arch/sparc/kernel/smp_64.c
-@@ -151,7 +151,7 @@ void cpu_panic(void)
- #define NUM_ROUNDS	64	/* magic value */
- #define NUM_ITERS	5	/* likewise */
- 
--static DEFINE_SPINLOCK(itc_sync_lock);
-+static DEFINE_RAW_SPINLOCK(itc_sync_lock);
- static unsigned long go[SLAVE + 1];
- 
- #define DEBUG_TICK_SYNC	0
-@@ -259,7 +259,7 @@ static void smp_synchronize_one_tick(int cpu)
- 	go[MASTER] = 0;
- 	membar_safe("#StoreLoad");
- 
--	spin_lock_irqsave(&itc_sync_lock, flags);
-+	raw_spin_lock_irqsave(&itc_sync_lock, flags);
- 	{
- 		for (i = 0; i < NUM_ROUNDS*NUM_ITERS; i++) {
- 			while (!go[MASTER])
-@@ -270,7 +270,7 @@ static void smp_synchronize_one_tick(int cpu)
- 			membar_safe("#StoreLoad");
- 		}
- 	}
--	spin_unlock_irqrestore(&itc_sync_lock, flags);
-+	raw_spin_unlock_irqrestore(&itc_sync_lock, flags);
- }
- 
- #if defined(CONFIG_SUN_LDOMS) && defined(CONFIG_HOTPLUG_CPU)
--- 
-2.28.0
-
-
-From d2671e681d044d236c7a39b8c4b718216f2261df Mon Sep 17 00:00:00 2001
-From: "David S. Miller" <davem@davemloft.net>
-Date: Mon, 28 Apr 2014 23:50:08 -0700
-Subject: [PATCH 13/24] sparc64: Handle 32-bit tasks properly in
- compute_effective_address().
-
-[ Upstream commit d037d16372bbe4d580342bebbb8826821ad9edf0 ]
-
-If we have a 32-bit task we must chop off the top 32-bits of the
-64-bit value just as the cpu would.
-
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/kernel/unaligned_64.c | 12 +++++++++---
- 1 file changed, 9 insertions(+), 3 deletions(-)
-
-diff --git a/arch/sparc/kernel/unaligned_64.c b/arch/sparc/kernel/unaligned_64.c
-index dae85bc2eda5..a3c3a5bcd126 100644
---- a/arch/sparc/kernel/unaligned_64.c
-+++ b/arch/sparc/kernel/unaligned_64.c
-@@ -156,17 +156,23 @@ static unsigned long *fetch_reg_addr(unsigned int reg, struct pt_regs *regs)
- unsigned long compute_effective_address(struct pt_regs *regs,
- 					unsigned int insn, unsigned int rd)
- {
-+	int from_kernel = (regs->tstate & TSTATE_PRIV) != 0;
- 	unsigned int rs1 = (insn >> 14) & 0x1f;
- 	unsigned int rs2 = insn & 0x1f;
--	int from_kernel = (regs->tstate & TSTATE_PRIV) != 0;
-+	unsigned long addr;
- 
- 	if (insn & 0x2000) {
- 		maybe_flush_windows(rs1, 0, rd, from_kernel);
--		return (fetch_reg(rs1, regs) + sign_extend_imm13(insn));
-+		addr = (fetch_reg(rs1, regs) + sign_extend_imm13(insn));
- 	} else {
- 		maybe_flush_windows(rs1, rs2, rd, from_kernel);
--		return (fetch_reg(rs1, regs) + fetch_reg(rs2, regs));
-+		addr = (fetch_reg(rs1, regs) + fetch_reg(rs2, regs));
- 	}
-+
-+	if (!from_kernel && test_thread_flag(TIF_32BIT))
-+		addr &= 0xffffffff;
-+
-+	return addr;
- }
- 
- /* This is just to make gcc think die_if_kernel does return... */
--- 
-2.28.0
-
-
-From 86982cf46cf082ef705237b1ed7372ec772f3f8e Mon Sep 17 00:00:00 2001
-From: "David S. Miller" <davem@davemloft.net>
-Date: Mon, 28 Apr 2014 23:52:11 -0700
-Subject: [PATCH 14/24] sparc64: Fix top-level fault handling bugs.
-
-[ Upstream commit 70ffc6ebaead783ac8dafb1e87df0039bb043596 ]
-
-Make get_user_insn() able to cope with huge PMDs.
-
-Next, make do_fault_siginfo() more robust when get_user_insn() can't
-actually fetch the instruction.  In particular, use the MMU announced
-fault address when that happens, instead of calling
-compute_effective_address() and computing garbage.
-
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/mm/fault_64.c | 86 +++++++++++++++++++++++++---------------
- 1 file changed, 54 insertions(+), 32 deletions(-)
-
-diff --git a/arch/sparc/mm/fault_64.c b/arch/sparc/mm/fault_64.c
-index 1fe0429b6314..98a64f957ed5 100644
---- a/arch/sparc/mm/fault_64.c
-+++ b/arch/sparc/mm/fault_64.c
-@@ -95,38 +95,51 @@ static unsigned int get_user_insn(unsigned long tpc)
- 	pte_t *ptep, pte;
- 	unsigned long pa;
- 	u32 insn = 0;
--	unsigned long pstate;
- 
--	if (pgd_none(*pgdp))
--		goto outret;
-+	if (pgd_none(*pgdp) || unlikely(pgd_bad(*pgdp)))
-+		goto out;
- 	pudp = pud_offset(pgdp, tpc);
--	if (pud_none(*pudp))
--		goto outret;
--	pmdp = pmd_offset(pudp, tpc);
--	if (pmd_none(*pmdp))
--		goto outret;
--
--	/* This disables preemption for us as well. */
--	__asm__ __volatile__("rdpr %%pstate, %0" : "=r" (pstate));
--	__asm__ __volatile__("wrpr %0, %1, %%pstate"
--				: : "r" (pstate), "i" (PSTATE_IE));
--	ptep = pte_offset_map(pmdp, tpc);
--	pte = *ptep;
--	if (!pte_present(pte))
-+	if (pud_none(*pudp) || unlikely(pud_bad(*pudp)))
- 		goto out;
- 
--	pa  = (pte_pfn(pte) << PAGE_SHIFT);
--	pa += (tpc & ~PAGE_MASK);
--
--	/* Use phys bypass so we don't pollute dtlb/dcache. */
--	__asm__ __volatile__("lduwa [%1] %2, %0"
--			     : "=r" (insn)
--			     : "r" (pa), "i" (ASI_PHYS_USE_EC));
-+	/* This disables preemption for us as well. */
-+	local_irq_disable();
- 
-+	pmdp = pmd_offset(pudp, tpc);
-+	if (pmd_none(*pmdp) || unlikely(pmd_bad(*pmdp)))
-+		goto out_irq_enable;
-+
-+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-+	if (pmd_trans_huge(*pmdp)) {
-+		if (pmd_trans_splitting(*pmdp))
-+			goto out_irq_enable;
-+
-+		pa  = pmd_pfn(*pmdp) << PAGE_SHIFT;
-+		pa += tpc & ~HPAGE_MASK;
-+
-+		/* Use phys bypass so we don't pollute dtlb/dcache. */
-+		__asm__ __volatile__("lduwa [%1] %2, %0"
-+				     : "=r" (insn)
-+				     : "r" (pa), "i" (ASI_PHYS_USE_EC));
-+	} else
-+#endif
-+	{
-+		ptep = pte_offset_map(pmdp, tpc);
-+		pte = *ptep;
-+		if (pte_present(pte)) {
-+			pa  = (pte_pfn(pte) << PAGE_SHIFT);
-+			pa += (tpc & ~PAGE_MASK);
-+
-+			/* Use phys bypass so we don't pollute dtlb/dcache. */
-+			__asm__ __volatile__("lduwa [%1] %2, %0"
-+					     : "=r" (insn)
-+					     : "r" (pa), "i" (ASI_PHYS_USE_EC));
-+		}
-+		pte_unmap(ptep);
-+	}
-+out_irq_enable:
-+	local_irq_enable();
- out:
--	pte_unmap(ptep);
--	__asm__ __volatile__("wrpr %0, 0x0, %%pstate" : : "r" (pstate));
--outret:
- 	return insn;
- }
- 
-@@ -154,7 +167,8 @@ show_signal_msg(struct pt_regs *regs, int sig, int code,
- extern unsigned long compute_effective_address(struct pt_regs *, unsigned int, unsigned int);
- 
- static void do_fault_siginfo(int code, int sig, struct pt_regs *regs,
--			     unsigned int insn, int fault_code)
-+			     unsigned long fault_addr, unsigned int insn,
-+			     int fault_code)
- {
- 	unsigned long addr;
- 	siginfo_t info;
-@@ -162,10 +176,18 @@ static void do_fault_siginfo(int code, int sig, struct pt_regs *regs,
- 	info.si_code = code;
- 	info.si_signo = sig;
- 	info.si_errno = 0;
--	if (fault_code & FAULT_CODE_ITLB)
-+	if (fault_code & FAULT_CODE_ITLB) {
- 		addr = regs->tpc;
--	else
--		addr = compute_effective_address(regs, insn, 0);
-+	} else {
-+		/* If we were able to probe the faulting instruction, use it
-+		 * to compute a precise fault address.  Otherwise use the fault
-+		 * time provided address which may only have page granularity.
-+		 */
-+		if (insn)
-+			addr = compute_effective_address(regs, insn, 0);
-+		else
-+			addr = fault_addr;
-+	}
- 	info.si_addr = (void __user *) addr;
- 	info.si_trapno = 0;
- 
-@@ -240,7 +262,7 @@ static void __kprobes do_kernel_fault(struct pt_regs *regs, int si_code,
- 		/* The si_code was set to make clear whether
- 		 * this was a SEGV_MAPERR or SEGV_ACCERR fault.
- 		 */
--		do_fault_siginfo(si_code, SIGSEGV, regs, insn, fault_code);
-+		do_fault_siginfo(si_code, SIGSEGV, regs, address, insn, fault_code);
- 		return;
- 	}
- 
-@@ -515,7 +537,7 @@ do_sigbus:
- 	 * Send a sigbus, regardless of whether we were in kernel
- 	 * or user mode.
- 	 */
--	do_fault_siginfo(BUS_ADRERR, SIGBUS, regs, insn, fault_code);
-+	do_fault_siginfo(BUS_ADRERR, SIGBUS, regs, address, insn, fault_code);
- 
- 	/* Kernel mode? Handle exceptions or die */
- 	if (regs->tstate & TSTATE_PRIV)
--- 
-2.28.0
-
-
-From 0de492190948948d0ff5d3ad8f7e1f0942f0379e Mon Sep 17 00:00:00 2001
-From: "David S. Miller" <davem@davemloft.net>
-Date: Tue, 6 May 2014 21:27:37 -0700
-Subject: [PATCH 15/24] sparc64: Don't bark so loudly about 32-bit tasks
- generating 64-bit fault addresses.
-
-[ Upstream commit e5c460f46ae7ee94831cb55cb980f942aa9e5a85 ]
-
-This was found using Dave Jone's trinity tool.
-
-When a user process which is 32-bit performs a load or a store, the
-cpu chops off the top 32-bits of the effective address before
-translating it.
-
-This is because we run 32-bit tasks with the PSTATE_AM (address
-masking) bit set.
-
-We can't run the kernel with that bit set, so when the kernel accesses
-userspace no address masking occurs.
-
-Since a 32-bit process will have no mappings in that region we will
-properly fault, so we don't try to handle this using access_ok(),
-which can safely just be a NOP on sparc64.
-
-Real faults from 32-bit processes should never generate such addresses
-so a bug check was added long ago, and it barks in the logs if this
-happens.
-
-But it also barks when a kernel user access causes this condition, and
-that _can_ happen.  For example, if a pointer passed into a system call
-is "0xfffffffc" and the kernel access 4 bytes offset from that pointer.
-
-Just handle such faults normally via the exception entries.
-
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/mm/fault_64.c | 16 +---------------
- 1 file changed, 1 insertion(+), 15 deletions(-)
-
-diff --git a/arch/sparc/mm/fault_64.c b/arch/sparc/mm/fault_64.c
-index 98a64f957ed5..1387acafc62c 100644
---- a/arch/sparc/mm/fault_64.c
-+++ b/arch/sparc/mm/fault_64.c
-@@ -282,18 +282,6 @@ static void noinline __kprobes bogus_32bit_fault_tpc(struct pt_regs *regs)
- 	show_regs(regs);
- }
- 
--static void noinline __kprobes bogus_32bit_fault_address(struct pt_regs *regs,
--							 unsigned long addr)
--{
--	static int times;
--
--	if (times++ < 10)
--		printk(KERN_ERR "FAULT[%s:%d]: 32-bit process "
--		       "reports 64-bit fault address [%lx]\n",
--		       current->comm, current->pid, addr);
--	show_regs(regs);
--}
--
- asmlinkage void __kprobes do_sparc64_fault(struct pt_regs *regs)
- {
- 	struct mm_struct *mm = current->mm;
-@@ -322,10 +310,8 @@ asmlinkage void __kprobes do_sparc64_fault(struct pt_regs *regs)
- 				goto intr_or_no_mm;
- 			}
- 		}
--		if (unlikely((address >> 32) != 0)) {
--			bogus_32bit_fault_address(regs, address);
-+		if (unlikely((address >> 32) != 0))
- 			goto intr_or_no_mm;
--		}
- 	}
- 
- 	if (regs->tstate & TSTATE_PRIV) {
--- 
-2.28.0
-
-
-From fdd880110209aa34e5334797891e594b877c38aa Mon Sep 17 00:00:00 2001
-From: "David S. Miller" <davem@davemloft.net>
-Date: Wed, 7 May 2014 14:07:32 -0700
-Subject: [PATCH 16/24] sparc64: Fix huge TSB mapping on pre-UltraSPARC-III
- cpus.
-
-[ Upstream commit b18eb2d779240631a098626cb6841ee2dd34fda0 ]
-
-Access to the TSB hash tables during TLB misses requires that there be
-an atomic 128-bit quad load available so that we fetch a matching TAG
-and DATA field at the same time.
-
-On cpus prior to UltraSPARC-III only virtual address based quad loads
-are available.  UltraSPARC-III and later provide physical address
-based variants which are easier to use.
-
-When we only have virtual address based quad loads available this
-means that we have to lock the TSB into the TLB at a fixed virtual
-address on each cpu when it runs that process.  We can't just access
-the PAGE_OFFSET based aliased mapping of these TSBs because we cannot
-take a recursive TLB miss inside of the TLB miss handler without
-risking running out of hardware trap levels (some trap combinations
-can be deep, such as those generated by register window spill and fill
-traps).
-
-Without huge pages it's working perfectly fine, but when the huge TSB
-got added another chunk of fixed virtual address space was not
-allocated for this second TSB mapping.
-
-So we were mapping both the 8K and 4MB TSBs to the same exact virtual
-address, causing multiple TLB matches which gives undefined behavior.
-
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/include/asm/pgtable_64.h |  6 ++++--
- arch/sparc/mm/tsb.c                 | 14 +++++++++++++-
- 2 files changed, 17 insertions(+), 3 deletions(-)
-
-diff --git a/arch/sparc/include/asm/pgtable_64.h b/arch/sparc/include/asm/pgtable_64.h
-index 656de8bc0ed6..cd24caf1732d 100644
---- a/arch/sparc/include/asm/pgtable_64.h
-+++ b/arch/sparc/include/asm/pgtable_64.h
-@@ -24,7 +24,8 @@
- 
- /* The kernel image occupies 0x4000000 to 0x6000000 (4MB --> 96MB).
-  * The page copy blockops can use 0x6000000 to 0x8000000.
-- * The TSB is mapped in the 0x8000000 to 0xa000000 range.
-+ * The 8K TSB is mapped in the 0x8000000 to 0x8400000 range.
-+ * The 4M TSB is mapped in the 0x8400000 to 0x8800000 range.
-  * The PROM resides in an area spanning 0xf0000000 to 0x100000000.
-  * The vmalloc area spans 0x100000000 to 0x200000000.
-  * Since modules need to be in the lowest 32-bits of the address space,
-@@ -33,7 +34,8 @@
-  * 0x400000000.
-  */
- #define	TLBTEMP_BASE		_AC(0x0000000006000000,UL)
--#define	TSBMAP_BASE		_AC(0x0000000008000000,UL)
-+#define	TSBMAP_8K_BASE		_AC(0x0000000008000000,UL)
-+#define	TSBMAP_4M_BASE		_AC(0x0000000008400000,UL)
- #define MODULES_VADDR		_AC(0x0000000010000000,UL)
- #define MODULES_LEN		_AC(0x00000000e0000000,UL)
- #define MODULES_END		_AC(0x00000000f0000000,UL)
-diff --git a/arch/sparc/mm/tsb.c b/arch/sparc/mm/tsb.c
-index f4e84f3440dd..41530193e6d6 100644
---- a/arch/sparc/mm/tsb.c
-+++ b/arch/sparc/mm/tsb.c
-@@ -150,7 +150,19 @@ static void setup_tsb_params(struct mm_struct *mm, unsigned long tsb_idx, unsign
- 	mm->context.tsb_block[tsb_idx].tsb_nentries =
- 		tsb_bytes / sizeof(struct tsb);
- 
--	base = TSBMAP_BASE;
-+	switch (tsb_idx) {
-+	case MM_TSB_BASE:
-+		base = TSBMAP_8K_BASE;
-+		break;
-+#if defined(CONFIG_HUGETLB_PAGE) || defined(CONFIG_TRANSPARENT_HUGEPAGE)
-+	case MM_TSB_HUGE:
-+		base = TSBMAP_4M_BASE;
-+		break;
-+#endif
-+	default:
-+		BUG();
-+	}
-+
- 	tte = pgprot_val(PAGE_KERNEL_LOCKED);
- 	tsb_paddr = __pa(mm->context.tsb_block[tsb_idx].tsb);
- 	BUG_ON(tsb_paddr & (tsb_bytes - 1UL));
--- 
-2.28.0
-
-
-From 8e8955a262de468c34c83203375c1d405b9d6840 Mon Sep 17 00:00:00 2001
-From: "David S. Miller" <davem@davemloft.net>
-Date: Sat, 17 May 2014 11:28:05 -0700
-Subject: [PATCH 17/24] sparc64: Add membar to Niagara2 memcpy code.
-
-[ Upstream commit 5aa4ecfd0ddb1e6dcd1c886e6c49677550f581aa ]
-
-This is the prevent previous stores from overlapping the block stores
-done by the memcpy loop.
-
-Based upon a glibc patch by Jose E. Marchesi
-
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/lib/NG2memcpy.S | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/arch/sparc/lib/NG2memcpy.S b/arch/sparc/lib/NG2memcpy.S
-index 0aed75653b50..e993fc8d7c66 100644
---- a/arch/sparc/lib/NG2memcpy.S
-+++ b/arch/sparc/lib/NG2memcpy.S
-@@ -236,6 +236,7 @@ FUNC_NAME:	/* %o0=dst, %o1=src, %o2=len */
- 	 */
- 	VISEntryHalf
- 
-+	membar		#Sync
- 	alignaddr	%o1, %g0, %g0
- 
- 	add		%o1, (64 - 1), %o4
--- 
-2.28.0
-
-
-From afa9b047624f638f1cabc3c5bcbcbd86bea47ab3 Mon Sep 17 00:00:00 2001
-From: "David S. Miller" <davem@davemloft.net>
-Date: Mon, 4 Aug 2014 16:34:01 -0700
-Subject: [PATCH 18/24] sparc64: Do not insert non-valid PTEs into the TSB hash
- table.
-
-[ Upstream commit 18f38132528c3e603c66ea464727b29e9bbcb91b ]
-
-The assumption was that update_mmu_cache() (and the equivalent for PMDs) would
-only be called when the PTE being installed will be accessible by the user.
-
-This is not true for code paths originating from remove_migration_pte().
-
-There are dire consequences for placing a non-valid PTE into the TSB.  The TLB
-miss frramework assumes thatwhen a TSB entry matches we can just load it into
-the TLB and return from the TLB miss trap.
-
-So if a non-valid PTE is in there, we will deadlock taking the TLB miss over
-and over, never satisfying the miss.
-
-Just exit early from update_mmu_cache() and friends in this situation.
-
-Based upon a report and patch from Christopher Alexander Tobias Schulze.
-
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/mm/init_64.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
-index 7f8238f4f954..9ed22b571a05 100644
---- a/arch/sparc/mm/init_64.c
-+++ b/arch/sparc/mm/init_64.c
-@@ -308,6 +308,10 @@ void update_mmu_cache(struct vm_area_struct *vma, unsigned long address, pte_t *
- 	tsb_index = MM_TSB_BASE;
- 	tsb_hash_shift = PAGE_SHIFT;
- 
-+	/* Don't insert a non-valid PTE into the TSB, we'll deadlock.  */
-+	if (!(pte_val(pte) & _PAGE_VALID))
-+		return;
-+
- 	spin_lock_irqsave(&mm->context.lock, flags);
- 
- #ifdef CONFIG_HUGETLB_PAGE
--- 
-2.28.0
-
-
-From d7bcdfe04e385f4420b2a8d22d62dbf48935da4f Mon Sep 17 00:00:00 2001
-From: "David S. Miller" <davem@davemloft.net>
-Date: Mon, 4 Aug 2014 20:07:37 -0700
-Subject: [PATCH 19/24] sparc64: Guard against flushing openfirmware mappings.
-
-[ Upstream commit 4ca9a23765da3260058db3431faf5b4efd8cf926 ]
-
-Based almost entirely upon a patch by Christopher Alexander Tobias
-Schulze.
-
-In commit db64fe02258f1507e13fe5212a989922323685ce ("mm: rewrite vmap
-layer") lazy VMAP tlb flushing was added to the vmalloc layer.  This
-causes problems on sparc64.
-
-Sparc64 has two VMAP mapped regions and they are not contiguous with
-eachother.  First we have the malloc mapping area, then another
-unrelated region, then the vmalloc region.
-
-This "another unrelated region" is where the firmware is mapped.
-
-If the lazy TLB flushing logic in the vmalloc code triggers after
-we've had both a module unload and a vfree or similar, it will pass an
-address range that goes from somewhere inside the malloc region to
-somewhere inside the vmalloc region, and thus covering the
-openfirmware area entirely.
-
-The sparc64 kernel learns about openfirmware's dynamic mappings in
-this region early in the boot, and then services TLB misses in this
-area.  But openfirmware has some locked TLB entries which are not
-mentioned in those dynamic mappings and we should thus not disturb
-them.
-
-These huge lazy TLB flush ranges causes those openfirmware locked TLB
-entries to be removed, resulting in all kinds of problems including
-hard hangs and crashes during reboot/reset.
-
-Besides causing problems like this, such huge TLB flush ranges are
-also incredibly inefficient.  A plea has been made with the author of
-the VMAP lazy TLB flushing code, but for now we'll put a safety guard
-into our flush_tlb_kernel_range() implementation.
-
-Since the implementation has become non-trivial, stop defining it as a
-macro and instead make it a function in a C source file.
-
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/include/asm/tlbflush_64.h | 12 ++----------
- arch/sparc/mm/init_64.c              | 23 +++++++++++++++++++++++
- 2 files changed, 25 insertions(+), 10 deletions(-)
-
-diff --git a/arch/sparc/include/asm/tlbflush_64.h b/arch/sparc/include/asm/tlbflush_64.h
-index f0d6a9700f4c..1a4bb971e06d 100644
---- a/arch/sparc/include/asm/tlbflush_64.h
-+++ b/arch/sparc/include/asm/tlbflush_64.h
-@@ -35,6 +35,8 @@ static inline void flush_tlb_range(struct vm_area_struct *vma,
- {
- }
- 
-+void flush_tlb_kernel_range(unsigned long start, unsigned long end);
-+
- #define __HAVE_ARCH_ENTER_LAZY_MMU_MODE
- 
- extern void flush_tlb_pending(void);
-@@ -49,11 +51,6 @@ extern void __flush_tlb_kernel_range(unsigned long start, unsigned long end);
- 
- #ifndef CONFIG_SMP
- 
--#define flush_tlb_kernel_range(start,end) \
--do {	flush_tsb_kernel_range(start,end); \
--	__flush_tlb_kernel_range(start,end); \
--} while (0)
--
- static inline void global_flush_tlb_page(struct mm_struct *mm, unsigned long vaddr)
- {
- 	__flush_tlb_page(CTX_HWBITS(mm->context), vaddr);
-@@ -64,11 +61,6 @@ static inline void global_flush_tlb_page(struct mm_struct *mm, unsigned long vad
- extern void smp_flush_tlb_kernel_range(unsigned long start, unsigned long end);
- extern void smp_flush_tlb_page(struct mm_struct *mm, unsigned long vaddr);
- 
--#define flush_tlb_kernel_range(start, end) \
--do {	flush_tsb_kernel_range(start,end); \
--	smp_flush_tlb_kernel_range(start, end); \
--} while (0)
--
- #define global_flush_tlb_page(mm, vaddr) \
- 	smp_flush_tlb_page(mm, vaddr)
- 
-diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
-index 9ed22b571a05..7eb24bddf268 100644
---- a/arch/sparc/mm/init_64.c
-+++ b/arch/sparc/mm/init_64.c
-@@ -2421,3 +2421,26 @@ void __flush_tlb_all(void)
- 	__asm__ __volatile__("wrpr	%0, 0, %%pstate"
- 			     : : "r" (pstate));
- }
-+
-+#ifdef CONFIG_SMP
-+#define do_flush_tlb_kernel_range	smp_flush_tlb_kernel_range
-+#else
-+#define do_flush_tlb_kernel_range	__flush_tlb_kernel_range
-+#endif
-+
-+void flush_tlb_kernel_range(unsigned long start, unsigned long end)
-+{
-+	if (start < HI_OBP_ADDRESS && end > LOW_OBP_ADDRESS) {
-+		if (start < LOW_OBP_ADDRESS) {
-+			flush_tsb_kernel_range(start, LOW_OBP_ADDRESS);
-+			do_flush_tlb_kernel_range(start, LOW_OBP_ADDRESS);
-+		}
-+		if (end > HI_OBP_ADDRESS) {
-+			flush_tsb_kernel_range(end, HI_OBP_ADDRESS);
-+			do_flush_tlb_kernel_range(end, HI_OBP_ADDRESS);
-+		}
-+	} else {
-+		flush_tsb_kernel_range(start, end);
-+		do_flush_tlb_kernel_range(start, end);
-+	}
-+}
--- 
-2.28.0
-
-
-From 7554c49edacf3caacdc71736bf92fc840e46d986 Mon Sep 17 00:00:00 2001
-From: Christopher Alexander Tobias Schulze <cat.schulze@alice-dsl.net>
-Date: Sun, 3 Aug 2014 15:44:52 +0200
-Subject: [PATCH 20/24] bbc-i2c: Fix BBC I2C envctrl on SunBlade 2000
-
-[ Upstream commit 5cdceab3d5e02eb69ea0f5d8fa9181800baf6f77 ]
-
-Fix regression in bbc i2c temperature and fan control on some Sun systems
-that causes the driver to refuse to load due to the bbc_i2c_bussel resource not
-being present on the (second) i2c bus where the temperature sensors and fan
-control are located. (The check for the number of resources was removed when
-the driver was ported to a pure OF driver in mid 2008.)
-
-Signed-off-by: Christopher Alexander Tobias Schulze <cat.schulze@alice-dsl.net>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/sbus/char/bbc_envctrl.c |  6 ++++++
- drivers/sbus/char/bbc_i2c.c     | 11 ++++++++---
- 2 files changed, 14 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/sbus/char/bbc_envctrl.c b/drivers/sbus/char/bbc_envctrl.c
-index 160e7510aca6..0787b9756165 100644
---- a/drivers/sbus/char/bbc_envctrl.c
-+++ b/drivers/sbus/char/bbc_envctrl.c
-@@ -452,6 +452,9 @@ static void attach_one_temp(struct bbc_i2c_bus *bp, struct platform_device *op,
- 	if (!tp)
- 		return;
- 
-+	INIT_LIST_HEAD(&tp->bp_list);
-+	INIT_LIST_HEAD(&tp->glob_list);
-+
- 	tp->client = bbc_i2c_attach(bp, op);
- 	if (!tp->client) {
- 		kfree(tp);
-@@ -497,6 +500,9 @@ static void attach_one_fan(struct bbc_i2c_bus *bp, struct platform_device *op,
- 	if (!fp)
- 		return;
- 
-+	INIT_LIST_HEAD(&fp->bp_list);
-+	INIT_LIST_HEAD(&fp->glob_list);
-+
- 	fp->client = bbc_i2c_attach(bp, op);
- 	if (!fp->client) {
- 		kfree(fp);
-diff --git a/drivers/sbus/char/bbc_i2c.c b/drivers/sbus/char/bbc_i2c.c
-index 542668292900..7179f72b11ea 100644
---- a/drivers/sbus/char/bbc_i2c.c
-+++ b/drivers/sbus/char/bbc_i2c.c
-@@ -301,13 +301,18 @@ static struct bbc_i2c_bus * __init attach_one_i2c(struct platform_device *op, in
- 	if (!bp)
- 		return NULL;
- 
-+	INIT_LIST_HEAD(&bp->temps);
-+	INIT_LIST_HEAD(&bp->fans);
-+
- 	bp->i2c_control_regs = of_ioremap(&op->resource[0], 0, 0x2, "bbc_i2c_regs");
- 	if (!bp->i2c_control_regs)
- 		goto fail;
- 
--	bp->i2c_bussel_reg = of_ioremap(&op->resource[1], 0, 0x1, "bbc_i2c_bussel");
--	if (!bp->i2c_bussel_reg)
--		goto fail;
-+	if (op->num_resources == 2) {
-+		bp->i2c_bussel_reg = of_ioremap(&op->resource[1], 0, 0x1, "bbc_i2c_bussel");
-+		if (!bp->i2c_bussel_reg)
-+			goto fail;
-+	}
- 
- 	bp->waiting = 0;
- 	init_waitqueue_head(&bp->wq);
--- 
-2.28.0
-
-
-From a46e9456f1516e8238d43dcff766595452c0ed48 Mon Sep 17 00:00:00 2001
-From: Christopher Alexander Tobias Schulze <cat.schulze@alice-dsl.net>
-Date: Sun, 3 Aug 2014 16:01:53 +0200
-Subject: [PATCH 21/24] sunsab: Fix detection of BREAK on sunsab serial console
-
-[ Upstream commit fe418231b195c205701c0cc550a03f6c9758fd9e ]
-
-Fix detection of BREAK on sunsab serial console: BREAK detection was only
-performed when there were also serial characters received simultaneously.
-To handle all BREAKs correctly, the check for BREAK and the corresponding
-call to uart_handle_break() must also be done if count == 0, therefore
-duplicate this code fragment and pull it out of the loop over the received
-characters.
-
-Patch applies to 3.16-rc6.
-
-Signed-off-by: Christopher Alexander Tobias Schulze <cat.schulze@alice-dsl.net>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/tty/serial/sunsab.c | 9 +++++++++
- 1 file changed, 9 insertions(+)
-
-diff --git a/drivers/tty/serial/sunsab.c b/drivers/tty/serial/sunsab.c
-index f0d93eb7e6ec..c9549aa135b2 100644
---- a/drivers/tty/serial/sunsab.c
-+++ b/drivers/tty/serial/sunsab.c
-@@ -157,6 +157,15 @@ receive_chars(struct uart_sunsab_port *up,
- 	    (up->port.line == up->port.cons->index))
- 		saw_console_brk = 1;
- 
-+	if (count == 0) {
-+		if (unlikely(stat->sreg.isr1 & SAB82532_ISR1_BRK)) {
-+			stat->sreg.isr0 &= ~(SAB82532_ISR0_PERR |
-+					     SAB82532_ISR0_FERR);
-+			up->port.icount.brk++;
-+			uart_handle_break(&up->port);
-+		}
-+	}
-+
- 	for (i = 0; i < count; i++) {
- 		unsigned char ch = buf[i], flag;
- 
--- 
-2.28.0
-
-
-From 29fa649b993693ce21d10b841e93c07d1d8f2c7e Mon Sep 17 00:00:00 2001
-From: Sowmini Varadhan <sowmini.varadhan@oracle.com>
-Date: Fri, 1 Aug 2014 09:50:40 -0400
-Subject: [PATCH 22/24] sparc64: ldc_connect() should not return EINVAL when
- handshake is in progress.
-
-[ Upstream commit 4ec1b01029b4facb651b8ef70bc20a4be4cebc63 ]
-
-The LDC handshake could have been asynchronously triggered
-after ldc_bind() enables the ldc_rx() receive interrupt-handler
-(and thus intercepts incoming control packets)
-and before vio_port_up() calls ldc_connect(). If that is the case,
-ldc_connect() should return 0 and let the state-machine
-progress.
-
-Signed-off-by: Sowmini Varadhan <sowmini.varadhan@oracle.com>
-Acked-by: Karl Volz <karl.volz@oracle.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/kernel/ldc.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/sparc/kernel/ldc.c b/arch/sparc/kernel/ldc.c
-index 435e406fdec3..1beaf60a5f78 100644
---- a/arch/sparc/kernel/ldc.c
-+++ b/arch/sparc/kernel/ldc.c
-@@ -1339,7 +1339,7 @@ int ldc_connect(struct ldc_channel *lp)
- 	if (!(lp->flags & LDC_FLAG_ALLOCED_QUEUES) ||
- 	    !(lp->flags & LDC_FLAG_REGISTERED_QUEUES) ||
- 	    lp->hs_state != LDC_HS_OPEN)
--		err = -EINVAL;
-+		err = ((lp->hs_state > LDC_HS_OPEN) ? 0 : -EINVAL);
- 	else
- 		err = start_handshake(lp);
- 
--- 
-2.28.0
-
-
-From 0ace429a33ac4e4f7909fa7976dcf94b997ea353 Mon Sep 17 00:00:00 2001
-From: Andrey Utkin <andrey.krieger.utkin@gmail.com>
-Date: Mon, 4 Aug 2014 23:47:41 +0300
-Subject: [PATCH 23/24] arch/sparc/math-emu/math_32.c: drop stray break
- operator
-
-[ Upstream commit 093758e3daede29cb4ce6aedb111becf9d4bfc57 ]
-
-This commit is a guesswork, but it seems to make sense to drop this
-break, as otherwise the following line is never executed and becomes
-dead code. And that following line actually saves the result of
-local calculation by the pointer given in function argument. So the
-proposed change makes sense if this code in the whole makes sense (but I
-am unable to analyze it in the whole).
-
-Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=81641
-Reported-by: David Binderman <dcb314@hotmail.com>
-Signed-off-by: Andrey Utkin <andrey.krieger.utkin@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/math-emu/math_32.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/sparc/math-emu/math_32.c b/arch/sparc/math-emu/math_32.c
-index aa4d55b0bdf0..5ce8f2f64604 100644
---- a/arch/sparc/math-emu/math_32.c
-+++ b/arch/sparc/math-emu/math_32.c
-@@ -499,7 +499,7 @@ static int do_one_mathemu(u32 insn, unsigned long *pfsr, unsigned long *fregs)
- 		case 0: fsr = *pfsr;
- 			if (IR == -1) IR = 2;
- 			/* fcc is always fcc0 */
--			fsr &= ~0xc00; fsr |= (IR << 10); break;
-+			fsr &= ~0xc00; fsr |= (IR << 10);
- 			*pfsr = fsr;
- 			break;
- 		case 1: rd->s = IR; break;
--- 
-2.28.0
-
-
-From 9f089cfb4be27efe7c1cd1d6261da02496820441 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Thu, 14 Aug 2014 09:07:43 +0800
-Subject: [PATCH 24/24] Linux 3.4.103
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index dd03fa5777a0..36f0913bd1d6 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 4
--SUBLEVEL = 102
-+SUBLEVEL = 103
- EXTRAVERSION =
- NAME = Saber-toothed Squirrel
- 
--- 
-2.28.0
-

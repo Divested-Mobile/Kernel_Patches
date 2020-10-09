@@ -1,1439 +1,15 @@
-From e6952841ade0f937750c7748a812cb403bd744b0 Mon Sep 17 00:00:00 2001
-From: Cong Wang <xiyou.wangcong@gmail.com>
-Date: Sun, 9 Jul 2017 13:19:55 -0700
-Subject: [PATCH 01/26] mqueue: fix a use-after-free in sys_mq_notify()
-
-commit f991af3daabaecff34684fd51fac80319d1baad1 upstream.
-
-The retry logic for netlink_attachskb() inside sys_mq_notify()
-is nasty and vulnerable:
-
-1) The sock refcnt is already released when retry is needed
-2) The fd is controllable by user-space because we already
-   release the file refcnt
-
-so we when retry but the fd has been just closed by user-space
-during this small window, we end up calling netlink_detachskb()
-on the error path which releases the sock again, later when
-the user-space closes this socket a use-after-free could be
-triggered.
-
-Setting 'sock' to NULL here should be sufficient to fix it.
-
-Reported-by: GeneBlue <geneblue.mail@gmail.com>
-Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
-Cc: Andrew Morton <akpm@linux-foundation.org>
-Cc: Manfred Spraul <manfred@colorfullife.com>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- ipc/mqueue.c | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
-diff --git a/ipc/mqueue.c b/ipc/mqueue.c
-index 8cbd6e6894d5..28a142f1be36 100644
---- a/ipc/mqueue.c
-+++ b/ipc/mqueue.c
-@@ -1249,8 +1249,10 @@ SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
- 
- 			timeo = MAX_SCHEDULE_TIMEOUT;
- 			ret = netlink_attachskb(sock, nc, &timeo, NULL);
--			if (ret == 1)
-+			if (ret == 1) {
-+				sock = NULL;
- 				goto retry;
-+			}
- 			if (ret) {
- 				sock = NULL;
- 				nc = NULL;
--- 
-2.28.0
-
-
-From 5a1e1c62f37e83657b570953cab9855f17fcbc7d Mon Sep 17 00:00:00 2001
-From: Josh Zimmerman <joshz@google.com>
-Date: Sun, 25 Jun 2017 14:53:23 -0700
-Subject: [PATCH 02/26] Add "shutdown" to "struct class".
-
-commit f77af15165847406b15d8f70c382c4cb15846b2a upstream.
-
-The TPM class has some common shutdown code that must be executed for
-all drivers. This adds some needed functionality for that.
-
-Signed-off-by: Josh Zimmerman <joshz@google.com>
-Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Fixes: 74d6b3ceaa17 ("tpm: fix suspend/resume paths for TPM 2.0")
-Reviewed-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Tested-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Signed-off-by: James Morris <james.l.morris@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/base/core.c    | 6 +++++-
- include/linux/device.h | 2 ++
- 2 files changed, 7 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/base/core.c b/drivers/base/core.c
-index ce057a568673..03a82d017cf1 100644
---- a/drivers/base/core.c
-+++ b/drivers/base/core.c
-@@ -2095,7 +2095,11 @@ void device_shutdown(void)
- 		pm_runtime_get_noresume(dev);
- 		pm_runtime_barrier(dev);
- 
--		if (dev->bus && dev->bus->shutdown) {
-+		if (dev->class && dev->class->shutdown) {
-+			if (initcall_debug)
-+				dev_info(dev, "shutdown\n");
-+			dev->class->shutdown(dev);
-+		} else if (dev->bus && dev->bus->shutdown) {
- 			if (initcall_debug)
- 				dev_info(dev, "shutdown\n");
- 			dev->bus->shutdown(dev);
-diff --git a/include/linux/device.h b/include/linux/device.h
-index bc41e87a969b..8d732965fab7 100644
---- a/include/linux/device.h
-+++ b/include/linux/device.h
-@@ -373,6 +373,7 @@ int subsys_virtual_register(struct bus_type *subsys,
-  * @suspend:	Used to put the device to sleep mode, usually to a low power
-  *		state.
-  * @resume:	Used to bring the device from the sleep mode.
-+ * @shutdown:	Called at shut-down time to quiesce the device.
-  * @ns_type:	Callbacks so sysfs can detemine namespaces.
-  * @namespace:	Namespace of the device belongs to this class.
-  * @pm:		The default device power management operations of this class.
-@@ -401,6 +402,7 @@ struct class {
- 
- 	int (*suspend)(struct device *dev, pm_message_t state);
- 	int (*resume)(struct device *dev);
-+	int (*shutdown)(struct device *dev);
- 
- 	const struct kobj_ns_type_operations *ns_type;
- 	const void *(*namespace)(struct device *dev);
--- 
-2.28.0
-
-
-From b635182b4f41d5c5d7c9e059f6ee336f02921cb9 Mon Sep 17 00:00:00 2001
-From: Josh Zimmerman <joshz@google.com>
-Date: Sun, 25 Jun 2017 14:53:24 -0700
-Subject: [PATCH 03/26] tpm: Issue a TPM2_Shutdown for TPM2 devices.
-
-commit d1bd4a792d3961a04e6154118816b00167aad91a upstream.
-
-If a TPM2 loses power without a TPM2_Shutdown command being issued (a
-"disorderly reboot"), it may lose some state that has yet to be
-persisted to NVRam, and will increment the DA counter. After the DA
-counter gets sufficiently large, the TPM will lock the user out.
-
-NOTE: This only changes behavior on TPM2 devices. Since TPM1 uses sysfs,
-and sysfs relies on implicit locking on chip->ops, it is not safe to
-allow this code to run in TPM1, or to add sysfs support to TPM2, until
-that locking is made explicit.
-
-Signed-off-by: Josh Zimmerman <joshz@google.com>
-Fixes: 74d6b3ceaa17 ("tpm: fix suspend/resume paths for TPM 2.0")
-Reviewed-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Tested-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Signed-off-by: Jarkko Sakkinen <jarkko.sakkinen@linux.intel.com>
-Signed-off-by: James Morris <james.l.morris@oracle.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/char/tpm/tpm-chip.c  | 36 ++++++++++++++++++++++++++++++++++++
- drivers/char/tpm/tpm-sysfs.c |  5 +++++
- 2 files changed, 41 insertions(+)
-
-diff --git a/drivers/char/tpm/tpm-chip.c b/drivers/char/tpm/tpm-chip.c
-index a017ccd8cc3b..9ff853229957 100644
---- a/drivers/char/tpm/tpm-chip.c
-+++ b/drivers/char/tpm/tpm-chip.c
-@@ -130,6 +130,41 @@ static void tpm_dev_release(struct device *dev)
- 	kfree(chip);
- }
- 
-+
-+/**
-+ * tpm_class_shutdown() - prepare the TPM device for loss of power.
-+ * @dev: device to which the chip is associated.
-+ *
-+ * Issues a TPM2_Shutdown command prior to loss of power, as required by the
-+ * TPM 2.0 spec.
-+ * Then, calls bus- and device- specific shutdown code.
-+ *
-+ * XXX: This codepath relies on the fact that sysfs is not enabled for
-+ * TPM2: sysfs uses an implicit lock on chip->ops, so this could race if TPM2
-+ * has sysfs support enabled before TPM sysfs's implicit locking is fixed.
-+ */
-+static int tpm_class_shutdown(struct device *dev)
-+{
-+	struct tpm_chip *chip = container_of(dev, struct tpm_chip, dev);
-+
-+	if (chip->flags & TPM_CHIP_FLAG_TPM2) {
-+		down_write(&chip->ops_sem);
-+		tpm2_shutdown(chip, TPM2_SU_CLEAR);
-+		chip->ops = NULL;
-+		up_write(&chip->ops_sem);
-+	}
-+	/* Allow bus- and device-specific code to run. Note: since chip->ops
-+	 * is NULL, more-specific shutdown code will not be able to issue TPM
-+	 * commands.
-+	 */
-+	if (dev->bus && dev->bus->shutdown)
-+		dev->bus->shutdown(dev);
-+	else if (dev->driver && dev->driver->shutdown)
-+		dev->driver->shutdown(dev);
-+	return 0;
-+}
-+
-+
- /**
-  * tpm_chip_alloc() - allocate a new struct tpm_chip instance
-  * @pdev: device to which the chip is associated
-@@ -168,6 +203,7 @@ struct tpm_chip *tpm_chip_alloc(struct device *pdev,
- 	device_initialize(&chip->dev);
- 
- 	chip->dev.class = tpm_class;
-+	chip->dev.class->shutdown = tpm_class_shutdown;
- 	chip->dev.release = tpm_dev_release;
- 	chip->dev.parent = pdev;
- 	chip->dev.groups = chip->groups;
-diff --git a/drivers/char/tpm/tpm-sysfs.c b/drivers/char/tpm/tpm-sysfs.c
-index 47005840c42c..edf8c59a6ed4 100644
---- a/drivers/char/tpm/tpm-sysfs.c
-+++ b/drivers/char/tpm/tpm-sysfs.c
-@@ -285,6 +285,11 @@ static const struct attribute_group tpm_dev_group = {
- 
- void tpm_sysfs_add_device(struct tpm_chip *chip)
- {
-+	/* XXX: If you wish to remove this restriction, you must first update
-+	 * tpm_sysfs to explicitly lock chip->ops.
-+	 */
-+	if (chip->flags & TPM_CHIP_FLAG_TPM2)
-+		return;
- 	/* The sysfs routines rely on an implicit tpm_try_get_ops, device_del
- 	 * is called before ops is null'd and the sysfs core synchronizes this
- 	 * removal so that no callbacks are running or can run again
--- 
-2.28.0
-
-
-From dae518419a4247ce624b417db7a46c656215373d Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Wed, 8 Feb 2017 17:01:46 -0300
-Subject: [PATCH 04/26] tools include: Add a __fallthrough statement
-
-commit b5bf1733d6a391c4e90ea8f8468d83023be74a2a upstream.
-
-For cases where implicit fall through case labels are intended,
-to let us inform that to gcc >= 7:
-
-    CC       /tmp/build/perf/util/string.o
-  util/string.c: In function 'perf_atoll':
-  util/string.c:22:7: error: this statement may fall through [-Werror=implicit-fallthrough=]
-      if (*p)
-         ^
-  util/string.c:24:3: note: here
-     case '\0':
-     ^~~~
-
-So we introduce:
-
-  #define __fallthrough __attribute__ ((fallthrough))
-
-And use it in such cases.
-
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Wang Nan <wangnan0@huawei.com>
-Cc: William Cohen <wcohen@redhat.com>
-Link: http://lkml.kernel.org/n/tip-qnpig0xfop4hwv6k4mv1wts5@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/include/linux/compiler.h | 9 +++++++++
- 1 file changed, 9 insertions(+)
-
-diff --git a/tools/include/linux/compiler.h b/tools/include/linux/compiler.h
-index e33fc1df3935..d94179f94caa 100644
---- a/tools/include/linux/compiler.h
-+++ b/tools/include/linux/compiler.h
-@@ -126,4 +126,13 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
- #define WRITE_ONCE(x, val) \
- 	({ union { typeof(x) __val; char __c[1]; } __u = { .__val = (val) }; __write_once_size(&(x), __u.__c, sizeof(x)); __u.__val; })
- 
-+
-+#ifndef __fallthrough
-+# if defined(__GNUC__) && __GNUC__ >= 7
-+#  define __fallthrough __attribute__ ((fallthrough))
-+# else
-+#  define __fallthrough
-+# endif
-+#endif
-+
- #endif /* _TOOLS_LINUX_COMPILER_H */
--- 
-2.28.0
-
-
-From 76efd703014fbf446ca5115588322758724a42c9 Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Wed, 8 Feb 2017 17:01:46 -0300
-Subject: [PATCH 05/26] tools string: Use __fallthrough in perf_atoll()
-
-commit 94bdd5edb34e472980d1e18b4600d6fb92bd6b0a upstream.
-
-The implicit fall through case label here is intended, so let us inform
-that to gcc >= 7:
-
-    CC       /tmp/build/perf/util/string.o
-  util/string.c: In function 'perf_atoll':
-  util/string.c:22:7: error: this statement may fall through [-Werror=implicit-fallthrough=]
-      if (*p)
-         ^
-  util/string.c:24:3: note: here
-     case '\0':
-     ^~~~
-
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Wang Nan <wangnan0@huawei.com>
-Link: http://lkml.kernel.org/n/tip-0ophb30v9apkk6o95el0rqlq@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/string.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/tools/perf/util/string.c b/tools/perf/util/string.c
-index 7f7e072be746..f4e3444d90ab 100644
---- a/tools/perf/util/string.c
-+++ b/tools/perf/util/string.c
-@@ -21,6 +21,8 @@ s64 perf_atoll(const char *str)
- 		case 'b': case 'B':
- 			if (*p)
- 				goto out_err;
-+
-+			__fallthrough;
- 		case '\0':
- 			return length;
- 		default:
--- 
-2.28.0
-
-
-From 94218786b3ba106014a2e523907ea72cd316627f Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Wed, 8 Feb 2017 17:01:46 -0300
-Subject: [PATCH 06/26] tools strfilter: Use __fallthrough
-
-commit d64b721d27aef3fbeb16ecda9dd22ee34818ff70 upstream.
-
-The implicit fall through case label here is intended, so let us inform
-that to gcc >= 7:
-
-  util/strfilter.c: In function 'strfilter_node__sprint':
-  util/strfilter.c:270:6: error: this statement may fall through [-Werror=implicit-fallthrough=]
-     if (len < 0)
-        ^
-  util/strfilter.c:272:2: note: here
-    case '!':
-    ^~~~
-  cc1: all warnings being treated as errors
-
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Wang Nan <wangnan0@huawei.com>
-Link: http://lkml.kernel.org/n/tip-z2dpywg7u8fim000hjfbpyfm@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/strfilter.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/tools/perf/util/strfilter.c b/tools/perf/util/strfilter.c
-index bcae659b6546..efb53772e0ec 100644
---- a/tools/perf/util/strfilter.c
-+++ b/tools/perf/util/strfilter.c
-@@ -269,6 +269,7 @@ static int strfilter_node__sprint(struct strfilter_node *node, char *buf)
- 		len = strfilter_node__sprint_pt(node->l, buf);
- 		if (len < 0)
- 			return len;
-+		__fallthrough;
- 	case '!':
- 		if (buf) {
- 			*(buf + len++) = *node->p;
--- 
-2.28.0
-
-
-From a814c7d1d8f4232e3c12f954d7b1789616258189 Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Wed, 8 Feb 2017 17:01:46 -0300
-Subject: [PATCH 07/26] perf top: Use __fallthrough
-
-commit 7b0214b702ad8e124e039a317beeebb3f020d125 upstream.
-
-The implicit fall through case label here is intended, so let us inform
-that to gcc >= 7:
-
-    CC       /tmp/build/perf/builtin-top.o
-  builtin-top.c: In function 'display_thread':
-  builtin-top.c:644:7: error: this statement may fall through [-Werror=implicit-fallthrough=]
-      if (errno == EINTR)
-         ^
-  builtin-top.c:647:3: note: here
-     default:
-   ^~~~~~~
-
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Wang Nan <wangnan0@huawei.com>
-Link: http://lkml.kernel.org/n/tip-lmcfnnyx9ic0m6j0aud98p4e@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/builtin-top.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
-index fe3af9535e85..0b613e701736 100644
---- a/tools/perf/builtin-top.c
-+++ b/tools/perf/builtin-top.c
-@@ -643,7 +643,7 @@ static void *display_thread(void *arg)
- 		case -1:
- 			if (errno == EINTR)
- 				continue;
--			/* Fall trhu */
-+			__fallthrough;
- 		default:
- 			c = getc(stdin);
- 			tcsetattr(0, TCSAFLUSH, &save);
--- 
-2.28.0
-
-
-From 055237857974d5abd3f35962a4572386d1876fe5 Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Wed, 8 Feb 2017 17:01:46 -0300
-Subject: [PATCH 08/26] perf thread_map: Correctly size buffer used with
- dirent->dt_name
-
-commit bdf23a9a190d7ecea092fd5c4aabb7d4bd0a9980 upstream.
-
-The size of dirent->dt_name is NAME_MAX + 1, but the size for the 'path'
-buffer is hard coded at 256, which may truncate it because we also
-prepend "/proc/", so that all that into account and thank gcc 7 for this
-warning:
-
-  /git/linux/tools/perf/util/thread_map.c: In function 'thread_map__new_by_uid':
-  /git/linux/tools/perf/util/thread_map.c:119:39: error: '%s' directive output may be truncated writing up to 255 bytes into a region of size 250 [-Werror=format-truncation=]
-     snprintf(path, sizeof(path), "/proc/%s", dirent->d_name);
-                                         ^~
-  In file included from /usr/include/stdio.h:939:0,
-                   from /git/linux/tools/perf/util/thread_map.c:5:
-  /usr/include/bits/stdio2.h:64:10: note: '__builtin___snprintf_chk' output between 7 and 262 bytes into a destination of size 256
-     return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
-            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-          __bos (__s), __fmt, __va_arg_pack ());
-          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Wang Nan <wangnan0@huawei.com>
-Link: http://lkml.kernel.org/n/tip-csy0r8zrvz5efccgd4k12c82@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/thread_map.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/tools/perf/util/thread_map.c b/tools/perf/util/thread_map.c
-index 40585f5b7027..ddec5c583d2b 100644
---- a/tools/perf/util/thread_map.c
-+++ b/tools/perf/util/thread_map.c
-@@ -93,7 +93,7 @@ struct thread_map *thread_map__new_by_uid(uid_t uid)
- {
- 	DIR *proc;
- 	int max_threads = 32, items, i;
--	char path[256];
-+	char path[NAME_MAX + 1 + 6];
- 	struct dirent *dirent, **namelist = NULL;
- 	struct thread_map *threads = thread_map__alloc(max_threads);
- 
--- 
-2.28.0
-
-
-From 93a3c47d033a2aafd98dddbb0b0b035f852522ab Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Thu, 9 Feb 2017 15:22:22 -0300
-Subject: [PATCH 09/26] perf intel-pt: Use __fallthrough
-
-commit 7ea6856d6f5629d742edc23b8b76e6263371ef45 upstream.
-
-To address new warnings emmited by gcc 7, e.g.::
-
-    CC       /tmp/build/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.o
-    CC       /tmp/build/perf/tests/parse-events.o
-  util/intel-pt-decoder/intel-pt-pkt-decoder.c: In function 'intel_pt_pkt_desc':
-  util/intel-pt-decoder/intel-pt-pkt-decoder.c:499:6: error: this statement may fall through [-Werror=implicit-fallthrough=]
-     if (!(packet->count))
-        ^
-  util/intel-pt-decoder/intel-pt-pkt-decoder.c:501:2: note: here
-    case INTEL_PT_CYC:
-    ^~~~
-    CC       /tmp/build/perf/util/intel-pt-decoder/intel-pt-decoder.o
-  cc1: all warnings being treated as errors
-
-Acked-by: Andi Kleen <ak@linux.intel.com>
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Wang Nan <wangnan0@huawei.com>
-Link: http://lkml.kernel.org/n/tip-mf0hw789pu9x855us5l32c83@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/intel-pt-decoder/intel-pt-decoder.c     | 5 +++++
- tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c | 2 ++
- 2 files changed, 7 insertions(+)
-
-diff --git a/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c b/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
-index 16c06d3ae577..04387ab31316 100644
---- a/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
-+++ b/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
-@@ -22,6 +22,7 @@
- #include <errno.h>
- #include <stdint.h>
- #include <inttypes.h>
-+#include <linux/compiler.h>
- 
- #include "../cache.h"
- #include "../util.h"
-@@ -1744,6 +1745,7 @@ static int intel_pt_walk_psb(struct intel_pt_decoder *decoder)
- 		switch (decoder->packet.type) {
- 		case INTEL_PT_TIP_PGD:
- 			decoder->continuous_period = false;
-+			__fallthrough;
- 		case INTEL_PT_TIP_PGE:
- 		case INTEL_PT_TIP:
- 			intel_pt_log("ERROR: Unexpected packet\n");
-@@ -1797,6 +1799,8 @@ static int intel_pt_walk_psb(struct intel_pt_decoder *decoder)
- 			decoder->pge = false;
- 			decoder->continuous_period = false;
- 			intel_pt_clear_tx_flags(decoder);
-+			__fallthrough;
-+
- 		case INTEL_PT_TNT:
- 			decoder->have_tma = false;
- 			intel_pt_log("ERROR: Unexpected packet\n");
-@@ -1837,6 +1841,7 @@ static int intel_pt_walk_to_ip(struct intel_pt_decoder *decoder)
- 		switch (decoder->packet.type) {
- 		case INTEL_PT_TIP_PGD:
- 			decoder->continuous_period = false;
-+			__fallthrough;
- 		case INTEL_PT_TIP_PGE:
- 		case INTEL_PT_TIP:
- 			decoder->pge = decoder->packet.type != INTEL_PT_TIP_PGD;
-diff --git a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
-index 4f7b32020487..7528ae4f7e28 100644
---- a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
-+++ b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
-@@ -17,6 +17,7 @@
- #include <string.h>
- #include <endian.h>
- #include <byteswap.h>
-+#include <linux/compiler.h>
- 
- #include "intel-pt-pkt-decoder.h"
- 
-@@ -498,6 +499,7 @@ int intel_pt_pkt_desc(const struct intel_pt_pkt *packet, char *buf,
- 	case INTEL_PT_FUP:
- 		if (!(packet->count))
- 			return snprintf(buf, buf_len, "%s no ip", name);
-+		__fallthrough;
- 	case INTEL_PT_CYC:
- 	case INTEL_PT_VMCS:
- 	case INTEL_PT_MTC:
--- 
-2.28.0
-
-
-From b246fc09a2232a26f348cd625d7b1d57b14b18fb Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Thu, 9 Feb 2017 14:48:46 -0300
-Subject: [PATCH 10/26] perf tests: Avoid possible truncation with
- dirent->d_name + snprintf
-
-commit 2e2bbc039fad9eabad6c4c1a473c8b2554cdd2d4 upstream.
-
-Addressing a few cases spotted by a new warning in gcc 7:
-
-  tests/parse-events.c: In function 'test_pmu_events':
-  tests/parse-events.c:1790:39: error: '%s' directive output may be truncated writing up to 255 bytes into a region of size 90 [-Werror=format-truncation=]
-     snprintf(name, MAX_NAME, "cpu/event=%s/u", ent->d_name);
-                                       ^~
-  In file included from /usr/include/stdio.h:939:0,
-                   from /git/linux/tools/perf/util/map.h:9,
-                   from /git/linux/tools/perf/util/symbol.h:7,
-                   from /git/linux/tools/perf/util/evsel.h:10,
-                   from tests/parse-events.c:3:
-  /usr/include/bits/stdio2.h:64:10: note: '__builtin___snprintf_chk' output between 13 and 268 bytes into a destination of size 100
-     return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
-            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-          __bos (__s), __fmt, __va_arg_pack ());
-          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  tests/parse-events.c:1798:29: error: '%s' directive output may be truncated writing up to 255 bytes into a region of size 100 [-Werror=format-truncation=]
-     snprintf(name, MAX_NAME, "%s:u,cpu/event=%s/u", ent->d_name, ent->d_name);
-
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Wang Nan <wangnan0@huawei.com>
-Fixes: 945aea220bb8 ("perf tests: Move test objects into 'tests' directory")
-Link: http://lkml.kernel.org/n/tip-ty4q2p8zp1dp3mskvubxskm5@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/tests/parse-events.c | 8 +++-----
- 1 file changed, 3 insertions(+), 5 deletions(-)
-
-diff --git a/tools/perf/tests/parse-events.c b/tools/perf/tests/parse-events.c
-index 20c2e641c422..aa9276bfe3e9 100644
---- a/tools/perf/tests/parse-events.c
-+++ b/tools/perf/tests/parse-events.c
-@@ -1779,15 +1779,14 @@ static int test_pmu_events(void)
- 	}
- 
- 	while (!ret && (ent = readdir(dir))) {
--#define MAX_NAME 100
- 		struct evlist_test e;
--		char name[MAX_NAME];
-+		char name[2 * NAME_MAX + 1 + 12 + 3];
- 
- 		/* Names containing . are special and cannot be used directly */
- 		if (strchr(ent->d_name, '.'))
- 			continue;
- 
--		snprintf(name, MAX_NAME, "cpu/event=%s/u", ent->d_name);
-+		snprintf(name, sizeof(name), "cpu/event=%s/u", ent->d_name);
- 
- 		e.name  = name;
- 		e.check = test__checkevent_pmu_events;
-@@ -1795,11 +1794,10 @@ static int test_pmu_events(void)
- 		ret = test_event(&e);
- 		if (ret)
- 			break;
--		snprintf(name, MAX_NAME, "%s:u,cpu/event=%s/u", ent->d_name, ent->d_name);
-+		snprintf(name, sizeof(name), "%s:u,cpu/event=%s/u", ent->d_name, ent->d_name);
- 		e.name  = name;
- 		e.check = test__checkevent_pmu_events_mix;
- 		ret = test_event(&e);
--#undef MAX_NAME
- 	}
- 
- 	closedir(dir);
--- 
-2.28.0
-
-
-From 15c249c85d57d269860154df129b0234f30c9f8b Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Thu, 9 Feb 2017 14:39:42 -0300
-Subject: [PATCH 11/26] perf bench numa: Avoid possible truncation when using
- snprintf()
-
-commit 3aff8ba0a4c9c9191bb788171a1c54778e1246a2 upstream.
-
-Addressing this warning from gcc 7:
-
-    CC       /tmp/build/perf/bench/numa.o
-  bench/numa.c: In function '__bench_numa':
-  bench/numa.c:1582:42: error: '%d' directive output may be truncated writing between 1 and 10 bytes into a region of size between 8 and 17 [-Werror=format-truncation=]
-       snprintf(tname, 32, "process%d:thread%d", p, t);
-                                            ^~
-  bench/numa.c:1582:25: note: directive argument in the range [0, 2147483647]
-       snprintf(tname, 32, "process%d:thread%d", p, t);
-                           ^~~~~~~~~~~~~~~~~~~~
-  In file included from /usr/include/stdio.h:939:0,
-                   from bench/../util/util.h:47,
-                   from bench/../builtin.h:4,
-                   from bench/numa.c:11:
-  /usr/include/bits/stdio2.h:64:10: note: '__builtin___snprintf_chk' output between 17 and 35 bytes into a destination of size 32
-     return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
-            ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-          __bos (__s), __fmt, __va_arg_pack ());
-          ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  cc1: all warnings being treated as errors
-
-Cc: Adrian Hunter <adrian.hunter@intel.com>
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Petr Holasek <pholasek@redhat.com>
-Cc: Wang Nan <wangnan0@huawei.com>
-Link: http://lkml.kernel.org/n/tip-twa37vsfqcie5gwpqwnjuuz9@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/bench/numa.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/tools/perf/bench/numa.c b/tools/perf/bench/numa.c
-index 8efe904e486b..9e5a02d6b9a9 100644
---- a/tools/perf/bench/numa.c
-+++ b/tools/perf/bench/numa.c
-@@ -1573,13 +1573,13 @@ static int __bench_numa(const char *name)
- 		"GB/sec,", "total-speed",	"GB/sec total speed");
- 
- 	if (g->p.show_details >= 2) {
--		char tname[32];
-+		char tname[14 + 2 * 10 + 1];
- 		struct thread_data *td;
- 		for (p = 0; p < g->p.nr_proc; p++) {
- 			for (t = 0; t < g->p.nr_threads; t++) {
--				memset(tname, 0, 32);
-+				memset(tname, 0, sizeof(tname));
- 				td = g->threads + p*g->p.nr_threads + t;
--				snprintf(tname, 32, "process%d:thread%d", p, t);
-+				snprintf(tname, sizeof(tname), "process%d:thread%d", p, t);
- 				print_res(tname, td->speed_gbs,
- 					"GB/sec",	"thread-speed", "GB/sec/thread speed");
- 				print_res(tname, td->system_time_ns / NSEC_PER_SEC,
--- 
-2.28.0
-
-
-From b9175b3fa90cf77ebebdb4d86fb7089b7495ca2a Mon Sep 17 00:00:00 2001
-From: Arnaldo Carvalho de Melo <acme@redhat.com>
-Date: Wed, 8 Feb 2017 21:57:22 -0300
-Subject: [PATCH 12/26] perf header: Fix handling of PERF_EVENT_UPDATE__SCALE
-
-commit 8434a2ec13d5c8cb25716950bfbf7c9d7b64628a upstream.
-
-In commit daeecbc0c431 ("perf tools: Add event_update event scale type"), the
-handling of PERF_EVENT_UPDATE__SCALE cast struct event_update_event->data to a
-pointer to event_update_event_scale, uses some field from this casted struct
-and then ends up falling through to the handling of another event type,
-PERF_EVENT_UPDATE__CPUS were it casts that ev->data to yet another type, oops,
-fix it by inserting the missing break.
-
-Noticed when building perf using gcc 7 on Fedora Rawhide:
-
-  util/header.c: In function 'perf_event__process_event_update':
-  util/header.c:3207:16: error: this statement may fall through [-Werror=implicit-fallthrough=]
-     evsel->scale = ev_scale->scale;
-     ~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~
-  util/header.c:3208:2: note: here
-    case PERF_EVENT_UPDATE__CPUS:
-    ^~~~
-
-This wasn't noticed because probably PERF_EVENT_UPDATE__CPUS comes after
-PERF_EVENT_UPDATE__SCALE, so we would just create a bogus evsel->own_cpus when
-processing a PERF_EVENT_UPDATE__SCALE to then leak it and create a new cpu map
-with the correct data.
-
-Cc: David Ahern <dsahern@gmail.com>
-Cc: Jiri Olsa <jolsa@kernel.org>
-Cc: Kan Liang <kan.liang@intel.com>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
-Fixes: daeecbc0c431 ("perf tools: Add event_update event scale type")
-Link: http://lkml.kernel.org/n/tip-lukcf9hdj092ax2914ss95at@git.kernel.org
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/header.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/tools/perf/util/header.c b/tools/perf/util/header.c
-index 2f3eded54b0c..5337f49db361 100644
---- a/tools/perf/util/header.c
-+++ b/tools/perf/util/header.c
-@@ -3184,6 +3184,7 @@ int perf_event__process_event_update(struct perf_tool *tool __maybe_unused,
- 	case PERF_EVENT_UPDATE__SCALE:
- 		ev_scale = (struct event_update_event_scale *) ev->data;
- 		evsel->scale = ev_scale->scale;
-+		break;
- 	case PERF_EVENT_UPDATE__CPUS:
- 		ev_cpus = (struct event_update_event_cpus *) ev->data;
- 
--- 
-2.28.0
-
-
-From cd206153672a96640a4288b5b838634fea23d8ce Mon Sep 17 00:00:00 2001
-From: Wang YanQing <udknight@gmail.com>
-Date: Sun, 12 Feb 2017 10:46:55 +0800
-Subject: [PATCH 13/26] perf scripting perl: Fix compile error with some perl5
- versions
-
-commit d7dd112ea5cacf91ae72c0714c3b911eb6016fea upstream.
-
-Fix below compile error:
-
-  CC       util/scripting-engines/trace-event-perl.o
-  In file included from /usr/lib/perl5/5.22.2/i686-linux/CORE/perl.h:5673:0,
-                   from util/scripting-engines/trace-event-perl.c:31:
-  /usr/lib/perl5/5.22.2/i686-linux/CORE/inline.h: In function 'S__is_utf8_char_slow':
-  /usr/lib/perl5/5.22.2/i686-linux/CORE/inline.h:270:5: error: nested extern declaration of 'Perl___notused' [-Werror=nested-externs]
-          dTHX;   /* The function called below requires thread context */
-			     ^
-  cc1: all warnings being treated as errors
-
-After digging perl5 repository, I find out that we will meet this
-compile error with perl from v5.21.1 to v5.25.4
-
-Signed-off-by: Wang YanQing <udknight@gmail.com>
-Acked-by: Jiri Olsa <jolsa@kernel.org>
-Link: http://lkml.kernel.org/r/20170212024655.GA15997@udknight
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/scripting-engines/Build | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/tools/perf/util/scripting-engines/Build b/tools/perf/util/scripting-engines/Build
-index 6516e220c247..82d28c67e0f3 100644
---- a/tools/perf/util/scripting-engines/Build
-+++ b/tools/perf/util/scripting-engines/Build
+diff --git a/Makefile b/Makefile
+index 342e19adbf7f..ad0c045d36cd 100644
+--- a/Makefile
++++ b/Makefile
 @@ -1,6 +1,6 @@
- libperf-$(CONFIG_LIBPERL)   += trace-event-perl.o
- libperf-$(CONFIG_LIBPYTHON) += trace-event-python.o
+ VERSION = 4
+ PATCHLEVEL = 9
+-SUBLEVEL = 37
++SUBLEVEL = 38
+ EXTRAVERSION =
+ NAME = Roaring Lionus
  
--CFLAGS_trace-event-perl.o += $(PERL_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes -Wno-unused-parameter -Wno-shadow -Wno-undef -Wno-switch-default
-+CFLAGS_trace-event-perl.o += $(PERL_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes -Wno-unused-parameter -Wno-shadow -Wno-nested-externs -Wno-undef -Wno-switch-default
- 
- CFLAGS_trace-event-python.o += $(PYTHON_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes -Wno-unused-parameter -Wno-shadow
--- 
-2.28.0
-
-
-From 364973599e2e24b2f64f555a746215b4697de1ae Mon Sep 17 00:00:00 2001
-From: Masami Hiramatsu <mhiramat@kernel.org>
-Date: Wed, 4 Jan 2017 12:30:19 +0900
-Subject: [PATCH 14/26] perf probe: Fix to probe on gcc generated symbols for
- offline kernel
-
-commit 8a937a25a7e3c19d5fb3f9d92f605cf5fda219d8 upstream.
-
-Fix perf-probe to show probe definition on gcc generated symbols for
-offline kernel (including cross-arch kernel image).
-
-gcc sometimes optimizes functions and generate new symbols with suffixes
-such as ".constprop.N" or ".isra.N" etc. Since those symbol names are
-not recorded in DWARF, we have to find correct generated symbols from
-offline ELF binary to probe on it (kallsyms doesn't correct it).  For
-online kernel or uprobes we don't need it because those are rebased on
-_text, or a section relative address.
-
-E.g. Without this:
-
-  $ perf probe -k build-arm/vmlinux -F __slab_alloc*
-  __slab_alloc.constprop.9
-  $ perf probe -k build-arm/vmlinux -D __slab_alloc
-  p:probe/__slab_alloc __slab_alloc+0
-
-If you put above definition on target machine, it should fail
-because there is no __slab_alloc in kallsyms.
-
-With this fix, perf probe shows correct probe definition on
-__slab_alloc.constprop.9:
-
-  $ perf probe -k build-arm/vmlinux -D __slab_alloc
-  p:probe/__slab_alloc __slab_alloc.constprop.9+0
-
-Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
-Cc: Jiri Olsa <jolsa@redhat.com>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Link: http://lkml.kernel.org/r/148350060434.19001.11864836288580083501.stgit@devbox
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Cc: Krister Johansen <kjlx@templeofstupid.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/probe-event.c | 48 ++++++++++++++++++++++++++++++++++-
- 1 file changed, 47 insertions(+), 1 deletion(-)
-
-diff --git a/tools/perf/util/probe-event.c b/tools/perf/util/probe-event.c
-index 1d9c02bc00f1..5f5281020f4e 100644
---- a/tools/perf/util/probe-event.c
-+++ b/tools/perf/util/probe-event.c
-@@ -618,6 +618,51 @@ static int find_perf_probe_point_from_dwarf(struct probe_trace_point *tp,
- 	return ret ? : -ENOENT;
- }
- 
-+/*
-+ * Rename DWARF symbols to ELF symbols -- gcc sometimes optimizes functions
-+ * and generate new symbols with suffixes such as .constprop.N or .isra.N
-+ * etc. Since those symbols are not recorded in DWARF, we have to find
-+ * correct generated symbols from offline ELF binary.
-+ * For online kernel or uprobes we don't need this because those are
-+ * rebased on _text, or already a section relative address.
-+ */
-+static int
-+post_process_offline_probe_trace_events(struct probe_trace_event *tevs,
-+					int ntevs, const char *pathname)
-+{
-+	struct symbol *sym;
-+	struct map *map;
-+	unsigned long stext = 0;
-+	u64 addr;
-+	int i;
-+
-+	/* Prepare a map for offline binary */
-+	map = dso__new_map(pathname);
-+	if (!map || get_text_start_address(pathname, &stext) < 0) {
-+		pr_warning("Failed to get ELF symbols for %s\n", pathname);
-+		return -EINVAL;
-+	}
-+
-+	for (i = 0; i < ntevs; i++) {
-+		addr = tevs[i].point.address + tevs[i].point.offset - stext;
-+		sym = map__find_symbol(map, addr);
-+		if (!sym)
-+			continue;
-+		if (!strcmp(sym->name, tevs[i].point.symbol))
-+			continue;
-+		/* If we have no realname, use symbol for it */
-+		if (!tevs[i].point.realname)
-+			tevs[i].point.realname = tevs[i].point.symbol;
-+		else
-+			free(tevs[i].point.symbol);
-+		tevs[i].point.symbol = strdup(sym->name);
-+		tevs[i].point.offset = addr - sym->start;
-+	}
-+	map__put(map);
-+
-+	return 0;
-+}
-+
- static int add_exec_to_probe_trace_events(struct probe_trace_event *tevs,
- 					  int ntevs, const char *exec)
- {
-@@ -694,7 +739,8 @@ post_process_kernel_probe_trace_events(struct probe_trace_event *tevs,
- 
- 	/* Skip post process if the target is an offline kernel */
- 	if (symbol_conf.ignore_vmlinux_buildid)
--		return 0;
-+		return post_process_offline_probe_trace_events(tevs, ntevs,
-+						symbol_conf.vmlinux_name);
- 
- 	reloc_sym = kernel_get_ref_reloc_sym();
- 	if (!reloc_sym) {
--- 
-2.28.0
-
-
-From ce02effed0ec8f8702af643726a601bb06cd0aa9 Mon Sep 17 00:00:00 2001
-From: Masami Hiramatsu <mhiramat@kernel.org>
-Date: Wed, 11 Jan 2017 15:00:47 +0900
-Subject: [PATCH 15/26] perf probe: Add error checks to offline probe
- post-processing
-
-commit 3e96dac7c956089d3f23aca98c4dfca57b6aaf8a upstream.
-
-Add error check codes on post processing and improve it for offline
-probe events as:
-
- - post processing fails if no matched symbol found in map(-ENOENT)
-   or strdup() failed(-ENOMEM).
-
- - Even if the symbol name is the same, it updates symbol address
-   and offset.
-
-Signed-off-by: Masami Hiramatsu <mhiramat@kernel.org>
-Cc: Jiri Olsa <jolsa@redhat.com>
-Cc: Namhyung Kim <namhyung@kernel.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Link: http://lkml.kernel.org/r/148411443738.9978.4617979132625405545.stgit@devbox
-Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
-Cc: Krister Johansen <kjlx@templeofstupid.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/perf/util/probe-event.c | 50 +++++++++++++++++++++++------------
- 1 file changed, 33 insertions(+), 17 deletions(-)
-
-diff --git a/tools/perf/util/probe-event.c b/tools/perf/util/probe-event.c
-index 5f5281020f4e..7ea13f44178d 100644
---- a/tools/perf/util/probe-event.c
-+++ b/tools/perf/util/probe-event.c
-@@ -618,6 +618,33 @@ static int find_perf_probe_point_from_dwarf(struct probe_trace_point *tp,
- 	return ret ? : -ENOENT;
- }
- 
-+/* Adjust symbol name and address */
-+static int post_process_probe_trace_point(struct probe_trace_point *tp,
-+					   struct map *map, unsigned long offs)
-+{
-+	struct symbol *sym;
-+	u64 addr = tp->address + tp->offset - offs;
-+
-+	sym = map__find_symbol(map, addr);
-+	if (!sym)
-+		return -ENOENT;
-+
-+	if (strcmp(sym->name, tp->symbol)) {
-+		/* If we have no realname, use symbol for it */
-+		if (!tp->realname)
-+			tp->realname = tp->symbol;
-+		else
-+			free(tp->symbol);
-+		tp->symbol = strdup(sym->name);
-+		if (!tp->symbol)
-+			return -ENOMEM;
-+	}
-+	tp->offset = addr - sym->start;
-+	tp->address -= offs;
-+
-+	return 0;
-+}
-+
- /*
-  * Rename DWARF symbols to ELF symbols -- gcc sometimes optimizes functions
-  * and generate new symbols with suffixes such as .constprop.N or .isra.N
-@@ -630,11 +657,9 @@ static int
- post_process_offline_probe_trace_events(struct probe_trace_event *tevs,
- 					int ntevs, const char *pathname)
- {
--	struct symbol *sym;
- 	struct map *map;
- 	unsigned long stext = 0;
--	u64 addr;
--	int i;
-+	int i, ret = 0;
- 
- 	/* Prepare a map for offline binary */
- 	map = dso__new_map(pathname);
-@@ -644,23 +669,14 @@ post_process_offline_probe_trace_events(struct probe_trace_event *tevs,
- 	}
- 
- 	for (i = 0; i < ntevs; i++) {
--		addr = tevs[i].point.address + tevs[i].point.offset - stext;
--		sym = map__find_symbol(map, addr);
--		if (!sym)
--			continue;
--		if (!strcmp(sym->name, tevs[i].point.symbol))
--			continue;
--		/* If we have no realname, use symbol for it */
--		if (!tevs[i].point.realname)
--			tevs[i].point.realname = tevs[i].point.symbol;
--		else
--			free(tevs[i].point.symbol);
--		tevs[i].point.symbol = strdup(sym->name);
--		tevs[i].point.offset = addr - sym->start;
-+		ret = post_process_probe_trace_point(&tevs[i].point,
-+						     map, stext);
-+		if (ret < 0)
-+			break;
- 	}
- 	map__put(map);
- 
--	return 0;
-+	return ret;
- }
- 
- static int add_exec_to_probe_trace_events(struct probe_trace_event *tevs,
--- 
-2.28.0
-
-
-From 9a37d02c497cd839beee3e0cab0fc606bcfe08bf Mon Sep 17 00:00:00 2001
-From: Jason Yan <yanaijie@huawei.com>
-Date: Fri, 10 Mar 2017 11:49:12 +0800
-Subject: [PATCH 16/26] md: fix incorrect use of lexx_to_cpu in
- does_sb_need_changing
-
-commit 1345921393ba23b60d3fcf15933e699232ad25ae upstream.
-
-The sb->layout is of type __le32, so we shoud use le32_to_cpu.
-
-Signed-off-by: Jason Yan <yanaijie@huawei.com>
-Signed-off-by: Shaohua Li <shli@fb.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/md/md.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/md/md.c b/drivers/md/md.c
-index eddd360624a1..1d90307a16c4 100644
---- a/drivers/md/md.c
-+++ b/drivers/md/md.c
-@@ -2270,7 +2270,7 @@ static bool does_sb_need_changing(struct mddev *mddev)
- 	/* Check if any mddev parameters have changed */
- 	if ((mddev->dev_sectors != le64_to_cpu(sb->size)) ||
- 	    (mddev->reshape_position != le64_to_cpu(sb->reshape_position)) ||
--	    (mddev->layout != le64_to_cpu(sb->layout)) ||
-+	    (mddev->layout != le32_to_cpu(sb->layout)) ||
- 	    (mddev->raid_disks != le32_to_cpu(sb->raid_disks)) ||
- 	    (mddev->chunk_sectors != le32_to_cpu(sb->chunksize)))
- 		return true;
--- 
-2.28.0
-
-
-From 3953403ca660817a33e7f7ad65a265facc0e59c7 Mon Sep 17 00:00:00 2001
-From: Jason Yan <yanaijie@huawei.com>
-Date: Fri, 10 Mar 2017 11:27:23 +0800
-Subject: [PATCH 17/26] md: fix super_offset endianness in
- super_1_rdev_size_change
-
-commit 3fb632e40d7667d8bedfabc28850ac06d5493f54 upstream.
-
-The sb->super_offset should be big-endian, but the rdev->sb_start is in
-host byte order, so fix this by adding cpu_to_le64.
-
-Signed-off-by: Jason Yan <yanaijie@huawei.com>
-Signed-off-by: Shaohua Li <shli@fb.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/md/md.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/md/md.c b/drivers/md/md.c
-index 1d90307a16c4..8ebf1b97e1d2 100644
---- a/drivers/md/md.c
-+++ b/drivers/md/md.c
-@@ -1861,7 +1861,7 @@ super_1_rdev_size_change(struct md_rdev *rdev, sector_t num_sectors)
- 	}
- 	sb = page_address(rdev->sb_page);
- 	sb->data_size = cpu_to_le64(num_sectors);
--	sb->super_offset = rdev->sb_start;
-+	sb->super_offset = cpu_to_le64(rdev->sb_start);
- 	sb->sb_csum = calc_sb_1_csum(sb);
- 	md_super_write(rdev->mddev, rdev, rdev->sb_start, rdev->sb_size,
- 		       rdev->sb_page);
--- 
-2.28.0
-
-
-From 5497d74e75f8b33bc0777d3550c0159b66f0d3fa Mon Sep 17 00:00:00 2001
-From: Kirill Tkhai <ktkhai@virtuozzo.com>
-Date: Fri, 16 Jun 2017 16:44:34 +0300
-Subject: [PATCH 18/26] locking/rwsem-spinlock: Fix EINTR branch in
- __down_write_common()
-
-commit a0c4acd2c220376b4e9690e75782d0c0afdaab9f upstream.
-
-If a writer could been woken up, the above branch
-
-	if (sem->count == 0)
-		break;
-
-would have moved us to taking the sem. So, it's
-not the time to wake a writer now, and only readers
-are allowed now. Thus, 0 must be passed to __rwsem_do_wake().
-
-Next, __rwsem_do_wake() wakes readers unconditionally.
-But we mustn't do that if the sem is owned by writer
-in the moment. Otherwise, writer and reader own the sem
-the same time, which leads to memory corruption in
-callers.
-
-rwsem-xadd.c does not need that, as:
-
-  1) the similar check is made lockless there,
-  2) in __rwsem_mark_wake::try_reader_grant we test,
-
-that sem is not owned by writer.
-
-Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
-Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Niklas Cassel <niklas.cassel@axis.com>
-Cc: Peter Zijlstra (Intel) <peterz@infradead.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Fixes: 17fcbd590d0c "locking/rwsem: Fix down_write_killable() for CONFIG_RWSEM_GENERIC_SPINLOCK=y"
-Link: http://lkml.kernel.org/r/149762063282.19811.9129615532201147826.stgit@localhost.localdomain
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/locking/rwsem-spinlock.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/kernel/locking/rwsem-spinlock.c b/kernel/locking/rwsem-spinlock.c
-index 2bef4ab94003..a608f7a8fbd1 100644
---- a/kernel/locking/rwsem-spinlock.c
-+++ b/kernel/locking/rwsem-spinlock.c
-@@ -233,8 +233,8 @@ int __sched __down_write_common(struct rw_semaphore *sem, int state)
- 
- out_nolock:
- 	list_del(&waiter.list);
--	if (!list_empty(&sem->wait_list))
--		__rwsem_do_wake(sem, 1);
-+	if (!list_empty(&sem->wait_list) && sem->count >= 0)
-+		__rwsem_do_wake(sem, 0);
- 	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
- 
- 	return -EINTR;
--- 
-2.28.0
-
-
-From 80c965cbd28032aa941a431d7c69d9f5c1a5ff34 Mon Sep 17 00:00:00 2001
-From: Malcolm Priestley <tvboxspy@gmail.com>
-Date: Sat, 29 Apr 2017 13:03:44 +0100
-Subject: [PATCH 19/26] staging: vt6556: vnt_start Fix missing call to
- vnt_key_init_table.
-
-commit dc32190f2cd41c7dba25363ea7d618d4f5172b4e upstream.
-
-The key table is not intialized correctly without this call.
-
-Signed-off-by: Malcolm Priestley <tvboxspy@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/staging/vt6656/main_usb.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/drivers/staging/vt6656/main_usb.c b/drivers/staging/vt6656/main_usb.c
-index 0594828bdabf..b1955378852a 100644
---- a/drivers/staging/vt6656/main_usb.c
-+++ b/drivers/staging/vt6656/main_usb.c
-@@ -522,6 +522,9 @@ static int vnt_start(struct ieee80211_hw *hw)
- 		goto free_all;
- 	}
- 
-+	if (vnt_key_init_table(priv))
-+		goto free_all;
-+
- 	priv->int_interval = 1;  /* bInterval is set to 1 */
- 
- 	vnt_int_start_interrupt(priv);
--- 
-2.28.0
-
-
-From 090661e4073d4eea3f9644f48193d6791fed9b1d Mon Sep 17 00:00:00 2001
-From: Ian Abbott <abbotti@mev.co.uk>
-Date: Fri, 16 Jun 2017 19:35:34 +0100
-Subject: [PATCH 20/26] staging: comedi: fix clean-up of comedi_class in
- comedi_init()
-
-commit a9332e9ad09c2644c99058fcf6ae2f355e93ce74 upstream.
-
-There is a clean-up bug in the core comedi module initialization
-functions, `comedi_init()`.  If the `comedi_num_legacy_minors` module
-parameter is non-zero (and valid), it creates that many "legacy" devices
-and registers them in SysFS.  A failure causes the function to clean up
-and return an error.  Unfortunately, it fails to destroy the "comedi"
-class that was created earlier.  Fix it by adding a call to
-`class_destroy(comedi_class)` at the appropriate place in the clean-up
-sequence.
-
-Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/staging/comedi/comedi_fops.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/staging/comedi/comedi_fops.c b/drivers/staging/comedi/comedi_fops.c
-index 64b3966c5f1f..a34fd5afb9a8 100644
---- a/drivers/staging/comedi/comedi_fops.c
-+++ b/drivers/staging/comedi/comedi_fops.c
-@@ -2908,6 +2908,7 @@ static int __init comedi_init(void)
- 		dev = comedi_alloc_board_minor(NULL);
- 		if (IS_ERR(dev)) {
- 			comedi_cleanup_board_minors();
-+			class_destroy(comedi_class);
- 			cdev_del(&comedi_cdev);
- 			unregister_chrdev_region(MKDEV(COMEDI_MAJOR, 0),
- 						 COMEDI_NUM_MINORS);
--- 
-2.28.0
-
-
-From 0d6758f74a469ff34e353ddd9bf3229afff7915b Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Horia=20Geant=C4=83?= <horia.geanta@nxp.com>
-Date: Mon, 19 Jun 2017 11:44:45 +0300
-Subject: [PATCH 21/26] crypto: caam - fix gfp allocation flags (part I)
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 42cfcafb91dabb0f9d9e08396c39824535948c67 upstream.
-
-Changes in the SW cts (ciphertext stealing) code in
-commit 0605c41cc53ca ("crypto: cts - Convert to skcipher")
-revealed a problem in the CAAM driver:
-when cts(cbc(aes)) is executed and cts runs in SW,
-cbc(aes) is offloaded in CAAM; cts encrypts the last block
-in atomic context and CAAM incorrectly decides to use GFP_KERNEL
-for memory allocation.
-
-Fix this by allowing GFP_KERNEL (sleeping) only when MAY_SLEEP flag is
-set, i.e. remove MAY_BACKLOG flag.
-
-We split the fix in two parts - first is sent to -stable, while the
-second is not (since there is no known failure case).
-
-Link: http://lkml.kernel.org/g/20170602122446.2427-1-david@sigma-star.at
-Reported-by: David Gstir <david@sigma-star.at>
-Signed-off-by: Horia Geantă <horia.geanta@nxp.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/crypto/caam/caamalg.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
-diff --git a/drivers/crypto/caam/caamalg.c b/drivers/crypto/caam/caamalg.c
-index c310318b34dd..3bda6e5e2a45 100644
---- a/drivers/crypto/caam/caamalg.c
-+++ b/drivers/crypto/caam/caamalg.c
-@@ -2601,8 +2601,7 @@ static struct ablkcipher_edesc *ablkcipher_edesc_alloc(struct ablkcipher_request
- 	struct crypto_ablkcipher *ablkcipher = crypto_ablkcipher_reqtfm(req);
- 	struct caam_ctx *ctx = crypto_ablkcipher_ctx(ablkcipher);
- 	struct device *jrdev = ctx->jrdev;
--	gfp_t flags = (req->base.flags & (CRYPTO_TFM_REQ_MAY_BACKLOG |
--					  CRYPTO_TFM_REQ_MAY_SLEEP)) ?
-+	gfp_t flags = (req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) ?
- 		       GFP_KERNEL : GFP_ATOMIC;
- 	int src_nents, dst_nents = 0, sec4_sg_bytes;
- 	struct ablkcipher_edesc *edesc;
--- 
-2.28.0
-
-
-From 716986547f1f052a7f49b5e5502e76db3a32d3e7 Mon Sep 17 00:00:00 2001
-From: "Jason A. Donenfeld" <Jason@zx2c4.com>
-Date: Sun, 11 Jun 2017 23:20:23 +0200
-Subject: [PATCH 22/26] crypto: rsa-pkcs1pad - use constant time memory
- comparison for MACs
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit fec17cb2231733174e039ad9054fa16bb358e2ec upstream.
-
-Otherwise, we enable all sorts of forgeries via timing attack.
-
-Signed-off-by: Jason A. Donenfeld <Jason@zx2c4.com>
-Suggested-by: Stephan Müller <smueller@chronox.de>
-Cc: Herbert Xu <herbert@gondor.apana.org.au>
-Cc: linux-crypto@vger.kernel.org
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/rsa-pkcs1pad.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/crypto/rsa-pkcs1pad.c b/crypto/rsa-pkcs1pad.c
-index 8baab4307f7b..7830d304dff6 100644
---- a/crypto/rsa-pkcs1pad.c
-+++ b/crypto/rsa-pkcs1pad.c
-@@ -496,7 +496,7 @@ static int pkcs1pad_verify_complete(struct akcipher_request *req, int err)
- 		goto done;
- 	pos++;
- 
--	if (memcmp(out_buf + pos, digest_info->data, digest_info->size))
-+	if (crypto_memneq(out_buf + pos, digest_info->data, digest_info->size))
- 		goto done;
- 
- 	pos += digest_info->size;
--- 
-2.28.0
-
-
-From c0d3a7bdc7c29e2c34e9d6580d28c0cec6973182 Mon Sep 17 00:00:00 2001
-From: Chao Yu <yuchao0@huawei.com>
-Date: Fri, 23 Jun 2017 01:08:22 -0400
-Subject: [PATCH 23/26] ext4: check return value of kstrtoull correctly in
- reserved_clusters_store
-
-commit 1ea1516fbbab2b30bf98c534ecaacba579a35208 upstream.
-
-kstrtoull returns 0 on success, however, in reserved_clusters_store we
-will return -EINVAL if kstrtoull returns 0, it makes us fail to update
-reserved_clusters value through sysfs.
-
-Fixes: 76d33bca5581b1dd5c3157fa168db849a784ada4
-Signed-off-by: Chao Yu <yuchao0@huawei.com>
-Signed-off-by: Miao Xie <miaoxie@huawei.com>
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ext4/sysfs.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/fs/ext4/sysfs.c b/fs/ext4/sysfs.c
-index 42145be5c6b4..5dc655e410b4 100644
---- a/fs/ext4/sysfs.c
-+++ b/fs/ext4/sysfs.c
-@@ -100,7 +100,7 @@ static ssize_t reserved_clusters_store(struct ext4_attr *a,
- 	int ret;
- 
- 	ret = kstrtoull(skip_spaces(buf), 0, &val);
--	if (!ret || val >= clusters)
-+	if (ret || val >= clusters)
- 		return -EINVAL;
- 
- 	atomic64_set(&sbi->s_resv_clusters, val);
--- 
-2.28.0
-
-
-From 81ba752aa4761261e9caa32c6706703286b96e98 Mon Sep 17 00:00:00 2001
-From: Mikulas Patocka <mpatocka@redhat.com>
-Date: Tue, 4 Jul 2017 19:04:23 -0400
-Subject: [PATCH 24/26] x86/mm/pat: Don't report PAT on CPUs that don't support
- it
-
-commit 99c13b8c8896d7bcb92753bf0c63a8de4326e78d upstream.
-
-The pat_enabled() logic is broken on CPUs which do not support PAT and
-where the initialization code fails to call pat_init(). Due to that the
-enabled flag stays true and pat_enabled() returns true wrongfully.
-
-As a consequence the mappings, e.g. for Xorg, are set up with the wrong
-caching mode and the required MTRR setups are omitted.
-
-To cure this the following changes are required:
-
-  1) Make pat_enabled() return true only if PAT initialization was
-     invoked and successful.
-
-  2) Invoke init_cache_modes() unconditionally in setup_arch() and
-     remove the extra callsites in pat_disable() and the pat disabled
-     code path in pat_init().
-
-Also rename __pat_enabled to pat_disabled to reflect the real purpose of
-this variable.
-
-Fixes: 9cd25aac1f44 ("x86/mm/pat: Emulate PAT when it is disabled")
-Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
-Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
-Cc: Bernhard Held <berny156@gmx.de>
-Cc: Denys Vlasenko <dvlasenk@redhat.com>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Brian Gerst <brgerst@gmail.com>
-Cc: "Luis R. Rodriguez" <mcgrof@suse.com>
-Cc: Borislav Petkov <bp@alien8.de>
-Cc: Andy Lutomirski <luto@kernel.org>
-Cc: Josh Poimboeuf <jpoimboe@redhat.com>
-Cc: Andrew Morton <akpm@linux-foundation.org>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Link: http://lkml.kernel.org/r/alpine.LRH.2.02.1707041749300.3456@file01.intranet.prod.int.rdu2.redhat.com
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/include/asm/pat.h |  1 +
- arch/x86/kernel/setup.c    |  7 +++++++
- arch/x86/mm/pat.c          | 28 ++++++++++++----------------
- 3 files changed, 20 insertions(+), 16 deletions(-)
-
 diff --git a/arch/x86/include/asm/pat.h b/arch/x86/include/asm/pat.h
 index 0b1ff4c1c14e..fffb2794dd89 100644
 --- a/arch/x86/include/asm/pat.h
@@ -1450,20 +26,20 @@ diff --git a/arch/x86/kernel/setup.c b/arch/x86/kernel/setup.c
 index 9c337b0e8ba7..feaab07fa124 100644
 --- a/arch/x86/kernel/setup.c
 +++ b/arch/x86/kernel/setup.c
-@@ -1053,6 +1053,13 @@ void __init setup_arch(char **cmdline_p)
- 
+@@ -1054,6 +1054,13 @@ void __init setup_arch(char **cmdline_p)
  	max_possible_pfn = max_pfn;
  
-+	/*
+ 	/*
 +	 * This call is required when the CPU does not support PAT. If
 +	 * mtrr_bp_init() invoked it already via pat_init() the call has no
 +	 * effect.
 +	 */
 +	init_cache_modes();
 +
- 	/*
++	/*
  	 * Define random base addresses for memory sections after max_pfn is
  	 * defined and before each memory section base is used.
+ 	 */
 diff --git a/arch/x86/mm/pat.c b/arch/x86/mm/pat.c
 index 83e701f160a9..89d7907c4218 100644
 --- a/arch/x86/mm/pat.c
@@ -1559,34 +135,142 @@ index 83e701f160a9..89d7907c4218 100644
  
  	if ((c->x86_vendor == X86_VENDOR_INTEL) &&
  	    (((c->x86 == 0x6) && (c->x86_model <= 0xd)) ||
--- 
-2.28.0
-
-
-From fb2dc28cf20a25707b2165d7227d09d33fc44f7a Mon Sep 17 00:00:00 2001
-From: "Maciej S. Szmigiero" <mail@maciej.szmigiero.name>
-Date: Sat, 2 Jul 2016 20:27:46 -0300
-Subject: [PATCH 25/26] saa7134: fix warm Medion 7134 EEPROM read
-
-commit 5a91206ff0d0548939f3e85a65fb76b400fb0e89 upstream.
-
-When saa7134 module driving a Medion 7134 card is reloaded reads of this
-card EEPROM (required for automatic detection of tuner model) will be
-corrupted due to I2C gate in DVB-T demod being left closed.
-This sometimes also happens on first saa7134 module load after a warm
-reboot.
-
-Fix this by opening this I2C gate before doing EEPROM read during i2c
-initialization.
-
-Signed-off-by: Maciej S. Szmigiero <mail@maciej.szmigiero.name>
-Signed-off-by: Mauro Carvalho Chehab <mchehab@s-opensource.com>
-Cc: Oliver Hartkopp <socketcan@hartkopp.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/media/pci/saa7134/saa7134-i2c.c | 31 +++++++++++++++++++++++++
- 1 file changed, 31 insertions(+)
-
+diff --git a/crypto/rsa-pkcs1pad.c b/crypto/rsa-pkcs1pad.c
+index 8baab4307f7b..7830d304dff6 100644
+--- a/crypto/rsa-pkcs1pad.c
++++ b/crypto/rsa-pkcs1pad.c
+@@ -496,7 +496,7 @@ static int pkcs1pad_verify_complete(struct akcipher_request *req, int err)
+ 		goto done;
+ 	pos++;
+ 
+-	if (memcmp(out_buf + pos, digest_info->data, digest_info->size))
++	if (crypto_memneq(out_buf + pos, digest_info->data, digest_info->size))
+ 		goto done;
+ 
+ 	pos += digest_info->size;
+diff --git a/drivers/base/core.c b/drivers/base/core.c
+index ce057a568673..03a82d017cf1 100644
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@ -2095,7 +2095,11 @@ void device_shutdown(void)
+ 		pm_runtime_get_noresume(dev);
+ 		pm_runtime_barrier(dev);
+ 
+-		if (dev->bus && dev->bus->shutdown) {
++		if (dev->class && dev->class->shutdown) {
++			if (initcall_debug)
++				dev_info(dev, "shutdown\n");
++			dev->class->shutdown(dev);
++		} else if (dev->bus && dev->bus->shutdown) {
+ 			if (initcall_debug)
+ 				dev_info(dev, "shutdown\n");
+ 			dev->bus->shutdown(dev);
+diff --git a/drivers/char/tpm/tpm-chip.c b/drivers/char/tpm/tpm-chip.c
+index a017ccd8cc3b..9ff853229957 100644
+--- a/drivers/char/tpm/tpm-chip.c
++++ b/drivers/char/tpm/tpm-chip.c
+@@ -130,6 +130,41 @@ static void tpm_dev_release(struct device *dev)
+ 	kfree(chip);
+ }
+ 
++
++/**
++ * tpm_class_shutdown() - prepare the TPM device for loss of power.
++ * @dev: device to which the chip is associated.
++ *
++ * Issues a TPM2_Shutdown command prior to loss of power, as required by the
++ * TPM 2.0 spec.
++ * Then, calls bus- and device- specific shutdown code.
++ *
++ * XXX: This codepath relies on the fact that sysfs is not enabled for
++ * TPM2: sysfs uses an implicit lock on chip->ops, so this could race if TPM2
++ * has sysfs support enabled before TPM sysfs's implicit locking is fixed.
++ */
++static int tpm_class_shutdown(struct device *dev)
++{
++	struct tpm_chip *chip = container_of(dev, struct tpm_chip, dev);
++
++	if (chip->flags & TPM_CHIP_FLAG_TPM2) {
++		down_write(&chip->ops_sem);
++		tpm2_shutdown(chip, TPM2_SU_CLEAR);
++		chip->ops = NULL;
++		up_write(&chip->ops_sem);
++	}
++	/* Allow bus- and device-specific code to run. Note: since chip->ops
++	 * is NULL, more-specific shutdown code will not be able to issue TPM
++	 * commands.
++	 */
++	if (dev->bus && dev->bus->shutdown)
++		dev->bus->shutdown(dev);
++	else if (dev->driver && dev->driver->shutdown)
++		dev->driver->shutdown(dev);
++	return 0;
++}
++
++
+ /**
+  * tpm_chip_alloc() - allocate a new struct tpm_chip instance
+  * @pdev: device to which the chip is associated
+@@ -168,6 +203,7 @@ struct tpm_chip *tpm_chip_alloc(struct device *pdev,
+ 	device_initialize(&chip->dev);
+ 
+ 	chip->dev.class = tpm_class;
++	chip->dev.class->shutdown = tpm_class_shutdown;
+ 	chip->dev.release = tpm_dev_release;
+ 	chip->dev.parent = pdev;
+ 	chip->dev.groups = chip->groups;
+diff --git a/drivers/char/tpm/tpm-sysfs.c b/drivers/char/tpm/tpm-sysfs.c
+index 47005840c42c..edf8c59a6ed4 100644
+--- a/drivers/char/tpm/tpm-sysfs.c
++++ b/drivers/char/tpm/tpm-sysfs.c
+@@ -285,6 +285,11 @@ static const struct attribute_group tpm_dev_group = {
+ 
+ void tpm_sysfs_add_device(struct tpm_chip *chip)
+ {
++	/* XXX: If you wish to remove this restriction, you must first update
++	 * tpm_sysfs to explicitly lock chip->ops.
++	 */
++	if (chip->flags & TPM_CHIP_FLAG_TPM2)
++		return;
+ 	/* The sysfs routines rely on an implicit tpm_try_get_ops, device_del
+ 	 * is called before ops is null'd and the sysfs core synchronizes this
+ 	 * removal so that no callbacks are running or can run again
+diff --git a/drivers/crypto/caam/caamalg.c b/drivers/crypto/caam/caamalg.c
+index c310318b34dd..3bda6e5e2a45 100644
+--- a/drivers/crypto/caam/caamalg.c
++++ b/drivers/crypto/caam/caamalg.c
+@@ -2601,8 +2601,7 @@ static struct ablkcipher_edesc *ablkcipher_edesc_alloc(struct ablkcipher_request
+ 	struct crypto_ablkcipher *ablkcipher = crypto_ablkcipher_reqtfm(req);
+ 	struct caam_ctx *ctx = crypto_ablkcipher_ctx(ablkcipher);
+ 	struct device *jrdev = ctx->jrdev;
+-	gfp_t flags = (req->base.flags & (CRYPTO_TFM_REQ_MAY_BACKLOG |
+-					  CRYPTO_TFM_REQ_MAY_SLEEP)) ?
++	gfp_t flags = (req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP) ?
+ 		       GFP_KERNEL : GFP_ATOMIC;
+ 	int src_nents, dst_nents = 0, sec4_sg_bytes;
+ 	struct ablkcipher_edesc *edesc;
+diff --git a/drivers/md/md.c b/drivers/md/md.c
+index eddd360624a1..8ebf1b97e1d2 100644
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@ -1861,7 +1861,7 @@ super_1_rdev_size_change(struct md_rdev *rdev, sector_t num_sectors)
+ 	}
+ 	sb = page_address(rdev->sb_page);
+ 	sb->data_size = cpu_to_le64(num_sectors);
+-	sb->super_offset = rdev->sb_start;
++	sb->super_offset = cpu_to_le64(rdev->sb_start);
+ 	sb->sb_csum = calc_sb_1_csum(sb);
+ 	md_super_write(rdev->mddev, rdev, rdev->sb_start, rdev->sb_size,
+ 		       rdev->sb_page);
+@@ -2270,7 +2270,7 @@ static bool does_sb_need_changing(struct mddev *mddev)
+ 	/* Check if any mddev parameters have changed */
+ 	if ((mddev->dev_sectors != le64_to_cpu(sb->size)) ||
+ 	    (mddev->reshape_position != le64_to_cpu(sb->reshape_position)) ||
+-	    (mddev->layout != le64_to_cpu(sb->layout)) ||
++	    (mddev->layout != le32_to_cpu(sb->layout)) ||
+ 	    (mddev->raid_disks != le32_to_cpu(sb->raid_disks)) ||
+ 	    (mddev->chunk_sectors != le32_to_cpu(sb->chunksize)))
+ 		return true;
 diff --git a/drivers/media/pci/saa7134/saa7134-i2c.c b/drivers/media/pci/saa7134/saa7134-i2c.c
 index 2dac48fa1386..dca0592c5f47 100644
 --- a/drivers/media/pci/saa7134/saa7134-i2c.c
@@ -1635,31 +319,381 @@ index 2dac48fa1386..dca0592c5f47 100644
  	dev->i2c_client.addr = 0xa0 >> 1;
  	buf = 0;
  	if (1 != (err = i2c_master_send(&dev->i2c_client,&buf,1))) {
--- 
-2.28.0
-
-
-From f0cd77ded5127168b1b83ca2f366ee17e9c0586f Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sat, 15 Jul 2017 12:17:55 +0200
-Subject: [PATCH 26/26] Linux 4.9.38
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 342e19adbf7f..ad0c045d36cd 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 9
--SUBLEVEL = 37
-+SUBLEVEL = 38
- EXTRAVERSION =
- NAME = Roaring Lionus
+diff --git a/drivers/staging/comedi/comedi_fops.c b/drivers/staging/comedi/comedi_fops.c
+index 64b3966c5f1f..a34fd5afb9a8 100644
+--- a/drivers/staging/comedi/comedi_fops.c
++++ b/drivers/staging/comedi/comedi_fops.c
+@@ -2908,6 +2908,7 @@ static int __init comedi_init(void)
+ 		dev = comedi_alloc_board_minor(NULL);
+ 		if (IS_ERR(dev)) {
+ 			comedi_cleanup_board_minors();
++			class_destroy(comedi_class);
+ 			cdev_del(&comedi_cdev);
+ 			unregister_chrdev_region(MKDEV(COMEDI_MAJOR, 0),
+ 						 COMEDI_NUM_MINORS);
+diff --git a/drivers/staging/vt6656/main_usb.c b/drivers/staging/vt6656/main_usb.c
+index 0594828bdabf..b1955378852a 100644
+--- a/drivers/staging/vt6656/main_usb.c
++++ b/drivers/staging/vt6656/main_usb.c
+@@ -522,6 +522,9 @@ static int vnt_start(struct ieee80211_hw *hw)
+ 		goto free_all;
+ 	}
  
--- 
-2.28.0
-
++	if (vnt_key_init_table(priv))
++		goto free_all;
++
+ 	priv->int_interval = 1;  /* bInterval is set to 1 */
+ 
+ 	vnt_int_start_interrupt(priv);
+diff --git a/fs/ext4/sysfs.c b/fs/ext4/sysfs.c
+index 42145be5c6b4..5dc655e410b4 100644
+--- a/fs/ext4/sysfs.c
++++ b/fs/ext4/sysfs.c
+@@ -100,7 +100,7 @@ static ssize_t reserved_clusters_store(struct ext4_attr *a,
+ 	int ret;
+ 
+ 	ret = kstrtoull(skip_spaces(buf), 0, &val);
+-	if (!ret || val >= clusters)
++	if (ret || val >= clusters)
+ 		return -EINVAL;
+ 
+ 	atomic64_set(&sbi->s_resv_clusters, val);
+diff --git a/include/linux/device.h b/include/linux/device.h
+index bc41e87a969b..8d732965fab7 100644
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -373,6 +373,7 @@ int subsys_virtual_register(struct bus_type *subsys,
+  * @suspend:	Used to put the device to sleep mode, usually to a low power
+  *		state.
+  * @resume:	Used to bring the device from the sleep mode.
++ * @shutdown:	Called at shut-down time to quiesce the device.
+  * @ns_type:	Callbacks so sysfs can detemine namespaces.
+  * @namespace:	Namespace of the device belongs to this class.
+  * @pm:		The default device power management operations of this class.
+@@ -401,6 +402,7 @@ struct class {
+ 
+ 	int (*suspend)(struct device *dev, pm_message_t state);
+ 	int (*resume)(struct device *dev);
++	int (*shutdown)(struct device *dev);
+ 
+ 	const struct kobj_ns_type_operations *ns_type;
+ 	const void *(*namespace)(struct device *dev);
+diff --git a/ipc/mqueue.c b/ipc/mqueue.c
+index 8cbd6e6894d5..28a142f1be36 100644
+--- a/ipc/mqueue.c
++++ b/ipc/mqueue.c
+@@ -1249,8 +1249,10 @@ SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
+ 
+ 			timeo = MAX_SCHEDULE_TIMEOUT;
+ 			ret = netlink_attachskb(sock, nc, &timeo, NULL);
+-			if (ret == 1)
++			if (ret == 1) {
++				sock = NULL;
+ 				goto retry;
++			}
+ 			if (ret) {
+ 				sock = NULL;
+ 				nc = NULL;
+diff --git a/kernel/locking/rwsem-spinlock.c b/kernel/locking/rwsem-spinlock.c
+index 2bef4ab94003..a608f7a8fbd1 100644
+--- a/kernel/locking/rwsem-spinlock.c
++++ b/kernel/locking/rwsem-spinlock.c
+@@ -233,8 +233,8 @@ int __sched __down_write_common(struct rw_semaphore *sem, int state)
+ 
+ out_nolock:
+ 	list_del(&waiter.list);
+-	if (!list_empty(&sem->wait_list))
+-		__rwsem_do_wake(sem, 1);
++	if (!list_empty(&sem->wait_list) && sem->count >= 0)
++		__rwsem_do_wake(sem, 0);
+ 	raw_spin_unlock_irqrestore(&sem->wait_lock, flags);
+ 
+ 	return -EINTR;
+diff --git a/tools/include/linux/compiler.h b/tools/include/linux/compiler.h
+index e33fc1df3935..d94179f94caa 100644
+--- a/tools/include/linux/compiler.h
++++ b/tools/include/linux/compiler.h
+@@ -126,4 +126,13 @@ static __always_inline void __write_once_size(volatile void *p, void *res, int s
+ #define WRITE_ONCE(x, val) \
+ 	({ union { typeof(x) __val; char __c[1]; } __u = { .__val = (val) }; __write_once_size(&(x), __u.__c, sizeof(x)); __u.__val; })
+ 
++
++#ifndef __fallthrough
++# if defined(__GNUC__) && __GNUC__ >= 7
++#  define __fallthrough __attribute__ ((fallthrough))
++# else
++#  define __fallthrough
++# endif
++#endif
++
+ #endif /* _TOOLS_LINUX_COMPILER_H */
+diff --git a/tools/perf/bench/numa.c b/tools/perf/bench/numa.c
+index 8efe904e486b..9e5a02d6b9a9 100644
+--- a/tools/perf/bench/numa.c
++++ b/tools/perf/bench/numa.c
+@@ -1573,13 +1573,13 @@ static int __bench_numa(const char *name)
+ 		"GB/sec,", "total-speed",	"GB/sec total speed");
+ 
+ 	if (g->p.show_details >= 2) {
+-		char tname[32];
++		char tname[14 + 2 * 10 + 1];
+ 		struct thread_data *td;
+ 		for (p = 0; p < g->p.nr_proc; p++) {
+ 			for (t = 0; t < g->p.nr_threads; t++) {
+-				memset(tname, 0, 32);
++				memset(tname, 0, sizeof(tname));
+ 				td = g->threads + p*g->p.nr_threads + t;
+-				snprintf(tname, 32, "process%d:thread%d", p, t);
++				snprintf(tname, sizeof(tname), "process%d:thread%d", p, t);
+ 				print_res(tname, td->speed_gbs,
+ 					"GB/sec",	"thread-speed", "GB/sec/thread speed");
+ 				print_res(tname, td->system_time_ns / NSEC_PER_SEC,
+diff --git a/tools/perf/builtin-top.c b/tools/perf/builtin-top.c
+index fe3af9535e85..0b613e701736 100644
+--- a/tools/perf/builtin-top.c
++++ b/tools/perf/builtin-top.c
+@@ -643,7 +643,7 @@ static void *display_thread(void *arg)
+ 		case -1:
+ 			if (errno == EINTR)
+ 				continue;
+-			/* Fall trhu */
++			__fallthrough;
+ 		default:
+ 			c = getc(stdin);
+ 			tcsetattr(0, TCSAFLUSH, &save);
+diff --git a/tools/perf/tests/parse-events.c b/tools/perf/tests/parse-events.c
+index 20c2e641c422..aa9276bfe3e9 100644
+--- a/tools/perf/tests/parse-events.c
++++ b/tools/perf/tests/parse-events.c
+@@ -1779,15 +1779,14 @@ static int test_pmu_events(void)
+ 	}
+ 
+ 	while (!ret && (ent = readdir(dir))) {
+-#define MAX_NAME 100
+ 		struct evlist_test e;
+-		char name[MAX_NAME];
++		char name[2 * NAME_MAX + 1 + 12 + 3];
+ 
+ 		/* Names containing . are special and cannot be used directly */
+ 		if (strchr(ent->d_name, '.'))
+ 			continue;
+ 
+-		snprintf(name, MAX_NAME, "cpu/event=%s/u", ent->d_name);
++		snprintf(name, sizeof(name), "cpu/event=%s/u", ent->d_name);
+ 
+ 		e.name  = name;
+ 		e.check = test__checkevent_pmu_events;
+@@ -1795,11 +1794,10 @@ static int test_pmu_events(void)
+ 		ret = test_event(&e);
+ 		if (ret)
+ 			break;
+-		snprintf(name, MAX_NAME, "%s:u,cpu/event=%s/u", ent->d_name, ent->d_name);
++		snprintf(name, sizeof(name), "%s:u,cpu/event=%s/u", ent->d_name, ent->d_name);
+ 		e.name  = name;
+ 		e.check = test__checkevent_pmu_events_mix;
+ 		ret = test_event(&e);
+-#undef MAX_NAME
+ 	}
+ 
+ 	closedir(dir);
+diff --git a/tools/perf/util/header.c b/tools/perf/util/header.c
+index 2f3eded54b0c..5337f49db361 100644
+--- a/tools/perf/util/header.c
++++ b/tools/perf/util/header.c
+@@ -3184,6 +3184,7 @@ int perf_event__process_event_update(struct perf_tool *tool __maybe_unused,
+ 	case PERF_EVENT_UPDATE__SCALE:
+ 		ev_scale = (struct event_update_event_scale *) ev->data;
+ 		evsel->scale = ev_scale->scale;
++		break;
+ 	case PERF_EVENT_UPDATE__CPUS:
+ 		ev_cpus = (struct event_update_event_cpus *) ev->data;
+ 
+diff --git a/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c b/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
+index 16c06d3ae577..04387ab31316 100644
+--- a/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
++++ b/tools/perf/util/intel-pt-decoder/intel-pt-decoder.c
+@@ -22,6 +22,7 @@
+ #include <errno.h>
+ #include <stdint.h>
+ #include <inttypes.h>
++#include <linux/compiler.h>
+ 
+ #include "../cache.h"
+ #include "../util.h"
+@@ -1744,6 +1745,7 @@ static int intel_pt_walk_psb(struct intel_pt_decoder *decoder)
+ 		switch (decoder->packet.type) {
+ 		case INTEL_PT_TIP_PGD:
+ 			decoder->continuous_period = false;
++			__fallthrough;
+ 		case INTEL_PT_TIP_PGE:
+ 		case INTEL_PT_TIP:
+ 			intel_pt_log("ERROR: Unexpected packet\n");
+@@ -1797,6 +1799,8 @@ static int intel_pt_walk_psb(struct intel_pt_decoder *decoder)
+ 			decoder->pge = false;
+ 			decoder->continuous_period = false;
+ 			intel_pt_clear_tx_flags(decoder);
++			__fallthrough;
++
+ 		case INTEL_PT_TNT:
+ 			decoder->have_tma = false;
+ 			intel_pt_log("ERROR: Unexpected packet\n");
+@@ -1837,6 +1841,7 @@ static int intel_pt_walk_to_ip(struct intel_pt_decoder *decoder)
+ 		switch (decoder->packet.type) {
+ 		case INTEL_PT_TIP_PGD:
+ 			decoder->continuous_period = false;
++			__fallthrough;
+ 		case INTEL_PT_TIP_PGE:
+ 		case INTEL_PT_TIP:
+ 			decoder->pge = decoder->packet.type != INTEL_PT_TIP_PGD;
+diff --git a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
+index 4f7b32020487..7528ae4f7e28 100644
+--- a/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
++++ b/tools/perf/util/intel-pt-decoder/intel-pt-pkt-decoder.c
+@@ -17,6 +17,7 @@
+ #include <string.h>
+ #include <endian.h>
+ #include <byteswap.h>
++#include <linux/compiler.h>
+ 
+ #include "intel-pt-pkt-decoder.h"
+ 
+@@ -498,6 +499,7 @@ int intel_pt_pkt_desc(const struct intel_pt_pkt *packet, char *buf,
+ 	case INTEL_PT_FUP:
+ 		if (!(packet->count))
+ 			return snprintf(buf, buf_len, "%s no ip", name);
++		__fallthrough;
+ 	case INTEL_PT_CYC:
+ 	case INTEL_PT_VMCS:
+ 	case INTEL_PT_MTC:
+diff --git a/tools/perf/util/probe-event.c b/tools/perf/util/probe-event.c
+index 1d9c02bc00f1..7ea13f44178d 100644
+--- a/tools/perf/util/probe-event.c
++++ b/tools/perf/util/probe-event.c
+@@ -618,6 +618,67 @@ static int find_perf_probe_point_from_dwarf(struct probe_trace_point *tp,
+ 	return ret ? : -ENOENT;
+ }
+ 
++/* Adjust symbol name and address */
++static int post_process_probe_trace_point(struct probe_trace_point *tp,
++					   struct map *map, unsigned long offs)
++{
++	struct symbol *sym;
++	u64 addr = tp->address + tp->offset - offs;
++
++	sym = map__find_symbol(map, addr);
++	if (!sym)
++		return -ENOENT;
++
++	if (strcmp(sym->name, tp->symbol)) {
++		/* If we have no realname, use symbol for it */
++		if (!tp->realname)
++			tp->realname = tp->symbol;
++		else
++			free(tp->symbol);
++		tp->symbol = strdup(sym->name);
++		if (!tp->symbol)
++			return -ENOMEM;
++	}
++	tp->offset = addr - sym->start;
++	tp->address -= offs;
++
++	return 0;
++}
++
++/*
++ * Rename DWARF symbols to ELF symbols -- gcc sometimes optimizes functions
++ * and generate new symbols with suffixes such as .constprop.N or .isra.N
++ * etc. Since those symbols are not recorded in DWARF, we have to find
++ * correct generated symbols from offline ELF binary.
++ * For online kernel or uprobes we don't need this because those are
++ * rebased on _text, or already a section relative address.
++ */
++static int
++post_process_offline_probe_trace_events(struct probe_trace_event *tevs,
++					int ntevs, const char *pathname)
++{
++	struct map *map;
++	unsigned long stext = 0;
++	int i, ret = 0;
++
++	/* Prepare a map for offline binary */
++	map = dso__new_map(pathname);
++	if (!map || get_text_start_address(pathname, &stext) < 0) {
++		pr_warning("Failed to get ELF symbols for %s\n", pathname);
++		return -EINVAL;
++	}
++
++	for (i = 0; i < ntevs; i++) {
++		ret = post_process_probe_trace_point(&tevs[i].point,
++						     map, stext);
++		if (ret < 0)
++			break;
++	}
++	map__put(map);
++
++	return ret;
++}
++
+ static int add_exec_to_probe_trace_events(struct probe_trace_event *tevs,
+ 					  int ntevs, const char *exec)
+ {
+@@ -694,7 +755,8 @@ post_process_kernel_probe_trace_events(struct probe_trace_event *tevs,
+ 
+ 	/* Skip post process if the target is an offline kernel */
+ 	if (symbol_conf.ignore_vmlinux_buildid)
+-		return 0;
++		return post_process_offline_probe_trace_events(tevs, ntevs,
++						symbol_conf.vmlinux_name);
+ 
+ 	reloc_sym = kernel_get_ref_reloc_sym();
+ 	if (!reloc_sym) {
+diff --git a/tools/perf/util/scripting-engines/Build b/tools/perf/util/scripting-engines/Build
+index 6516e220c247..82d28c67e0f3 100644
+--- a/tools/perf/util/scripting-engines/Build
++++ b/tools/perf/util/scripting-engines/Build
+@@ -1,6 +1,6 @@
+ libperf-$(CONFIG_LIBPERL)   += trace-event-perl.o
+ libperf-$(CONFIG_LIBPYTHON) += trace-event-python.o
+ 
+-CFLAGS_trace-event-perl.o += $(PERL_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes -Wno-unused-parameter -Wno-shadow -Wno-undef -Wno-switch-default
++CFLAGS_trace-event-perl.o += $(PERL_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes -Wno-unused-parameter -Wno-shadow -Wno-nested-externs -Wno-undef -Wno-switch-default
+ 
+ CFLAGS_trace-event-python.o += $(PYTHON_EMBED_CCOPTS) -Wno-redundant-decls -Wno-strict-prototypes -Wno-unused-parameter -Wno-shadow
+diff --git a/tools/perf/util/strfilter.c b/tools/perf/util/strfilter.c
+index bcae659b6546..efb53772e0ec 100644
+--- a/tools/perf/util/strfilter.c
++++ b/tools/perf/util/strfilter.c
+@@ -269,6 +269,7 @@ static int strfilter_node__sprint(struct strfilter_node *node, char *buf)
+ 		len = strfilter_node__sprint_pt(node->l, buf);
+ 		if (len < 0)
+ 			return len;
++		__fallthrough;
+ 	case '!':
+ 		if (buf) {
+ 			*(buf + len++) = *node->p;
+diff --git a/tools/perf/util/string.c b/tools/perf/util/string.c
+index 7f7e072be746..f4e3444d90ab 100644
+--- a/tools/perf/util/string.c
++++ b/tools/perf/util/string.c
+@@ -21,6 +21,8 @@ s64 perf_atoll(const char *str)
+ 		case 'b': case 'B':
+ 			if (*p)
+ 				goto out_err;
++
++			__fallthrough;
+ 		case '\0':
+ 			return length;
+ 		default:
+diff --git a/tools/perf/util/thread_map.c b/tools/perf/util/thread_map.c
+index 40585f5b7027..ddec5c583d2b 100644
+--- a/tools/perf/util/thread_map.c
++++ b/tools/perf/util/thread_map.c
+@@ -93,7 +93,7 @@ struct thread_map *thread_map__new_by_uid(uid_t uid)
+ {
+ 	DIR *proc;
+ 	int max_threads = 32, items, i;
+-	char path[256];
++	char path[NAME_MAX + 1 + 6];
+ 	struct dirent *dirent, **namelist = NULL;
+ 	struct thread_map *threads = thread_map__alloc(max_threads);
+ 

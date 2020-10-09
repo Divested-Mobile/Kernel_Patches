@@ -1,951 +1,15 @@
-From fb138c4699c94b16bf9400394142c6d86fe70226 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Sebastian=20P=C3=B6hn?= <sebastian.poehn@gmail.com>
-Date: Mon, 20 Apr 2015 09:19:20 +0200
-Subject: [PATCH 01/65] ip_forward: Drop frames with attached skb->sk
-
-[ Upstream commit 2ab957492d13bb819400ac29ae55911d50a82a13 ]
-
-Initial discussion was:
-[FYI] xfrm: Don't lookup sk_policy for timewait sockets
-
-Forwarded frames should not have a socket attached. Especially
-tw sockets will lead to panics later-on in the stack.
-
-This was observed with TPROXY assigning a tw socket and broken
-policy routing (misconfigured). As a result frame enters
-forwarding path instead of input. We cannot solve this in
-TPROXY as it cannot know that policy routing is broken.
-
-v2:
-Remove useless comment
-
-Signed-off-by: Sebastian Poehn <sebastian.poehn@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/ip_forward.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/net/ipv4/ip_forward.c b/net/ipv4/ip_forward.c
-index 31ee5c6033df..479e8a63125a 100644
---- a/net/ipv4/ip_forward.c
-+++ b/net/ipv4/ip_forward.c
-@@ -126,6 +126,9 @@ int ip_forward(struct sk_buff *skb)
- 	struct rtable *rt;	/* Route we use */
- 	struct ip_options *opt	= &(IPCB(skb)->opt);
+diff --git a/Makefile b/Makefile
+index 019a6a4b386d..923ad8a64e3b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 10
+-SUBLEVEL = 76
++SUBLEVEL = 77
+ EXTRAVERSION =
+ NAME = TOSSUG Baby Fish
  
-+	if (unlikely(skb->sk))
-+		goto drop;
-+
- 	if (skb_warn_if_lro(skb))
- 		goto drop;
- 
--- 
-2.28.0
-
-
-From aac9fda375bbe75e0b8c033874af25e0f7f5a3a4 Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Tue, 21 Apr 2015 18:32:24 -0700
-Subject: [PATCH 02/65] tcp: fix possible deadlock in tcp_send_fin()
-
-[ Upstream commit d83769a580f1132ac26439f50068a29b02be535e ]
-
-Using sk_stream_alloc_skb() in tcp_send_fin() is dangerous in
-case a huge process is killed by OOM, and tcp_mem[2] is hit.
-
-To be able to free memory we need to make progress, so this
-patch allows FIN packets to not care about tcp_mem[2], if
-skb allocation succeeded.
-
-In a follow-up patch, we might abort tcp_send_fin() infinite loop
-in case TIF_MEMDIE is set on this thread, as memory allocator
-did its best getting extra memory already.
-
-This patch reverts d22e15371811 ("tcp: fix tcp fin memory accounting")
-
-Fixes: d22e15371811 ("tcp: fix tcp fin memory accounting")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/tcp_output.c | 20 +++++++++++++++++++-
- 1 file changed, 19 insertions(+), 1 deletion(-)
-
-diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
-index 7681a1bbd97f..546371973b9a 100644
---- a/net/ipv4/tcp_output.c
-+++ b/net/ipv4/tcp_output.c
-@@ -2571,6 +2571,21 @@ begin_fwd:
- 	}
- }
- 
-+/* We allow to exceed memory limits for FIN packets to expedite
-+ * connection tear down and (memory) recovery.
-+ * Otherwise tcp_send_fin() could loop forever.
-+ */
-+static void sk_forced_wmem_schedule(struct sock *sk, int size)
-+{
-+	int amt, status;
-+
-+	if (size <= sk->sk_forward_alloc)
-+		return;
-+	amt = sk_mem_pages(size);
-+	sk->sk_forward_alloc += amt * SK_MEM_QUANTUM;
-+	sk_memory_allocated_add(sk, amt, &status);
-+}
-+
- /* Send a fin.  The caller locks the socket for us.  This cannot be
-  * allowed to fail queueing a FIN frame under any circumstances.
-  */
-@@ -2593,11 +2608,14 @@ void tcp_send_fin(struct sock *sk)
- 	} else {
- 		/* Socket is locked, keep trying until memory is available. */
- 		for (;;) {
--			skb = sk_stream_alloc_skb(sk, 0, sk->sk_allocation);
-+			skb = alloc_skb_fclone(MAX_TCP_HEADER,
-+					       sk->sk_allocation);
- 			if (skb)
- 				break;
- 			yield();
- 		}
-+		skb_reserve(skb, MAX_TCP_HEADER);
-+		sk_forced_wmem_schedule(sk, skb->truesize);
- 		/* FIN eats a sequence byte, write_seq advanced by tcp_queue_skb(). */
- 		tcp_init_nondata_skb(skb, tp->write_seq,
- 				     TCPHDR_ACK | TCPHDR_FIN);
--- 
-2.28.0
-
-
-From bc9f0ea1c736358f2db263ee2afe5af5a9dfcf2a Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Thu, 23 Apr 2015 10:42:39 -0700
-Subject: [PATCH 03/65] tcp: avoid looping in tcp_send_fin()
-
-[ Upstream commit 845704a535e9b3c76448f52af1b70e4422ea03fd ]
-
-Presence of an unbound loop in tcp_send_fin() had always been hard
-to explain when analyzing crash dumps involving gigantic dying processes
-with millions of sockets.
-
-Lets try a different strategy :
-
-In case of memory pressure, try to add the FIN flag to last packet
-in write queue, even if packet was already sent. TCP stack will
-be able to deliver this FIN after a timeout event. Note that this
-FIN being delivered by a retransmit, it also carries a Push flag
-given our current implementation.
-
-By checking sk_under_memory_pressure(), we anticipate that cooking
-many FIN packets might deplete tcp memory.
-
-In the case we could not allocate a packet, even with __GFP_WAIT
-allocation, then not sending a FIN seems quite reasonable if it allows
-to get rid of this socket, free memory, and not block the process from
-eventually doing other useful work.
-
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/tcp_output.c | 50 +++++++++++++++++++++++++------------------
- 1 file changed, 29 insertions(+), 21 deletions(-)
-
-diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
-index 546371973b9a..76c80b59e80f 100644
---- a/net/ipv4/tcp_output.c
-+++ b/net/ipv4/tcp_output.c
-@@ -2573,7 +2573,8 @@ begin_fwd:
- 
- /* We allow to exceed memory limits for FIN packets to expedite
-  * connection tear down and (memory) recovery.
-- * Otherwise tcp_send_fin() could loop forever.
-+ * Otherwise tcp_send_fin() could be tempted to either delay FIN
-+ * or even be forced to close flow without any FIN.
-  */
- static void sk_forced_wmem_schedule(struct sock *sk, int size)
- {
-@@ -2586,33 +2587,40 @@ static void sk_forced_wmem_schedule(struct sock *sk, int size)
- 	sk_memory_allocated_add(sk, amt, &status);
- }
- 
--/* Send a fin.  The caller locks the socket for us.  This cannot be
-- * allowed to fail queueing a FIN frame under any circumstances.
-+/* Send a FIN. The caller locks the socket for us.
-+ * We should try to send a FIN packet really hard, but eventually give up.
-  */
- void tcp_send_fin(struct sock *sk)
- {
-+	struct sk_buff *skb, *tskb = tcp_write_queue_tail(sk);
- 	struct tcp_sock *tp = tcp_sk(sk);
--	struct sk_buff *skb = tcp_write_queue_tail(sk);
--	int mss_now;
- 
--	/* Optimization, tack on the FIN if we have a queue of
--	 * unsent frames.  But be careful about outgoing SACKS
--	 * and IP options.
-+	/* Optimization, tack on the FIN if we have one skb in write queue and
-+	 * this skb was not yet sent, or we are under memory pressure.
-+	 * Note: in the latter case, FIN packet will be sent after a timeout,
-+	 * as TCP stack thinks it has already been transmitted.
- 	 */
--	mss_now = tcp_current_mss(sk);
--
--	if (tcp_send_head(sk) != NULL) {
--		TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_FIN;
--		TCP_SKB_CB(skb)->end_seq++;
-+	if (tskb && (tcp_send_head(sk) || sk_under_memory_pressure(sk))) {
-+coalesce:
-+		TCP_SKB_CB(tskb)->tcp_flags |= TCPHDR_FIN;
-+		TCP_SKB_CB(tskb)->end_seq++;
- 		tp->write_seq++;
-+		if (!tcp_send_head(sk)) {
-+			/* This means tskb was already sent.
-+			 * Pretend we included the FIN on previous transmit.
-+			 * We need to set tp->snd_nxt to the value it would have
-+			 * if FIN had been sent. This is because retransmit path
-+			 * does not change tp->snd_nxt.
-+			 */
-+			tp->snd_nxt++;
-+			return;
-+		}
- 	} else {
--		/* Socket is locked, keep trying until memory is available. */
--		for (;;) {
--			skb = alloc_skb_fclone(MAX_TCP_HEADER,
--					       sk->sk_allocation);
--			if (skb)
--				break;
--			yield();
-+		skb = alloc_skb_fclone(MAX_TCP_HEADER, sk->sk_allocation);
-+		if (unlikely(!skb)) {
-+			if (tskb)
-+				goto coalesce;
-+			return;
- 		}
- 		skb_reserve(skb, MAX_TCP_HEADER);
- 		sk_forced_wmem_schedule(sk, skb->truesize);
-@@ -2621,7 +2629,7 @@ void tcp_send_fin(struct sock *sk)
- 				     TCPHDR_ACK | TCPHDR_FIN);
- 		tcp_queue_skb(sk, skb);
- 	}
--	__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_OFF);
-+	__tcp_push_pending_frames(sk, tcp_current_mss(sk), TCP_NAGLE_OFF);
- }
- 
- /* We get here when a process closes a file descriptor (either due to
--- 
-2.28.0
-
-
-From bf339141f604388ace1c3f97b9297683f45170dd Mon Sep 17 00:00:00 2001
-From: Filipe Manana <fdmanana@suse.com>
-Date: Mon, 23 Mar 2015 14:07:40 +0000
-Subject: [PATCH 04/65] Btrfs: fix log tree corruption when fs mounted with -o
- discard
-
-commit dcc82f4783ad91d4ab654f89f37ae9291cdc846a upstream.
-
-While committing a transaction we free the log roots before we write the
-new super block. Freeing the log roots implies marking the disk location
-of every node/leaf (metadata extent) as pinned before the new super block
-is written. This is to prevent the disk location of log metadata extents
-from being reused before the new super block is written, otherwise we
-would have a corrupted log tree if before the new super block is written
-a crash/reboot happens and the location of any log tree metadata extent
-ended up being reused and rewritten.
-
-Even though we pinned the log tree's metadata extents, we were issuing a
-discard against them if the fs was mounted with the -o discard option,
-resulting in corruption of the log tree if a crash/reboot happened before
-writing the new super block - the next time the fs was mounted, during
-the log replay process we would find nodes/leafs of the log btree with
-a content full of zeroes, causing the process to fail and require the
-use of the tool btrfs-zero-log to wipeout the log tree (and all data
-previously fsynced becoming lost forever).
-
-Fix this by not doing a discard when pinning an extent. The discard will
-be done later when it's safe (after the new super block is committed) at
-extent-tree.c:btrfs_finish_extent_commit().
-
-Fixes: e688b7252f78 (Btrfs: fix extent pinning bugs in the tree log)
-Signed-off-by: Filipe Manana <fdmanana@suse.com>
-Signed-off-by: Chris Mason <clm@fb.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/btrfs/extent-tree.c | 5 ++---
- 1 file changed, 2 insertions(+), 3 deletions(-)
-
-diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
-index f99c71e40f8b..07f167a1d271 100644
---- a/fs/btrfs/extent-tree.c
-+++ b/fs/btrfs/extent-tree.c
-@@ -6363,12 +6363,11 @@ static int __btrfs_free_reserved_extent(struct btrfs_root *root,
- 		return -ENOSPC;
- 	}
- 
--	if (btrfs_test_opt(root, DISCARD))
--		ret = btrfs_discard_extent(root, start, len, NULL);
--
- 	if (pin)
- 		pin_down_extent(root, cache, start, len, 1);
- 	else {
-+		if (btrfs_test_opt(root, DISCARD))
-+			ret = btrfs_discard_extent(root, start, len, NULL);
- 		btrfs_add_free_space(cache, start, len);
- 		btrfs_update_reserved_bytes(cache, len, RESERVE_FREE);
- 	}
--- 
-2.28.0
-
-
-From 6073c4162289fcae16b359f8e105d60343a209ca Mon Sep 17 00:00:00 2001
-From: Filipe Manana <fdmanana@suse.com>
-Date: Mon, 30 Mar 2015 18:23:59 +0100
-Subject: [PATCH 05/65] Btrfs: fix inode eviction infinite loop after cloning
- into it
-
-commit ccccf3d67294714af2d72a6fd6fd7d73b01c9329 upstream.
-
-If we attempt to clone a 0 length region into a file we can end up
-inserting a range in the inode's extent_io tree with a start offset
-that is greater then the end offset, which triggers immediately the
-following warning:
-
-[ 3914.619057] WARNING: CPU: 17 PID: 4199 at fs/btrfs/extent_io.c:435 insert_state+0x4b/0x10b [btrfs]()
-[ 3914.620886] BTRFS: end < start 4095 4096
-(...)
-[ 3914.638093] Call Trace:
-[ 3914.638636]  [<ffffffff81425fd9>] dump_stack+0x4c/0x65
-[ 3914.639620]  [<ffffffff81045390>] warn_slowpath_common+0xa1/0xbb
-[ 3914.640789]  [<ffffffffa03ca44f>] ? insert_state+0x4b/0x10b [btrfs]
-[ 3914.642041]  [<ffffffff810453f0>] warn_slowpath_fmt+0x46/0x48
-[ 3914.643236]  [<ffffffffa03ca44f>] insert_state+0x4b/0x10b [btrfs]
-[ 3914.644441]  [<ffffffffa03ca729>] __set_extent_bit+0x107/0x3f4 [btrfs]
-[ 3914.645711]  [<ffffffffa03cb256>] lock_extent_bits+0x65/0x1bf [btrfs]
-[ 3914.646914]  [<ffffffff8142b2fb>] ? _raw_spin_unlock+0x28/0x33
-[ 3914.648058]  [<ffffffffa03cbac4>] ? test_range_bit+0xcc/0xde [btrfs]
-[ 3914.650105]  [<ffffffffa03cb3c3>] lock_extent+0x13/0x15 [btrfs]
-[ 3914.651361]  [<ffffffffa03db39e>] lock_extent_range+0x3d/0xcd [btrfs]
-[ 3914.652761]  [<ffffffffa03de1fe>] btrfs_ioctl_clone+0x278/0x388 [btrfs]
-[ 3914.654128]  [<ffffffff811226dd>] ? might_fault+0x58/0xb5
-[ 3914.655320]  [<ffffffffa03e0909>] btrfs_ioctl+0xb51/0x2195 [btrfs]
-(...)
-[ 3914.669271] ---[ end trace 14843d3e2e622fc1 ]---
-
-This later makes the inode eviction handler enter an infinite loop that
-keeps dumping the following warning over and over:
-
-[ 3915.117629] WARNING: CPU: 22 PID: 4228 at fs/btrfs/extent_io.c:435 insert_state+0x4b/0x10b [btrfs]()
-[ 3915.119913] BTRFS: end < start 4095 4096
-(...)
-[ 3915.137394] Call Trace:
-[ 3915.137913]  [<ffffffff81425fd9>] dump_stack+0x4c/0x65
-[ 3915.139154]  [<ffffffff81045390>] warn_slowpath_common+0xa1/0xbb
-[ 3915.140316]  [<ffffffffa03ca44f>] ? insert_state+0x4b/0x10b [btrfs]
-[ 3915.141505]  [<ffffffff810453f0>] warn_slowpath_fmt+0x46/0x48
-[ 3915.142709]  [<ffffffffa03ca44f>] insert_state+0x4b/0x10b [btrfs]
-[ 3915.143849]  [<ffffffffa03ca729>] __set_extent_bit+0x107/0x3f4 [btrfs]
-[ 3915.145120]  [<ffffffffa038c1e3>] ? btrfs_kill_super+0x17/0x23 [btrfs]
-[ 3915.146352]  [<ffffffff811548f6>] ? deactivate_locked_super+0x3b/0x50
-[ 3915.147565]  [<ffffffffa03cb256>] lock_extent_bits+0x65/0x1bf [btrfs]
-[ 3915.148785]  [<ffffffff8142b7e2>] ? _raw_write_unlock+0x28/0x33
-[ 3915.149931]  [<ffffffffa03bc325>] btrfs_evict_inode+0x196/0x482 [btrfs]
-[ 3915.151154]  [<ffffffff81168904>] evict+0xa0/0x148
-[ 3915.152094]  [<ffffffff811689e5>] dispose_list+0x39/0x43
-[ 3915.153081]  [<ffffffff81169564>] evict_inodes+0xdc/0xeb
-[ 3915.154062]  [<ffffffff81154418>] generic_shutdown_super+0x49/0xef
-[ 3915.155193]  [<ffffffff811546d1>] kill_anon_super+0x13/0x1e
-[ 3915.156274]  [<ffffffffa038c1e3>] btrfs_kill_super+0x17/0x23 [btrfs]
-(...)
-[ 3915.167404] ---[ end trace 14843d3e2e622fc2 ]---
-
-So just bail out of the clone ioctl if the length of the region to clone
-is zero, without locking any extent range, in order to prevent this issue
-(same behaviour as a pwrite with a 0 length for example).
-
-This is trivial to reproduce. For example, the steps for the test I just
-made for fstests:
-
-  mkfs.btrfs -f SCRATCH_DEV
-  mount SCRATCH_DEV $SCRATCH_MNT
-
-  touch $SCRATCH_MNT/foo
-  touch $SCRATCH_MNT/bar
-
-  $CLONER_PROG -s 0 -d 4096 -l 0 $SCRATCH_MNT/foo $SCRATCH_MNT/bar
-  umount $SCRATCH_MNT
-
-A test case for fstests follows soon.
-
-Signed-off-by: Filipe Manana <fdmanana@suse.com>
-Reviewed-by: Omar Sandoval <osandov@osandov.com>
-Signed-off-by: Chris Mason <clm@fb.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/btrfs/ioctl.c | 5 +++++
- 1 file changed, 5 insertions(+)
-
-diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
-index 783906c687b5..dbefa6c609f4 100644
---- a/fs/btrfs/ioctl.c
-+++ b/fs/btrfs/ioctl.c
-@@ -2572,6 +2572,11 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
- 	if (off + len == src->i_size)
- 		len = ALIGN(src->i_size, bs) - off;
- 
-+	if (len == 0) {
-+		ret = 0;
-+		goto out_unlock;
-+	}
-+
- 	/* verify the end result is block aligned */
- 	if (!IS_ALIGNED(off, bs) || !IS_ALIGNED(off + len, bs) ||
- 	    !IS_ALIGNED(destoff, bs))
--- 
-2.28.0
-
-
-From 3518a2e4bbe8c336d3f59138d1f7bdd628a841b3 Mon Sep 17 00:00:00 2001
-From: Felipe Balbi <balbi@ti.com>
-Date: Tue, 30 Sep 2014 16:08:03 -0500
-Subject: [PATCH 06/65] usb: gadget: composite: enable BESL support
-
-commit a6615937bcd9234e6d6bb817c3701fce44d0a84d upstream.
-
-According to USB 2.0 ECN Errata for Link Power
-Management (USB2-LPM-Errata-final.pdf), BESL
-must be enabled if LPM is enabled.
-
-This helps with USB30CV TD 9.21 LPM L1
-Suspend Resume Test.
-
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Du, Changbin <changbin.du@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/gadget/composite.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/usb/gadget/composite.c b/drivers/usb/gadget/composite.c
-index 44a292b75012..a660716f9331 100644
---- a/drivers/usb/gadget/composite.c
-+++ b/drivers/usb/gadget/composite.c
-@@ -528,7 +528,7 @@ static int bos_desc(struct usb_composite_dev *cdev)
- 	usb_ext->bLength = USB_DT_USB_EXT_CAP_SIZE;
- 	usb_ext->bDescriptorType = USB_DT_DEVICE_CAPABILITY;
- 	usb_ext->bDevCapabilityType = USB_CAP_TYPE_EXT;
--	usb_ext->bmAttributes = cpu_to_le32(USB_LPM_SUPPORT);
-+	usb_ext->bmAttributes = cpu_to_le32(USB_LPM_SUPPORT | USB_BESL_SUPPORT);
- 
- 	/*
- 	 * The Superspeed USB Capability descriptor shall be implemented by all
--- 
-2.28.0
-
-
-From 38db3faa86115d76cc9df29b3706cb90d6583a77 Mon Sep 17 00:00:00 2001
-From: Ekaterina Tumanova <tumanova@linux.vnet.ibm.com>
-Date: Tue, 3 Mar 2015 09:54:41 +0100
-Subject: [PATCH 07/65] KVM: s390: Zero out current VMDB of STSI before
- including level3 data.
-
-commit b75f4c9afac2604feb971441116c07a24ecca1ec upstream.
-
-s390 documentation requires words 0 and 10-15 to be reserved and stored as
-zeros. As we fill out all other fields, we can memset the full structure.
-
-Signed-off-by: Ekaterina Tumanova <tumanova@linux.vnet.ibm.com>
-Reviewed-by: David Hildenbrand <dahi@linux.vnet.ibm.com>
-Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/s390/kvm/priv.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/arch/s390/kvm/priv.c b/arch/s390/kvm/priv.c
-index 6bbd7b5a0bbe..0220c2ba7590 100644
---- a/arch/s390/kvm/priv.c
-+++ b/arch/s390/kvm/priv.c
-@@ -328,6 +328,7 @@ static void handle_stsi_3_2_2(struct kvm_vcpu *vcpu, struct sysinfo_3_2_2 *mem)
- 	for (n = mem->count - 1; n > 0 ; n--)
- 		memcpy(&mem->vm[n], &mem->vm[n - 1], sizeof(mem->vm[0]));
- 
-+	memset(&mem->vm[0], 0, sizeof(mem->vm[0]));
- 	mem->vm[0].cpus_total = cpus;
- 	mem->vm[0].cpus_configured = cpus;
- 	mem->vm[0].cpus_standby = 0;
--- 
-2.28.0
-
-
-From 793d5cc7015f5ccea3114523471188ece3958904 Mon Sep 17 00:00:00 2001
-From: Heiko Carstens <heiko.carstens@de.ibm.com>
-Date: Wed, 25 Mar 2015 10:13:33 +0100
-Subject: [PATCH 08/65] s390/hibernate: fix save and restore of kernel text
- section
-
-commit d74419495633493c9cd3f2bbeb7f3529d0edded6 upstream.
-
-Sebastian reported a crash caused by a jump label mismatch after resume.
-This happens because we do not save the kernel text section during suspend
-and therefore also do not restore it during resume, but use the kernel image
-that restores the old system.
-
-This means that after a suspend/resume cycle we lost all modifications done
-to the kernel text section.
-The reason for this is the pfn_is_nosave() function, which incorrectly
-returns that read-only pages don't need to be saved. This is incorrect since
-we mark the kernel text section read-only.
-We still need to make sure to not save and restore pages contained within
-NSS and DCSS segment.
-To fix this add an extra case for the kernel text section and only save
-those pages if they are not contained within an NSS segment.
-
-Fixes the following crash (and the above bugs as well):
-
-Jump label code mismatch at netif_receive_skb_internal+0x28/0xd0
-Found:    c0 04 00 00 00 00
-Expected: c0 f4 00 00 00 11
-New:      c0 04 00 00 00 00
-Kernel panic - not syncing: Corrupted kernel text
-CPU: 0 PID: 9 Comm: migration/0 Not tainted 3.19.0-01975-gb1b096e70f23 #4
-Call Trace:
-  [<0000000000113972>] show_stack+0x72/0xf0
-  [<000000000081f15e>] dump_stack+0x6e/0x90
-  [<000000000081c4e8>] panic+0x108/0x2b0
-  [<000000000081be64>] jump_label_bug.isra.2+0x104/0x108
-  [<0000000000112176>] __jump_label_transform+0x9e/0xd0
-  [<00000000001121e6>] __sm_arch_jump_label_transform+0x3e/0x50
-  [<00000000001d1136>] multi_cpu_stop+0x12e/0x170
-  [<00000000001d1472>] cpu_stopper_thread+0xb2/0x168
-  [<000000000015d2ac>] smpboot_thread_fn+0x134/0x1b0
-  [<0000000000158baa>] kthread+0x10a/0x110
-  [<0000000000824a86>] kernel_thread_starter+0x6/0xc
-
-Reported-and-tested-by: Sebastian Ott <sebott@linux.vnet.ibm.com>
-Signed-off-by: Heiko Carstens <heiko.carstens@de.ibm.com>
-Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/s390/kernel/suspend.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/arch/s390/kernel/suspend.c b/arch/s390/kernel/suspend.c
-index c479d2f9605b..f176bc83cc8d 100644
---- a/arch/s390/kernel/suspend.c
-+++ b/arch/s390/kernel/suspend.c
-@@ -138,6 +138,8 @@ int pfn_is_nosave(unsigned long pfn)
- {
- 	unsigned long nosave_begin_pfn = PFN_DOWN(__pa(&__nosave_begin));
- 	unsigned long nosave_end_pfn = PFN_DOWN(__pa(&__nosave_end));
-+	unsigned long eshared_pfn = PFN_DOWN(__pa(&_eshared)) - 1;
-+	unsigned long stext_pfn = PFN_DOWN(__pa(&_stext));
- 
- 	/* Always save lowcore pages (LC protection might be enabled). */
- 	if (pfn <= LC_PAGES)
-@@ -145,6 +147,8 @@ int pfn_is_nosave(unsigned long pfn)
- 	if (pfn >= nosave_begin_pfn && pfn < nosave_end_pfn)
- 		return 1;
- 	/* Skip memory holes and read-only pages (NSS, DCSS, ...). */
-+	if (pfn >= stext_pfn && pfn <= eshared_pfn)
-+		return ipl_info.type == IPL_TYPE_NSS ? 1 : 0;
- 	if (tprot(PFN_PHYS(pfn)))
- 		return 1;
- 	return 0;
--- 
-2.28.0
-
-
-From cad1af8cfbafe09d84ebd87977540fbd896f7225 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Radim=20Kr=C4=8Dm=C3=A1=C5=99?= <rkrcmar@redhat.com>
-Date: Wed, 8 Apr 2015 14:16:48 +0200
-Subject: [PATCH 09/65] KVM: use slowpath for cross page cached accesses
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit ca3f0874723fad81d0c701b63ae3a17a408d5f25 upstream.
-
-kvm_write_guest_cached() does not mark all written pages as dirty and
-code comments in kvm_gfn_to_hva_cache_init() talk about NULL memslot
-with cross page accesses.  Fix all the easy way.
-
-The check is '<= 1' to have the same result for 'len = 0' cache anywhere
-in the page.  (nr_pages_needed is 0 on page boundary.)
-
-Fixes: 8f964525a121 ("KVM: Allow cross page reads and writes from cached translations.")
-Signed-off-by: Radim Krčmář <rkrcmar@redhat.com>
-Message-Id: <20150408121648.GA3519@potion.brq.redhat.com>
-Reviewed-by: Wanpeng Li <wanpeng.li@linux.intel.com>
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- virt/kvm/kvm_main.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
-index a17f190be58e..1d4b8bed4e48 100644
---- a/virt/kvm/kvm_main.c
-+++ b/virt/kvm/kvm_main.c
-@@ -1549,8 +1549,8 @@ int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
- 	ghc->generation = slots->generation;
- 	ghc->len = len;
- 	ghc->memslot = gfn_to_memslot(kvm, start_gfn);
--	ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn, &nr_pages_avail);
--	if (!kvm_is_error_hva(ghc->hva) && nr_pages_avail >= nr_pages_needed) {
-+	ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn, NULL);
-+	if (!kvm_is_error_hva(ghc->hva) && nr_pages_needed <= 1) {
- 		ghc->hva += offset;
- 	} else {
- 		/*
--- 
-2.28.0
-
-
-From dacbdb36cc75ef32aa6b3dccfe5aef77f29bab90 Mon Sep 17 00:00:00 2001
-From: Huacai Chen <chenhc@lemote.com>
-Date: Sun, 29 Mar 2015 10:54:05 +0800
-Subject: [PATCH 10/65] MIPS: Hibernate: flush TLB entries earlier
-
-commit a843d00d038b11267279e3b5388222320f9ddc1d upstream.
-
-We found that TLB mismatch not only happens after kernel resume, but
-also happens during snapshot restore. So move it to the beginning of
-swsusp_arch_suspend().
-
-Signed-off-by: Huacai Chen <chenhc@lemote.com>
-Cc: Steven J. Hill <Steven.Hill@imgtec.com>
-Cc: linux-mips@linux-mips.org
-Cc: Fuxin Zhang <zhangfx@lemote.com>
-Cc: Zhangjin Wu <wuzhangjin@gmail.com>
-Patchwork: https://patchwork.linux-mips.org/patch/9621/
-Signed-off-by: Ralf Baechle <ralf@linux-mips.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/mips/power/hibernate.S | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/arch/mips/power/hibernate.S b/arch/mips/power/hibernate.S
-index 32a7c828f073..e7567c8a9e79 100644
---- a/arch/mips/power/hibernate.S
-+++ b/arch/mips/power/hibernate.S
-@@ -30,6 +30,8 @@ LEAF(swsusp_arch_suspend)
- END(swsusp_arch_suspend)
- 
- LEAF(swsusp_arch_resume)
-+	/* Avoid TLB mismatch during and after kernel resume */
-+	jal local_flush_tlb_all
- 	PTR_L t0, restore_pblist
- 0:
- 	PTR_L t1, PBE_ADDRESS(t0)   /* source */
-@@ -43,7 +45,6 @@ LEAF(swsusp_arch_resume)
- 	bne t1, t3, 1b
- 	PTR_L t0, PBE_NEXT(t0)
- 	bnez t0, 0b
--	jal local_flush_tlb_all /* Avoid TLB mismatch after kernel resume */
- 	PTR_LA t0, saved_regs
- 	PTR_L ra, PT_R31(t0)
- 	PTR_L sp, PT_R29(t0)
--- 
-2.28.0
-
-
-From 317ff32c67fed6260972f3f706abc05c1752b16e Mon Sep 17 00:00:00 2001
-From: Oliver Neukum <oneukum@suse.de>
-Date: Fri, 20 Mar 2015 14:29:34 +0100
-Subject: [PATCH 11/65] cdc-wdm: fix endianness bug in debug statements
-
-commit 323ece54e0761198946ecd0c2091f1d2bfdfcb64 upstream.
-
-Values directly from descriptors given in debug statements
-must be converted to native endianness.
-
-Signed-off-by: Oliver Neukum <oneukum@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/class/cdc-wdm.c | 12 +++++++-----
- 1 file changed, 7 insertions(+), 5 deletions(-)
-
-diff --git a/drivers/usb/class/cdc-wdm.c b/drivers/usb/class/cdc-wdm.c
-index 6463ca3bcfba..07133d0c971b 100644
---- a/drivers/usb/class/cdc-wdm.c
-+++ b/drivers/usb/class/cdc-wdm.c
-@@ -244,7 +244,7 @@ static void wdm_int_callback(struct urb *urb)
- 	case USB_CDC_NOTIFY_RESPONSE_AVAILABLE:
- 		dev_dbg(&desc->intf->dev,
- 			"NOTIFY_RESPONSE_AVAILABLE received: index %d len %d",
--			dr->wIndex, dr->wLength);
-+			le16_to_cpu(dr->wIndex), le16_to_cpu(dr->wLength));
- 		break;
- 
- 	case USB_CDC_NOTIFY_NETWORK_CONNECTION:
-@@ -257,7 +257,9 @@ static void wdm_int_callback(struct urb *urb)
- 		clear_bit(WDM_POLL_RUNNING, &desc->flags);
- 		dev_err(&desc->intf->dev,
- 			"unknown notification %d received: index %d len %d\n",
--			dr->bNotificationType, dr->wIndex, dr->wLength);
-+			dr->bNotificationType,
-+			le16_to_cpu(dr->wIndex),
-+			le16_to_cpu(dr->wLength));
- 		goto exit;
- 	}
- 
-@@ -403,7 +405,7 @@ static ssize_t wdm_write
- 			     USB_RECIP_INTERFACE);
- 	req->bRequest = USB_CDC_SEND_ENCAPSULATED_COMMAND;
- 	req->wValue = 0;
--	req->wIndex = desc->inum;
-+	req->wIndex = desc->inum; /* already converted */
- 	req->wLength = cpu_to_le16(count);
- 	set_bit(WDM_IN_USE, &desc->flags);
- 	desc->outbuf = buf;
-@@ -417,7 +419,7 @@ static ssize_t wdm_write
- 		rv = usb_translate_errors(rv);
- 	} else {
- 		dev_dbg(&desc->intf->dev, "Tx URB has been submitted index=%d",
--			req->wIndex);
-+			le16_to_cpu(req->wIndex));
- 	}
- out:
- 	usb_autopm_put_interface(desc->intf);
-@@ -780,7 +782,7 @@ static int wdm_create(struct usb_interface *intf, struct usb_endpoint_descriptor
- 	desc->irq->bRequestType = (USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE);
- 	desc->irq->bRequest = USB_CDC_GET_ENCAPSULATED_RESPONSE;
- 	desc->irq->wValue = 0;
--	desc->irq->wIndex = desc->inum;
-+	desc->irq->wIndex = desc->inum; /* already converted */
- 	desc->irq->wLength = cpu_to_le16(desc->wMaxCommand);
- 
- 	usb_fill_control_urb(
--- 
-2.28.0
-
-
-From 14a1fe5de9d7c391301b517e8effb5f098ada9c4 Mon Sep 17 00:00:00 2001
-From: Ian Abbott <abbotti@mev.co.uk>
-Date: Mon, 23 Mar 2015 17:50:27 +0000
-Subject: [PATCH 12/65] spi: spidev: fix possible arithmetic overflow for
- multi-transfer message
-
-commit f20fbaad7620af2df36a1f9d1c9ecf48ead5b747 upstream.
-
-`spidev_message()` sums the lengths of the individual SPI transfers to
-determine the overall SPI message length.  It restricts the total
-length, returning an error if too long, but it does not check for
-arithmetic overflow.  For example, if the SPI message consisted of two
-transfers and the first has a length of 10 and the second has a length
-of (__u32)(-1), the total length would be seen as 9, even though the
-second transfer is actually very long.  If the second transfer specifies
-a null `rx_buf` and a non-null `tx_buf`, the `copy_from_user()` could
-overrun the spidev's pre-allocated tx buffer before it reaches an
-invalid user memory address.  Fix it by checking that neither the total
-nor the individual transfer lengths exceed the maximum allowed value.
-
-Thanks to Dan Carpenter for reporting the potential integer overflow.
-
-Signed-off-by: Ian Abbott <abbotti@mev.co.uk>
-Signed-off-by: Mark Brown <broonie@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/spi/spidev.c | 5 ++++-
- 1 file changed, 4 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/spi/spidev.c b/drivers/spi/spidev.c
-index 911e9e0711d2..a08f923b9925 100644
---- a/drivers/spi/spidev.c
-+++ b/drivers/spi/spidev.c
-@@ -243,7 +243,10 @@ static int spidev_message(struct spidev_data *spidev,
- 		k_tmp->len = u_tmp->len;
- 
- 		total += k_tmp->len;
--		if (total > bufsiz) {
-+		/* Check total length of transfers.  Also check each
-+		 * transfer length to avoid arithmetic overflow.
-+		 */
-+		if (total > bufsiz || k_tmp->len > bufsiz) {
- 			status = -EMSGSIZE;
- 			goto done;
- 		}
--- 
-2.28.0
-
-
-From faf8db2e2247ac49104653eddfca2e1eeb7efeea Mon Sep 17 00:00:00 2001
-From: Steven Rostedt <rostedt@goodmis.org>
-Date: Tue, 17 Mar 2015 10:40:38 -0400
-Subject: [PATCH 13/65] ring-buffer: Replace this_cpu_*() with __this_cpu_*()
-
-commit 80a9b64e2c156b6523e7a01f2ba6e5d86e722814 upstream.
-
-It has come to my attention that this_cpu_read/write are horrible on
-architectures other than x86. Worse yet, they actually disable
-preemption or interrupts! This caused some unexpected tracing results
-on ARM.
-
-   101.356868: preempt_count_add <-ring_buffer_lock_reserve
-   101.356870: preempt_count_sub <-ring_buffer_lock_reserve
-
-The ring_buffer_lock_reserve has recursion protection that requires
-accessing a per cpu variable. But since preempt_disable() is traced, it
-too got traced while accessing the variable that is suppose to prevent
-recursion like this.
-
-The generic version of this_cpu_read() and write() are:
-
- #define this_cpu_generic_read(pcp)					\
- ({	typeof(pcp) ret__;						\
-	preempt_disable();						\
-	ret__ = *this_cpu_ptr(&(pcp));					\
-	preempt_enable();						\
-	ret__;								\
- })
-
- #define this_cpu_generic_to_op(pcp, val, op)				\
- do {									\
-	unsigned long flags;						\
-	raw_local_irq_save(flags);					\
-	*__this_cpu_ptr(&(pcp)) op val;					\
-	raw_local_irq_restore(flags);					\
- } while (0)
-
-Which is unacceptable for locations that know they are within preempt
-disabled or interrupt disabled locations.
-
-Paul McKenney stated that __this_cpu_() versions produce much better code on
-other architectures than this_cpu_() does, if we know that the call is done in
-a preempt disabled location.
-
-I also changed the recursive_unlock() to use two local variables instead
-of accessing the per_cpu variable twice.
-
-Link: http://lkml.kernel.org/r/20150317114411.GE3589@linux.vnet.ibm.com
-Link: http://lkml.kernel.org/r/20150317104038.312e73d1@gandalf.local.home
-
-Acked-by: Christoph Lameter <cl@linux.com>
-Reported-by: Uwe Kleine-Koenig <u.kleine-koenig@pengutronix.de>
-Tested-by: Uwe Kleine-Koenig <u.kleine-koenig@pengutronix.de>
-Signed-off-by: Steven Rostedt <rostedt@goodmis.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/trace/ring_buffer.c | 11 +++++------
- 1 file changed, 5 insertions(+), 6 deletions(-)
-
-diff --git a/kernel/trace/ring_buffer.c b/kernel/trace/ring_buffer.c
-index 3d9fee3a80b3..ab21b8c66535 100644
---- a/kernel/trace/ring_buffer.c
-+++ b/kernel/trace/ring_buffer.c
-@@ -2650,7 +2650,7 @@ static DEFINE_PER_CPU(unsigned int, current_context);
- 
- static __always_inline int trace_recursive_lock(void)
- {
--	unsigned int val = this_cpu_read(current_context);
-+	unsigned int val = __this_cpu_read(current_context);
- 	int bit;
- 
- 	if (in_interrupt()) {
-@@ -2667,18 +2667,17 @@ static __always_inline int trace_recursive_lock(void)
- 		return 1;
- 
- 	val |= (1 << bit);
--	this_cpu_write(current_context, val);
-+	__this_cpu_write(current_context, val);
- 
- 	return 0;
- }
- 
- static __always_inline void trace_recursive_unlock(void)
- {
--	unsigned int val = this_cpu_read(current_context);
-+	unsigned int val = __this_cpu_read(current_context);
- 
--	val--;
--	val &= this_cpu_read(current_context);
--	this_cpu_write(current_context, val);
-+	val &= val & (val - 1);
-+	__this_cpu_write(current_context, val);
- }
- 
- #else
--- 
-2.28.0
-
-
-From 7aea358e5c37d8f17e3911f21bd555d5533be7ec Mon Sep 17 00:00:00 2001
-From: Krzysztof Kozlowski <k.kozlowski@samsung.com>
-Date: Fri, 20 Feb 2015 14:32:25 +0100
-Subject: [PATCH 14/65] power_supply: lp8788-charger: Fix leaked power supply
- on probe fail
-
-commit a7117f81e8391e035c49b3440792f7e6cea28173 upstream.
-
-Driver forgot to unregister charger power supply if registering of
-battery supply failed in probe(). In such case the memory associated
-with power supply leaked.
-
-Signed-off-by: Krzysztof Kozlowski <k.kozlowski@samsung.com>
-Fixes: 98a276649358 ("power_supply: Add new lp8788 charger driver")
-Signed-off-by: Sebastian Reichel <sre@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/power/lp8788-charger.c | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/power/lp8788-charger.c b/drivers/power/lp8788-charger.c
-index ed49b50b220b..72da2a6c22db 100644
---- a/drivers/power/lp8788-charger.c
-+++ b/drivers/power/lp8788-charger.c
-@@ -417,8 +417,10 @@ static int lp8788_psy_register(struct platform_device *pdev,
- 	pchg->battery.num_properties = ARRAY_SIZE(lp8788_battery_prop);
- 	pchg->battery.get_property = lp8788_battery_get_property;
- 
--	if (power_supply_register(&pdev->dev, &pchg->battery))
-+	if (power_supply_register(&pdev->dev, &pchg->battery)) {
-+		power_supply_unregister(&pchg->charger);
- 		return -EPERM;
-+	}
- 
- 	return 0;
- }
--- 
-2.28.0
-
-
-From e26c761f5a57dc335748b2e730e89925744ce6c5 Mon Sep 17 00:00:00 2001
-From: Andrey Ryabinin <a.ryabinin@samsung.com>
-Date: Fri, 20 Mar 2015 15:42:27 +0100
-Subject: [PATCH 15/65] ARM: 8320/1: fix integer overflow in ELF_ET_DYN_BASE
-
-commit 8defb3367fcd19d1af64c07792aade0747b54e0f upstream.
-
-Usually ELF_ET_DYN_BASE is 2/3 of TASK_SIZE. With 3G/1G user/kernel
-split this is not so, because 2*TASK_SIZE overflows 32 bits,
-so the actual value of ELF_ET_DYN_BASE is:
-	(2 * TASK_SIZE / 3) = 0x2a000000
-
-When ASLR is disabled PIE binaries will load at ELF_ET_DYN_BASE address.
-On 32bit platforms AddressSanitzer uses addresses [0x20000000 - 0x40000000]
-for shadow memory [1]. So ASan doesn't work for PIE binaries when ASLR disabled
-as it fails to map shadow memory.
-Also after Kees's 'split ET_DYN ASLR from mmap ASLR' patchset PIE binaries
-has a high chance of loading somewhere in between [0x2a000000 - 0x40000000]
-even if ASLR enabled. This makes ASan with PIE absolutely incompatible.
-
-Fix overflow by dividing TASK_SIZE prior to multiplying.
-After this patch ELF_ET_DYN_BASE equals to (for CONFIG_VMSPLIT_3G=y):
-	(TASK_SIZE / 3 * 2) = 0x7f555554
-
-[1] https://code.google.com/p/address-sanitizer/wiki/AddressSanitizerAlgorithm#Mapping
-
-Signed-off-by: Andrey Ryabinin <a.ryabinin@samsung.com>
-Reported-by: Maria Guseva <m.guseva@samsung.com>
-Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/include/asm/elf.h | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
 diff --git a/arch/arm/include/asm/elf.h b/arch/arm/include/asm/elf.h
 index 56211f2084ef..ce6e30628cc1 100644
 --- a/arch/arm/include/asm/elf.h
@@ -959,31 +23,6 @@ index 56211f2084ef..ce6e30628cc1 100644
  
  /* When the program starts, a1 contains a pointer to a function to be 
     registered with atexit, as per the SVR4 ABI.  A value of 0 means we 
--- 
-2.28.0
-
-
-From c82d2edfe720101550a377afceb903a52ac44e19 Mon Sep 17 00:00:00 2001
-From: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
-Date: Fri, 27 Mar 2015 01:58:08 +0900
-Subject: [PATCH 16/65] ARM: S3C64XX: Use fixed IRQ bases to avoid conflicts on
- Cragganmore
-
-commit 4e330ae4ab2915444f1e6dca1358a910aa259362 upstream.
-
-There are two PMICs on Cragganmore, currently one dynamically assign
-its IRQ base and the other uses a fixed base. It is possible for the
-statically assigned PMIC to fail if its IRQ is taken by the dynamically
-assigned one. Fix this by statically assigning both the IRQ bases.
-
-Signed-off-by: Charles Keepax <ckeepax@opensource.wolfsonmicro.com>
-Signed-off-by: Kukjin Kim <kgene@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/mach-s3c64xx/crag6410.h      | 1 +
- arch/arm/mach-s3c64xx/mach-crag6410.c | 1 +
- 2 files changed, 2 insertions(+)
-
 diff --git a/arch/arm/mach-s3c64xx/crag6410.h b/arch/arm/mach-s3c64xx/crag6410.h
 index 4c3c9994fc2c..81dc722ced57 100644
 --- a/arch/arm/mach-s3c64xx/crag6410.h
@@ -1008,915 +47,6 @@ index 8ad88ace795a..5fa9ac9104e1 100644
  	.gpio_base = BANFF_PMIC_GPIO_BASE,
  	.soft_shutdown = true,
  
--- 
-2.28.0
-
-
-From 99cecd301837acb25276c629483eb11205176414 Mon Sep 17 00:00:00 2001
-From: Axel Lin <axel.lin@ingics.com>
-Date: Thu, 12 Mar 2015 09:15:28 +0800
-Subject: [PATCH 17/65] usb: phy: Find the right match in devm_usb_phy_match
-
-commit 869aee0f31429fa9d94d5aef539602b73ae0cf4b upstream.
-
-The res parameter passed to devm_usb_phy_match() is the location where the
-pointer to the usb_phy is stored, hence it needs to be dereferenced before
-comparing to the match data in order to find the correct match.
-
-Fixes: 410219dcd2ba ("usb: otg: utils: devres: Add API's to associate a device with the phy")
-Signed-off-by: Axel Lin <axel.lin@ingics.com>
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/phy/phy.c | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/usb/phy/phy.c b/drivers/usb/phy/phy.c
-index a9984c700d2c..5f79d8e2caab 100644
---- a/drivers/usb/phy/phy.c
-+++ b/drivers/usb/phy/phy.c
-@@ -78,7 +78,9 @@ static void devm_usb_phy_release(struct device *dev, void *res)
- 
- static int devm_usb_phy_match(struct device *dev, void *res, void *match_data)
- {
--	return res == match_data;
-+	struct usb_phy **phy = res;
-+
-+	return *phy == match_data;
- }
- 
- /**
--- 
-2.28.0
-
-
-From 7a2d2855fc7ba8eb962ff596f188b894f2b57eb1 Mon Sep 17 00:00:00 2001
-From: Felipe Balbi <balbi@ti.com>
-Date: Fri, 13 Feb 2015 14:34:25 -0600
-Subject: [PATCH 18/65] usb: define a generic USB_RESUME_TIMEOUT macro
-
-commit 62f0342de1f012f3e90607d39e20fce811391169 upstream.
-
-Every USB Host controller should use this new
-macro to define for how long resume signalling
-should be driven on the bus.
-
-Currently, almost every single USB controller
-is using a 20ms timeout for resume signalling.
-
-That's problematic for two reasons:
-
-a) sometimes that 20ms timer expires a little
-before 20ms, which makes us fail certification
-
-b) some (many) devices actually need more than
-20ms resume signalling.
-
-Sure, in case of (b) we can state that the device
-is against the USB spec, but the fact is that
-we have no control over which device the certification
-lab will use. We also have no control over which host
-they will use. Most likely they'll be using a Windows
-PC which, again, we have no control over how that
-USB stack is written and how long resume signalling
-they are using.
-
-At the end of the day, we must make sure Linux passes
-electrical compliance when working as Host or as Device
-and currently we don't pass compliance as host because
-we're driving resume signallig for exactly 20ms and
-that confuses certification test setup resulting in
-Certification failure.
-
-Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Acked-by: Peter Chen <peter.chen@freescale.com>
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/usb.h | 26 ++++++++++++++++++++++++++
- 1 file changed, 26 insertions(+)
-
-diff --git a/include/linux/usb.h b/include/linux/usb.h
-index a0bee5a28d1a..28bd3a898cba 100644
---- a/include/linux/usb.h
-+++ b/include/linux/usb.h
-@@ -206,6 +206,32 @@ void usb_put_intf(struct usb_interface *intf);
- #define USB_MAXINTERFACES	32
- #define USB_MAXIADS		(USB_MAXINTERFACES/2)
- 
-+/*
-+ * USB Resume Timer: Every Host controller driver should drive the resume
-+ * signalling on the bus for the amount of time defined by this macro.
-+ *
-+ * That way we will have a 'stable' behavior among all HCDs supported by Linux.
-+ *
-+ * Note that the USB Specification states we should drive resume for *at least*
-+ * 20 ms, but it doesn't give an upper bound. This creates two possible
-+ * situations which we want to avoid:
-+ *
-+ * (a) sometimes an msleep(20) might expire slightly before 20 ms, which causes
-+ * us to fail USB Electrical Tests, thus failing Certification
-+ *
-+ * (b) Some (many) devices actually need more than 20 ms of resume signalling,
-+ * and while we can argue that's against the USB Specification, we don't have
-+ * control over which devices a certification laboratory will be using for
-+ * certification. If CertLab uses a device which was tested against Windows and
-+ * that happens to have relaxed resume signalling rules, we might fall into
-+ * situations where we fail interoperability and electrical tests.
-+ *
-+ * In order to avoid both conditions, we're using a 40 ms resume timeout, which
-+ * should cope with both LPJ calibration errors and devices not following every
-+ * detail of the USB Specification.
-+ */
-+#define USB_RESUME_TIMEOUT	40 /* ms */
-+
- /**
-  * struct usb_interface_cache - long-term representation of a device interface
-  * @num_altsetting: number of altsettings defined.
--- 
-2.28.0
-
-
-From 3a8c01bc40fd66c07e8e943dd36dc9bc2090d6aa Mon Sep 17 00:00:00 2001
-From: Felipe Balbi <balbi@ti.com>
-Date: Fri, 13 Feb 2015 14:58:53 -0600
-Subject: [PATCH 19/65] usb: host: r8a66597: use new USB_RESUME_TIMEOUT
-
-commit 7a606ac29752a3e571b83f9b3fceb1eaa1d37781 upstream.
-
-While this driver was already using a 50ms resume
-timeout, let's make sure everybody uses the same
-macro so it's easy to fix later should anything
-go wrong.
-
-It also gives a more "stable" expectation to Linux
-users.
-
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/host/r8a66597-hcd.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/usb/host/r8a66597-hcd.c b/drivers/usb/host/r8a66597-hcd.c
-index a6fd8f5371df..6656dfda5665 100644
---- a/drivers/usb/host/r8a66597-hcd.c
-+++ b/drivers/usb/host/r8a66597-hcd.c
-@@ -2301,7 +2301,7 @@ static int r8a66597_bus_resume(struct usb_hcd *hcd)
- 		rh->port &= ~USB_PORT_STAT_SUSPEND;
- 		rh->port |= USB_PORT_STAT_C_SUSPEND << 16;
- 		r8a66597_mdfy(r8a66597, RESUME, RESUME | UACT, dvstctr_reg);
--		msleep(50);
-+		msleep(USB_RESUME_TIMEOUT);
- 		r8a66597_mdfy(r8a66597, UACT, RESUME | UACT, dvstctr_reg);
- 	}
- 
--- 
-2.28.0
-
-
-From 38faf1a5651345e72bf176a45877400329fc411d Mon Sep 17 00:00:00 2001
-From: Felipe Balbi <balbi@ti.com>
-Date: Fri, 13 Feb 2015 14:50:10 -0600
-Subject: [PATCH 20/65] usb: host: isp116x: use new USB_RESUME_TIMEOUT
-
-commit 8c0ae6574ccfd3d619876a65829aad74c9d22ba5 upstream.
-
-Make sure we're using the new macro, so our
-resume signaling will always pass certification.
-
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/host/isp116x-hcd.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/usb/host/isp116x-hcd.c b/drivers/usb/host/isp116x-hcd.c
-index b64e661618bb..baf2807934c1 100644
---- a/drivers/usb/host/isp116x-hcd.c
-+++ b/drivers/usb/host/isp116x-hcd.c
-@@ -1488,7 +1488,7 @@ static int isp116x_bus_resume(struct usb_hcd *hcd)
- 	spin_unlock_irq(&isp116x->lock);
- 
- 	hcd->state = HC_STATE_RESUMING;
--	msleep(20);
-+	msleep(USB_RESUME_TIMEOUT);
- 
- 	/* Go operational */
- 	spin_lock_irq(&isp116x->lock);
--- 
-2.28.0
-
-
-From 181d303cb1c16ef27ad48314675cbe47e6e45ffb Mon Sep 17 00:00:00 2001
-From: Felipe Balbi <balbi@ti.com>
-Date: Fri, 13 Feb 2015 14:39:13 -0600
-Subject: [PATCH 21/65] usb: host: xhci: use new USB_RESUME_TIMEOUT
-
-commit b9e451885deb6262dbaf5cd14aa77d192d9ac759 upstream.
-
-Make sure we're using the new macro, so our
-resume signaling will always pass certification.
-
-Acked-by: Mathias Nyman <mathias.nyman@linux.intel.com>
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/host/xhci-ring.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
-index 9948890ef93e..bc7a886e3c36 100644
---- a/drivers/usb/host/xhci-ring.c
-+++ b/drivers/usb/host/xhci-ring.c
-@@ -1697,7 +1697,7 @@ static void handle_port_status(struct xhci_hcd *xhci,
- 		} else {
- 			xhci_dbg(xhci, "resume HS port %d\n", port_id);
- 			bus_state->resume_done[faked_port_index] = jiffies +
--				msecs_to_jiffies(20);
-+				msecs_to_jiffies(USB_RESUME_TIMEOUT);
- 			set_bit(faked_port_index, &bus_state->resuming_ports);
- 			mod_timer(&hcd->rh_timer,
- 				  bus_state->resume_done[faked_port_index]);
--- 
-2.28.0
-
-
-From e0565f62a0e1ebfe6fa62e633f75c2ec8be522c9 Mon Sep 17 00:00:00 2001
-From: Felipe Balbi <balbi@ti.com>
-Date: Fri, 13 Feb 2015 15:00:38 -0600
-Subject: [PATCH 22/65] usb: host: sl811: use new USB_RESUME_TIMEOUT
-
-commit 08debfb13b199716da6153940c31968c556b195d upstream.
-
-Make sure we're using the new macro, so our
-resume signaling will always pass certification.
-
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/host/sl811-hcd.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/usb/host/sl811-hcd.c b/drivers/usb/host/sl811-hcd.c
-index b2ec7fe758dd..b4cad9346035 100644
---- a/drivers/usb/host/sl811-hcd.c
-+++ b/drivers/usb/host/sl811-hcd.c
-@@ -1251,7 +1251,7 @@ sl811h_hub_control(
- 			sl811_write(sl811, SL11H_CTLREG1, sl811->ctrl1);
- 
- 			mod_timer(&sl811->timer, jiffies
--					+ msecs_to_jiffies(20));
-+					+ msecs_to_jiffies(USB_RESUME_TIMEOUT));
- 			break;
- 		case USB_PORT_FEAT_POWER:
- 			port_power(sl811, 0);
--- 
-2.28.0
-
-
-From e217fcc13682beef6eaafbb5a419e6b50ddf94b9 Mon Sep 17 00:00:00 2001
-From: Felipe Balbi <balbi@ti.com>
-Date: Fri, 13 Feb 2015 15:38:33 -0600
-Subject: [PATCH 23/65] usb: core: hub: use new USB_RESUME_TIMEOUT
-
-commit bbc78c07a51f6fd29c227b1220a9016e585358ba upstream.
-
-Make sure we're using the new macro, so our
-resume signaling will always pass certification.
-
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/core/hub.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
-index c9f56ffdba9a..11a073cda1d6 100644
---- a/drivers/usb/core/hub.c
-+++ b/drivers/usb/core/hub.c
-@@ -3282,10 +3282,10 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
- 		dev_dbg(hub->intfdev, "can't resume port %d, status %d\n",
- 				port1, status);
- 	} else {
--		/* drive resume for at least 20 msec */
-+		/* drive resume for USB_RESUME_TIMEOUT msec */
- 		dev_dbg(&udev->dev, "usb %sresume\n",
- 				(PMSG_IS_AUTO(msg) ? "auto-" : ""));
--		msleep(25);
-+		msleep(USB_RESUME_TIMEOUT);
- 
- 		/* Virtual root hubs can trigger on GET_PORT_STATUS to
- 		 * stop resume signaling.  Then finish the resume
--- 
-2.28.0
-
-
-From 6c6f8aac03406e6cba87267a6075b4e3340af892 Mon Sep 17 00:00:00 2001
-From: Michael Gernoth <michael@gernoth.net>
-Date: Thu, 9 Apr 2015 23:42:15 +0200
-Subject: [PATCH 24/65] ALSA: emu10k1: don't deadlock in proc-functions
-
-commit 91bf0c2dcb935a87e5c0795f5047456b965fd143 upstream.
-
-The functions snd_emu10k1_proc_spdif_read and snd_emu1010_fpga_read
-acquire the emu_lock before accessing the FPGA. The function used
-to access the FPGA (snd_emu1010_fpga_read) also tries to take
-the emu_lock which causes a deadlock.
-Remove the outer locking in the proc-functions (guarding only the
-already safe fpga read) to prevent this deadlock.
-
-[removed superfluous flags variables too -- tiwai]
-
-Signed-off-by: Michael Gernoth <michael@gernoth.net>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/emu10k1/emuproc.c | 12 ------------
- 1 file changed, 12 deletions(-)
-
-diff --git a/sound/pci/emu10k1/emuproc.c b/sound/pci/emu10k1/emuproc.c
-index 2ca9f2e93139..53745f4c2bf5 100644
---- a/sound/pci/emu10k1/emuproc.c
-+++ b/sound/pci/emu10k1/emuproc.c
-@@ -241,31 +241,22 @@ static void snd_emu10k1_proc_spdif_read(struct snd_info_entry *entry,
- 	struct snd_emu10k1 *emu = entry->private_data;
- 	u32 value;
- 	u32 value2;
--	unsigned long flags;
- 	u32 rate;
- 
- 	if (emu->card_capabilities->emu_model) {
--		spin_lock_irqsave(&emu->emu_lock, flags);
- 		snd_emu1010_fpga_read(emu, 0x38, &value);
--		spin_unlock_irqrestore(&emu->emu_lock, flags);
- 		if ((value & 0x1) == 0) {
--			spin_lock_irqsave(&emu->emu_lock, flags);
- 			snd_emu1010_fpga_read(emu, 0x2a, &value);
- 			snd_emu1010_fpga_read(emu, 0x2b, &value2);
--			spin_unlock_irqrestore(&emu->emu_lock, flags);
- 			rate = 0x1770000 / (((value << 5) | value2)+1);	
- 			snd_iprintf(buffer, "ADAT Locked : %u\n", rate);
- 		} else {
- 			snd_iprintf(buffer, "ADAT Unlocked\n");
- 		}
--		spin_lock_irqsave(&emu->emu_lock, flags);
- 		snd_emu1010_fpga_read(emu, 0x20, &value);
--		spin_unlock_irqrestore(&emu->emu_lock, flags);
- 		if ((value & 0x4) == 0) {
--			spin_lock_irqsave(&emu->emu_lock, flags);
- 			snd_emu1010_fpga_read(emu, 0x28, &value);
- 			snd_emu1010_fpga_read(emu, 0x29, &value2);
--			spin_unlock_irqrestore(&emu->emu_lock, flags);
- 			rate = 0x1770000 / (((value << 5) | value2)+1);	
- 			snd_iprintf(buffer, "SPDIF Locked : %d\n", rate);
- 		} else {
-@@ -410,14 +401,11 @@ static void snd_emu_proc_emu1010_reg_read(struct snd_info_entry *entry,
- {
- 	struct snd_emu10k1 *emu = entry->private_data;
- 	u32 value;
--	unsigned long flags;
- 	int i;
- 	snd_iprintf(buffer, "EMU1010 Registers:\n\n");
- 
- 	for(i = 0; i < 0x40; i+=1) {
--		spin_lock_irqsave(&emu->emu_lock, flags);
- 		snd_emu1010_fpga_read(emu, i, &value);
--		spin_unlock_irqrestore(&emu->emu_lock, flags);
- 		snd_iprintf(buffer, "%02X: %08X, %02X\n", i, value, (value >> 8) & 0x7f);
- 	}
- }
--- 
-2.28.0
-
-
-From b9c4062783872c5e6e7cda86e0fb55b34be41943 Mon Sep 17 00:00:00 2001
-From: Ulrik De Bie <ulrik.debie-os@e2big.org>
-Date: Mon, 6 Apr 2015 15:35:38 -0700
-Subject: [PATCH 25/65] Input: elantech - fix absolute mode setting on some
- ASUS laptops
-
-commit bd884149aca61de269fd9bad83fe2a4232ffab21 upstream.
-
-On ASUS TP500LN and X750JN, the touchpad absolute mode is reset each
-time set_rate is done.
-
-In order to fix this, we will verify the firmware version, and if it
-matches the one in those laptops, the set_rate function is overloaded
-with a function elantech_set_rate_restore_reg_07 that performs the
-set_rate with the original function, followed by a restore of reg_07
-(the register that sets the absolute mode on elantech v4 hardware).
-
-Also the ASUS TP500LN and X750JN firmware version, capabilities, and
-button constellation is added to elantech.c
-
-Reported-and-tested-by: George Moutsopoulos <gmoutso@yahoo.co.uk>
-Signed-off-by: Ulrik De Bie <ulrik.debie-os@e2big.org>
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/input/mouse/elantech.c | 22 ++++++++++++++++++++++
- drivers/input/mouse/elantech.h |  1 +
- 2 files changed, 23 insertions(+)
-
-diff --git a/drivers/input/mouse/elantech.c b/drivers/input/mouse/elantech.c
-index 85e75239c814..1af7df263368 100644
---- a/drivers/input/mouse/elantech.c
-+++ b/drivers/input/mouse/elantech.c
-@@ -783,6 +783,21 @@ static psmouse_ret_t elantech_process_byte(struct psmouse *psmouse)
- 	return PSMOUSE_FULL_PACKET;
- }
- 
-+/*
-+ * This writes the reg_07 value again to the hardware at the end of every
-+ * set_rate call because the register loses its value. reg_07 allows setting
-+ * absolute mode on v4 hardware
-+ */
-+static void elantech_set_rate_restore_reg_07(struct psmouse *psmouse,
-+		unsigned int rate)
-+{
-+	struct elantech_data *etd = psmouse->private;
-+
-+	etd->original_set_rate(psmouse, rate);
-+	if (elantech_write_reg(psmouse, 0x07, etd->reg_07))
-+		psmouse_err(psmouse, "restoring reg_07 failed\n");
-+}
-+
- /*
-  * Put the touchpad into absolute mode
-  */
-@@ -985,6 +1000,8 @@ static int elantech_get_resolution_v4(struct psmouse *psmouse,
-  * Asus K53SV              0x450f01        78, 15, 0c      2 hw buttons
-  * Asus G46VW              0x460f02        00, 18, 0c      2 hw buttons
-  * Asus G750JX             0x360f00        00, 16, 0c      2 hw buttons
-+ * Asus TP500LN            0x381f17        10, 14, 0e      clickpad
-+ * Asus X750JN             0x381f17        10, 14, 0e      clickpad
-  * Asus UX31               0x361f00        20, 15, 0e      clickpad
-  * Asus UX32VD             0x361f02        00, 15, 0e      clickpad
-  * Avatar AVIU-145A2       0x361f00        ?               clickpad
-@@ -1452,6 +1469,11 @@ int elantech_init(struct psmouse *psmouse)
- 		goto init_fail;
- 	}
- 
-+	if (etd->fw_version == 0x381f17) {
-+		etd->original_set_rate = psmouse->set_rate;
-+		psmouse->set_rate = elantech_set_rate_restore_reg_07;
-+	}
-+
- 	if (elantech_set_input_params(psmouse)) {
- 		psmouse_err(psmouse, "failed to query touchpad range.\n");
- 		goto init_fail;
-diff --git a/drivers/input/mouse/elantech.h b/drivers/input/mouse/elantech.h
-index c1c15ab6872d..13a12ccbff51 100644
---- a/drivers/input/mouse/elantech.h
-+++ b/drivers/input/mouse/elantech.h
-@@ -138,6 +138,7 @@ struct elantech_data {
- 	struct finger_pos mt[ETP_MAX_FINGERS];
- 	unsigned char parity[256];
- 	int (*send_cmd)(struct psmouse *psmouse, unsigned char c, unsigned char *param);
-+	void (*original_set_rate)(struct psmouse *psmouse, unsigned int rate);
- };
- 
- #ifdef CONFIG_MOUSE_PS2_ELANTECH
--- 
-2.28.0
-
-
-From 00c65c8a660bd5b5d4228137ff5be2654dd1840a Mon Sep 17 00:00:00 2001
-From: Michael Davidson <md@google.com>
-Date: Tue, 14 Apr 2015 15:47:38 -0700
-Subject: [PATCH 26/65] fs/binfmt_elf.c: fix bug in loading of PIE binaries
-
-commit a87938b2e246b81b4fb713edb371a9fa3c5c3c86 upstream.
-
-With CONFIG_ARCH_BINFMT_ELF_RANDOMIZE_PIE enabled, and a normal top-down
-address allocation strategy, load_elf_binary() will attempt to map a PIE
-binary into an address range immediately below mm->mmap_base.
-
-Unfortunately, load_elf_ binary() does not take account of the need to
-allocate sufficient space for the entire binary which means that, while
-the first PT_LOAD segment is mapped below mm->mmap_base, the subsequent
-PT_LOAD segment(s) end up being mapped above mm->mmap_base into the are
-that is supposed to be the "gap" between the stack and the binary.
-
-Since the size of the "gap" on x86_64 is only guaranteed to be 128MB this
-means that binaries with large data segments > 128MB can end up mapping
-part of their data segment over their stack resulting in corruption of the
-stack (and the data segment once the binary starts to run).
-
-Any PIE binary with a data segment > 128MB is vulnerable to this although
-address randomization means that the actual gap between the stack and the
-end of the binary is normally greater than 128MB.  The larger the data
-segment of the binary the higher the probability of failure.
-
-Fix this by calculating the total size of the binary in the same way as
-load_elf_interp().
-
-Signed-off-by: Michael Davidson <md@google.com>
-Cc: Alexander Viro <viro@zeniv.linux.org.uk>
-Cc: Jiri Kosina <jkosina@suse.cz>
-Cc: Kees Cook <keescook@chromium.org>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/binfmt_elf.c | 9 ++++++++-
- 1 file changed, 8 insertions(+), 1 deletion(-)
-
-diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
-index 3c4d8797ea9a..53f620a4350e 100644
---- a/fs/binfmt_elf.c
-+++ b/fs/binfmt_elf.c
-@@ -756,6 +756,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
- 	    i < loc->elf_ex.e_phnum; i++, elf_ppnt++) {
- 		int elf_prot = 0, elf_flags;
- 		unsigned long k, vaddr;
-+		unsigned long total_size = 0;
- 
- 		if (elf_ppnt->p_type != PT_LOAD)
- 			continue;
-@@ -820,10 +821,16 @@ static int load_elf_binary(struct linux_binprm *bprm)
- #else
- 			load_bias = ELF_PAGESTART(ELF_ET_DYN_BASE - vaddr);
- #endif
-+			total_size = total_mapping_size(elf_phdata,
-+							loc->elf_ex.e_phnum);
-+			if (!total_size) {
-+				error = -EINVAL;
-+				goto out_free_dentry;
-+			}
- 		}
- 
- 		error = elf_map(bprm->file, load_bias + vaddr, elf_ppnt,
--				elf_prot, elf_flags, 0);
-+				elf_prot, elf_flags, total_size);
- 		if (BAD_ADDR(error)) {
- 			send_sig(SIGKILL, current, 0);
- 			retval = IS_ERR((void *)error) ?
--- 
-2.28.0
-
-
-From ddb56eac0e63d9eea725bbbebdb3d1df7e58242c Mon Sep 17 00:00:00 2001
-From: Oleg Nesterov <oleg@redhat.com>
-Date: Thu, 16 Apr 2015 12:47:29 -0700
-Subject: [PATCH 27/65] ptrace: fix race between ptrace_resume() and
- wait_task_stopped()
-
-commit b72c186999e689cb0b055ab1c7b3cd8fffbeb5ed upstream.
-
-ptrace_resume() is called when the tracee is still __TASK_TRACED.  We set
-tracee->exit_code and then wake_up_state() changes tracee->state.  If the
-tracer's sub-thread does wait() in between, task_stopped_code(ptrace => T)
-wrongly looks like another report from tracee.
-
-This confuses debugger, and since wait_task_stopped() clears ->exit_code
-the tracee can miss a signal.
-
-Test-case:
-
-	#include <stdio.h>
-	#include <unistd.h>
-	#include <sys/wait.h>
-	#include <sys/ptrace.h>
-	#include <pthread.h>
-	#include <assert.h>
-
-	int pid;
-
-	void *waiter(void *arg)
-	{
-		int stat;
-
-		for (;;) {
-			assert(pid == wait(&stat));
-			assert(WIFSTOPPED(stat));
-			if (WSTOPSIG(stat) == SIGHUP)
-				continue;
-
-			assert(WSTOPSIG(stat) == SIGCONT);
-			printf("ERR! extra/wrong report:%x\n", stat);
-		}
-	}
-
-	int main(void)
-	{
-		pthread_t thread;
-
-		pid = fork();
-		if (!pid) {
-			assert(ptrace(PTRACE_TRACEME, 0,0,0) == 0);
-			for (;;)
-				kill(getpid(), SIGHUP);
-		}
-
-		assert(pthread_create(&thread, NULL, waiter, NULL) == 0);
-
-		for (;;)
-			ptrace(PTRACE_CONT, pid, 0, SIGCONT);
-
-		return 0;
-	}
-
-Note for stable: the bug is very old, but without 9899d11f6544 "ptrace:
-ensure arch_ptrace/ptrace_request can never race with SIGKILL" the fix
-should use lock_task_sighand(child).
-
-Signed-off-by: Oleg Nesterov <oleg@redhat.com>
-Reported-by: Pavel Labath <labath@google.com>
-Tested-by: Pavel Labath <labath@google.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/ptrace.c | 20 ++++++++++++++++++++
- 1 file changed, 20 insertions(+)
-
-diff --git a/kernel/ptrace.c b/kernel/ptrace.c
-index afadcf7b4a22..118323bc8529 100644
---- a/kernel/ptrace.c
-+++ b/kernel/ptrace.c
-@@ -720,6 +720,8 @@ static int ptrace_peek_siginfo(struct task_struct *child,
- static int ptrace_resume(struct task_struct *child, long request,
- 			 unsigned long data)
- {
-+	bool need_siglock;
-+
- 	if (!valid_signal(data))
- 		return -EIO;
- 
-@@ -747,8 +749,26 @@ static int ptrace_resume(struct task_struct *child, long request,
- 		user_disable_single_step(child);
- 	}
- 
-+	/*
-+	 * Change ->exit_code and ->state under siglock to avoid the race
-+	 * with wait_task_stopped() in between; a non-zero ->exit_code will
-+	 * wrongly look like another report from tracee.
-+	 *
-+	 * Note that we need siglock even if ->exit_code == data and/or this
-+	 * status was not reported yet, the new status must not be cleared by
-+	 * wait_task_stopped() after resume.
-+	 *
-+	 * If data == 0 we do not care if wait_task_stopped() reports the old
-+	 * status and clears the code too; this can't race with the tracee, it
-+	 * takes siglock after resume.
-+	 */
-+	need_siglock = data && !thread_group_empty(current);
-+	if (need_siglock)
-+		spin_lock_irq(&child->sighand->siglock);
- 	child->exit_code = data;
- 	wake_up_state(child, __TASK_TRACED);
-+	if (need_siglock)
-+		spin_unlock_irq(&child->sighand->siglock);
- 
- 	return 0;
- }
--- 
-2.28.0
-
-
-From 11f0198def5b4c143885f630bd964e3c2909783a Mon Sep 17 00:00:00 2001
-From: Larry Finger <Larry.Finger@lwfinger.net>
-Date: Mon, 23 Mar 2015 18:14:10 -0500
-Subject: [PATCH 28/65] rtlwifi: rtl8192cu: Add new USB ID
-
-commit 2f92b314f4daff2117847ac5343c54d3d041bf78 upstream.
-
-USB ID 2001:330d is used for a D-Link DWA-131.
-
-Signed-off-by: Larry Finger <Larry.Finger@lwfinger.net>
-Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/rtlwifi/rtl8192cu/sw.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c b/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
-index e7a2af3ad05a..8cf0d3919b98 100644
---- a/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
-+++ b/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
-@@ -369,6 +369,7 @@ static struct usb_device_id rtl8192c_usb_ids[] = {
- 	{RTL_USB_DEVICE(0x2001, 0x3307, rtl92cu_hal_cfg)}, /*D-Link-Cameo*/
- 	{RTL_USB_DEVICE(0x2001, 0x3309, rtl92cu_hal_cfg)}, /*D-Link-Alpha*/
- 	{RTL_USB_DEVICE(0x2001, 0x330a, rtl92cu_hal_cfg)}, /*D-Link-Alpha*/
-+	{RTL_USB_DEVICE(0x2001, 0x330d, rtl92cu_hal_cfg)}, /*D-Link DWA-131 */
- 	{RTL_USB_DEVICE(0x2019, 0xab2b, rtl92cu_hal_cfg)}, /*Planex -Abocom*/
- 	{RTL_USB_DEVICE(0x20f4, 0x624d, rtl92cu_hal_cfg)}, /*TRENDNet*/
- 	{RTL_USB_DEVICE(0x2357, 0x0100, rtl92cu_hal_cfg)}, /*TP-Link WN8200ND*/
--- 
-2.28.0
-
-
-From 4cbb68afc05fe04c35f1b742639a9e4660219cd0 Mon Sep 17 00:00:00 2001
-From: Marek Vasut <marex@denx.de>
-Date: Thu, 26 Mar 2015 02:16:06 +0100
-Subject: [PATCH 29/65] rtlwifi: rtl8192cu: Add new device ID
-
-commit 9374e7d2fdcad3c36dafc8d3effd554bc702c4b6 upstream.
-
-Add new ID for ASUS N10 WiFi dongle.
-
-Signed-off-by: Marek Vasut <marex@denx.de>
-Tested-by: Marek Vasut <marex@denx.de>
-Cc: Larry Finger <Larry.Finger@lwfinger.net>
-Cc: John W. Linville <linville@tuxdriver.com>
-Acked-by: Larry Finger <Larry.Finger@lwfinger.net>
-Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/rtlwifi/rtl8192cu/sw.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c b/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
-index 8cf0d3919b98..7555095e0b74 100644
---- a/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
-+++ b/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
-@@ -313,6 +313,7 @@ static struct usb_device_id rtl8192c_usb_ids[] = {
- 	{RTL_USB_DEVICE(0x07b8, 0x8188, rtl92cu_hal_cfg)}, /*Abocom - Abocom*/
- 	{RTL_USB_DEVICE(0x07b8, 0x8189, rtl92cu_hal_cfg)}, /*Funai - Abocom*/
- 	{RTL_USB_DEVICE(0x0846, 0x9041, rtl92cu_hal_cfg)}, /*NetGear WNA1000M*/
-+	{RTL_USB_DEVICE(0x0b05, 0x17ba, rtl92cu_hal_cfg)}, /*ASUS-Edimax*/
- 	{RTL_USB_DEVICE(0x0bda, 0x5088, rtl92cu_hal_cfg)}, /*Thinkware-CC&C*/
- 	{RTL_USB_DEVICE(0x0df6, 0x0052, rtl92cu_hal_cfg)}, /*Sitecom - Edimax*/
- 	{RTL_USB_DEVICE(0x0df6, 0x005c, rtl92cu_hal_cfg)}, /*Sitecom - Edimax*/
--- 
-2.28.0
-
-
-From bd147d13c83f04522ef5693845926713bb10e360 Mon Sep 17 00:00:00 2001
-From: Geert Uytterhoeven <geert@linux-m68k.org>
-Date: Wed, 15 May 2013 22:51:15 +0200
-Subject: [PATCH 30/65] parport: disable PC-style parallel port support on cris
-
-commit cb1ff5f90e1550d5752521205506b99f1aa8b1e0 upstream.
-
-Signed-off-by: Geert Uytterhoeven <geert@linux-m68k.org>
-Cc: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/parport/Kconfig | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/parport/Kconfig b/drivers/parport/Kconfig
-index a50576081b34..dc82ef096f3b 100644
---- a/drivers/parport/Kconfig
-+++ b/drivers/parport/Kconfig
-@@ -36,7 +36,9 @@ if PARPORT
- config PARPORT_PC
- 	tristate "PC-style hardware"
- 	depends on (!SPARC64 || PCI) && !SPARC32 && !M32R && !FRV && !S390 && \
--		(!M68K || ISA) && !MN10300 && !AVR32 && !BLACKFIN && !XTENSA
-+		(!M68K || ISA) && !MN10300 && !AVR32 && !BLACKFIN && \
-+		!XTENSA && !CRIS
-+
- 	---help---
- 	  You should say Y here if you have a PC-style parallel port. All
- 	  IBM PC compatible computers and some Alphas have PC-style
--- 
-2.28.0
-
-
-From 7a9a57cb8d0311a007c5e3f64b93bcf0d46038f2 Mon Sep 17 00:00:00 2001
-From: Chen Gang <gang.chen@asianux.com>
-Date: Fri, 30 Aug 2013 12:09:57 +0800
-Subject: [PATCH 31/65] drivers: parport: Kconfig: exclude h8300 for PARPORT_PC
-
-commit d94bb2d756e525a7c67fa71762227533d48b03c9 upstream.
-
-h8300 does not support PARPORT_PC.
-
-The related error (with allmodconfig for h8300):
-
-    CC [M]  drivers/parport/parport_pc.o
-  drivers/parport/parport_pc.c:67:25: fatal error: asm/parport.h: No such file or directory
-
-Signed-off-by: Chen Gang <gang.chen@asianux.com>
-Cc: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/parport/Kconfig | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/parport/Kconfig b/drivers/parport/Kconfig
-index dc82ef096f3b..70694ce38be2 100644
---- a/drivers/parport/Kconfig
-+++ b/drivers/parport/Kconfig
-@@ -37,7 +37,7 @@ config PARPORT_PC
- 	tristate "PC-style hardware"
- 	depends on (!SPARC64 || PCI) && !SPARC32 && !M32R && !FRV && !S390 && \
- 		(!M68K || ISA) && !MN10300 && !AVR32 && !BLACKFIN && \
--		!XTENSA && !CRIS
-+		!XTENSA && !CRIS && !H8300
- 
- 	---help---
- 	  You should say Y here if you have a PC-style parallel port. All
--- 
-2.28.0
-
-
-From 55ce22eeb9e8090ccef3de9c8129046a4589de63 Mon Sep 17 00:00:00 2001
-From: Geert Uytterhoeven <geert@linux-m68k.org>
-Date: Fri, 17 May 2013 11:04:44 +0200
-Subject: [PATCH 32/65] console: Disable VGA text console support on cris
-
-commit 3535629264e69ddbec0bd44b6f9a119947fbe4e2 upstream.
-
-Signed-off-by: Geert Uytterhoeven <geert@linux-m68k.org>
-Cc: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/video/console/Kconfig | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/video/console/Kconfig b/drivers/video/console/Kconfig
-index bc922c47d046..84f04d9461a9 100644
---- a/drivers/video/console/Kconfig
-+++ b/drivers/video/console/Kconfig
-@@ -6,7 +6,9 @@ menu "Console display driver support"
- 
- config VGA_CONSOLE
- 	bool "VGA text console" if EXPERT || !X86
--	depends on !4xx && !8xx && !SPARC && !M68K && !PARISC && !FRV && !SUPERH && !BLACKFIN && !AVR32 && !MN10300 && (!ARM || ARCH_FOOTBRIDGE || ARCH_INTEGRATOR || ARCH_NETWINDER)
-+	depends on !4xx && !8xx && !SPARC && !M68K && !PARISC && !FRV && \
-+		!SUPERH && !BLACKFIN && !AVR32 && !MN10300 && !CRIS && \
-+		(!ARM || ARCH_FOOTBRIDGE || ARCH_INTEGRATOR || ARCH_NETWINDER)
- 	default y
- 	help
- 	  Saying Y here will allow you to use Linux in text mode through a
--- 
-2.28.0
-
-
-From d821f4be02a54eba7ef6d69f051f8a79aac09096 Mon Sep 17 00:00:00 2001
-From: Mark Brown <broonie@linaro.org>
-Date: Tue, 17 Dec 2013 23:37:01 +0000
-Subject: [PATCH 33/65] video: vgacon: Don't build on arm64
-
-commit ee23794b86689e655cedd616e98c03bc3c74f5ec upstream.
-
-arm64 is unlikely to have a VGA console and does not export screen_info
-causing build failures if the driver is build, for example in all*config.
-Add a dependency on !ARM64 to prevent this.
-
-This list is getting quite long, it may be easier to depend on a symbol
-which architectures that do support the driver can select.
-
-Signed-off-by: Mark Brown <broonie@linaro.org>
-[tomi.valkeinen@ti.com: moved && to first modified line]
-Signed-off-by: Tomi Valkeinen <tomi.valkeinen@ti.com>
-Cc: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/video/console/Kconfig | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/video/console/Kconfig b/drivers/video/console/Kconfig
-index 84f04d9461a9..37e62c7b3273 100644
---- a/drivers/video/console/Kconfig
-+++ b/drivers/video/console/Kconfig
-@@ -8,7 +8,8 @@ config VGA_CONSOLE
- 	bool "VGA text console" if EXPERT || !X86
- 	depends on !4xx && !8xx && !SPARC && !M68K && !PARISC && !FRV && \
- 		!SUPERH && !BLACKFIN && !AVR32 && !MN10300 && !CRIS && \
--		(!ARM || ARCH_FOOTBRIDGE || ARCH_INTEGRATOR || ARCH_NETWINDER)
-+		(!ARM || ARCH_FOOTBRIDGE || ARCH_INTEGRATOR || ARCH_NETWINDER) && \
-+		!ARM64
- 	default y
- 	help
- 	  Saying Y here will allow you to use Linux in text mode through a
--- 
-2.28.0
-
-
-From 9818f16f1af710d6475ad73d589903914e4584cd Mon Sep 17 00:00:00 2001
-From: Chen Gang <gang.chen@asianux.com>
-Date: Tue, 21 May 2013 10:46:05 +0100
-Subject: [PATCH 34/65] arm64: kernel: compiling issue, need delete
- read_current_timer()
-
-commit 6916b14ea140ff5c915895eefe9431888a39a84d upstream.
-
-Under arm64, we will calibrate the delay loop statically using a known
-timer frequency, so delete read_current_timer(), or it will cause
-compiling issue with allmodconfig.
-
-The related error:
-  ERROR: "read_current_timer" [lib/rbtree_test.ko] undefined!
-  ERROR: "read_current_timer" [lib/interval_tree_test.ko] undefined!
-  ERROR: "read_current_timer" [fs/ext4/ext4.ko] undefined!
-  ERROR: "read_current_timer" [crypto/tcrypt.ko] undefined!
-
-Signed-off-by: Chen Gang <gang.chen@asianux.com>
-Acked-by: Marc Zyngier <marc.zyngier@arm.com>
-Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
-Cc: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm64/include/asm/timex.h | 6 +++---
- arch/arm64/kernel/time.c       | 6 ------
- 2 files changed, 3 insertions(+), 9 deletions(-)
-
 diff --git a/arch/arm64/include/asm/timex.h b/arch/arm64/include/asm/timex.h
 index b24a31a7e2c9..81a076eb37fa 100644
 --- a/arch/arm64/include/asm/timex.h
@@ -1956,133 +86,81 @@ index a551f88ae2c1..03dc3718eb13 100644
  void __init time_init(void)
  {
  	u32 arch_timer_rate;
--- 
-2.28.0
-
-
-From 72a2c0394991ca2785f4fda903aeec82d578376a Mon Sep 17 00:00:00 2001
-From: Lukas Czerner <lczerner@redhat.com>
-Date: Fri, 3 Apr 2015 10:46:58 -0400
-Subject: [PATCH 35/65] ext4: make fsync to sync parent dir in no-journal for
- real this time
-
-commit e12fb97222fc41e8442896934f76d39ef99b590a upstream.
-
-Previously commit 14ece1028b3ed53ffec1b1213ffc6acaf79ad77c added a
-support for for syncing parent directory of newly created inodes to
-make sure that the inode is not lost after a power failure in
-no-journal mode.
-
-However this does not work in majority of cases, namely:
- - if the directory has inline data
- - if the directory is already indexed
- - if the directory already has at least one block and:
-	- the new entry fits into it
-	- or we've successfully converted it to indexed
-
-So in those cases we might lose the inode entirely even after fsync in
-the no-journal mode. This also includes ext2 default mode obviously.
-
-I've noticed this while running xfstest generic/321 and even though the
-test should fail (we need to run fsck after a crash in no-journal mode)
-I could not find a newly created entries even when if it was fsynced
-before.
-
-Fix this by adjusting the ext4_add_entry() successful exit paths to set
-the inode EXT4_STATE_NEWENTRY so that fsync has the chance to fsync the
-parent directory as well.
-
-Signed-off-by: Lukas Czerner <lczerner@redhat.com>
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Reviewed-by: Jan Kara <jack@suse.cz>
-Cc: Frank Mayhar <fmayhar@google.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ext4/namei.c | 20 +++++++++++---------
- 1 file changed, 11 insertions(+), 9 deletions(-)
-
-diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
-index f1312173fa90..facf8590b714 100644
---- a/fs/ext4/namei.c
-+++ b/fs/ext4/namei.c
-@@ -1880,7 +1880,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
- 			  struct inode *inode)
+diff --git a/arch/c6x/kernel/time.c b/arch/c6x/kernel/time.c
+index 356ee84cad95..04845aaf5985 100644
+--- a/arch/c6x/kernel/time.c
++++ b/arch/c6x/kernel/time.c
+@@ -49,7 +49,7 @@ u64 sched_clock(void)
+ 	return (tsc * sched_clock_multiplier) >> SCHED_CLOCK_SHIFT;
+ }
+ 
+-void time_init(void)
++void __init time_init(void)
  {
- 	struct inode *dir = dentry->d_parent->d_inode;
--	struct buffer_head *bh;
-+	struct buffer_head *bh = NULL;
- 	struct ext4_dir_entry_2 *de;
- 	struct ext4_dir_entry_tail *t;
- 	struct super_block *sb;
-@@ -1905,14 +1905,14 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
- 			return retval;
- 		if (retval == 1) {
- 			retval = 0;
--			return retval;
-+			goto out;
- 		}
- 	}
+ 	u64 tmp = (u64)NSEC_PER_SEC << SCHED_CLOCK_SHIFT;
  
- 	if (is_dx(dir)) {
- 		retval = ext4_dx_add_entry(handle, dentry, inode);
- 		if (!retval || (retval != ERR_BAD_DX_DIR))
--			return retval;
-+			goto out;
- 		ext4_clear_inode_flag(dir, EXT4_INODE_INDEX);
- 		dx_fallback++;
- 		ext4_mark_inode_dirty(handle, dir);
-@@ -1924,14 +1924,15 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
- 			return PTR_ERR(bh);
+diff --git a/arch/mips/include/asm/suspend.h b/arch/mips/include/asm/suspend.h
+deleted file mode 100644
+index 3adac3b53d19..000000000000
+--- a/arch/mips/include/asm/suspend.h
++++ /dev/null
+@@ -1,7 +0,0 @@
+-#ifndef __ASM_SUSPEND_H
+-#define __ASM_SUSPEND_H
+-
+-/* References to section boundaries */
+-extern const void __nosave_begin, __nosave_end;
+-
+-#endif /* __ASM_SUSPEND_H */
+diff --git a/arch/mips/power/cpu.c b/arch/mips/power/cpu.c
+index 521e5963df05..2129e67723ff 100644
+--- a/arch/mips/power/cpu.c
++++ b/arch/mips/power/cpu.c
+@@ -7,7 +7,7 @@
+  * Author: Hu Hongbing <huhb@lemote.com>
+  *	   Wu Zhangjin <wuzhangjin@gmail.com>
+  */
+-#include <asm/suspend.h>
++#include <asm/sections.h>
+ #include <asm/fpu.h>
+ #include <asm/dsp.h>
  
- 		retval = add_dirent_to_buf(handle, dentry, inode, NULL, bh);
--		if (retval != -ENOSPC) {
--			brelse(bh);
--			return retval;
--		}
-+		if (retval != -ENOSPC)
-+			goto out;
+diff --git a/arch/mips/power/hibernate.S b/arch/mips/power/hibernate.S
+index 32a7c828f073..e7567c8a9e79 100644
+--- a/arch/mips/power/hibernate.S
++++ b/arch/mips/power/hibernate.S
+@@ -30,6 +30,8 @@ LEAF(swsusp_arch_suspend)
+ END(swsusp_arch_suspend)
  
- 		if (blocks == 1 && !dx_fallback &&
--		    EXT4_HAS_COMPAT_FEATURE(sb, EXT4_FEATURE_COMPAT_DIR_INDEX))
--			return make_indexed_dir(handle, dentry, inode, bh);
-+		    EXT4_HAS_COMPAT_FEATURE(sb, EXT4_FEATURE_COMPAT_DIR_INDEX)) {
-+			retval = make_indexed_dir(handle, dentry, inode, bh);
-+			bh = NULL; /* make_indexed_dir releases bh */
-+			goto out;
-+		}
- 		brelse(bh);
- 	}
- 	bh = ext4_append(handle, dir, &block);
-@@ -1947,6 +1948,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
- 	}
+ LEAF(swsusp_arch_resume)
++	/* Avoid TLB mismatch during and after kernel resume */
++	jal local_flush_tlb_all
+ 	PTR_L t0, restore_pblist
+ 0:
+ 	PTR_L t1, PBE_ADDRESS(t0)   /* source */
+@@ -43,7 +45,6 @@ LEAF(swsusp_arch_resume)
+ 	bne t1, t3, 1b
+ 	PTR_L t0, PBE_NEXT(t0)
+ 	bnez t0, 0b
+-	jal local_flush_tlb_all /* Avoid TLB mismatch after kernel resume */
+ 	PTR_LA t0, saved_regs
+ 	PTR_L ra, PT_R31(t0)
+ 	PTR_L sp, PT_R29(t0)
+diff --git a/arch/powerpc/kernel/suspend.c b/arch/powerpc/kernel/suspend.c
+index 0167d53da30c..a531154cc0f3 100644
+--- a/arch/powerpc/kernel/suspend.c
++++ b/arch/powerpc/kernel/suspend.c
+@@ -9,9 +9,7 @@
  
- 	retval = add_dirent_to_buf(handle, dentry, inode, de, bh);
-+out:
- 	brelse(bh);
- 	if (retval == 0)
- 		ext4_set_inode_state(inode, EXT4_STATE_NEWENTRY);
--- 
-2.28.0
-
-
-From 903b1970c835f69a1e2f1bde5ac446691b396a5c Mon Sep 17 00:00:00 2001
-From: Anton Blanchard <anton@samba.org>
-Date: Tue, 14 Apr 2015 07:51:03 +1000
-Subject: [PATCH 36/65] powerpc/perf: Cap 64bit userspace backtraces to
- PERF_MAX_STACK_DEPTH
-
-commit 9a5cbce421a283e6aea3c4007f141735bf9da8c3 upstream.
-
-We cap 32bit userspace backtraces to PERF_MAX_STACK_DEPTH
-(currently 127), but we forgot to do the same for 64bit backtraces.
-
-Signed-off-by: Anton Blanchard <anton@samba.org>
-Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/powerpc/perf/callchain.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
+ #include <linux/mm.h>
+ #include <asm/page.h>
+-
+-/* References to section boundaries */
+-extern const void __nosave_begin, __nosave_end;
++#include <asm/sections.h>
+ 
+ /*
+  *	pfn_is_nosave - check if given pfn is in the 'nosave' section
 diff --git a/arch/powerpc/perf/callchain.c b/arch/powerpc/perf/callchain.c
 index 2396dda282cd..ead55351b254 100644
 --- a/arch/powerpc/perf/callchain.c
@@ -2096,455 +174,145 @@ index 2396dda282cd..ead55351b254 100644
  		fp = (unsigned long __user *) sp;
  		if (!valid_user_sp(sp, 1) || read_user_stack_64(fp, &next_sp))
  			return;
--- 
-2.28.0
-
-
-From bc7df9868f9e35cd883d7cb61bbf60de2413c450 Mon Sep 17 00:00:00 2001
-From: Thomas D <whissi@whissi.de>
-Date: Mon, 5 Jan 2015 21:37:23 +0100
-Subject: [PATCH 37/65] tools/power turbostat: Use $(CURDIR) instead of $(PWD)
- and add support for O= option in Makefile
-
-commit f82263c6989c31ae9b94cecddffb29dcbec38710 upstream.
-
-Since commit ee0778a30153
-("tools/power: turbostat: make Makefile a bit more capable")
-turbostat's Makefile is using
-
-  [...]
-  BUILD_OUTPUT    := $(PWD)
-  [...]
-
-which obviously causes trouble when building "turbostat" with
-
-  make -C /usr/src/linux/tools/power/x86/turbostat ARCH=x86 turbostat
-
-because GNU make does not update nor guarantee that $PWD is set.
-
-This patch changes the Makefile to use $CURDIR instead, which GNU make
-guarantees to set and update (i.e. when using "make -C ...") and also
-adds support for the O= option (see "make help" in your root of your
-kernel source tree for more details).
-
-Link: https://bugs.gentoo.org/show_bug.cgi?id=533918
-Fixes: ee0778a30153 ("tools/power: turbostat: make Makefile a bit more capable")
-Signed-off-by: Thomas D. <whissi@whissi.de>
-Cc: Mark Asselstine <mark.asselstine@windriver.com>
-Signed-off-by: Len Brown <len.brown@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/power/x86/turbostat/Makefile | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
-
-diff --git a/tools/power/x86/turbostat/Makefile b/tools/power/x86/turbostat/Makefile
-index d1b3a361e526..4039854560d0 100644
---- a/tools/power/x86/turbostat/Makefile
-+++ b/tools/power/x86/turbostat/Makefile
-@@ -1,8 +1,12 @@
- CC		= $(CROSS_COMPILE)gcc
--BUILD_OUTPUT	:= $(PWD)
-+BUILD_OUTPUT	:= $(CURDIR)
- PREFIX		:= /usr
- DESTDIR		:=
+diff --git a/arch/s390/kernel/suspend.c b/arch/s390/kernel/suspend.c
+index c479d2f9605b..58cbb75e89e9 100644
+--- a/arch/s390/kernel/suspend.c
++++ b/arch/s390/kernel/suspend.c
+@@ -9,12 +9,9 @@
+ #include <linux/pfn.h>
+ #include <linux/suspend.h>
+ #include <linux/mm.h>
++#include <asm/sections.h>
+ #include <asm/ctl_reg.h>
+-
+-/*
+- * References to section boundaries
+- */
+-extern const void __nosave_begin, __nosave_end;
++#include <asm/ipl.h>
  
-+ifeq ("$(origin O)", "command line")
-+	BUILD_OUTPUT := $(O)
-+endif
-+
- turbostat : turbostat.c
- CFLAGS +=	-Wall
- CFLAGS +=	-DMSRHEADER='"../../../../arch/x86/include/uapi/asm/msr-index.h"'
--- 
-2.28.0
-
-
-From ac38b131c6f9ccf52bf0687158540673da1d1f5b Mon Sep 17 00:00:00 2001
-From: Brian Norris <computersforpeace@gmail.com>
-Date: Sat, 28 Feb 2015 02:23:25 -0800
-Subject: [PATCH 38/65] UBI: account for bitflips in both the VID header and
- data
-
-commit 8eef7d70f7c6772c3490f410ee2bceab3b543fa1 upstream.
-
-We are completely discarding the earlier value of 'bitflips', which
-could reflect a bitflip found in ubi_io_read_vid_hdr(). Let's use the
-bitwise OR of header and data 'bitflip' statuses instead.
-
-Coverity CID #1226856
-
-Signed-off-by: Brian Norris <computersforpeace@gmail.com>
-Signed-off-by: Richard Weinberger <richard@nod.at>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/mtd/ubi/attach.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/mtd/ubi/attach.c b/drivers/mtd/ubi/attach.c
-index c071d410488f..79d69bd26dd2 100644
---- a/drivers/mtd/ubi/attach.c
-+++ b/drivers/mtd/ubi/attach.c
-@@ -408,7 +408,7 @@ int ubi_compare_lebs(struct ubi_device *ubi, const struct ubi_ainf_peb *aeb,
- 		second_is_newer = !second_is_newer;
- 	} else {
- 		dbg_bld("PEB %d CRC is OK", pnum);
--		bitflips = !!err;
-+		bitflips |= !!err;
- 	}
- 	mutex_unlock(&ubi->buf_mutex);
- 
--- 
-2.28.0
-
-
-From 5fd7a188f8471516981df3f6b061f7d2ea470616 Mon Sep 17 00:00:00 2001
-From: Brian Norris <computersforpeace@gmail.com>
-Date: Sat, 28 Feb 2015 02:23:26 -0800
-Subject: [PATCH 39/65] UBI: fix out of bounds write
-
-commit d74adbdb9abf0d2506a6c4afa534d894f28b763f upstream.
-
-If aeb->len >= vol->reserved_pebs, we should not be writing aeb into the
-PEB->LEB mapping.
-
-Caught by Coverity, CID #711212.
-
-Signed-off-by: Brian Norris <computersforpeace@gmail.com>
-Signed-off-by: Richard Weinberger <richard@nod.at>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/mtd/ubi/eba.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/mtd/ubi/eba.c b/drivers/mtd/ubi/eba.c
-index 0e11671dadc4..930cf2c77abb 100644
---- a/drivers/mtd/ubi/eba.c
-+++ b/drivers/mtd/ubi/eba.c
-@@ -1362,7 +1362,8 @@ int ubi_eba_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
- 				 * during re-size.
- 				 */
- 				ubi_move_aeb_to_list(av, aeb, &ai->erase);
--			vol->eba_tbl[aeb->lnum] = aeb->pnum;
-+			else
-+				vol->eba_tbl[aeb->lnum] = aeb->pnum;
- 		}
- 	}
- 
--- 
-2.28.0
-
-
-From 7e0a5b1f3d114523b282e71462dcf0cc6006a884 Mon Sep 17 00:00:00 2001
-From: Brian Norris <computersforpeace@gmail.com>
-Date: Sat, 28 Feb 2015 02:23:27 -0800
-Subject: [PATCH 40/65] UBI: initialize LEB number variable
-
-commit f16db8071ce18819fbd705ddcc91c6f392fb61f8 upstream.
-
-In some of the 'out_not_moved' error paths, lnum may be used
-uninitialized. Don't ignore the warning; let's fix it.
-
-This uninitialized variable doesn't have much visible effect in the end,
-since we just schedule the PEB for erasure, and its LEB number doesn't
-really matter (it just gets printed in debug messages). But let's get it
-straight anyway.
-
-Coverity CID #113449
-
-Signed-off-by: Brian Norris <computersforpeace@gmail.com>
-Signed-off-by: Richard Weinberger <richard@nod.at>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/mtd/ubi/wl.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/mtd/ubi/wl.c b/drivers/mtd/ubi/wl.c
-index 49e570abe58b..c08254016fe8 100644
---- a/drivers/mtd/ubi/wl.c
-+++ b/drivers/mtd/ubi/wl.c
-@@ -999,7 +999,7 @@ static int wear_leveling_worker(struct ubi_device *ubi, struct ubi_work *wrk,
- 				int cancel)
+ /*
+  * The restore of the saved pages in an hibernation image will set
+@@ -138,6 +135,8 @@ int pfn_is_nosave(unsigned long pfn)
  {
- 	int err, scrubbing = 0, torture = 0, protect = 0, erroneous = 0;
--	int vol_id = -1, uninitialized_var(lnum);
-+	int vol_id = -1, lnum = -1;
- #ifdef CONFIG_MTD_UBI_FASTMAP
- 	int anchor = wrk->anchor;
+ 	unsigned long nosave_begin_pfn = PFN_DOWN(__pa(&__nosave_begin));
+ 	unsigned long nosave_end_pfn = PFN_DOWN(__pa(&__nosave_end));
++	unsigned long eshared_pfn = PFN_DOWN(__pa(&_eshared)) - 1;
++	unsigned long stext_pfn = PFN_DOWN(__pa(&_stext));
+ 
+ 	/* Always save lowcore pages (LC protection might be enabled). */
+ 	if (pfn <= LC_PAGES)
+@@ -145,6 +144,8 @@ int pfn_is_nosave(unsigned long pfn)
+ 	if (pfn >= nosave_begin_pfn && pfn < nosave_end_pfn)
+ 		return 1;
+ 	/* Skip memory holes and read-only pages (NSS, DCSS, ...). */
++	if (pfn >= stext_pfn && pfn <= eshared_pfn)
++		return ipl_info.type == IPL_TYPE_NSS ? 1 : 0;
+ 	if (tprot(PFN_PHYS(pfn)))
+ 		return 1;
+ 	return 0;
+diff --git a/arch/s390/kvm/priv.c b/arch/s390/kvm/priv.c
+index 6bbd7b5a0bbe..0220c2ba7590 100644
+--- a/arch/s390/kvm/priv.c
++++ b/arch/s390/kvm/priv.c
+@@ -328,6 +328,7 @@ static void handle_stsi_3_2_2(struct kvm_vcpu *vcpu, struct sysinfo_3_2_2 *mem)
+ 	for (n = mem->count - 1; n > 0 ; n--)
+ 		memcpy(&mem->vm[n], &mem->vm[n - 1], sizeof(mem->vm[0]));
+ 
++	memset(&mem->vm[0], 0, sizeof(mem->vm[0]));
+ 	mem->vm[0].cpus_total = cpus;
+ 	mem->vm[0].cpus_configured = cpus;
+ 	mem->vm[0].cpus_standby = 0;
+diff --git a/arch/sh/include/asm/sections.h b/arch/sh/include/asm/sections.h
+index 1b6199740e98..7a99e6af6372 100644
+--- a/arch/sh/include/asm/sections.h
++++ b/arch/sh/include/asm/sections.h
+@@ -3,7 +3,6 @@
+ 
+ #include <asm-generic/sections.h>
+ 
+-extern long __nosave_begin, __nosave_end;
+ extern long __machvec_start, __machvec_end;
+ extern char __uncached_start, __uncached_end;
+ extern char __start_eh_frame[], __stop_eh_frame[];
+diff --git a/arch/sparc/power/hibernate.c b/arch/sparc/power/hibernate.c
+index 42b0b8ce699a..17bd2e167e07 100644
+--- a/arch/sparc/power/hibernate.c
++++ b/arch/sparc/power/hibernate.c
+@@ -9,11 +9,9 @@
+ #include <asm/hibernate.h>
+ #include <asm/visasm.h>
+ #include <asm/page.h>
++#include <asm/sections.h>
+ #include <asm/tlb.h>
+ 
+-/* References to section boundaries */
+-extern const void __nosave_begin, __nosave_end;
+-
+ struct saved_context saved_context;
+ 
+ /*
+diff --git a/arch/unicore32/include/mach/pm.h b/arch/unicore32/include/mach/pm.h
+index 4dcd34ae194c..77b522694e74 100644
+--- a/arch/unicore32/include/mach/pm.h
++++ b/arch/unicore32/include/mach/pm.h
+@@ -36,8 +36,5 @@ extern int puv3_pm_enter(suspend_state_t state);
+ /* Defined in hibernate_asm.S */
+ extern int restore_image(pgd_t *resume_pg_dir, struct pbe *restore_pblist);
+ 
+-/* References to section boundaries */
+-extern const void __nosave_begin, __nosave_end;
+-
+ extern struct pbe *restore_pblist;
  #endif
--- 
-2.28.0
-
-
-From a4014203612e80fb6de1e0f3f70de84ad8ba75fa Mon Sep 17 00:00:00 2001
-From: Brian Norris <computersforpeace@gmail.com>
-Date: Sat, 28 Feb 2015 02:23:28 -0800
-Subject: [PATCH 41/65] UBI: fix check for "too many bytes"
-
-commit 299d0c5b27346a77a0777c993372bf8777d4f2e5 upstream.
-
-The comparison from the previous line seems to have been erroneously
-(partially) copied-and-pasted onto the next. The second line should be
-checking req.bytes, not req.lnum.
-
-Coverity CID #139400
-
-Signed-off-by: Brian Norris <computersforpeace@gmail.com>
-[rw: Fixed comparison]
-Signed-off-by: Richard Weinberger <richard@nod.at>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/mtd/ubi/cdev.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/mtd/ubi/cdev.c b/drivers/mtd/ubi/cdev.c
-index 4f02848bb2bc..fc764e7976bd 100644
---- a/drivers/mtd/ubi/cdev.c
-+++ b/drivers/mtd/ubi/cdev.c
-@@ -475,7 +475,7 @@ static long vol_cdev_ioctl(struct file *file, unsigned int cmd,
- 		/* Validate the request */
- 		err = -EINVAL;
- 		if (req.lnum < 0 || req.lnum >= vol->reserved_pebs ||
--		    req.bytes < 0 || req.lnum >= vol->usable_leb_size)
-+		    req.bytes < 0 || req.bytes > vol->usable_leb_size)
- 			break;
+diff --git a/arch/unicore32/kernel/hibernate.c b/arch/unicore32/kernel/hibernate.c
+index d75ef8b6cb56..9969ec374abb 100644
+--- a/arch/unicore32/kernel/hibernate.c
++++ b/arch/unicore32/kernel/hibernate.c
+@@ -18,6 +18,7 @@
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ #include <asm/pgalloc.h>
++#include <asm/sections.h>
+ #include <asm/suspend.h>
  
- 		err = get_exclusive(desc);
--- 
-2.28.0
-
-
-From 7c906f0661e74cb0b1b8872f256e1f0014c82fd4 Mon Sep 17 00:00:00 2001
-From: "K. Y. Srinivasan" <kys@microsoft.com>
-Date: Fri, 27 Mar 2015 00:27:18 -0700
-Subject: [PATCH 42/65] scsi: storvsc: Fix a bug in copy_from_bounce_buffer()
-
-commit 8de580742fee8bc34d116f57a20b22b9a5f08403 upstream.
-
-We may exit this function without properly freeing up the maapings
-we may have acquired. Fix the bug.
-
-Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
-Reviewed-by: Long Li <longli@microsoft.com>
-Signed-off-by: James Bottomley <JBottomley@Odin.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/scsi/storvsc_drv.c | 15 ++++++++-------
- 1 file changed, 8 insertions(+), 7 deletions(-)
-
-diff --git a/drivers/scsi/storvsc_drv.c b/drivers/scsi/storvsc_drv.c
-index a8990783ba66..913b91c78a22 100644
---- a/drivers/scsi/storvsc_drv.c
-+++ b/drivers/scsi/storvsc_drv.c
-@@ -631,21 +631,22 @@ static unsigned int copy_to_bounce_buffer(struct scatterlist *orig_sgl,
- 			if (bounce_sgl[j].length == PAGE_SIZE) {
- 				/* full..move to next entry */
- 				sg_kunmap_atomic(bounce_addr);
-+				bounce_addr = 0;
- 				j++;
-+			}
+ #include "mach/pm.h"
+diff --git a/arch/x86/power/hibernate_32.c b/arch/x86/power/hibernate_32.c
+index 7d28c885d238..291226b952a9 100644
+--- a/arch/x86/power/hibernate_32.c
++++ b/arch/x86/power/hibernate_32.c
+@@ -13,13 +13,11 @@
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ #include <asm/mmzone.h>
++#include <asm/sections.h>
  
--				/* if we need to use another bounce buffer */
--				if (srclen || i != orig_sgl_count - 1)
--					bounce_addr = sg_kmap_atomic(bounce_sgl,j);
-+			/* if we need to use another bounce buffer */
-+			if (srclen && bounce_addr == 0)
-+				bounce_addr = sg_kmap_atomic(bounce_sgl, j);
+ /* Defined in hibernate_asm_32.S */
+ extern int restore_image(void);
  
--			} else if (srclen == 0 && i == orig_sgl_count - 1) {
--				/* unmap the last bounce that is < PAGE_SIZE */
--				sg_kunmap_atomic(bounce_addr);
--			}
- 		}
+-/* References to section boundaries */
+-extern const void __nosave_begin, __nosave_end;
+-
+ /* Pointer to the temporary resume page tables */
+ pgd_t *resume_pg_dir;
  
- 		sg_kunmap_atomic(src_addr - orig_sgl[i].offset);
- 	}
+diff --git a/arch/x86/power/hibernate_64.c b/arch/x86/power/hibernate_64.c
+index a0fde91c16cf..8ecaed127634 100644
+--- a/arch/x86/power/hibernate_64.c
++++ b/arch/x86/power/hibernate_64.c
+@@ -17,11 +17,9 @@
+ #include <asm/page.h>
+ #include <asm/pgtable.h>
+ #include <asm/mtrr.h>
++#include <asm/sections.h>
+ #include <asm/suspend.h>
  
-+	if (bounce_addr)
-+		sg_kunmap_atomic(bounce_addr);
-+
- 	local_irq_restore(flags);
+-/* References to section boundaries */
+-extern const void __nosave_begin, __nosave_end;
+-
+ /* Defined in hibernate_asm_64.S */
+ extern int restore_image(void);
  
- 	return total_copied;
--- 
-2.28.0
-
-
-From 1c9b773d9183be9a8f36a9646910cc37d7578757 Mon Sep 17 00:00:00 2001
-From: Guenter Roeck <linux@roeck-us.net>
-Date: Wed, 22 Apr 2015 22:23:54 -0700
-Subject: [PATCH 43/65] drivers: parport: Kconfig: exclude arm64 for PARPORT_PC
-
-Fix build problem seen with arm64:allmodconfig.
-
-drivers/parport/parport_pc.c:67:25: fatal error: asm/parport.h: No such file or
-directory
-
-arm64 does not support PARPORT_PC.
-
-Signed-off-by: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/parport/Kconfig | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/parport/Kconfig b/drivers/parport/Kconfig
-index 70694ce38be2..46d2de24bf3e 100644
---- a/drivers/parport/Kconfig
-+++ b/drivers/parport/Kconfig
-@@ -37,7 +37,7 @@ config PARPORT_PC
- 	tristate "PC-style hardware"
- 	depends on (!SPARC64 || PCI) && !SPARC32 && !M32R && !FRV && !S390 && \
- 		(!M68K || ISA) && !MN10300 && !AVR32 && !BLACKFIN && \
--		!XTENSA && !CRIS && !H8300
-+		!XTENSA && !CRIS && !H8300 && !ARM64
- 
- 	---help---
- 	  You should say Y here if you have a PC-style parallel port. All
--- 
-2.28.0
-
-
-From 27b22d0124993f4c321a3462946608dfd3512cda Mon Sep 17 00:00:00 2001
-From: Lv Zheng <lv.zheng@intel.com>
-Date: Mon, 13 Apr 2015 11:48:58 +0800
-Subject: [PATCH 44/65] ACPICA: Utilities: split IO address types from data
- type models.
-
-commit 2b8760100e1de69b6ff004c986328a82947db4ad upstream.
-
-ACPICA commit aacf863cfffd46338e268b7415f7435cae93b451
-
-It is reported that on a physically 64-bit addressed machine, 32-bit kernel
-can trigger crashes in accessing the memory regions that are beyond the
-32-bit boundary. The region field's start address should still be 32-bit
-compliant, but after a calculation (adding some offsets), it may exceed the
-32-bit boundary. This case is rare and buggy, but there are real BIOSes
-leaked with such issues (see References below).
-
-This patch fixes this gap by always defining IO addresses as 64-bit, and
-allows OSPMs to optimize it for a real 32-bit machine to reduce the size of
-the internal objects.
-
-Internal acpi_physical_address usages in the structures that can be fixed
-by this change include:
- 1. struct acpi_object_region:
-    acpi_physical_address		address;
- 2. struct acpi_address_range:
-    acpi_physical_address		start_address;
-    acpi_physical_address		end_address;
- 3. struct acpi_mem_space_context;
-    acpi_physical_address		address;
- 4. struct acpi_table_desc
-    acpi_physical_address		address;
-See known issues 1 for other usages.
-
-Note that acpi_io_address which is used for ACPI_PROCESSOR may also suffer
-from same problem, so this patch changes it accordingly.
-
-For iasl, it will enforce acpi_physical_address as 32-bit to generate
-32-bit OSPM compatible tables on 32-bit platforms, we need to define
-ACPI_32BIT_PHYSICAL_ADDRESS for it in acenv.h.
-
-Known issues:
- 1. Cleanup of mapped virtual address
-   In struct acpi_mem_space_context, acpi_physical_address is used as a virtual
-   address:
-    acpi_physical_address                   mapped_physical_address;
-   It is better to introduce acpi_virtual_address or use acpi_size instead.
-   This patch doesn't make such a change. Because this should be done along
-   with a change to acpi_os_map_memory()/acpi_os_unmap_memory().
-   There should be no functional problem to leave this unchanged except
-   that only this structure is enlarged unexpectedly.
-
-Link: https://github.com/acpica/acpica/commit/aacf863c
-Reference: https://bugzilla.kernel.org/show_bug.cgi?id=87971
-Reference: https://bugzilla.kernel.org/show_bug.cgi?id=79501
-Reported-and-tested-by: Paul Menzel <paulepanter@users.sourceforge.net>
-Reported-and-tested-by: Sial Nije <sialnije@gmail.com>
-Signed-off-by: Lv Zheng <lv.zheng@intel.com>
-Signed-off-by: Bob Moore <robert.moore@intel.com>
-Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/acpi/actypes.h        | 20 ++++++++++++++++++++
- include/acpi/platform/acenv.h |  1 +
- 2 files changed, 21 insertions(+)
-
-diff --git a/include/acpi/actypes.h b/include/acpi/actypes.h
-index a64adcc29ae5..f819e813c8ac 100644
---- a/include/acpi/actypes.h
-+++ b/include/acpi/actypes.h
-@@ -198,9 +198,29 @@ typedef int INT32;
- typedef s32 acpi_native_int;
- 
- typedef u32 acpi_size;
-+
-+#ifdef ACPI_32BIT_PHYSICAL_ADDRESS
-+
-+/*
-+ * OSPMs can define this to shrink the size of the structures for 32-bit
-+ * none PAE environment. ASL compiler may always define this to generate
-+ * 32-bit OSPM compliant tables.
-+ */
- typedef u32 acpi_io_address;
- typedef u32 acpi_physical_address;
- 
-+#else				/* ACPI_32BIT_PHYSICAL_ADDRESS */
-+
-+/*
-+ * It is reported that, after some calculations, the physical addresses can
-+ * wrap over the 32-bit boundary on 32-bit PAE environment.
-+ * https://bugzilla.kernel.org/show_bug.cgi?id=87971
-+ */
-+typedef u64 acpi_io_address;
-+typedef u64 acpi_physical_address;
-+
-+#endif				/* ACPI_32BIT_PHYSICAL_ADDRESS */
-+
- #define ACPI_MAX_PTR                    ACPI_UINT32_MAX
- #define ACPI_SIZE_MAX                   ACPI_UINT32_MAX
- 
-diff --git a/include/acpi/platform/acenv.h b/include/acpi/platform/acenv.h
-index ef04b36ca6ed..f7db107abb04 100644
---- a/include/acpi/platform/acenv.h
-+++ b/include/acpi/platform/acenv.h
-@@ -76,6 +76,7 @@
- #define ACPI_LARGE_NAMESPACE_NODE
- #define ACPI_DATA_TABLE_DISASSEMBLY
- #define ACPI_SINGLE_THREADED
-+#define ACPI_32BIT_PHYSICAL_ADDRESS
- #endif
- 
- /* acpi_exec configuration. Multithreaded with full AML debugger */
--- 
-2.28.0
-
-
-From e86de8b5eaf5415ab76cce33de00ad21e78c83e7 Mon Sep 17 00:00:00 2001
-From: Max Filippov <jcmvbkbc@gmail.com>
-Date: Fri, 27 Feb 2015 06:28:00 +0300
-Subject: [PATCH 45/65] xtensa: xtfpga: fix hardware lockup caused by LCD
- driver
-
-commit 4949009eb8d40a441dcddcd96e101e77d31cf1b2 upstream.
-
-LCD driver is always built for the XTFPGA platform, but its base address
-is not configurable, and is wrong for ML605/KC705. Its initialization
-locks up KC705 board hardware.
-
-Make the whole driver optional, and its base address and bus width
-configurable. Implement 4-bit bus access method.
-
-Signed-off-by: Max Filippov <jcmvbkbc@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/xtensa/Kconfig                           | 30 ++++++++++
- arch/xtensa/platforms/xtfpga/Makefile         |  3 +-
- .../xtfpga/include/platform/hardware.h        |  3 -
- .../platforms/xtfpga/include/platform/lcd.h   | 15 +++++
- arch/xtensa/platforms/xtfpga/lcd.c            | 55 ++++++++++++-------
- 5 files changed, 81 insertions(+), 25 deletions(-)
-
 diff --git a/arch/xtensa/Kconfig b/arch/xtensa/Kconfig
 index 0a1b95f81a32..2b086a6ae6c7 100644
 --- a/arch/xtensa/Kconfig
@@ -2586,6 +354,19 @@ index 0a1b95f81a32..2b086a6ae6c7 100644
  endmenu
  
  source "net/Kconfig"
+diff --git a/arch/xtensa/include/uapi/asm/unistd.h b/arch/xtensa/include/uapi/asm/unistd.h
+index 513effd48060..d07c1886bc8f 100644
+--- a/arch/xtensa/include/uapi/asm/unistd.h
++++ b/arch/xtensa/include/uapi/asm/unistd.h
+@@ -715,7 +715,7 @@ __SYSCALL(323, sys_process_vm_writev, 6)
+ __SYSCALL(324, sys_name_to_handle_at, 5)
+ #define __NR_open_by_handle_at			325
+ __SYSCALL(325, sys_open_by_handle_at, 3)
+-#define __NR_sync_file_range			326
++#define __NR_sync_file_range2			326
+ __SYSCALL(326, sys_sync_file_range2, 6)
+ #define __NR_perf_event_open			327
+ __SYSCALL(327, sys_perf_event_open, 5)
 diff --git a/arch/xtensa/platforms/xtfpga/Makefile b/arch/xtensa/platforms/xtfpga/Makefile
 index b9ae206340cd..7839d38b2337 100644
 --- a/arch/xtensa/platforms/xtfpga/Makefile
@@ -2755,506 +536,6 @@ index 2872301598df..4dc0c1b43f4b 100644
  	udelay(50);
  }
  
--- 
-2.28.0
-
-
-From a2ed2ed6fe49a3ffe9fba835c3a11c0e73d0c4cc Mon Sep 17 00:00:00 2001
-From: Max Filippov <jcmvbkbc@gmail.com>
-Date: Fri, 27 Feb 2015 11:02:38 +0300
-Subject: [PATCH 46/65] xtensa: provide __NR_sync_file_range2 instead of
- __NR_sync_file_range
-
-commit 01e84c70fe40c8111f960987bcf7f931842e6d07 upstream.
-
-xtensa actually uses sync_file_range2 implementation, so it should
-define __NR_sync_file_range2 as other architectures that use that
-function. That fixes userspace interface (that apparently never worked)
-and avoids special-casing xtensa in libc implementations.
-See the thread ending at
-http://lists.busybox.net/pipermail/uclibc/2015-February/048833.html
-for more details.
-
-Signed-off-by: Max Filippov <jcmvbkbc@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/xtensa/include/uapi/asm/unistd.h | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/xtensa/include/uapi/asm/unistd.h b/arch/xtensa/include/uapi/asm/unistd.h
-index 513effd48060..d07c1886bc8f 100644
---- a/arch/xtensa/include/uapi/asm/unistd.h
-+++ b/arch/xtensa/include/uapi/asm/unistd.h
-@@ -715,7 +715,7 @@ __SYSCALL(323, sys_process_vm_writev, 6)
- __SYSCALL(324, sys_name_to_handle_at, 5)
- #define __NR_open_by_handle_at			325
- __SYSCALL(325, sys_open_by_handle_at, 3)
--#define __NR_sync_file_range			326
-+#define __NR_sync_file_range2			326
- __SYSCALL(326, sys_sync_file_range2, 6)
- #define __NR_perf_event_open			327
- __SYSCALL(327, sys_perf_event_open, 5)
--- 
-2.28.0
-
-
-From b020a4676df1d550f893801f6c722845c2f6d5b3 Mon Sep 17 00:00:00 2001
-From: "K. Y. Srinivasan" <kys@microsoft.com>
-Date: Fri, 27 Feb 2015 11:26:04 -0800
-Subject: [PATCH 47/65] Drivers: hv: vmbus: Fix a bug in the error path in
- vmbus_open()
-
-commit 40384e4bbeb9f2651fe9bffc0062d9f31ef625bf upstream.
-
-Correctly rollback state if the failure occurs after we have handed over
-the ownership of the buffer to the host.
-
-Signed-off-by: K. Y. Srinivasan <kys@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/hv/channel.c | 7 +++++--
- 1 file changed, 5 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/hv/channel.c b/drivers/hv/channel.c
-index 92f34de7aee9..05e6a7d13d4e 100644
---- a/drivers/hv/channel.c
-+++ b/drivers/hv/channel.c
-@@ -169,7 +169,7 @@ int vmbus_open(struct vmbus_channel *newchannel, u32 send_ringbuffer_size,
- 			   GFP_KERNEL);
- 	if (!open_info) {
- 		err = -ENOMEM;
--		goto error0;
-+		goto error_gpadl;
- 	}
- 
- 	init_completion(&open_info->waitevent);
-@@ -185,7 +185,7 @@ int vmbus_open(struct vmbus_channel *newchannel, u32 send_ringbuffer_size,
- 
- 	if (userdatalen > MAX_USER_DEFINED_BYTES) {
- 		err = -EINVAL;
--		goto error0;
-+		goto error_gpadl;
- 	}
- 
- 	if (userdatalen)
-@@ -226,6 +226,9 @@ error1:
- 	list_del(&open_info->msglistentry);
- 	spin_unlock_irqrestore(&vmbus_connection.channelmsg_lock, flags);
- 
-+error_gpadl:
-+	vmbus_teardown_gpadl(newchannel, newchannel->ringbuffer_gpadlhandle);
-+
- error0:
- 	free_pages((unsigned long)out,
- 		get_order(send_ringbuffer_size + recv_ringbuffer_size));
--- 
-2.28.0
-
-
-From 62d37cc41178d2f0f8df6785e7a89e123154b278 Mon Sep 17 00:00:00 2001
-From: James Bottomley <JBottomley@Odin.com>
-Date: Wed, 15 Apr 2015 22:16:01 -0700
-Subject: [PATCH 48/65] mvsas: fix panic on expander attached SATA devices
-
-commit 56cbd0ccc1b508de19561211d7ab9e1c77e6b384 upstream.
-
-mvsas is giving a General protection fault when it encounters an expander
-attached ATA device.  Analysis of mvs_task_prep_ata() shows that the driver is
-assuming all ATA devices are locally attached and obtaining the phy mask by
-indexing the local phy table (in the HBA structure) with the phy id.  Since
-expanders have many more phys than the HBA, this is causing the index into the
-HBA phy table to overflow and returning rubbish as the pointer.
-
-mvs_task_prep_ssp() instead does the phy mask using the port properties.
-Mirror this in mvs_task_prep_ata() to fix the panic.
-
-Reported-by: Adam Talbot <ajtalbot1@gmail.com>
-Tested-by: Adam Talbot <ajtalbot1@gmail.com>
-Signed-off-by: James Bottomley <JBottomley@Odin.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/scsi/mvsas/mv_sas.c | 5 +----
- 1 file changed, 1 insertion(+), 4 deletions(-)
-
-diff --git a/drivers/scsi/mvsas/mv_sas.c b/drivers/scsi/mvsas/mv_sas.c
-index c9e244984e30..fa50c7dc3d3e 100644
---- a/drivers/scsi/mvsas/mv_sas.c
-+++ b/drivers/scsi/mvsas/mv_sas.c
-@@ -441,14 +441,11 @@ static u32 mvs_get_ncq_tag(struct sas_task *task, u32 *tag)
- static int mvs_task_prep_ata(struct mvs_info *mvi,
- 			     struct mvs_task_exec_info *tei)
- {
--	struct sas_ha_struct *sha = mvi->sas;
- 	struct sas_task *task = tei->task;
- 	struct domain_device *dev = task->dev;
- 	struct mvs_device *mvi_dev = dev->lldd_dev;
- 	struct mvs_cmd_hdr *hdr = tei->hdr;
- 	struct asd_sas_port *sas_port = dev->port;
--	struct sas_phy *sphy = dev->phy;
--	struct asd_sas_phy *sas_phy = sha->sas_phy[sphy->number];
- 	struct mvs_slot_info *slot;
- 	void *buf_prd;
- 	u32 tag = tei->tag, hdr_tag;
-@@ -468,7 +465,7 @@ static int mvs_task_prep_ata(struct mvs_info *mvi,
- 	slot->tx = mvi->tx_prod;
- 	del_q = TXQ_MODE_I | tag |
- 		(TXQ_CMD_STP << TXQ_CMD_SHIFT) |
--		(MVS_PHY_ID << TXQ_PHY_SHIFT) |
-+		((sas_port->phy_mask & TXQ_PHY_MASK) << TXQ_PHY_SHIFT) |
- 		(mvi_dev->taskfileset << TXQ_SRS_SHIFT);
- 	mvi->tx[mvi->tx_prod] = cpu_to_le32(del_q);
- 
--- 
-2.28.0
-
-
-From 035d9f212c511009f13a6b26d9a3c2777d414804 Mon Sep 17 00:00:00 2001
-From: Ezequiel Garcia <ezequiel@vanguardiasur.com.ar>
-Date: Tue, 10 Mar 2015 11:37:14 -0300
-Subject: [PATCH 49/65] stk1160: Make sure current buffer is released
-
-commit aeff09276748b66072f2db2e668cec955cf41959 upstream.
-
-The available (i.e. not used) buffers are returned by stk1160_clear_queue(),
-on the stop_streaming() path. However, this is insufficient and the current
-buffer must be released as well. Fix it.
-
-Signed-off-by: Ezequiel Garcia <ezequiel@vanguardiasur.com.ar>
-Signed-off-by: Hans Verkuil <hans.verkuil@cisco.com>
-Signed-off-by: Mauro Carvalho Chehab <mchehab@osg.samsung.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/media/usb/stk1160/stk1160-v4l.c | 17 +++++++++++++++--
- 1 file changed, 15 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/media/usb/stk1160/stk1160-v4l.c b/drivers/media/usb/stk1160/stk1160-v4l.c
-index a59153d2f8bf..518a5299ff0b 100644
---- a/drivers/media/usb/stk1160/stk1160-v4l.c
-+++ b/drivers/media/usb/stk1160/stk1160-v4l.c
-@@ -245,6 +245,11 @@ static int stk1160_stop_streaming(struct stk1160 *dev)
- 	if (mutex_lock_interruptible(&dev->v4l_lock))
- 		return -ERESTARTSYS;
- 
-+	/*
-+	 * Once URBs are cancelled, the URB complete handler
-+	 * won't be running. This is required to safely release the
-+	 * current buffer (dev->isoc_ctl.buf).
-+	 */
- 	stk1160_cancel_isoc(dev);
- 
- 	/*
-@@ -665,8 +670,16 @@ void stk1160_clear_queue(struct stk1160 *dev)
- 		stk1160_info("buffer [%p/%d] aborted\n",
- 				buf, buf->vb.v4l2_buf.index);
- 	}
--	/* It's important to clear current buffer */
--	dev->isoc_ctl.buf = NULL;
-+
-+	/* It's important to release the current buffer */
-+	if (dev->isoc_ctl.buf) {
-+		buf = dev->isoc_ctl.buf;
-+		dev->isoc_ctl.buf = NULL;
-+
-+		vb2_buffer_done(&buf->vb, VB2_BUF_STATE_ERROR);
-+		stk1160_info("buffer [%p/%d] aborted\n",
-+				buf, buf->vb.v4l2_buf.index);
-+	}
- 	spin_unlock_irqrestore(&dev->buf_lock, flags);
- }
- 
--- 
-2.28.0
-
-
-From b55c80ba21ce7cd6aed4323c2b86552434b44fd6 Mon Sep 17 00:00:00 2001
-From: Yann Droneaud <ydroneaud@opteya.com>
-Date: Mon, 13 Apr 2015 14:56:22 +0200
-Subject: [PATCH 50/65] IB/core: disallow registering 0-sized memory region
-
-commit 8abaae62f3fdead8f4ce0ab46b4ab93dee39bab2 upstream.
-
-If ib_umem_get() is called with a size equal to 0 and an
-non-page aligned address, one page will be pinned and a
-0-sized umem will be returned to the caller.
-
-This should not be allowed: it's not expected for a memory
-region to have a size equal to 0.
-
-This patch adds a check to explicitly refuse to register
-a 0-sized region.
-
-Link: http://mid.gmane.org/cover.1428929103.git.ydroneaud@opteya.com
-Cc: Shachar Raindel <raindel@mellanox.com>
-Cc: Jack Morgenstein <jackm@mellanox.com>
-Cc: Or Gerlitz <ogerlitz@mellanox.com>
-Signed-off-by: Yann Droneaud <ydroneaud@opteya.com>
-Signed-off-by: Doug Ledford <dledford@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/core/umem.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
-index 055ebebc07dd..dccb9aac35c3 100644
---- a/drivers/infiniband/core/umem.c
-+++ b/drivers/infiniband/core/umem.c
-@@ -94,6 +94,9 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
- 	if (dmasync)
- 		dma_set_attr(DMA_ATTR_WRITE_BARRIER, &attrs);
- 
-+	if (!size)
-+		return ERR_PTR(-EINVAL);
-+
- 	/*
- 	 * If the combination of the addr and size requested for this memory
- 	 * region causes an integer overflow, return error.
--- 
-2.28.0
-
-
-From d016c609f3165cfca74504c55ae55b2030d8a9e3 Mon Sep 17 00:00:00 2001
-From: Yann Droneaud <ydroneaud@opteya.com>
-Date: Mon, 13 Apr 2015 14:56:23 +0200
-Subject: [PATCH 51/65] IB/core: don't disallow registering region starting at
- 0x0
-
-commit 66578b0b2f69659f00b6169e6fe7377c4b100d18 upstream.
-
-In a call to ib_umem_get(), if address is 0x0 and size is
-already page aligned, check added in commit 8494057ab5e4
-("IB/uverbs: Prevent integer overflow in ib_umem_get address
-arithmetic") will refuse to register a memory region that
-could otherwise be valid (provided vm.mmap_min_addr sysctl
-and mmap_low_allowed SELinux knobs allow userspace to map
-something at address 0x0).
-
-This patch allows back such registration: ib_umem_get()
-should probably don't care of the base address provided it
-can be pinned with get_user_pages().
-
-There's two possible overflows, in (addr + size) and in
-PAGE_ALIGN(addr + size), this patch keep ensuring none
-of them happen while allowing to pin memory at address
-0x0. Anyway, the case of size equal 0 is no more (partially)
-handled as 0-length memory region are disallowed by an
-earlier check.
-
-Link: http://mid.gmane.org/cover.1428929103.git.ydroneaud@opteya.com
-Cc: Shachar Raindel <raindel@mellanox.com>
-Cc: Jack Morgenstein <jackm@mellanox.com>
-Cc: Or Gerlitz <ogerlitz@mellanox.com>
-Signed-off-by: Yann Droneaud <ydroneaud@opteya.com>
-Reviewed-by: Sagi Grimberg <sagig@mellanox.com>
-Reviewed-by: Haggai Eran <haggaie@mellanox.com>
-Signed-off-by: Doug Ledford <dledford@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/core/umem.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
-index dccb9aac35c3..c1fef27010d4 100644
---- a/drivers/infiniband/core/umem.c
-+++ b/drivers/infiniband/core/umem.c
-@@ -101,8 +101,8 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
- 	 * If the combination of the addr and size requested for this memory
- 	 * region causes an integer overflow, return error.
- 	 */
--	if ((PAGE_ALIGN(addr + size) <= size) ||
--	    (PAGE_ALIGN(addr + size) <= addr))
-+	if (((addr + size) < addr) ||
-+	    PAGE_ALIGN(addr + size) < (addr + size))
- 		return ERR_PTR(-EINVAL);
- 
- 	if (!can_do_mlock())
--- 
-2.28.0
-
-
-From 90615370309b5bb32962b50a822730dda467e7f5 Mon Sep 17 00:00:00 2001
-From: Erez Shitrit <erezsh@mellanox.com>
-Date: Thu, 2 Apr 2015 13:39:05 +0300
-Subject: [PATCH 52/65] IB/mlx4: Fix WQE LSO segment calculation
-
-commit ca9b590caa17bcbbea119594992666e96cde9c2f upstream.
-
-The current code decreases from the mss size (which is the gso_size
-from the kernel skb) the size of the packet headers.
-
-It shouldn't do that because the mss that comes from the stack
-(e.g IPoIB) includes only the tcp payload without the headers.
-
-The result is indication to the HW that each packet that the HW sends
-is smaller than what it could be, and too many packets will be sent
-for big messages.
-
-An easy way to demonstrate one more aspect of the problem is by
-configuring the ipoib mtu to be less than 2*hlen (2*56) and then
-run app sending big TCP messages. This will tell the HW to send packets
-with giant (negative value which under unsigned arithmetics becomes
-a huge positive one) length and the QP moves to SQE state.
-
-Fixes: b832be1e4007 ('IB/mlx4: Add IPoIB LSO support')
-Reported-by: Matthew Finlay <matt@mellanox.com>
-Signed-off-by: Erez Shitrit <erezsh@mellanox.com>
-Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
-Signed-off-by: Doug Ledford <dledford@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/hw/mlx4/qp.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
-diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
-index 4f10af2905b5..262a18437ceb 100644
---- a/drivers/infiniband/hw/mlx4/qp.c
-+++ b/drivers/infiniband/hw/mlx4/qp.c
-@@ -2174,8 +2174,7 @@ static int build_lso_seg(struct mlx4_wqe_lso_seg *wqe, struct ib_send_wr *wr,
- 
- 	memcpy(wqe->header, wr->wr.ud.header, wr->wr.ud.hlen);
- 
--	*lso_hdr_sz  = cpu_to_be32((wr->wr.ud.mss - wr->wr.ud.hlen) << 16 |
--				   wr->wr.ud.hlen);
-+	*lso_hdr_sz  = cpu_to_be32(wr->wr.ud.mss << 16 | wr->wr.ud.hlen);
- 	*lso_seg_len = halign;
- 	return 0;
- }
--- 
-2.28.0
-
-
-From 0001a0ca47f3d5e7c97ae4e984166175b863c698 Mon Sep 17 00:00:00 2001
-From: Mark Brown <broonie@kernel.org>
-Date: Wed, 15 Apr 2015 19:18:39 +0100
-Subject: [PATCH 53/65] i2c: core: Export bus recovery functions
-
-commit c1c21f4e60ed4523292f1a89ff45a208bddd3849 upstream.
-
-Current -next fails to link an ARM allmodconfig because drivers that use
-the core recovery functions can be built as modules but those functions
-are not exported:
-
-ERROR: "i2c_generic_gpio_recovery" [drivers/i2c/busses/i2c-davinci.ko] undefined!
-ERROR: "i2c_generic_scl_recovery" [drivers/i2c/busses/i2c-davinci.ko] undefined!
-ERROR: "i2c_recover_bus" [drivers/i2c/busses/i2c-davinci.ko] undefined!
-
-Add exports to fix this.
-
-Fixes: 5f9296ba21b3c (i2c: Add bus recovery infrastructure)
-Signed-off-by: Mark Brown <broonie@kernel.org>
-Signed-off-by: Wolfram Sang <wsa@the-dreams.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/i2c/i2c-core.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/drivers/i2c/i2c-core.c b/drivers/i2c/i2c-core.c
-index 48e31ed69dbf..9d539cbfc833 100644
---- a/drivers/i2c/i2c-core.c
-+++ b/drivers/i2c/i2c-core.c
-@@ -206,6 +206,7 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
- 	adap->bus_recovery_info->set_scl(adap, 1);
- 	return i2c_generic_recovery(adap);
- }
-+EXPORT_SYMBOL_GPL(i2c_generic_scl_recovery);
- 
- int i2c_generic_gpio_recovery(struct i2c_adapter *adap)
- {
-@@ -220,6 +221,7 @@ int i2c_generic_gpio_recovery(struct i2c_adapter *adap)
- 
- 	return ret;
- }
-+EXPORT_SYMBOL_GPL(i2c_generic_gpio_recovery);
- 
- int i2c_recover_bus(struct i2c_adapter *adap)
- {
-@@ -229,6 +231,7 @@ int i2c_recover_bus(struct i2c_adapter *adap)
- 	dev_dbg(&adap->dev, "Trying i2c bus recovery\n");
- 	return adap->bus_recovery_info->recover_bus(adap);
- }
-+EXPORT_SYMBOL_GPL(i2c_recover_bus);
- 
- static int i2c_device_probe(struct device *dev)
- {
--- 
-2.28.0
-
-
-From 2b239a97fc65379521fc92586654bcf9a230d878 Mon Sep 17 00:00:00 2001
-From: Alex Deucher <alexander.deucher@amd.com>
-Date: Tue, 24 Feb 2015 11:29:21 -0500
-Subject: [PATCH 54/65] drm/radeon: fix doublescan modes (v2)
-
-commit fd99a0943ffaa0320ea4f69d09ed188f950c0432 upstream.
-
-Use the correct flags for atom.
-
-v2: handle DRM_MODE_FLAG_DBLCLK
-
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/radeon/atombios_crtc.c | 8 ++++++--
- 1 file changed, 6 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/gpu/drm/radeon/atombios_crtc.c b/drivers/gpu/drm/radeon/atombios_crtc.c
-index 971dd8795b68..8ac333094991 100644
---- a/drivers/gpu/drm/radeon/atombios_crtc.c
-+++ b/drivers/gpu/drm/radeon/atombios_crtc.c
-@@ -312,8 +312,10 @@ atombios_set_crtc_dtd_timing(struct drm_crtc *crtc,
- 		misc |= ATOM_COMPOSITESYNC;
- 	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
- 		misc |= ATOM_INTERLACE;
--	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
-+	if (mode->flags & DRM_MODE_FLAG_DBLCLK)
- 		misc |= ATOM_DOUBLE_CLOCK_MODE;
-+	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
-+		misc |= ATOM_H_REPLICATIONBY2 | ATOM_V_REPLICATIONBY2;
- 
- 	args.susModeMiscInfo.usAccess = cpu_to_le16(misc);
- 	args.ucCRTC = radeon_crtc->crtc_id;
-@@ -356,8 +358,10 @@ static void atombios_crtc_set_timing(struct drm_crtc *crtc,
- 		misc |= ATOM_COMPOSITESYNC;
- 	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
- 		misc |= ATOM_INTERLACE;
--	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
-+	if (mode->flags & DRM_MODE_FLAG_DBLCLK)
- 		misc |= ATOM_DOUBLE_CLOCK_MODE;
-+	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
-+		misc |= ATOM_H_REPLICATIONBY2 | ATOM_V_REPLICATIONBY2;
- 
- 	args.susModeMiscInfo.usAccess = cpu_to_le16(misc);
- 	args.ucCRTC = radeon_crtc->crtc_id;
--- 
-2.28.0
-
-
-From 10e30152633a23d3da2326ff23f4b0b5fc1e94ce Mon Sep 17 00:00:00 2001
-From: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Date: Tue, 21 Apr 2015 09:49:11 -0700
-Subject: [PATCH 55/65] drm/i915: cope with large i2c transfers
-
-commit 9535c4757b881e06fae72a857485ad57c422b8d2 upstream.
-
-The hardware, according to the specs, is limited to 256 byte transfers,
-and current driver has no protections in case users attempt to do larger
-transfers. The code will just stomp over status register and mayhem
-ensues.
-
-Let's split larger transfers into digestable chunks. Doing this allows
-Atmel MXT driver on Pixel 1 function properly (it hasn't since commit
-9d8dc3e529a19e427fd379118acd132520935c5d "Input: atmel_mxt_ts -
-implement T44 message handling" which tries to consume multiple
-touchscreen/touchpad reports in a single transaction).
-
-Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
-Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
-Signed-off-by: Jani Nikula <jani.nikula@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/i915/i915_reg.h  |  1 +
- drivers/gpu/drm/i915/intel_i2c.c | 66 +++++++++++++++++++++++++++-----
- 2 files changed, 57 insertions(+), 10 deletions(-)
-
 diff --git a/drivers/gpu/drm/i915/i915_reg.h b/drivers/gpu/drm/i915/i915_reg.h
 index 7695b5dd9d2d..35287ab445cd 100644
 --- a/drivers/gpu/drm/i915/i915_reg.h
@@ -3374,179 +655,298 @@ index 639fe192997c..4a21e13cc58c 100644
  	return 0;
  }
  
--- 
-2.28.0
-
-
-From 3b388f33a1fc643f5e9dc496c741eafdf6ebef49 Mon Sep 17 00:00:00 2001
-From: Al Viro <viro@zeniv.linux.org.uk>
-Date: Fri, 24 Apr 2015 15:47:07 -0400
-Subject: [PATCH 56/65] RCU pathwalk breakage when running into a symlink
- overmounting something
-
-commit 3cab989afd8d8d1bc3d99fef0e7ed87c31e7b647 upstream.
-
-Calling unlazy_walk() in walk_component() and do_last() when we find
-a symlink that needs to be followed doesn't acquire a reference to vfsmount.
-That's fine when the symlink is on the same vfsmount as the parent directory
-(which is almost always the case), but it's not always true - one _can_
-manage to bind a symlink on top of something.  And in such cases we end up
-with excessive mntput().
-
-Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/namei.c | 6 ++++--
- 1 file changed, 4 insertions(+), 2 deletions(-)
-
-diff --git a/fs/namei.c b/fs/namei.c
-index f7c4393f8535..036c21246d6a 100644
---- a/fs/namei.c
-+++ b/fs/namei.c
-@@ -1542,7 +1542,8 @@ static inline int walk_component(struct nameidata *nd, struct path *path,
+diff --git a/drivers/gpu/drm/radeon/atombios_crtc.c b/drivers/gpu/drm/radeon/atombios_crtc.c
+index 971dd8795b68..8ac333094991 100644
+--- a/drivers/gpu/drm/radeon/atombios_crtc.c
++++ b/drivers/gpu/drm/radeon/atombios_crtc.c
+@@ -312,8 +312,10 @@ atombios_set_crtc_dtd_timing(struct drm_crtc *crtc,
+ 		misc |= ATOM_COMPOSITESYNC;
+ 	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+ 		misc |= ATOM_INTERLACE;
+-	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++	if (mode->flags & DRM_MODE_FLAG_DBLCLK)
+ 		misc |= ATOM_DOUBLE_CLOCK_MODE;
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		misc |= ATOM_H_REPLICATIONBY2 | ATOM_V_REPLICATIONBY2;
  
- 	if (should_follow_link(inode, follow)) {
- 		if (nd->flags & LOOKUP_RCU) {
--			if (unlikely(unlazy_walk(nd, path->dentry))) {
-+			if (unlikely(nd->path.mnt != path->mnt ||
-+				     unlazy_walk(nd, path->dentry))) {
- 				err = -ECHILD;
- 				goto out_err;
- 			}
-@@ -2824,7 +2825,8 @@ finish_lookup:
+ 	args.susModeMiscInfo.usAccess = cpu_to_le16(misc);
+ 	args.ucCRTC = radeon_crtc->crtc_id;
+@@ -356,8 +358,10 @@ static void atombios_crtc_set_timing(struct drm_crtc *crtc,
+ 		misc |= ATOM_COMPOSITESYNC;
+ 	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+ 		misc |= ATOM_INTERLACE;
+-	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++	if (mode->flags & DRM_MODE_FLAG_DBLCLK)
+ 		misc |= ATOM_DOUBLE_CLOCK_MODE;
++	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
++		misc |= ATOM_H_REPLICATIONBY2 | ATOM_V_REPLICATIONBY2;
  
- 	if (should_follow_link(inode, !symlink_ok)) {
- 		if (nd->flags & LOOKUP_RCU) {
--			if (unlikely(unlazy_walk(nd, path->dentry))) {
-+			if (unlikely(nd->path.mnt != path->mnt ||
-+				     unlazy_walk(nd, path->dentry))) {
- 				error = -ECHILD;
- 				goto out;
- 			}
--- 
-2.28.0
-
-
-From 61ea92b94820a4728f6ad1316a22d9dc0b9b4289 Mon Sep 17 00:00:00 2001
-From: Calvin Owens <calvinowens@fb.com>
-Date: Tue, 13 Jan 2015 13:16:18 -0800
-Subject: [PATCH 57/65] ksoftirqd: Enable IRQs and call cond_resched() before
- poking RCU
-
-commit 28423ad283d5348793b0c45cc9b1af058e776fd6 upstream.
-
-While debugging an issue with excessive softirq usage, I encountered the
-following note in commit 3e339b5dae24a706 ("softirq: Use hotplug thread
-infrastructure"):
-
-    [ paulmck: Call rcu_note_context_switch() with interrupts enabled. ]
-
-...but despite this note, the patch still calls RCU with IRQs disabled.
-
-This seemingly innocuous change caused a significant regression in softirq
-CPU usage on the sending side of a large TCP transfer (~1 GB/s): when
-introducing 0.01% packet loss, the softirq usage would jump to around 25%,
-spiking as high as 50%. Before the change, the usage would never exceed 5%.
-
-Moving the call to rcu_note_context_switch() after the cond_sched() call,
-as it was originally before the hotplug patch, completely eliminated this
-problem.
-
-Signed-off-by: Calvin Owens <calvinowens@fb.com>
-Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
-Signed-off-by: Mike Galbraith <mgalbraith@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/softirq.c | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
-
-diff --git a/kernel/softirq.c b/kernel/softirq.c
-index 787b3a032429..21956f00cb51 100644
---- a/kernel/softirq.c
-+++ b/kernel/softirq.c
-@@ -774,9 +774,13 @@ static void run_ksoftirqd(unsigned int cpu)
- 	local_irq_disable();
- 	if (local_softirq_pending()) {
- 		__do_softirq();
--		rcu_note_context_switch(cpu);
- 		local_irq_enable();
- 		cond_resched();
-+
-+		preempt_disable();
-+		rcu_note_context_switch(cpu);
-+		preempt_enable();
-+
- 		return;
+ 	args.susModeMiscInfo.usAccess = cpu_to_le16(misc);
+ 	args.ucCRTC = radeon_crtc->crtc_id;
+diff --git a/drivers/hv/channel.c b/drivers/hv/channel.c
+index 92f34de7aee9..05e6a7d13d4e 100644
+--- a/drivers/hv/channel.c
++++ b/drivers/hv/channel.c
+@@ -169,7 +169,7 @@ int vmbus_open(struct vmbus_channel *newchannel, u32 send_ringbuffer_size,
+ 			   GFP_KERNEL);
+ 	if (!open_info) {
+ 		err = -ENOMEM;
+-		goto error0;
++		goto error_gpadl;
  	}
- 	local_irq_enable();
--- 
-2.28.0
-
-
-From 9923e74aefabc4a73e572dc16e2999625885b1e7 Mon Sep 17 00:00:00 2001
-From: Sabrina Dubroca <sd@queasysnail.net>
-Date: Thu, 26 Feb 2015 05:35:41 +0000
-Subject: [PATCH 58/65] e1000: add dummy allocator to fix race condition
- between mtu change and netpoll
-
-commit 08e8331654d1d7b2c58045e549005bc356aa7810 upstream.
-
-There is a race condition between e1000_change_mtu's cleanups and
-netpoll, when we change the MTU across jumbo size:
-
-Changing MTU frees all the rx buffers:
-    e1000_change_mtu -> e1000_down -> e1000_clean_all_rx_rings ->
-        e1000_clean_rx_ring
-
-Then, close to the end of e1000_change_mtu:
-    pr_info -> ... -> netpoll_poll_dev -> e1000_clean ->
-        e1000_clean_rx_irq -> e1000_alloc_rx_buffers -> e1000_alloc_frag
-
-And when we come back to do the rest of the MTU change:
-    e1000_up -> e1000_configure -> e1000_configure_rx ->
-        e1000_alloc_jumbo_rx_buffers
-
-alloc_jumbo finds the buffers already != NULL, since data (shared with
-page in e1000_rx_buffer->rxbuf) has been re-alloc'd, but it's garbage,
-or at least not what is expected when in jumbo state.
-
-This results in an unusable adapter (packets don't get through), and a
-NULL pointer dereference on the next call to e1000_clean_rx_ring
-(other mtu change, link down, shutdown):
-
-BUG: unable to handle kernel NULL pointer dereference at           (null)
-IP: [<ffffffff81194d6e>] put_compound_page+0x7e/0x330
-
-    [...]
-
-Call Trace:
- [<ffffffff81195445>] put_page+0x55/0x60
- [<ffffffff815d9f44>] e1000_clean_rx_ring+0x134/0x200
- [<ffffffff815da055>] e1000_clean_all_rx_rings+0x45/0x60
- [<ffffffff815df5e0>] e1000_down+0x1c0/0x1d0
- [<ffffffff811e2260>] ? deactivate_slab+0x7f0/0x840
- [<ffffffff815e21bc>] e1000_change_mtu+0xdc/0x170
- [<ffffffff81647050>] dev_set_mtu+0xa0/0x140
- [<ffffffff81664218>] do_setlink+0x218/0xac0
- [<ffffffff814459e9>] ? nla_parse+0xb9/0x120
- [<ffffffff816652d0>] rtnl_newlink+0x6d0/0x890
- [<ffffffff8104f000>] ? kvm_clock_read+0x20/0x40
- [<ffffffff810a2068>] ? sched_clock_cpu+0xa8/0x100
- [<ffffffff81663802>] rtnetlink_rcv_msg+0x92/0x260
-
-By setting the allocator to a dummy version, netpoll can't mess up our
-rx buffers.  The allocator is set back to a sane value in
-e1000_configure_rx.
-
-Fixes: edbbb3ca1077 ("e1000: implement jumbo receive with partial descriptors")
-Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
-Tested-by: Aaron Brown <aaron.f.brown@intel.com>
-Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/intel/e1000/e1000_main.c | 10 +++++++++-
- 1 file changed, 9 insertions(+), 1 deletion(-)
-
+ 
+ 	init_completion(&open_info->waitevent);
+@@ -185,7 +185,7 @@ int vmbus_open(struct vmbus_channel *newchannel, u32 send_ringbuffer_size,
+ 
+ 	if (userdatalen > MAX_USER_DEFINED_BYTES) {
+ 		err = -EINVAL;
+-		goto error0;
++		goto error_gpadl;
+ 	}
+ 
+ 	if (userdatalen)
+@@ -226,6 +226,9 @@ error1:
+ 	list_del(&open_info->msglistentry);
+ 	spin_unlock_irqrestore(&vmbus_connection.channelmsg_lock, flags);
+ 
++error_gpadl:
++	vmbus_teardown_gpadl(newchannel, newchannel->ringbuffer_gpadlhandle);
++
+ error0:
+ 	free_pages((unsigned long)out,
+ 		get_order(send_ringbuffer_size + recv_ringbuffer_size));
+diff --git a/drivers/i2c/i2c-core.c b/drivers/i2c/i2c-core.c
+index 48e31ed69dbf..9d539cbfc833 100644
+--- a/drivers/i2c/i2c-core.c
++++ b/drivers/i2c/i2c-core.c
+@@ -206,6 +206,7 @@ int i2c_generic_scl_recovery(struct i2c_adapter *adap)
+ 	adap->bus_recovery_info->set_scl(adap, 1);
+ 	return i2c_generic_recovery(adap);
+ }
++EXPORT_SYMBOL_GPL(i2c_generic_scl_recovery);
+ 
+ int i2c_generic_gpio_recovery(struct i2c_adapter *adap)
+ {
+@@ -220,6 +221,7 @@ int i2c_generic_gpio_recovery(struct i2c_adapter *adap)
+ 
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(i2c_generic_gpio_recovery);
+ 
+ int i2c_recover_bus(struct i2c_adapter *adap)
+ {
+@@ -229,6 +231,7 @@ int i2c_recover_bus(struct i2c_adapter *adap)
+ 	dev_dbg(&adap->dev, "Trying i2c bus recovery\n");
+ 	return adap->bus_recovery_info->recover_bus(adap);
+ }
++EXPORT_SYMBOL_GPL(i2c_recover_bus);
+ 
+ static int i2c_device_probe(struct device *dev)
+ {
+diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
+index 055ebebc07dd..c1fef27010d4 100644
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@ -94,12 +94,15 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+ 	if (dmasync)
+ 		dma_set_attr(DMA_ATTR_WRITE_BARRIER, &attrs);
+ 
++	if (!size)
++		return ERR_PTR(-EINVAL);
++
+ 	/*
+ 	 * If the combination of the addr and size requested for this memory
+ 	 * region causes an integer overflow, return error.
+ 	 */
+-	if ((PAGE_ALIGN(addr + size) <= size) ||
+-	    (PAGE_ALIGN(addr + size) <= addr))
++	if (((addr + size) < addr) ||
++	    PAGE_ALIGN(addr + size) < (addr + size))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	if (!can_do_mlock())
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 4f10af2905b5..262a18437ceb 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -2174,8 +2174,7 @@ static int build_lso_seg(struct mlx4_wqe_lso_seg *wqe, struct ib_send_wr *wr,
+ 
+ 	memcpy(wqe->header, wr->wr.ud.header, wr->wr.ud.hlen);
+ 
+-	*lso_hdr_sz  = cpu_to_be32((wr->wr.ud.mss - wr->wr.ud.hlen) << 16 |
+-				   wr->wr.ud.hlen);
++	*lso_hdr_sz  = cpu_to_be32(wr->wr.ud.mss << 16 | wr->wr.ud.hlen);
+ 	*lso_seg_len = halign;
+ 	return 0;
+ }
+diff --git a/drivers/input/mouse/elantech.c b/drivers/input/mouse/elantech.c
+index 85e75239c814..1af7df263368 100644
+--- a/drivers/input/mouse/elantech.c
++++ b/drivers/input/mouse/elantech.c
+@@ -784,6 +784,21 @@ static psmouse_ret_t elantech_process_byte(struct psmouse *psmouse)
+ }
+ 
+ /*
++ * This writes the reg_07 value again to the hardware at the end of every
++ * set_rate call because the register loses its value. reg_07 allows setting
++ * absolute mode on v4 hardware
++ */
++static void elantech_set_rate_restore_reg_07(struct psmouse *psmouse,
++		unsigned int rate)
++{
++	struct elantech_data *etd = psmouse->private;
++
++	etd->original_set_rate(psmouse, rate);
++	if (elantech_write_reg(psmouse, 0x07, etd->reg_07))
++		psmouse_err(psmouse, "restoring reg_07 failed\n");
++}
++
++/*
+  * Put the touchpad into absolute mode
+  */
+ static int elantech_set_absolute_mode(struct psmouse *psmouse)
+@@ -985,6 +1000,8 @@ static int elantech_get_resolution_v4(struct psmouse *psmouse,
+  * Asus K53SV              0x450f01        78, 15, 0c      2 hw buttons
+  * Asus G46VW              0x460f02        00, 18, 0c      2 hw buttons
+  * Asus G750JX             0x360f00        00, 16, 0c      2 hw buttons
++ * Asus TP500LN            0x381f17        10, 14, 0e      clickpad
++ * Asus X750JN             0x381f17        10, 14, 0e      clickpad
+  * Asus UX31               0x361f00        20, 15, 0e      clickpad
+  * Asus UX32VD             0x361f02        00, 15, 0e      clickpad
+  * Avatar AVIU-145A2       0x361f00        ?               clickpad
+@@ -1452,6 +1469,11 @@ int elantech_init(struct psmouse *psmouse)
+ 		goto init_fail;
+ 	}
+ 
++	if (etd->fw_version == 0x381f17) {
++		etd->original_set_rate = psmouse->set_rate;
++		psmouse->set_rate = elantech_set_rate_restore_reg_07;
++	}
++
+ 	if (elantech_set_input_params(psmouse)) {
+ 		psmouse_err(psmouse, "failed to query touchpad range.\n");
+ 		goto init_fail;
+diff --git a/drivers/input/mouse/elantech.h b/drivers/input/mouse/elantech.h
+index c1c15ab6872d..13a12ccbff51 100644
+--- a/drivers/input/mouse/elantech.h
++++ b/drivers/input/mouse/elantech.h
+@@ -138,6 +138,7 @@ struct elantech_data {
+ 	struct finger_pos mt[ETP_MAX_FINGERS];
+ 	unsigned char parity[256];
+ 	int (*send_cmd)(struct psmouse *psmouse, unsigned char c, unsigned char *param);
++	void (*original_set_rate)(struct psmouse *psmouse, unsigned int rate);
+ };
+ 
+ #ifdef CONFIG_MOUSE_PS2_ELANTECH
+diff --git a/drivers/media/usb/stk1160/stk1160-v4l.c b/drivers/media/usb/stk1160/stk1160-v4l.c
+index a59153d2f8bf..518a5299ff0b 100644
+--- a/drivers/media/usb/stk1160/stk1160-v4l.c
++++ b/drivers/media/usb/stk1160/stk1160-v4l.c
+@@ -245,6 +245,11 @@ static int stk1160_stop_streaming(struct stk1160 *dev)
+ 	if (mutex_lock_interruptible(&dev->v4l_lock))
+ 		return -ERESTARTSYS;
+ 
++	/*
++	 * Once URBs are cancelled, the URB complete handler
++	 * won't be running. This is required to safely release the
++	 * current buffer (dev->isoc_ctl.buf).
++	 */
+ 	stk1160_cancel_isoc(dev);
+ 
+ 	/*
+@@ -665,8 +670,16 @@ void stk1160_clear_queue(struct stk1160 *dev)
+ 		stk1160_info("buffer [%p/%d] aborted\n",
+ 				buf, buf->vb.v4l2_buf.index);
+ 	}
+-	/* It's important to clear current buffer */
+-	dev->isoc_ctl.buf = NULL;
++
++	/* It's important to release the current buffer */
++	if (dev->isoc_ctl.buf) {
++		buf = dev->isoc_ctl.buf;
++		dev->isoc_ctl.buf = NULL;
++
++		vb2_buffer_done(&buf->vb, VB2_BUF_STATE_ERROR);
++		stk1160_info("buffer [%p/%d] aborted\n",
++				buf, buf->vb.v4l2_buf.index);
++	}
+ 	spin_unlock_irqrestore(&dev->buf_lock, flags);
+ }
+ 
+diff --git a/drivers/memstick/core/mspro_block.c b/drivers/memstick/core/mspro_block.c
+index f4176ca3a794..cdd61ab5c2b5 100644
+--- a/drivers/memstick/core/mspro_block.c
++++ b/drivers/memstick/core/mspro_block.c
+@@ -758,7 +758,7 @@ static int mspro_block_complete_req(struct memstick_dev *card, int error)
+ 
+ 		if (error || (card->current_mrq.tpc == MSPRO_CMD_STOP)) {
+ 			if (msb->data_dir == READ) {
+-				for (cnt = 0; cnt < msb->current_seg; cnt++)
++				for (cnt = 0; cnt < msb->current_seg; cnt++) {
+ 					t_len += msb->req_sg[cnt].length
+ 						 / msb->page_size;
+ 
+@@ -766,6 +766,7 @@ static int mspro_block_complete_req(struct memstick_dev *card, int error)
+ 						t_len += msb->current_page - 1;
+ 
+ 					t_len *= msb->page_size;
++				}
+ 			}
+ 		} else
+ 			t_len = blk_rq_bytes(msb->block_req);
+diff --git a/drivers/mtd/ubi/attach.c b/drivers/mtd/ubi/attach.c
+index c071d410488f..79d69bd26dd2 100644
+--- a/drivers/mtd/ubi/attach.c
++++ b/drivers/mtd/ubi/attach.c
+@@ -408,7 +408,7 @@ int ubi_compare_lebs(struct ubi_device *ubi, const struct ubi_ainf_peb *aeb,
+ 		second_is_newer = !second_is_newer;
+ 	} else {
+ 		dbg_bld("PEB %d CRC is OK", pnum);
+-		bitflips = !!err;
++		bitflips |= !!err;
+ 	}
+ 	mutex_unlock(&ubi->buf_mutex);
+ 
+diff --git a/drivers/mtd/ubi/cdev.c b/drivers/mtd/ubi/cdev.c
+index 4f02848bb2bc..fc764e7976bd 100644
+--- a/drivers/mtd/ubi/cdev.c
++++ b/drivers/mtd/ubi/cdev.c
+@@ -475,7 +475,7 @@ static long vol_cdev_ioctl(struct file *file, unsigned int cmd,
+ 		/* Validate the request */
+ 		err = -EINVAL;
+ 		if (req.lnum < 0 || req.lnum >= vol->reserved_pebs ||
+-		    req.bytes < 0 || req.lnum >= vol->usable_leb_size)
++		    req.bytes < 0 || req.bytes > vol->usable_leb_size)
+ 			break;
+ 
+ 		err = get_exclusive(desc);
+diff --git a/drivers/mtd/ubi/eba.c b/drivers/mtd/ubi/eba.c
+index 0e11671dadc4..930cf2c77abb 100644
+--- a/drivers/mtd/ubi/eba.c
++++ b/drivers/mtd/ubi/eba.c
+@@ -1362,7 +1362,8 @@ int ubi_eba_init(struct ubi_device *ubi, struct ubi_attach_info *ai)
+ 				 * during re-size.
+ 				 */
+ 				ubi_move_aeb_to_list(av, aeb, &ai->erase);
+-			vol->eba_tbl[aeb->lnum] = aeb->pnum;
++			else
++				vol->eba_tbl[aeb->lnum] = aeb->pnum;
+ 		}
+ 	}
+ 
+diff --git a/drivers/mtd/ubi/wl.c b/drivers/mtd/ubi/wl.c
+index 49e570abe58b..c08254016fe8 100644
+--- a/drivers/mtd/ubi/wl.c
++++ b/drivers/mtd/ubi/wl.c
+@@ -999,7 +999,7 @@ static int wear_leveling_worker(struct ubi_device *ubi, struct ubi_work *wrk,
+ 				int cancel)
+ {
+ 	int err, scrubbing = 0, torture = 0, protect = 0, erroneous = 0;
+-	int vol_id = -1, uninitialized_var(lnum);
++	int vol_id = -1, lnum = -1;
+ #ifdef CONFIG_MTD_UBI_FASTMAP
+ 	int anchor = wrk->anchor;
+ #endif
 diff --git a/drivers/net/ethernet/intel/e1000/e1000_main.c b/drivers/net/ethernet/intel/e1000/e1000_main.c
 index 59ad007dd5aa..a978fc82ceb5 100644
 --- a/drivers/net/ethernet/intel/e1000/e1000_main.c
@@ -3576,151 +976,26 @@ index 59ad007dd5aa..a978fc82ceb5 100644
  
  	/* NOTE: netdev_alloc_skb reserves 16 bytes, and typically NET_IP_ALIGN
  	 * means we reserve 2 more, this pushes us to allocate from the next
--- 
-2.28.0
-
-
-From e60e4dc082ca9c63d2113be4be5ac4cf3fd2f2a8 Mon Sep 17 00:00:00 2001
-From: mancha security <mancha1@zoho.com>
-Date: Wed, 18 Mar 2015 18:47:25 +0100
-Subject: [PATCH 59/65] lib: memzero_explicit: use barrier instead of
- OPTIMIZER_HIDE_VAR
-
-commit 0b053c9518292705736329a8fe20ef4686ffc8e9 upstream.
-
-OPTIMIZER_HIDE_VAR(), as defined when using gcc, is insufficient to
-ensure protection from dead store optimization.
-
-For the random driver and crypto drivers, calls are emitted ...
-
-  $ gdb vmlinux
-  (gdb) disassemble memzero_explicit
-  Dump of assembler code for function memzero_explicit:
-    0xffffffff813a18b0 <+0>:	push   %rbp
-    0xffffffff813a18b1 <+1>:	mov    %rsi,%rdx
-    0xffffffff813a18b4 <+4>:	xor    %esi,%esi
-    0xffffffff813a18b6 <+6>:	mov    %rsp,%rbp
-    0xffffffff813a18b9 <+9>:	callq  0xffffffff813a7120 <memset>
-    0xffffffff813a18be <+14>:	pop    %rbp
-    0xffffffff813a18bf <+15>:	retq
-  End of assembler dump.
-
-  (gdb) disassemble extract_entropy
-  [...]
-    0xffffffff814a5009 <+313>:	mov    %r12,%rdi
-    0xffffffff814a500c <+316>:	mov    $0xa,%esi
-    0xffffffff814a5011 <+321>:	callq  0xffffffff813a18b0 <memzero_explicit>
-    0xffffffff814a5016 <+326>:	mov    -0x48(%rbp),%rax
-  [...]
-
-... but in case in future we might use facilities such as LTO, then
-OPTIMIZER_HIDE_VAR() is not sufficient to protect gcc from a possible
-eviction of the memset(). We have to use a compiler barrier instead.
-
-Minimal test example when we assume memzero_explicit() would *not* be
-a call, but would have been *inlined* instead:
-
-  static inline void memzero_explicit(void *s, size_t count)
-  {
-    memset(s, 0, count);
-    <foo>
-  }
-
-  int main(void)
-  {
-    char buff[20];
-
-    snprintf(buff, sizeof(buff) - 1, "test");
-    printf("%s", buff);
-
-    memzero_explicit(buff, sizeof(buff));
-    return 0;
-  }
-
-With <foo> := OPTIMIZER_HIDE_VAR():
-
-  (gdb) disassemble main
-  Dump of assembler code for function main:
-  [...]
-   0x0000000000400464 <+36>:	callq  0x400410 <printf@plt>
-   0x0000000000400469 <+41>:	xor    %eax,%eax
-   0x000000000040046b <+43>:	add    $0x28,%rsp
-   0x000000000040046f <+47>:	retq
-  End of assembler dump.
-
-With <foo> := barrier():
-
-  (gdb) disassemble main
-  Dump of assembler code for function main:
-  [...]
-   0x0000000000400464 <+36>:	callq  0x400410 <printf@plt>
-   0x0000000000400469 <+41>:	movq   $0x0,(%rsp)
-   0x0000000000400471 <+49>:	movq   $0x0,0x8(%rsp)
-   0x000000000040047a <+58>:	movl   $0x0,0x10(%rsp)
-   0x0000000000400482 <+66>:	xor    %eax,%eax
-   0x0000000000400484 <+68>:	add    $0x28,%rsp
-   0x0000000000400488 <+72>:	retq
-  End of assembler dump.
-
-As can be seen, movq, movq, movl are being emitted inlined
-via memset().
-
-Reference: http://thread.gmane.org/gmane.linux.kernel.cryptoapi/13764/
-Fixes: d4c5efdb9777 ("random: add and use memzero_explicit() for clearing data")
-Cc: Theodore Ts'o <tytso@mit.edu>
-Signed-off-by: mancha security <mancha1@zoho.com>
-Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
-Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Acked-by: Stephan Mueller <smueller@chronox.de>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- lib/string.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/lib/string.c b/lib/string.c
-index 43d0781daf47..cb9ea2181557 100644
---- a/lib/string.c
-+++ b/lib/string.c
-@@ -598,7 +598,7 @@ EXPORT_SYMBOL(memset);
- void memzero_explicit(void *s, size_t count)
- {
- 	memset(s, 0, count);
--	OPTIMIZER_HIDE_VAR(s);
-+	barrier();
- }
- EXPORT_SYMBOL(memzero_explicit);
- 
--- 
-2.28.0
-
-
-From 7725bb06eba0b24a925c0739c117c907d6c59613 Mon Sep 17 00:00:00 2001
-From: Nicolas Iooss <nicolas.iooss_linux@m4x.org>
-Date: Fri, 13 Mar 2015 15:17:14 +0800
-Subject: [PATCH 60/65] wl18xx: show rx_frames_per_rates as an array as it
- really is
-
-commit a3fa71c40f1853d0c27e8f5bc01a722a705d9682 upstream.
-
-In struct wl18xx_acx_rx_rate_stat, rx_frames_per_rates field is an
-array, not a number.  This means WL18XX_DEBUGFS_FWSTATS_FILE can't be
-used to display this field in debugfs (it would display a pointer, not
-the actual data).  Use WL18XX_DEBUGFS_FWSTATS_FILE_ARRAY instead.
-
-This bug has been found by adding a __printf attribute to
-wl1271_format_buffer.  gcc complained about "format '%u' expects
-argument of type 'unsigned int', but argument 5 has type 'u32 *'".
-
-Fixes: c5d94169e818 ("wl18xx: use new fw stats structures")
-Signed-off-by: Nicolas Iooss <nicolas.iooss_linux@m4x.org>
-Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/wireless/ti/wl18xx/debugfs.c | 2 +-
- drivers/net/wireless/ti/wlcore/debugfs.h | 4 ++--
- 2 files changed, 3 insertions(+), 3 deletions(-)
-
+diff --git a/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c b/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
+index e7a2af3ad05a..7555095e0b74 100644
+--- a/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
++++ b/drivers/net/wireless/rtlwifi/rtl8192cu/sw.c
+@@ -313,6 +313,7 @@ static struct usb_device_id rtl8192c_usb_ids[] = {
+ 	{RTL_USB_DEVICE(0x07b8, 0x8188, rtl92cu_hal_cfg)}, /*Abocom - Abocom*/
+ 	{RTL_USB_DEVICE(0x07b8, 0x8189, rtl92cu_hal_cfg)}, /*Funai - Abocom*/
+ 	{RTL_USB_DEVICE(0x0846, 0x9041, rtl92cu_hal_cfg)}, /*NetGear WNA1000M*/
++	{RTL_USB_DEVICE(0x0b05, 0x17ba, rtl92cu_hal_cfg)}, /*ASUS-Edimax*/
+ 	{RTL_USB_DEVICE(0x0bda, 0x5088, rtl92cu_hal_cfg)}, /*Thinkware-CC&C*/
+ 	{RTL_USB_DEVICE(0x0df6, 0x0052, rtl92cu_hal_cfg)}, /*Sitecom - Edimax*/
+ 	{RTL_USB_DEVICE(0x0df6, 0x005c, rtl92cu_hal_cfg)}, /*Sitecom - Edimax*/
+@@ -369,6 +370,7 @@ static struct usb_device_id rtl8192c_usb_ids[] = {
+ 	{RTL_USB_DEVICE(0x2001, 0x3307, rtl92cu_hal_cfg)}, /*D-Link-Cameo*/
+ 	{RTL_USB_DEVICE(0x2001, 0x3309, rtl92cu_hal_cfg)}, /*D-Link-Alpha*/
+ 	{RTL_USB_DEVICE(0x2001, 0x330a, rtl92cu_hal_cfg)}, /*D-Link-Alpha*/
++	{RTL_USB_DEVICE(0x2001, 0x330d, rtl92cu_hal_cfg)}, /*D-Link DWA-131 */
+ 	{RTL_USB_DEVICE(0x2019, 0xab2b, rtl92cu_hal_cfg)}, /*Planex -Abocom*/
+ 	{RTL_USB_DEVICE(0x20f4, 0x624d, rtl92cu_hal_cfg)}, /*TRENDNet*/
+ 	{RTL_USB_DEVICE(0x2357, 0x0100, rtl92cu_hal_cfg)}, /*TP-Link WN8200ND*/
 diff --git a/drivers/net/wireless/ti/wl18xx/debugfs.c b/drivers/net/wireless/ti/wl18xx/debugfs.c
 index 7f1669cdea09..779dc2b2ca75 100644
 --- a/drivers/net/wireless/ti/wl18xx/debugfs.c
@@ -3749,295 +1024,474 @@ index f7381dd69009..1bce4325e86b 100644
  
  int wl1271_debugfs_init(struct wl1271 *wl);
  void wl1271_debugfs_exit(struct wl1271 *wl);
--- 
-2.28.0
-
-
-From 781dd2886e87d5f978a16082c878afe86df24093 Mon Sep 17 00:00:00 2001
-From: Nishanth Menon <nm@ti.com>
-Date: Sat, 7 Mar 2015 03:39:05 -0600
-Subject: [PATCH 61/65] C6x: time: Ensure consistency in __init
-
-commit f4831605f2dacd12730fe73961c77253cc2ea425 upstream.
-
-time_init invokes timer64_init (which is __init annotation)
-since all of these are invoked at init time, lets maintain
-consistency by ensuring time_init is marked appropriately
-as well.
-
-This fixes the following warning with CONFIG_DEBUG_SECTION_MISMATCH=y
-
-WARNING: vmlinux.o(.text+0x3bfc): Section mismatch in reference from the function time_init() to the function .init.text:timer64_init()
-The function time_init() references
-the function __init timer64_init().
-This is often because time_init lacks a __init
-annotation or the annotation of timer64_init is wrong.
-
-Fixes: 546a39546c64 ("C6X: time management")
-Signed-off-by: Nishanth Menon <nm@ti.com>
-Signed-off-by: Mark Salter <msalter@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/c6x/kernel/time.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/c6x/kernel/time.c b/arch/c6x/kernel/time.c
-index 356ee84cad95..04845aaf5985 100644
---- a/arch/c6x/kernel/time.c
-+++ b/arch/c6x/kernel/time.c
-@@ -49,7 +49,7 @@ u64 sched_clock(void)
- 	return (tsc * sched_clock_multiplier) >> SCHED_CLOCK_SHIFT;
+diff --git a/drivers/parport/Kconfig b/drivers/parport/Kconfig
+index a50576081b34..46d2de24bf3e 100644
+--- a/drivers/parport/Kconfig
++++ b/drivers/parport/Kconfig
+@@ -36,7 +36,9 @@ if PARPORT
+ config PARPORT_PC
+ 	tristate "PC-style hardware"
+ 	depends on (!SPARC64 || PCI) && !SPARC32 && !M32R && !FRV && !S390 && \
+-		(!M68K || ISA) && !MN10300 && !AVR32 && !BLACKFIN && !XTENSA
++		(!M68K || ISA) && !MN10300 && !AVR32 && !BLACKFIN && \
++		!XTENSA && !CRIS && !H8300 && !ARM64
++
+ 	---help---
+ 	  You should say Y here if you have a PC-style parallel port. All
+ 	  IBM PC compatible computers and some Alphas have PC-style
+diff --git a/drivers/power/lp8788-charger.c b/drivers/power/lp8788-charger.c
+index ed49b50b220b..72da2a6c22db 100644
+--- a/drivers/power/lp8788-charger.c
++++ b/drivers/power/lp8788-charger.c
+@@ -417,8 +417,10 @@ static int lp8788_psy_register(struct platform_device *pdev,
+ 	pchg->battery.num_properties = ARRAY_SIZE(lp8788_battery_prop);
+ 	pchg->battery.get_property = lp8788_battery_get_property;
+ 
+-	if (power_supply_register(&pdev->dev, &pchg->battery))
++	if (power_supply_register(&pdev->dev, &pchg->battery)) {
++		power_supply_unregister(&pchg->charger);
+ 		return -EPERM;
++	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/scsi/mvsas/mv_sas.c b/drivers/scsi/mvsas/mv_sas.c
+index c9e244984e30..fa50c7dc3d3e 100644
+--- a/drivers/scsi/mvsas/mv_sas.c
++++ b/drivers/scsi/mvsas/mv_sas.c
+@@ -441,14 +441,11 @@ static u32 mvs_get_ncq_tag(struct sas_task *task, u32 *tag)
+ static int mvs_task_prep_ata(struct mvs_info *mvi,
+ 			     struct mvs_task_exec_info *tei)
+ {
+-	struct sas_ha_struct *sha = mvi->sas;
+ 	struct sas_task *task = tei->task;
+ 	struct domain_device *dev = task->dev;
+ 	struct mvs_device *mvi_dev = dev->lldd_dev;
+ 	struct mvs_cmd_hdr *hdr = tei->hdr;
+ 	struct asd_sas_port *sas_port = dev->port;
+-	struct sas_phy *sphy = dev->phy;
+-	struct asd_sas_phy *sas_phy = sha->sas_phy[sphy->number];
+ 	struct mvs_slot_info *slot;
+ 	void *buf_prd;
+ 	u32 tag = tei->tag, hdr_tag;
+@@ -468,7 +465,7 @@ static int mvs_task_prep_ata(struct mvs_info *mvi,
+ 	slot->tx = mvi->tx_prod;
+ 	del_q = TXQ_MODE_I | tag |
+ 		(TXQ_CMD_STP << TXQ_CMD_SHIFT) |
+-		(MVS_PHY_ID << TXQ_PHY_SHIFT) |
++		((sas_port->phy_mask & TXQ_PHY_MASK) << TXQ_PHY_SHIFT) |
+ 		(mvi_dev->taskfileset << TXQ_SRS_SHIFT);
+ 	mvi->tx[mvi->tx_prod] = cpu_to_le32(del_q);
+ 
+diff --git a/drivers/scsi/storvsc_drv.c b/drivers/scsi/storvsc_drv.c
+index a8990783ba66..913b91c78a22 100644
+--- a/drivers/scsi/storvsc_drv.c
++++ b/drivers/scsi/storvsc_drv.c
+@@ -631,21 +631,22 @@ static unsigned int copy_to_bounce_buffer(struct scatterlist *orig_sgl,
+ 			if (bounce_sgl[j].length == PAGE_SIZE) {
+ 				/* full..move to next entry */
+ 				sg_kunmap_atomic(bounce_addr);
++				bounce_addr = 0;
+ 				j++;
++			}
+ 
+-				/* if we need to use another bounce buffer */
+-				if (srclen || i != orig_sgl_count - 1)
+-					bounce_addr = sg_kmap_atomic(bounce_sgl,j);
++			/* if we need to use another bounce buffer */
++			if (srclen && bounce_addr == 0)
++				bounce_addr = sg_kmap_atomic(bounce_sgl, j);
+ 
+-			} else if (srclen == 0 && i == orig_sgl_count - 1) {
+-				/* unmap the last bounce that is < PAGE_SIZE */
+-				sg_kunmap_atomic(bounce_addr);
+-			}
+ 		}
+ 
+ 		sg_kunmap_atomic(src_addr - orig_sgl[i].offset);
+ 	}
+ 
++	if (bounce_addr)
++		sg_kunmap_atomic(bounce_addr);
++
+ 	local_irq_restore(flags);
+ 
+ 	return total_copied;
+diff --git a/drivers/spi/spidev.c b/drivers/spi/spidev.c
+index 911e9e0711d2..a08f923b9925 100644
+--- a/drivers/spi/spidev.c
++++ b/drivers/spi/spidev.c
+@@ -243,7 +243,10 @@ static int spidev_message(struct spidev_data *spidev,
+ 		k_tmp->len = u_tmp->len;
+ 
+ 		total += k_tmp->len;
+-		if (total > bufsiz) {
++		/* Check total length of transfers.  Also check each
++		 * transfer length to avoid arithmetic overflow.
++		 */
++		if (total > bufsiz || k_tmp->len > bufsiz) {
+ 			status = -EMSGSIZE;
+ 			goto done;
+ 		}
+diff --git a/drivers/usb/class/cdc-wdm.c b/drivers/usb/class/cdc-wdm.c
+index 6463ca3bcfba..07133d0c971b 100644
+--- a/drivers/usb/class/cdc-wdm.c
++++ b/drivers/usb/class/cdc-wdm.c
+@@ -244,7 +244,7 @@ static void wdm_int_callback(struct urb *urb)
+ 	case USB_CDC_NOTIFY_RESPONSE_AVAILABLE:
+ 		dev_dbg(&desc->intf->dev,
+ 			"NOTIFY_RESPONSE_AVAILABLE received: index %d len %d",
+-			dr->wIndex, dr->wLength);
++			le16_to_cpu(dr->wIndex), le16_to_cpu(dr->wLength));
+ 		break;
+ 
+ 	case USB_CDC_NOTIFY_NETWORK_CONNECTION:
+@@ -257,7 +257,9 @@ static void wdm_int_callback(struct urb *urb)
+ 		clear_bit(WDM_POLL_RUNNING, &desc->flags);
+ 		dev_err(&desc->intf->dev,
+ 			"unknown notification %d received: index %d len %d\n",
+-			dr->bNotificationType, dr->wIndex, dr->wLength);
++			dr->bNotificationType,
++			le16_to_cpu(dr->wIndex),
++			le16_to_cpu(dr->wLength));
+ 		goto exit;
+ 	}
+ 
+@@ -403,7 +405,7 @@ static ssize_t wdm_write
+ 			     USB_RECIP_INTERFACE);
+ 	req->bRequest = USB_CDC_SEND_ENCAPSULATED_COMMAND;
+ 	req->wValue = 0;
+-	req->wIndex = desc->inum;
++	req->wIndex = desc->inum; /* already converted */
+ 	req->wLength = cpu_to_le16(count);
+ 	set_bit(WDM_IN_USE, &desc->flags);
+ 	desc->outbuf = buf;
+@@ -417,7 +419,7 @@ static ssize_t wdm_write
+ 		rv = usb_translate_errors(rv);
+ 	} else {
+ 		dev_dbg(&desc->intf->dev, "Tx URB has been submitted index=%d",
+-			req->wIndex);
++			le16_to_cpu(req->wIndex));
+ 	}
+ out:
+ 	usb_autopm_put_interface(desc->intf);
+@@ -780,7 +782,7 @@ static int wdm_create(struct usb_interface *intf, struct usb_endpoint_descriptor
+ 	desc->irq->bRequestType = (USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_INTERFACE);
+ 	desc->irq->bRequest = USB_CDC_GET_ENCAPSULATED_RESPONSE;
+ 	desc->irq->wValue = 0;
+-	desc->irq->wIndex = desc->inum;
++	desc->irq->wIndex = desc->inum; /* already converted */
+ 	desc->irq->wLength = cpu_to_le16(desc->wMaxCommand);
+ 
+ 	usb_fill_control_urb(
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index c9f56ffdba9a..11a073cda1d6 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -3282,10 +3282,10 @@ int usb_port_resume(struct usb_device *udev, pm_message_t msg)
+ 		dev_dbg(hub->intfdev, "can't resume port %d, status %d\n",
+ 				port1, status);
+ 	} else {
+-		/* drive resume for at least 20 msec */
++		/* drive resume for USB_RESUME_TIMEOUT msec */
+ 		dev_dbg(&udev->dev, "usb %sresume\n",
+ 				(PMSG_IS_AUTO(msg) ? "auto-" : ""));
+-		msleep(25);
++		msleep(USB_RESUME_TIMEOUT);
+ 
+ 		/* Virtual root hubs can trigger on GET_PORT_STATUS to
+ 		 * stop resume signaling.  Then finish the resume
+diff --git a/drivers/usb/gadget/composite.c b/drivers/usb/gadget/composite.c
+index 44a292b75012..a660716f9331 100644
+--- a/drivers/usb/gadget/composite.c
++++ b/drivers/usb/gadget/composite.c
+@@ -528,7 +528,7 @@ static int bos_desc(struct usb_composite_dev *cdev)
+ 	usb_ext->bLength = USB_DT_USB_EXT_CAP_SIZE;
+ 	usb_ext->bDescriptorType = USB_DT_DEVICE_CAPABILITY;
+ 	usb_ext->bDevCapabilityType = USB_CAP_TYPE_EXT;
+-	usb_ext->bmAttributes = cpu_to_le32(USB_LPM_SUPPORT);
++	usb_ext->bmAttributes = cpu_to_le32(USB_LPM_SUPPORT | USB_BESL_SUPPORT);
+ 
+ 	/*
+ 	 * The Superspeed USB Capability descriptor shall be implemented by all
+diff --git a/drivers/usb/host/isp116x-hcd.c b/drivers/usb/host/isp116x-hcd.c
+index b64e661618bb..baf2807934c1 100644
+--- a/drivers/usb/host/isp116x-hcd.c
++++ b/drivers/usb/host/isp116x-hcd.c
+@@ -1488,7 +1488,7 @@ static int isp116x_bus_resume(struct usb_hcd *hcd)
+ 	spin_unlock_irq(&isp116x->lock);
+ 
+ 	hcd->state = HC_STATE_RESUMING;
+-	msleep(20);
++	msleep(USB_RESUME_TIMEOUT);
+ 
+ 	/* Go operational */
+ 	spin_lock_irq(&isp116x->lock);
+diff --git a/drivers/usb/host/r8a66597-hcd.c b/drivers/usb/host/r8a66597-hcd.c
+index a6fd8f5371df..6656dfda5665 100644
+--- a/drivers/usb/host/r8a66597-hcd.c
++++ b/drivers/usb/host/r8a66597-hcd.c
+@@ -2301,7 +2301,7 @@ static int r8a66597_bus_resume(struct usb_hcd *hcd)
+ 		rh->port &= ~USB_PORT_STAT_SUSPEND;
+ 		rh->port |= USB_PORT_STAT_C_SUSPEND << 16;
+ 		r8a66597_mdfy(r8a66597, RESUME, RESUME | UACT, dvstctr_reg);
+-		msleep(50);
++		msleep(USB_RESUME_TIMEOUT);
+ 		r8a66597_mdfy(r8a66597, UACT, RESUME | UACT, dvstctr_reg);
+ 	}
+ 
+diff --git a/drivers/usb/host/sl811-hcd.c b/drivers/usb/host/sl811-hcd.c
+index b2ec7fe758dd..b4cad9346035 100644
+--- a/drivers/usb/host/sl811-hcd.c
++++ b/drivers/usb/host/sl811-hcd.c
+@@ -1251,7 +1251,7 @@ sl811h_hub_control(
+ 			sl811_write(sl811, SL11H_CTLREG1, sl811->ctrl1);
+ 
+ 			mod_timer(&sl811->timer, jiffies
+-					+ msecs_to_jiffies(20));
++					+ msecs_to_jiffies(USB_RESUME_TIMEOUT));
+ 			break;
+ 		case USB_PORT_FEAT_POWER:
+ 			port_power(sl811, 0);
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 9948890ef93e..bc7a886e3c36 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1697,7 +1697,7 @@ static void handle_port_status(struct xhci_hcd *xhci,
+ 		} else {
+ 			xhci_dbg(xhci, "resume HS port %d\n", port_id);
+ 			bus_state->resume_done[faked_port_index] = jiffies +
+-				msecs_to_jiffies(20);
++				msecs_to_jiffies(USB_RESUME_TIMEOUT);
+ 			set_bit(faked_port_index, &bus_state->resuming_ports);
+ 			mod_timer(&hcd->rh_timer,
+ 				  bus_state->resume_done[faked_port_index]);
+diff --git a/drivers/usb/phy/phy.c b/drivers/usb/phy/phy.c
+index a9984c700d2c..5f79d8e2caab 100644
+--- a/drivers/usb/phy/phy.c
++++ b/drivers/usb/phy/phy.c
+@@ -78,7 +78,9 @@ static void devm_usb_phy_release(struct device *dev, void *res)
+ 
+ static int devm_usb_phy_match(struct device *dev, void *res, void *match_data)
+ {
+-	return res == match_data;
++	struct usb_phy **phy = res;
++
++	return *phy == match_data;
  }
  
--void time_init(void)
-+void __init time_init(void)
- {
- 	u64 tmp = (u64)NSEC_PER_SEC << SCHED_CLOCK_SHIFT;
+ /**
+diff --git a/drivers/video/console/Kconfig b/drivers/video/console/Kconfig
+index bc922c47d046..37e62c7b3273 100644
+--- a/drivers/video/console/Kconfig
++++ b/drivers/video/console/Kconfig
+@@ -6,7 +6,10 @@ menu "Console display driver support"
  
--- 
-2.28.0
-
-
-From b0635e862c10d47ee5f13d0422f7bc9da718bab4 Mon Sep 17 00:00:00 2001
-From: Dan Carpenter <dan.carpenter@oracle.com>
-Date: Thu, 16 Apr 2015 12:48:35 -0700
-Subject: [PATCH 62/65] memstick: mspro_block: add missing curly braces
-
-commit 13f6b191aaa11c7fd718d35a0c565f3c16bc1d99 upstream.
-
-Using the indenting we can see the curly braces were obviously intended.
-This is a static checker fix, but my guess is that we don't read enough
-bytes, because we don't calculate "t_len" correctly.
-
-Fixes: f1d82698029b ('memstick: use fully asynchronous request processing')
-Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
-Cc: Alex Dubov <oakad@yahoo.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/memstick/core/mspro_block.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/memstick/core/mspro_block.c b/drivers/memstick/core/mspro_block.c
-index f4176ca3a794..cdd61ab5c2b5 100644
---- a/drivers/memstick/core/mspro_block.c
-+++ b/drivers/memstick/core/mspro_block.c
-@@ -758,7 +758,7 @@ static int mspro_block_complete_req(struct memstick_dev *card, int error)
+ config VGA_CONSOLE
+ 	bool "VGA text console" if EXPERT || !X86
+-	depends on !4xx && !8xx && !SPARC && !M68K && !PARISC && !FRV && !SUPERH && !BLACKFIN && !AVR32 && !MN10300 && (!ARM || ARCH_FOOTBRIDGE || ARCH_INTEGRATOR || ARCH_NETWINDER)
++	depends on !4xx && !8xx && !SPARC && !M68K && !PARISC && !FRV && \
++		!SUPERH && !BLACKFIN && !AVR32 && !MN10300 && !CRIS && \
++		(!ARM || ARCH_FOOTBRIDGE || ARCH_INTEGRATOR || ARCH_NETWINDER) && \
++		!ARM64
+ 	default y
+ 	help
+ 	  Saying Y here will allow you to use Linux in text mode through a
+diff --git a/fs/binfmt_elf.c b/fs/binfmt_elf.c
+index 3c4d8797ea9a..53f620a4350e 100644
+--- a/fs/binfmt_elf.c
++++ b/fs/binfmt_elf.c
+@@ -756,6 +756,7 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ 	    i < loc->elf_ex.e_phnum; i++, elf_ppnt++) {
+ 		int elf_prot = 0, elf_flags;
+ 		unsigned long k, vaddr;
++		unsigned long total_size = 0;
  
- 		if (error || (card->current_mrq.tpc == MSPRO_CMD_STOP)) {
- 			if (msb->data_dir == READ) {
--				for (cnt = 0; cnt < msb->current_seg; cnt++)
-+				for (cnt = 0; cnt < msb->current_seg; cnt++) {
- 					t_len += msb->req_sg[cnt].length
- 						 / msb->page_size;
- 
-@@ -766,6 +766,7 @@ static int mspro_block_complete_req(struct memstick_dev *card, int error)
- 						t_len += msb->current_page - 1;
- 
- 					t_len *= msb->page_size;
-+				}
- 			}
- 		} else
- 			t_len = blk_rq_bytes(msb->block_req);
--- 
-2.28.0
-
-
-From e034445e41bcaa968e8dc7721f5a581d5db34bff Mon Sep 17 00:00:00 2001
-From: Geert Uytterhoeven <geert@linux-m68k.org>
-Date: Thu, 9 Oct 2014 15:30:30 -0700
-Subject: [PATCH 63/65] nosave: consolidate __nosave_{begin,end} in
- <asm/sections.h>
-
-commit 7f8998c7aef3ac9c5f3f2943e083dfa6302e90d0 upstream.
-
-The different architectures used their own (and different) declarations:
-
-    extern __visible const void __nosave_begin, __nosave_end;
-    extern const void __nosave_begin, __nosave_end;
-    extern long __nosave_begin, __nosave_end;
-
-Consolidate them using the first variant in <asm/sections.h>.
-
-Signed-off-by: Geert Uytterhoeven <geert@linux-m68k.org>
-Cc: Russell King <linux@arm.linux.org.uk>
-Cc: Ralf Baechle <ralf@linux-mips.org>
-Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
-Cc: Martin Schwidefsky <schwidefsky@de.ibm.com>
-Cc: "David S. Miller" <davem@davemloft.net>
-Cc: Guan Xuetao <gxt@mprc.pku.edu.cn>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: Ingo Molnar <mingo@redhat.com>
-Cc: "H. Peter Anvin" <hpa@zytor.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/mips/include/asm/suspend.h   | 7 -------
- arch/mips/power/cpu.c             | 2 +-
- arch/powerpc/kernel/suspend.c     | 4 +---
- arch/s390/kernel/suspend.c        | 6 +-----
- arch/sh/include/asm/sections.h    | 1 -
- arch/sparc/power/hibernate.c      | 4 +---
- arch/unicore32/include/mach/pm.h  | 3 ---
- arch/unicore32/kernel/hibernate.c | 1 +
- arch/x86/power/hibernate_32.c     | 4 +---
- arch/x86/power/hibernate_64.c     | 4 +---
- include/asm-generic/sections.h    | 4 ++++
- 11 files changed, 11 insertions(+), 29 deletions(-)
- delete mode 100644 arch/mips/include/asm/suspend.h
-
-diff --git a/arch/mips/include/asm/suspend.h b/arch/mips/include/asm/suspend.h
-deleted file mode 100644
-index 3adac3b53d19..000000000000
---- a/arch/mips/include/asm/suspend.h
-+++ /dev/null
-@@ -1,7 +0,0 @@
--#ifndef __ASM_SUSPEND_H
--#define __ASM_SUSPEND_H
--
--/* References to section boundaries */
--extern const void __nosave_begin, __nosave_end;
--
--#endif /* __ASM_SUSPEND_H */
-diff --git a/arch/mips/power/cpu.c b/arch/mips/power/cpu.c
-index 521e5963df05..2129e67723ff 100644
---- a/arch/mips/power/cpu.c
-+++ b/arch/mips/power/cpu.c
-@@ -7,7 +7,7 @@
-  * Author: Hu Hongbing <huhb@lemote.com>
-  *	   Wu Zhangjin <wuzhangjin@gmail.com>
-  */
--#include <asm/suspend.h>
-+#include <asm/sections.h>
- #include <asm/fpu.h>
- #include <asm/dsp.h>
- 
-diff --git a/arch/powerpc/kernel/suspend.c b/arch/powerpc/kernel/suspend.c
-index 0167d53da30c..a531154cc0f3 100644
---- a/arch/powerpc/kernel/suspend.c
-+++ b/arch/powerpc/kernel/suspend.c
-@@ -9,9 +9,7 @@
- 
- #include <linux/mm.h>
- #include <asm/page.h>
--
--/* References to section boundaries */
--extern const void __nosave_begin, __nosave_end;
-+#include <asm/sections.h>
- 
- /*
-  *	pfn_is_nosave - check if given pfn is in the 'nosave' section
-diff --git a/arch/s390/kernel/suspend.c b/arch/s390/kernel/suspend.c
-index f176bc83cc8d..a3ab6798ce68 100644
---- a/arch/s390/kernel/suspend.c
-+++ b/arch/s390/kernel/suspend.c
-@@ -9,13 +9,9 @@
- #include <linux/pfn.h>
- #include <linux/suspend.h>
- #include <linux/mm.h>
-+#include <asm/sections.h>
- #include <asm/ctl_reg.h>
- 
--/*
-- * References to section boundaries
-- */
--extern const void __nosave_begin, __nosave_end;
--
- /*
-  * The restore of the saved pages in an hibernation image will set
-  * the change and referenced bits in the storage key for each page.
-diff --git a/arch/sh/include/asm/sections.h b/arch/sh/include/asm/sections.h
-index 1b6199740e98..7a99e6af6372 100644
---- a/arch/sh/include/asm/sections.h
-+++ b/arch/sh/include/asm/sections.h
-@@ -3,7 +3,6 @@
- 
- #include <asm-generic/sections.h>
- 
--extern long __nosave_begin, __nosave_end;
- extern long __machvec_start, __machvec_end;
- extern char __uncached_start, __uncached_end;
- extern char __start_eh_frame[], __stop_eh_frame[];
-diff --git a/arch/sparc/power/hibernate.c b/arch/sparc/power/hibernate.c
-index 42b0b8ce699a..17bd2e167e07 100644
---- a/arch/sparc/power/hibernate.c
-+++ b/arch/sparc/power/hibernate.c
-@@ -9,11 +9,9 @@
- #include <asm/hibernate.h>
- #include <asm/visasm.h>
- #include <asm/page.h>
-+#include <asm/sections.h>
- #include <asm/tlb.h>
- 
--/* References to section boundaries */
--extern const void __nosave_begin, __nosave_end;
--
- struct saved_context saved_context;
- 
- /*
-diff --git a/arch/unicore32/include/mach/pm.h b/arch/unicore32/include/mach/pm.h
-index 4dcd34ae194c..77b522694e74 100644
---- a/arch/unicore32/include/mach/pm.h
-+++ b/arch/unicore32/include/mach/pm.h
-@@ -36,8 +36,5 @@ extern int puv3_pm_enter(suspend_state_t state);
- /* Defined in hibernate_asm.S */
- extern int restore_image(pgd_t *resume_pg_dir, struct pbe *restore_pblist);
- 
--/* References to section boundaries */
--extern const void __nosave_begin, __nosave_end;
--
- extern struct pbe *restore_pblist;
+ 		if (elf_ppnt->p_type != PT_LOAD)
+ 			continue;
+@@ -820,10 +821,16 @@ static int load_elf_binary(struct linux_binprm *bprm)
+ #else
+ 			load_bias = ELF_PAGESTART(ELF_ET_DYN_BASE - vaddr);
  #endif
-diff --git a/arch/unicore32/kernel/hibernate.c b/arch/unicore32/kernel/hibernate.c
-index d75ef8b6cb56..9969ec374abb 100644
---- a/arch/unicore32/kernel/hibernate.c
-+++ b/arch/unicore32/kernel/hibernate.c
-@@ -18,6 +18,7 @@
- #include <asm/page.h>
- #include <asm/pgtable.h>
- #include <asm/pgalloc.h>
-+#include <asm/sections.h>
- #include <asm/suspend.h>
++			total_size = total_mapping_size(elf_phdata,
++							loc->elf_ex.e_phnum);
++			if (!total_size) {
++				error = -EINVAL;
++				goto out_free_dentry;
++			}
+ 		}
  
- #include "mach/pm.h"
-diff --git a/arch/x86/power/hibernate_32.c b/arch/x86/power/hibernate_32.c
-index 7d28c885d238..291226b952a9 100644
---- a/arch/x86/power/hibernate_32.c
-+++ b/arch/x86/power/hibernate_32.c
-@@ -13,13 +13,11 @@
- #include <asm/page.h>
- #include <asm/pgtable.h>
- #include <asm/mmzone.h>
-+#include <asm/sections.h>
+ 		error = elf_map(bprm->file, load_bias + vaddr, elf_ppnt,
+-				elf_prot, elf_flags, 0);
++				elf_prot, elf_flags, total_size);
+ 		if (BAD_ADDR(error)) {
+ 			send_sig(SIGKILL, current, 0);
+ 			retval = IS_ERR((void *)error) ?
+diff --git a/fs/btrfs/extent-tree.c b/fs/btrfs/extent-tree.c
+index f99c71e40f8b..07f167a1d271 100644
+--- a/fs/btrfs/extent-tree.c
++++ b/fs/btrfs/extent-tree.c
+@@ -6363,12 +6363,11 @@ static int __btrfs_free_reserved_extent(struct btrfs_root *root,
+ 		return -ENOSPC;
+ 	}
  
- /* Defined in hibernate_asm_32.S */
- extern int restore_image(void);
- 
--/* References to section boundaries */
--extern const void __nosave_begin, __nosave_end;
+-	if (btrfs_test_opt(root, DISCARD))
+-		ret = btrfs_discard_extent(root, start, len, NULL);
 -
- /* Pointer to the temporary resume page tables */
- pgd_t *resume_pg_dir;
+ 	if (pin)
+ 		pin_down_extent(root, cache, start, len, 1);
+ 	else {
++		if (btrfs_test_opt(root, DISCARD))
++			ret = btrfs_discard_extent(root, start, len, NULL);
+ 		btrfs_add_free_space(cache, start, len);
+ 		btrfs_update_reserved_bytes(cache, len, RESERVE_FREE);
+ 	}
+diff --git a/fs/btrfs/ioctl.c b/fs/btrfs/ioctl.c
+index 783906c687b5..dbefa6c609f4 100644
+--- a/fs/btrfs/ioctl.c
++++ b/fs/btrfs/ioctl.c
+@@ -2572,6 +2572,11 @@ static noinline long btrfs_ioctl_clone(struct file *file, unsigned long srcfd,
+ 	if (off + len == src->i_size)
+ 		len = ALIGN(src->i_size, bs) - off;
  
-diff --git a/arch/x86/power/hibernate_64.c b/arch/x86/power/hibernate_64.c
-index a0fde91c16cf..8ecaed127634 100644
---- a/arch/x86/power/hibernate_64.c
-+++ b/arch/x86/power/hibernate_64.c
-@@ -17,11 +17,9 @@
- #include <asm/page.h>
- #include <asm/pgtable.h>
- #include <asm/mtrr.h>
-+#include <asm/sections.h>
- #include <asm/suspend.h>
++	if (len == 0) {
++		ret = 0;
++		goto out_unlock;
++	}
++
+ 	/* verify the end result is block aligned */
+ 	if (!IS_ALIGNED(off, bs) || !IS_ALIGNED(off + len, bs) ||
+ 	    !IS_ALIGNED(destoff, bs))
+diff --git a/fs/ext4/namei.c b/fs/ext4/namei.c
+index f1312173fa90..facf8590b714 100644
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@ -1880,7 +1880,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
+ 			  struct inode *inode)
+ {
+ 	struct inode *dir = dentry->d_parent->d_inode;
+-	struct buffer_head *bh;
++	struct buffer_head *bh = NULL;
+ 	struct ext4_dir_entry_2 *de;
+ 	struct ext4_dir_entry_tail *t;
+ 	struct super_block *sb;
+@@ -1905,14 +1905,14 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
+ 			return retval;
+ 		if (retval == 1) {
+ 			retval = 0;
+-			return retval;
++			goto out;
+ 		}
+ 	}
  
--/* References to section boundaries */
--extern const void __nosave_begin, __nosave_end;
--
- /* Defined in hibernate_asm_64.S */
- extern int restore_image(void);
+ 	if (is_dx(dir)) {
+ 		retval = ext4_dx_add_entry(handle, dentry, inode);
+ 		if (!retval || (retval != ERR_BAD_DX_DIR))
+-			return retval;
++			goto out;
+ 		ext4_clear_inode_flag(dir, EXT4_INODE_INDEX);
+ 		dx_fallback++;
+ 		ext4_mark_inode_dirty(handle, dir);
+@@ -1924,14 +1924,15 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
+ 			return PTR_ERR(bh);
  
+ 		retval = add_dirent_to_buf(handle, dentry, inode, NULL, bh);
+-		if (retval != -ENOSPC) {
+-			brelse(bh);
+-			return retval;
+-		}
++		if (retval != -ENOSPC)
++			goto out;
+ 
+ 		if (blocks == 1 && !dx_fallback &&
+-		    EXT4_HAS_COMPAT_FEATURE(sb, EXT4_FEATURE_COMPAT_DIR_INDEX))
+-			return make_indexed_dir(handle, dentry, inode, bh);
++		    EXT4_HAS_COMPAT_FEATURE(sb, EXT4_FEATURE_COMPAT_DIR_INDEX)) {
++			retval = make_indexed_dir(handle, dentry, inode, bh);
++			bh = NULL; /* make_indexed_dir releases bh */
++			goto out;
++		}
+ 		brelse(bh);
+ 	}
+ 	bh = ext4_append(handle, dir, &block);
+@@ -1947,6 +1948,7 @@ static int ext4_add_entry(handle_t *handle, struct dentry *dentry,
+ 	}
+ 
+ 	retval = add_dirent_to_buf(handle, dentry, inode, de, bh);
++out:
+ 	brelse(bh);
+ 	if (retval == 0)
+ 		ext4_set_inode_state(inode, EXT4_STATE_NEWENTRY);
+diff --git a/fs/namei.c b/fs/namei.c
+index f7c4393f8535..036c21246d6a 100644
+--- a/fs/namei.c
++++ b/fs/namei.c
+@@ -1542,7 +1542,8 @@ static inline int walk_component(struct nameidata *nd, struct path *path,
+ 
+ 	if (should_follow_link(inode, follow)) {
+ 		if (nd->flags & LOOKUP_RCU) {
+-			if (unlikely(unlazy_walk(nd, path->dentry))) {
++			if (unlikely(nd->path.mnt != path->mnt ||
++				     unlazy_walk(nd, path->dentry))) {
+ 				err = -ECHILD;
+ 				goto out_err;
+ 			}
+@@ -2824,7 +2825,8 @@ finish_lookup:
+ 
+ 	if (should_follow_link(inode, !symlink_ok)) {
+ 		if (nd->flags & LOOKUP_RCU) {
+-			if (unlikely(unlazy_walk(nd, path->dentry))) {
++			if (unlikely(nd->path.mnt != path->mnt ||
++				     unlazy_walk(nd, path->dentry))) {
+ 				error = -ECHILD;
+ 				goto out;
+ 			}
+diff --git a/include/acpi/actypes.h b/include/acpi/actypes.h
+index a64adcc29ae5..f819e813c8ac 100644
+--- a/include/acpi/actypes.h
++++ b/include/acpi/actypes.h
+@@ -198,9 +198,29 @@ typedef int INT32;
+ typedef s32 acpi_native_int;
+ 
+ typedef u32 acpi_size;
++
++#ifdef ACPI_32BIT_PHYSICAL_ADDRESS
++
++/*
++ * OSPMs can define this to shrink the size of the structures for 32-bit
++ * none PAE environment. ASL compiler may always define this to generate
++ * 32-bit OSPM compliant tables.
++ */
+ typedef u32 acpi_io_address;
+ typedef u32 acpi_physical_address;
+ 
++#else				/* ACPI_32BIT_PHYSICAL_ADDRESS */
++
++/*
++ * It is reported that, after some calculations, the physical addresses can
++ * wrap over the 32-bit boundary on 32-bit PAE environment.
++ * https://bugzilla.kernel.org/show_bug.cgi?id=87971
++ */
++typedef u64 acpi_io_address;
++typedef u64 acpi_physical_address;
++
++#endif				/* ACPI_32BIT_PHYSICAL_ADDRESS */
++
+ #define ACPI_MAX_PTR                    ACPI_UINT32_MAX
+ #define ACPI_SIZE_MAX                   ACPI_UINT32_MAX
+ 
+diff --git a/include/acpi/platform/acenv.h b/include/acpi/platform/acenv.h
+index ef04b36ca6ed..f7db107abb04 100644
+--- a/include/acpi/platform/acenv.h
++++ b/include/acpi/platform/acenv.h
+@@ -76,6 +76,7 @@
+ #define ACPI_LARGE_NAMESPACE_NODE
+ #define ACPI_DATA_TABLE_DISASSEMBLY
+ #define ACPI_SINGLE_THREADED
++#define ACPI_32BIT_PHYSICAL_ADDRESS
+ #endif
+ 
+ /* acpi_exec configuration. Multithreaded with full AML debugger */
 diff --git a/include/asm-generic/sections.h b/include/asm-generic/sections.h
 index c1a1216e29ce..87b27263f5e2 100644
 --- a/include/asm-generic/sections.h
@@ -4060,66 +1514,335 @@ index c1a1216e29ce..87b27263f5e2 100644
  /* function descriptor handling (if any).  Override
   * in asm/sections.h */
  #ifndef dereference_function_descriptor
--- 
-2.28.0
-
-
-From e6095e729fde00eff27d6a04b1173340b20d274f Mon Sep 17 00:00:00 2001
-From: Guenter Roeck <linux@roeck-us.net>
-Date: Mon, 4 May 2015 21:42:41 -0700
-Subject: [PATCH 64/65] s390: Fix build error
-
-s390 images fail to build in 3.10 with
-
-arch/s390/kernel/suspend.c: In function 'pfn_is_nosave':
-arch/s390/kernel/suspend.c:147:10: error: 'ipl_info' undeclared
-arch/s390/kernel/suspend.c:147:27: error: 'IPL_TYPE_NSS' undeclared
-
-due to a missing include file.
-
-Signed-off-by: Guenter Roeck <linux@roeck-us.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/s390/kernel/suspend.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/arch/s390/kernel/suspend.c b/arch/s390/kernel/suspend.c
-index a3ab6798ce68..58cbb75e89e9 100644
---- a/arch/s390/kernel/suspend.c
-+++ b/arch/s390/kernel/suspend.c
-@@ -11,6 +11,7 @@
- #include <linux/mm.h>
- #include <asm/sections.h>
- #include <asm/ctl_reg.h>
-+#include <asm/ipl.h>
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index a0bee5a28d1a..28bd3a898cba 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -206,6 +206,32 @@ void usb_put_intf(struct usb_interface *intf);
+ #define USB_MAXINTERFACES	32
+ #define USB_MAXIADS		(USB_MAXINTERFACES/2)
  
- /*
-  * The restore of the saved pages in an hibernation image will set
--- 
-2.28.0
-
-
-From 9182148a5315d4b1de68ac74fd54cbb5da5a3703 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Wed, 6 May 2015 21:56:44 +0200
-Subject: [PATCH 65/65] Linux 3.10.77
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 019a6a4b386d..923ad8a64e3b 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 10
--SUBLEVEL = 76
-+SUBLEVEL = 77
- EXTRAVERSION =
- NAME = TOSSUG Baby Fish
++/*
++ * USB Resume Timer: Every Host controller driver should drive the resume
++ * signalling on the bus for the amount of time defined by this macro.
++ *
++ * That way we will have a 'stable' behavior among all HCDs supported by Linux.
++ *
++ * Note that the USB Specification states we should drive resume for *at least*
++ * 20 ms, but it doesn't give an upper bound. This creates two possible
++ * situations which we want to avoid:
++ *
++ * (a) sometimes an msleep(20) might expire slightly before 20 ms, which causes
++ * us to fail USB Electrical Tests, thus failing Certification
++ *
++ * (b) Some (many) devices actually need more than 20 ms of resume signalling,
++ * and while we can argue that's against the USB Specification, we don't have
++ * control over which devices a certification laboratory will be using for
++ * certification. If CertLab uses a device which was tested against Windows and
++ * that happens to have relaxed resume signalling rules, we might fall into
++ * situations where we fail interoperability and electrical tests.
++ *
++ * In order to avoid both conditions, we're using a 40 ms resume timeout, which
++ * should cope with both LPJ calibration errors and devices not following every
++ * detail of the USB Specification.
++ */
++#define USB_RESUME_TIMEOUT	40 /* ms */
++
+ /**
+  * struct usb_interface_cache - long-term representation of a device interface
+  * @num_altsetting: number of altsettings defined.
+diff --git a/kernel/ptrace.c b/kernel/ptrace.c
+index afadcf7b4a22..118323bc8529 100644
+--- a/kernel/ptrace.c
++++ b/kernel/ptrace.c
+@@ -720,6 +720,8 @@ static int ptrace_peek_siginfo(struct task_struct *child,
+ static int ptrace_resume(struct task_struct *child, long request,
+ 			 unsigned long data)
+ {
++	bool need_siglock;
++
+ 	if (!valid_signal(data))
+ 		return -EIO;
  
--- 
-2.28.0
-
+@@ -747,8 +749,26 @@ static int ptrace_resume(struct task_struct *child, long request,
+ 		user_disable_single_step(child);
+ 	}
+ 
++	/*
++	 * Change ->exit_code and ->state under siglock to avoid the race
++	 * with wait_task_stopped() in between; a non-zero ->exit_code will
++	 * wrongly look like another report from tracee.
++	 *
++	 * Note that we need siglock even if ->exit_code == data and/or this
++	 * status was not reported yet, the new status must not be cleared by
++	 * wait_task_stopped() after resume.
++	 *
++	 * If data == 0 we do not care if wait_task_stopped() reports the old
++	 * status and clears the code too; this can't race with the tracee, it
++	 * takes siglock after resume.
++	 */
++	need_siglock = data && !thread_group_empty(current);
++	if (need_siglock)
++		spin_lock_irq(&child->sighand->siglock);
+ 	child->exit_code = data;
+ 	wake_up_state(child, __TASK_TRACED);
++	if (need_siglock)
++		spin_unlock_irq(&child->sighand->siglock);
+ 
+ 	return 0;
+ }
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index 787b3a032429..21956f00cb51 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -774,9 +774,13 @@ static void run_ksoftirqd(unsigned int cpu)
+ 	local_irq_disable();
+ 	if (local_softirq_pending()) {
+ 		__do_softirq();
+-		rcu_note_context_switch(cpu);
+ 		local_irq_enable();
+ 		cond_resched();
++
++		preempt_disable();
++		rcu_note_context_switch(cpu);
++		preempt_enable();
++
+ 		return;
+ 	}
+ 	local_irq_enable();
+diff --git a/kernel/trace/ring_buffer.c b/kernel/trace/ring_buffer.c
+index 3d9fee3a80b3..ab21b8c66535 100644
+--- a/kernel/trace/ring_buffer.c
++++ b/kernel/trace/ring_buffer.c
+@@ -2650,7 +2650,7 @@ static DEFINE_PER_CPU(unsigned int, current_context);
+ 
+ static __always_inline int trace_recursive_lock(void)
+ {
+-	unsigned int val = this_cpu_read(current_context);
++	unsigned int val = __this_cpu_read(current_context);
+ 	int bit;
+ 
+ 	if (in_interrupt()) {
+@@ -2667,18 +2667,17 @@ static __always_inline int trace_recursive_lock(void)
+ 		return 1;
+ 
+ 	val |= (1 << bit);
+-	this_cpu_write(current_context, val);
++	__this_cpu_write(current_context, val);
+ 
+ 	return 0;
+ }
+ 
+ static __always_inline void trace_recursive_unlock(void)
+ {
+-	unsigned int val = this_cpu_read(current_context);
++	unsigned int val = __this_cpu_read(current_context);
+ 
+-	val--;
+-	val &= this_cpu_read(current_context);
+-	this_cpu_write(current_context, val);
++	val &= val & (val - 1);
++	__this_cpu_write(current_context, val);
+ }
+ 
+ #else
+diff --git a/lib/string.c b/lib/string.c
+index 43d0781daf47..cb9ea2181557 100644
+--- a/lib/string.c
++++ b/lib/string.c
+@@ -598,7 +598,7 @@ EXPORT_SYMBOL(memset);
+ void memzero_explicit(void *s, size_t count)
+ {
+ 	memset(s, 0, count);
+-	OPTIMIZER_HIDE_VAR(s);
++	barrier();
+ }
+ EXPORT_SYMBOL(memzero_explicit);
+ 
+diff --git a/net/ipv4/ip_forward.c b/net/ipv4/ip_forward.c
+index 31ee5c6033df..479e8a63125a 100644
+--- a/net/ipv4/ip_forward.c
++++ b/net/ipv4/ip_forward.c
+@@ -126,6 +126,9 @@ int ip_forward(struct sk_buff *skb)
+ 	struct rtable *rt;	/* Route we use */
+ 	struct ip_options *opt	= &(IPCB(skb)->opt);
+ 
++	if (unlikely(skb->sk))
++		goto drop;
++
+ 	if (skb_warn_if_lro(skb))
+ 		goto drop;
+ 
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index 7681a1bbd97f..76c80b59e80f 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -2571,39 +2571,65 @@ begin_fwd:
+ 	}
+ }
+ 
+-/* Send a fin.  The caller locks the socket for us.  This cannot be
+- * allowed to fail queueing a FIN frame under any circumstances.
++/* We allow to exceed memory limits for FIN packets to expedite
++ * connection tear down and (memory) recovery.
++ * Otherwise tcp_send_fin() could be tempted to either delay FIN
++ * or even be forced to close flow without any FIN.
++ */
++static void sk_forced_wmem_schedule(struct sock *sk, int size)
++{
++	int amt, status;
++
++	if (size <= sk->sk_forward_alloc)
++		return;
++	amt = sk_mem_pages(size);
++	sk->sk_forward_alloc += amt * SK_MEM_QUANTUM;
++	sk_memory_allocated_add(sk, amt, &status);
++}
++
++/* Send a FIN. The caller locks the socket for us.
++ * We should try to send a FIN packet really hard, but eventually give up.
+  */
+ void tcp_send_fin(struct sock *sk)
+ {
++	struct sk_buff *skb, *tskb = tcp_write_queue_tail(sk);
+ 	struct tcp_sock *tp = tcp_sk(sk);
+-	struct sk_buff *skb = tcp_write_queue_tail(sk);
+-	int mss_now;
+ 
+-	/* Optimization, tack on the FIN if we have a queue of
+-	 * unsent frames.  But be careful about outgoing SACKS
+-	 * and IP options.
++	/* Optimization, tack on the FIN if we have one skb in write queue and
++	 * this skb was not yet sent, or we are under memory pressure.
++	 * Note: in the latter case, FIN packet will be sent after a timeout,
++	 * as TCP stack thinks it has already been transmitted.
+ 	 */
+-	mss_now = tcp_current_mss(sk);
+-
+-	if (tcp_send_head(sk) != NULL) {
+-		TCP_SKB_CB(skb)->tcp_flags |= TCPHDR_FIN;
+-		TCP_SKB_CB(skb)->end_seq++;
++	if (tskb && (tcp_send_head(sk) || sk_under_memory_pressure(sk))) {
++coalesce:
++		TCP_SKB_CB(tskb)->tcp_flags |= TCPHDR_FIN;
++		TCP_SKB_CB(tskb)->end_seq++;
+ 		tp->write_seq++;
++		if (!tcp_send_head(sk)) {
++			/* This means tskb was already sent.
++			 * Pretend we included the FIN on previous transmit.
++			 * We need to set tp->snd_nxt to the value it would have
++			 * if FIN had been sent. This is because retransmit path
++			 * does not change tp->snd_nxt.
++			 */
++			tp->snd_nxt++;
++			return;
++		}
+ 	} else {
+-		/* Socket is locked, keep trying until memory is available. */
+-		for (;;) {
+-			skb = sk_stream_alloc_skb(sk, 0, sk->sk_allocation);
+-			if (skb)
+-				break;
+-			yield();
++		skb = alloc_skb_fclone(MAX_TCP_HEADER, sk->sk_allocation);
++		if (unlikely(!skb)) {
++			if (tskb)
++				goto coalesce;
++			return;
+ 		}
++		skb_reserve(skb, MAX_TCP_HEADER);
++		sk_forced_wmem_schedule(sk, skb->truesize);
+ 		/* FIN eats a sequence byte, write_seq advanced by tcp_queue_skb(). */
+ 		tcp_init_nondata_skb(skb, tp->write_seq,
+ 				     TCPHDR_ACK | TCPHDR_FIN);
+ 		tcp_queue_skb(sk, skb);
+ 	}
+-	__tcp_push_pending_frames(sk, mss_now, TCP_NAGLE_OFF);
++	__tcp_push_pending_frames(sk, tcp_current_mss(sk), TCP_NAGLE_OFF);
+ }
+ 
+ /* We get here when a process closes a file descriptor (either due to
+diff --git a/sound/pci/emu10k1/emuproc.c b/sound/pci/emu10k1/emuproc.c
+index 2ca9f2e93139..53745f4c2bf5 100644
+--- a/sound/pci/emu10k1/emuproc.c
++++ b/sound/pci/emu10k1/emuproc.c
+@@ -241,31 +241,22 @@ static void snd_emu10k1_proc_spdif_read(struct snd_info_entry *entry,
+ 	struct snd_emu10k1 *emu = entry->private_data;
+ 	u32 value;
+ 	u32 value2;
+-	unsigned long flags;
+ 	u32 rate;
+ 
+ 	if (emu->card_capabilities->emu_model) {
+-		spin_lock_irqsave(&emu->emu_lock, flags);
+ 		snd_emu1010_fpga_read(emu, 0x38, &value);
+-		spin_unlock_irqrestore(&emu->emu_lock, flags);
+ 		if ((value & 0x1) == 0) {
+-			spin_lock_irqsave(&emu->emu_lock, flags);
+ 			snd_emu1010_fpga_read(emu, 0x2a, &value);
+ 			snd_emu1010_fpga_read(emu, 0x2b, &value2);
+-			spin_unlock_irqrestore(&emu->emu_lock, flags);
+ 			rate = 0x1770000 / (((value << 5) | value2)+1);	
+ 			snd_iprintf(buffer, "ADAT Locked : %u\n", rate);
+ 		} else {
+ 			snd_iprintf(buffer, "ADAT Unlocked\n");
+ 		}
+-		spin_lock_irqsave(&emu->emu_lock, flags);
+ 		snd_emu1010_fpga_read(emu, 0x20, &value);
+-		spin_unlock_irqrestore(&emu->emu_lock, flags);
+ 		if ((value & 0x4) == 0) {
+-			spin_lock_irqsave(&emu->emu_lock, flags);
+ 			snd_emu1010_fpga_read(emu, 0x28, &value);
+ 			snd_emu1010_fpga_read(emu, 0x29, &value2);
+-			spin_unlock_irqrestore(&emu->emu_lock, flags);
+ 			rate = 0x1770000 / (((value << 5) | value2)+1);	
+ 			snd_iprintf(buffer, "SPDIF Locked : %d\n", rate);
+ 		} else {
+@@ -410,14 +401,11 @@ static void snd_emu_proc_emu1010_reg_read(struct snd_info_entry *entry,
+ {
+ 	struct snd_emu10k1 *emu = entry->private_data;
+ 	u32 value;
+-	unsigned long flags;
+ 	int i;
+ 	snd_iprintf(buffer, "EMU1010 Registers:\n\n");
+ 
+ 	for(i = 0; i < 0x40; i+=1) {
+-		spin_lock_irqsave(&emu->emu_lock, flags);
+ 		snd_emu1010_fpga_read(emu, i, &value);
+-		spin_unlock_irqrestore(&emu->emu_lock, flags);
+ 		snd_iprintf(buffer, "%02X: %08X, %02X\n", i, value, (value >> 8) & 0x7f);
+ 	}
+ }
+diff --git a/tools/power/x86/turbostat/Makefile b/tools/power/x86/turbostat/Makefile
+index d1b3a361e526..4039854560d0 100644
+--- a/tools/power/x86/turbostat/Makefile
++++ b/tools/power/x86/turbostat/Makefile
+@@ -1,8 +1,12 @@
+ CC		= $(CROSS_COMPILE)gcc
+-BUILD_OUTPUT	:= $(PWD)
++BUILD_OUTPUT	:= $(CURDIR)
+ PREFIX		:= /usr
+ DESTDIR		:=
+ 
++ifeq ("$(origin O)", "command line")
++	BUILD_OUTPUT := $(O)
++endif
++
+ turbostat : turbostat.c
+ CFLAGS +=	-Wall
+ CFLAGS +=	-DMSRHEADER='"../../../../arch/x86/include/uapi/asm/msr-index.h"'
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index a17f190be58e..1d4b8bed4e48 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -1549,8 +1549,8 @@ int kvm_gfn_to_hva_cache_init(struct kvm *kvm, struct gfn_to_hva_cache *ghc,
+ 	ghc->generation = slots->generation;
+ 	ghc->len = len;
+ 	ghc->memslot = gfn_to_memslot(kvm, start_gfn);
+-	ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn, &nr_pages_avail);
+-	if (!kvm_is_error_hva(ghc->hva) && nr_pages_avail >= nr_pages_needed) {
++	ghc->hva = gfn_to_hva_many(ghc->memslot, start_gfn, NULL);
++	if (!kvm_is_error_hva(ghc->hva) && nr_pages_needed <= 1) {
+ 		ghc->hva += offset;
+ 	} else {
+ 		/*

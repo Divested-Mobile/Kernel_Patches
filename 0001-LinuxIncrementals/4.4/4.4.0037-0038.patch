@@ -1,26 +1,338 @@
-From 790fd11f9ed6d2558a516280c3bd1e25b0c64c90 Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Tue, 15 Nov 2016 22:24:12 -0800
-Subject: [PATCH 01/29] virtio-net: add a missing synchronize_net()
-
-[ Upstream commit 963abe5c8a0273a1cf5913556da1b1189de0e57a ]
-
-It seems many drivers do not respect napi_hash_del() contract.
-
-When napi_hash_del() is used before netif_napi_del(), an RCU grace
-period is needed before freeing NAPI object.
-
-Fixes: 91815639d880 ("virtio-net: rx busy polling support")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Cc: Jason Wang <jasowang@redhat.com>
-Cc: Michael S. Tsirkin <mst@redhat.com>
-Acked-by: Michael S. Tsirkin <mst@redhat.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/virtio_net.c | 5 +++++
- 1 file changed, 5 insertions(+)
-
+diff --git a/Makefile b/Makefile
+index b57ec79b4941..6876efe0d735 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+-SUBLEVEL = 37
++SUBLEVEL = 38
+ EXTRAVERSION =
+ NAME = Blurry Fish Butt
+ 
+diff --git a/arch/sparc/kernel/signal_32.c b/arch/sparc/kernel/signal_32.c
+index c3c12efe0bc0..9c0c8fd0b292 100644
+--- a/arch/sparc/kernel/signal_32.c
++++ b/arch/sparc/kernel/signal_32.c
+@@ -89,7 +89,7 @@ asmlinkage void do_sigreturn(struct pt_regs *regs)
+ 	sf = (struct signal_frame __user *) regs->u_regs[UREG_FP];
+ 
+ 	/* 1. Make sure we are not getting garbage from the user */
+-	if (!invalid_frame_pointer(sf, sizeof(*sf)))
++	if (invalid_frame_pointer(sf, sizeof(*sf)))
+ 		goto segv_and_exit;
+ 
+ 	if (get_user(ufp, &sf->info.si_regs.u_regs[UREG_FP]))
+@@ -150,7 +150,7 @@ asmlinkage void do_rt_sigreturn(struct pt_regs *regs)
+ 
+ 	synchronize_user_stack();
+ 	sf = (struct rt_signal_frame __user *) regs->u_regs[UREG_FP];
+-	if (!invalid_frame_pointer(sf, sizeof(*sf)))
++	if (invalid_frame_pointer(sf, sizeof(*sf)))
+ 		goto segv;
+ 
+ 	if (get_user(ufp, &sf->regs.u_regs[UREG_FP]))
+diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
+index a5331c336b2a..3d3414c14792 100644
+--- a/arch/sparc/mm/init_64.c
++++ b/arch/sparc/mm/init_64.c
+@@ -800,8 +800,10 @@ struct mdesc_mblock {
+ };
+ static struct mdesc_mblock *mblocks;
+ static int num_mblocks;
++static int find_numa_node_for_addr(unsigned long pa,
++				   struct node_mem_mask *pnode_mask);
+ 
+-static unsigned long ra_to_pa(unsigned long addr)
++static unsigned long __init ra_to_pa(unsigned long addr)
+ {
+ 	int i;
+ 
+@@ -817,8 +819,11 @@ static unsigned long ra_to_pa(unsigned long addr)
+ 	return addr;
+ }
+ 
+-static int find_node(unsigned long addr)
++static int __init find_node(unsigned long addr)
+ {
++	static bool search_mdesc = true;
++	static struct node_mem_mask last_mem_mask = { ~0UL, ~0UL };
++	static int last_index;
+ 	int i;
+ 
+ 	addr = ra_to_pa(addr);
+@@ -828,13 +833,30 @@ static int find_node(unsigned long addr)
+ 		if ((addr & p->mask) == p->val)
+ 			return i;
+ 	}
+-	/* The following condition has been observed on LDOM guests.*/
+-	WARN_ONCE(1, "find_node: A physical address doesn't match a NUMA node"
+-		" rule. Some physical memory will be owned by node 0.");
+-	return 0;
++	/* The following condition has been observed on LDOM guests because
++	 * node_masks only contains the best latency mask and value.
++	 * LDOM guest's mdesc can contain a single latency group to
++	 * cover multiple address range. Print warning message only if the
++	 * address cannot be found in node_masks nor mdesc.
++	 */
++	if ((search_mdesc) &&
++	    ((addr & last_mem_mask.mask) != last_mem_mask.val)) {
++		/* find the available node in the mdesc */
++		last_index = find_numa_node_for_addr(addr, &last_mem_mask);
++		numadbg("find_node: latency group for address 0x%lx is %d\n",
++			addr, last_index);
++		if ((last_index < 0) || (last_index >= num_node_masks)) {
++			/* WARN_ONCE() and use default group 0 */
++			WARN_ONCE(1, "find_node: A physical address doesn't match a NUMA node rule. Some physical memory will be owned by node 0.");
++			search_mdesc = false;
++			last_index = 0;
++		}
++	}
++
++	return last_index;
+ }
+ 
+-static u64 memblock_nid_range(u64 start, u64 end, int *nid)
++static u64 __init memblock_nid_range(u64 start, u64 end, int *nid)
+ {
+ 	*nid = find_node(start);
+ 	start += PAGE_SIZE;
+@@ -1158,6 +1180,41 @@ int __node_distance(int from, int to)
+ 	return numa_latency[from][to];
+ }
+ 
++static int find_numa_node_for_addr(unsigned long pa,
++				   struct node_mem_mask *pnode_mask)
++{
++	struct mdesc_handle *md = mdesc_grab();
++	u64 node, arc;
++	int i = 0;
++
++	node = mdesc_node_by_name(md, MDESC_NODE_NULL, "latency-groups");
++	if (node == MDESC_NODE_NULL)
++		goto out;
++
++	mdesc_for_each_node_by_name(md, node, "group") {
++		mdesc_for_each_arc(arc, md, node, MDESC_ARC_TYPE_FWD) {
++			u64 target = mdesc_arc_target(md, arc);
++			struct mdesc_mlgroup *m = find_mlgroup(target);
++
++			if (!m)
++				continue;
++			if ((pa & m->mask) == m->match) {
++				if (pnode_mask) {
++					pnode_mask->mask = m->mask;
++					pnode_mask->val = m->match;
++				}
++				mdesc_release(md);
++				return i;
++			}
++		}
++		i++;
++	}
++
++out:
++	mdesc_release(md);
++	return -1;
++}
++
+ static int find_best_numa_node_for_mlgroup(struct mdesc_mlgroup *grp)
+ {
+ 	int i;
+diff --git a/block/blk-map.c b/block/blk-map.c
+index f565e11f465a..69953bd97e65 100644
+--- a/block/blk-map.c
++++ b/block/blk-map.c
+@@ -90,6 +90,9 @@ int blk_rq_map_user_iov(struct request_queue *q, struct request *rq,
+ 	if (!iter || !iter->count)
+ 		return -EINVAL;
+ 
++	if (!iter_is_iovec(iter))
++		return -EINVAL;
++
+ 	iov_for_each(iov, i, *iter) {
+ 		unsigned long uaddr = (unsigned long) iov.iov_base;
+ 
+diff --git a/drivers/net/dsa/bcm_sf2.c b/drivers/net/dsa/bcm_sf2.c
+index 6f946fedbb77..0864f05633a2 100644
+--- a/drivers/net/dsa/bcm_sf2.c
++++ b/drivers/net/dsa/bcm_sf2.c
+@@ -1137,6 +1137,7 @@ static void bcm_sf2_sw_adjust_link(struct dsa_switch *ds, int port,
+ 				   struct phy_device *phydev)
+ {
+ 	struct bcm_sf2_priv *priv = ds_to_priv(ds);
++	struct ethtool_eee *p = &priv->port_sts[port].eee;
+ 	u32 id_mode_dis = 0, port_mode;
+ 	const char *str = NULL;
+ 	u32 reg;
+@@ -1211,6 +1212,9 @@ force_link:
+ 		reg |= DUPLX_MODE;
+ 
+ 	core_writel(priv, reg, CORE_STS_OVERRIDE_GMIIP_PORT(port));
++
++	if (!phydev->is_pseudo_fixed_link)
++		p->eee_enabled = bcm_sf2_eee_init(ds, port, phydev);
+ }
+ 
+ static void bcm_sf2_sw_fixed_link_update(struct dsa_switch *ds, int port,
+diff --git a/drivers/net/ethernet/broadcom/genet/bcmgenet.c b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
+index 0fb3f8de88e9..91627561c58d 100644
+--- a/drivers/net/ethernet/broadcom/genet/bcmgenet.c
++++ b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
+@@ -1168,6 +1168,7 @@ static unsigned int __bcmgenet_tx_reclaim(struct net_device *dev,
+ 					  struct bcmgenet_tx_ring *ring)
+ {
+ 	struct bcmgenet_priv *priv = netdev_priv(dev);
++	struct device *kdev = &priv->pdev->dev;
+ 	struct enet_cb *tx_cb_ptr;
+ 	struct netdev_queue *txq;
+ 	unsigned int pkts_compl = 0;
+@@ -1195,7 +1196,7 @@ static unsigned int __bcmgenet_tx_reclaim(struct net_device *dev,
+ 			pkts_compl++;
+ 			dev->stats.tx_packets++;
+ 			dev->stats.tx_bytes += tx_cb_ptr->skb->len;
+-			dma_unmap_single(&dev->dev,
++			dma_unmap_single(kdev,
+ 					 dma_unmap_addr(tx_cb_ptr, dma_addr),
+ 					 dma_unmap_len(tx_cb_ptr, dma_len),
+ 					 DMA_TO_DEVICE);
+@@ -1203,7 +1204,7 @@ static unsigned int __bcmgenet_tx_reclaim(struct net_device *dev,
+ 		} else if (dma_unmap_addr(tx_cb_ptr, dma_addr)) {
+ 			dev->stats.tx_bytes +=
+ 				dma_unmap_len(tx_cb_ptr, dma_len);
+-			dma_unmap_page(&dev->dev,
++			dma_unmap_page(kdev,
+ 				       dma_unmap_addr(tx_cb_ptr, dma_addr),
+ 				       dma_unmap_len(tx_cb_ptr, dma_len),
+ 				       DMA_TO_DEVICE);
+@@ -1754,6 +1755,7 @@ static int bcmgenet_alloc_rx_buffers(struct bcmgenet_priv *priv,
+ 
+ static void bcmgenet_free_rx_buffers(struct bcmgenet_priv *priv)
+ {
++	struct device *kdev = &priv->pdev->dev;
+ 	struct enet_cb *cb;
+ 	int i;
+ 
+@@ -1761,7 +1763,7 @@ static void bcmgenet_free_rx_buffers(struct bcmgenet_priv *priv)
+ 		cb = &priv->rx_cbs[i];
+ 
+ 		if (dma_unmap_addr(cb, dma_addr)) {
+-			dma_unmap_single(&priv->dev->dev,
++			dma_unmap_single(kdev,
+ 					 dma_unmap_addr(cb, dma_addr),
+ 					 priv->rx_buf_len, DMA_FROM_DEVICE);
+ 			dma_unmap_addr_set(cb, dma_addr, 0);
+diff --git a/drivers/net/ethernet/marvell/sky2.c b/drivers/net/ethernet/marvell/sky2.c
+index 5606a043063e..4b62aa1f9ff8 100644
+--- a/drivers/net/ethernet/marvell/sky2.c
++++ b/drivers/net/ethernet/marvell/sky2.c
+@@ -5220,6 +5220,19 @@ static SIMPLE_DEV_PM_OPS(sky2_pm_ops, sky2_suspend, sky2_resume);
+ 
+ static void sky2_shutdown(struct pci_dev *pdev)
+ {
++	struct sky2_hw *hw = pci_get_drvdata(pdev);
++	int port;
++
++	for (port = 0; port < hw->ports; port++) {
++		struct net_device *ndev = hw->dev[port];
++
++		rtnl_lock();
++		if (netif_running(ndev)) {
++			dev_close(ndev);
++			netif_device_detach(ndev);
++		}
++		rtnl_unlock();
++	}
+ 	sky2_suspend(&pdev->dev);
+ 	pci_wake_from_d3(pdev, device_may_wakeup(&pdev->dev));
+ 	pci_set_power_state(pdev, PCI_D3hot);
+diff --git a/drivers/net/ethernet/renesas/sh_eth.c b/drivers/net/ethernet/renesas/sh_eth.c
+index 36fc9427418f..480f3dae0780 100644
+--- a/drivers/net/ethernet/renesas/sh_eth.c
++++ b/drivers/net/ethernet/renesas/sh_eth.c
+@@ -832,7 +832,7 @@ static struct sh_eth_cpu_data r7s72100_data = {
+ 
+ 	.ecsr_value	= ECSR_ICD,
+ 	.ecsipr_value	= ECSIPR_ICDIP,
+-	.eesipr_value	= 0xff7f009f,
++	.eesipr_value	= 0xe77f009f,
+ 
+ 	.tx_check	= EESR_TC1 | EESR_FTC,
+ 	.eesr_err_check	= EESR_TWB1 | EESR_TWB | EESR_TABT | EESR_RABT |
+diff --git a/drivers/net/geneve.c b/drivers/net/geneve.c
+index 4827c6987ac3..f0961cbaf87e 100644
+--- a/drivers/net/geneve.c
++++ b/drivers/net/geneve.c
+@@ -815,7 +815,6 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ 	struct geneve_dev *geneve = netdev_priv(dev);
+ 	struct geneve_sock *gs4 = geneve->sock4;
+ 	struct rtable *rt = NULL;
+-	const struct iphdr *iip; /* interior IP header */
+ 	int err = -EINVAL;
+ 	struct flowi4 fl4;
+ 	__u8 tos, ttl;
+@@ -842,8 +841,6 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ 	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+ 	skb_reset_mac_header(skb);
+ 
+-	iip = ip_hdr(skb);
+-
+ 	if (info) {
+ 		const struct ip_tunnel_key *key = &info->key;
+ 		u8 *opts = NULL;
+@@ -859,7 +856,7 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ 		if (unlikely(err))
+ 			goto err;
+ 
+-		tos = ip_tunnel_ecn_encap(key->tos, iip, skb);
++		tos = ip_tunnel_ecn_encap(key->tos, ip_hdr(skb), skb);
+ 		ttl = key->ttl;
+ 		df = key->tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
+ 	} else {
+@@ -869,7 +866,7 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ 		if (unlikely(err))
+ 			goto err;
+ 
+-		tos = ip_tunnel_ecn_encap(fl4.flowi4_tos, iip, skb);
++		tos = ip_tunnel_ecn_encap(fl4.flowi4_tos, ip_hdr(skb), skb);
+ 		ttl = geneve->ttl;
+ 		if (!ttl && IN_MULTICAST(ntohl(fl4.daddr)))
+ 			ttl = 1;
+@@ -903,7 +900,6 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ 	struct geneve_dev *geneve = netdev_priv(dev);
+ 	struct geneve_sock *gs6 = geneve->sock6;
+ 	struct dst_entry *dst = NULL;
+-	const struct iphdr *iip; /* interior IP header */
+ 	int err = -EINVAL;
+ 	struct flowi6 fl6;
+ 	__u8 prio, ttl;
+@@ -927,8 +923,6 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ 	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
+ 	skb_reset_mac_header(skb);
+ 
+-	iip = ip_hdr(skb);
+-
+ 	if (info) {
+ 		const struct ip_tunnel_key *key = &info->key;
+ 		u8 *opts = NULL;
+@@ -945,7 +939,7 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ 		if (unlikely(err))
+ 			goto err;
+ 
+-		prio = ip_tunnel_ecn_encap(key->tos, iip, skb);
++		prio = ip_tunnel_ecn_encap(key->tos, ip_hdr(skb), skb);
+ 		ttl = key->ttl;
+ 	} else {
+ 		udp_csum = false;
+@@ -954,7 +948,7 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
+ 		if (unlikely(err))
+ 			goto err;
+ 
+-		prio = ip_tunnel_ecn_encap(fl6.flowi6_tos, iip, skb);
++		prio = ip_tunnel_ecn_encap(fl6.flowi6_tos, ip_hdr(skb), skb);
+ 		ttl = geneve->ttl;
+ 		if (!ttl && ipv6_addr_is_multicast(&fl6.daddr))
+ 			ttl = 1;
 diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
 index f94ab786088f..0e2a19e58923 100644
 --- a/drivers/net/virtio_net.c
@@ -37,50 +349,25 @@ index f94ab786088f..0e2a19e58923 100644
  	kfree(vi->rq);
  	kfree(vi->sq);
  }
--- 
-2.28.0
-
-
-From 2b54505c877f71155c7aba26550015bd1e30d3dc Mon Sep 17 00:00:00 2001
-From: WANG Cong <xiyou.wangcong@gmail.com>
-Date: Wed, 16 Nov 2016 10:27:02 -0800
-Subject: [PATCH 02/29] net: check dead netns for peernet2id_alloc()
-
-[ Upstream commit cfc44a4d147ea605d66ccb917cc24467d15ff867 ]
-
-Andrei reports we still allocate netns ID from idr after we destroy
-it in cleanup_net().
-
-cleanup_net():
-  ...
-  idr_destroy(&net->netns_ids);
-  ...
-  list_for_each_entry_reverse(ops, &pernet_list, list)
-    ops_exit_list(ops, &net_exit_list);
-      -> rollback_registered_many()
-        -> rtmsg_ifinfo_build_skb()
-         -> rtnl_fill_ifinfo()
-           -> peernet2id_alloc()
-
-After that point we should not even access net->netns_ids, we
-should check the death of the current netns as early as we can in
-peernet2id_alloc().
-
-For net-next we can consider to avoid sending rtmsg totally,
-it is a good optimization for netns teardown path.
-
-Fixes: 0c7aecd4bde4 ("netns: add rtnl cmd to add and get peer netns ids")
-Reported-by: Andrei Vagin <avagin@gmail.com>
-Cc: Nicolas Dichtel <nicolas.dichtel@6wind.com>
-Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
-Acked-by: Andrei Vagin <avagin@openvz.org>
-Signed-off-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/core/net_namespace.c | 2 ++
- 1 file changed, 2 insertions(+)
-
+diff --git a/include/linux/uio.h b/include/linux/uio.h
+index 5f9c59da978b..e2225109b816 100644
+--- a/include/linux/uio.h
++++ b/include/linux/uio.h
+@@ -101,12 +101,12 @@ int iov_iter_npages(const struct iov_iter *i, int maxpages);
+ 
+ const void *dup_iter(struct iov_iter *new, struct iov_iter *old, gfp_t flags);
+ 
+-static inline size_t iov_iter_count(struct iov_iter *i)
++static inline size_t iov_iter_count(const struct iov_iter *i)
+ {
+ 	return i->count;
+ }
+ 
+-static inline bool iter_is_iovec(struct iov_iter *i)
++static inline bool iter_is_iovec(const struct iov_iter *i)
+ {
+ 	return !(i->type & (ITER_BVEC | ITER_KVEC));
+ }
 diff --git a/net/core/net_namespace.c b/net/core/net_namespace.c
 index 2c2eb1b629b1..2e9a1c2818c7 100644
 --- a/net/core/net_namespace.c
@@ -94,34 +381,136 @@ index 2c2eb1b629b1..2e9a1c2818c7 100644
  	spin_lock_irqsave(&net->nsid_lock, flags);
  	alloc = atomic_read(&peer->count) == 0 ? false : true;
  	id = __peernet2id_alloc(net, peer, &alloc);
--- 
-2.28.0
-
-
-From 49695d1e3b817743a155e63d923e1e14b97e14eb Mon Sep 17 00:00:00 2001
-From: Paolo Abeni <pabeni@redhat.com>
-Date: Wed, 16 Nov 2016 16:26:46 +0100
-Subject: [PATCH 03/29] ip6_tunnel: disable caching when the traffic class is
- inherited
-
-[ Upstream commit b5c2d49544e5930c96e2632a7eece3f4325a1888 ]
-
-If an ip6 tunnel is configured to inherit the traffic class from
-the inner header, the dst_cache must be disabled or it will foul
-the policy routing.
-
-The issue is apprently there since at leat Linux-2.6.12-rc2.
-
-Reported-by: Liam McBirnie <liam.mcbirnie@boeing.com>
-Cc: Liam McBirnie <liam.mcbirnie@boeing.com>
-Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Signed-off-by: Paolo Abeni <pabeni@redhat.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/ip6_tunnel.c | 13 +++++++++++--
- 1 file changed, 11 insertions(+), 2 deletions(-)
-
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 87b91ffbdec3..b94e165a4f79 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -2600,7 +2600,10 @@ nla_put_failure:
+ 
+ static inline size_t rtnl_fdb_nlmsg_size(void)
+ {
+-	return NLMSG_ALIGN(sizeof(struct ndmsg)) + nla_total_size(ETH_ALEN);
++	return NLMSG_ALIGN(sizeof(struct ndmsg)) +
++	       nla_total_size(ETH_ALEN) +	/* NDA_LLADDR */
++	       nla_total_size(sizeof(u16)) +	/* NDA_VLAN */
++	       0;
+ }
+ 
+ static void rtnl_fdb_notify(struct net_device *dev, u8 *addr, u16 vid, int type)
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 88f017854509..f4c0917e66b5 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -745,7 +745,7 @@ int sock_setsockopt(struct socket *sock, int level, int optname,
+ 		val = min_t(u32, val, sysctl_wmem_max);
+ set_sndbuf:
+ 		sk->sk_userlocks |= SOCK_SNDBUF_LOCK;
+-		sk->sk_sndbuf = max_t(u32, val * 2, SOCK_MIN_SNDBUF);
++		sk->sk_sndbuf = max_t(int, val * 2, SOCK_MIN_SNDBUF);
+ 		/* Wake up sending tasks if we upped the value. */
+ 		sk->sk_write_space(sk);
+ 		break;
+@@ -781,7 +781,7 @@ set_rcvbuf:
+ 		 * returning the value we actually used in getsockopt
+ 		 * is the most desirable behavior.
+ 		 */
+-		sk->sk_rcvbuf = max_t(u32, val * 2, SOCK_MIN_RCVBUF);
++		sk->sk_rcvbuf = max_t(int, val * 2, SOCK_MIN_RCVBUF);
+ 		break;
+ 
+ 	case SO_RCVBUFFORCE:
+diff --git a/net/dccp/ipv4.c b/net/dccp/ipv4.c
+index 861e1fa25d5e..0759f5b9180e 100644
+--- a/net/dccp/ipv4.c
++++ b/net/dccp/ipv4.c
+@@ -698,6 +698,7 @@ int dccp_invalid_packet(struct sk_buff *skb)
+ {
+ 	const struct dccp_hdr *dh;
+ 	unsigned int cscov;
++	u8 dccph_doff;
+ 
+ 	if (skb->pkt_type != PACKET_HOST)
+ 		return 1;
+@@ -719,18 +720,19 @@ int dccp_invalid_packet(struct sk_buff *skb)
+ 	/*
+ 	 * If P.Data Offset is too small for packet type, drop packet and return
+ 	 */
+-	if (dh->dccph_doff < dccp_hdr_len(skb) / sizeof(u32)) {
+-		DCCP_WARN("P.Data Offset(%u) too small\n", dh->dccph_doff);
++	dccph_doff = dh->dccph_doff;
++	if (dccph_doff < dccp_hdr_len(skb) / sizeof(u32)) {
++		DCCP_WARN("P.Data Offset(%u) too small\n", dccph_doff);
+ 		return 1;
+ 	}
+ 	/*
+ 	 * If P.Data Offset is too too large for packet, drop packet and return
+ 	 */
+-	if (!pskb_may_pull(skb, dh->dccph_doff * sizeof(u32))) {
+-		DCCP_WARN("P.Data Offset(%u) too large\n", dh->dccph_doff);
++	if (!pskb_may_pull(skb, dccph_doff * sizeof(u32))) {
++		DCCP_WARN("P.Data Offset(%u) too large\n", dccph_doff);
+ 		return 1;
+ 	}
+-
++	dh = dccp_hdr(skb);
+ 	/*
+ 	 * If P.type is not Data, Ack, or DataAck and P.X == 0 (the packet
+ 	 * has short sequence numbers), drop packet and return
+diff --git a/net/ipv4/esp4.c b/net/ipv4/esp4.c
+index d95631d09248..20fb25e3027b 100644
+--- a/net/ipv4/esp4.c
++++ b/net/ipv4/esp4.c
+@@ -476,7 +476,7 @@ static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
+ 		esph = (void *)skb_push(skb, 4);
+ 		*seqhi = esph->spi;
+ 		esph->spi = esph->seq_no;
+-		esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.input.hi);
++		esph->seq_no = XFRM_SKB_CB(skb)->seq.input.hi;
+ 		aead_request_set_callback(req, 0, esp_input_done_esn, skb);
+ 	}
+ 
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index f2ad5216c438..2b7283303650 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -102,6 +102,9 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 
+ 	iph->tot_len = htons(skb->len);
+ 	ip_send_check(iph);
++
++	skb->protocol = htons(ETH_P_IP);
++
+ 	return nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
+ 		       net, sk, skb, NULL, skb_dst(skb)->dev,
+ 		       dst_output);
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index aa67e0e64b69..23160d2b3f71 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -660,6 +660,10 @@ int ping_common_sendmsg(int family, struct msghdr *msg, size_t len,
+ 	if (len > 0xFFFF)
+ 		return -EMSGSIZE;
+ 
++	/* Must have at least a full ICMP header. */
++	if (len < icmph_len)
++		return -EINVAL;
++
+ 	/*
+ 	 *	Check the flags.
+ 	 */
+diff --git a/net/ipv6/esp6.c b/net/ipv6/esp6.c
+index 060a60b2f8a6..111ba55fd512 100644
+--- a/net/ipv6/esp6.c
++++ b/net/ipv6/esp6.c
+@@ -418,7 +418,7 @@ static int esp6_input(struct xfrm_state *x, struct sk_buff *skb)
+ 		esph = (void *)skb_push(skb, 4);
+ 		*seqhi = esph->spi;
+ 		esph->spi = esph->seq_no;
+-		esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.input.hi);
++		esph->seq_no = XFRM_SKB_CB(skb)->seq.input.hi;
+ 		aead_request_set_callback(req, 0, esp_input_done_esn, skb);
+ 	}
+ 
 diff --git a/net/ipv6/ip6_tunnel.c b/net/ipv6/ip6_tunnel.c
 index e8878886eba4..2994d1f1a661 100644
 --- a/net/ipv6/ip6_tunnel.c
@@ -160,345 +549,19 @@ index e8878886eba4..2994d1f1a661 100644
  		ip6_tnl_dst_set(t, ndst);
  	skb_dst_set(skb, dst);
  
--- 
-2.28.0
-
-
-From acf9504ae220acbd1caa8ee4668c8a3a3b51d73a Mon Sep 17 00:00:00 2001
-From: Jeremy Linton <jeremy.linton@arm.com>
-Date: Thu, 17 Nov 2016 09:14:25 -0600
-Subject: [PATCH 04/29] net: sky2: Fix shutdown crash
-
-[ Upstream commit 06ba3b2133dc203e1e9bc36cee7f0839b79a9e8b ]
-
-The sky2 frequently crashes during machine shutdown with:
-
-sky2_get_stats+0x60/0x3d8 [sky2]
-dev_get_stats+0x68/0xd8
-rtnl_fill_stats+0x54/0x140
-rtnl_fill_ifinfo+0x46c/0xc68
-rtmsg_ifinfo_build_skb+0x7c/0xf0
-rtmsg_ifinfo.part.22+0x3c/0x70
-rtmsg_ifinfo+0x50/0x5c
-netdev_state_change+0x4c/0x58
-linkwatch_do_dev+0x50/0x88
-__linkwatch_run_queue+0x104/0x1a4
-linkwatch_event+0x30/0x3c
-process_one_work+0x140/0x3e0
-worker_thread+0x60/0x44c
-kthread+0xdc/0xf0
-ret_from_fork+0x10/0x50
-
-This is caused by the sky2 being called after it has been shutdown.
-A previous thread about this can be found here:
-
-https://lkml.org/lkml/2016/4/12/410
-
-An alternative fix is to assure that IFF_UP gets cleared by
-calling dev_close() during shutdown. This is similar to what the
-bnx2/tg3/xgene and maybe others are doing to assure that the driver
-isn't being called following _shutdown().
-
-Signed-off-by: Jeremy Linton <jeremy.linton@arm.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/marvell/sky2.c | 13 +++++++++++++
- 1 file changed, 13 insertions(+)
-
-diff --git a/drivers/net/ethernet/marvell/sky2.c b/drivers/net/ethernet/marvell/sky2.c
-index 5606a043063e..4b62aa1f9ff8 100644
---- a/drivers/net/ethernet/marvell/sky2.c
-+++ b/drivers/net/ethernet/marvell/sky2.c
-@@ -5220,6 +5220,19 @@ static SIMPLE_DEV_PM_OPS(sky2_pm_ops, sky2_suspend, sky2_resume);
+diff --git a/net/ipv6/output_core.c b/net/ipv6/output_core.c
+index 462f2a76b5c2..1d184322a7b1 100644
+--- a/net/ipv6/output_core.c
++++ b/net/ipv6/output_core.c
+@@ -148,6 +148,8 @@ int __ip6_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 	ipv6_hdr(skb)->payload_len = htons(len);
+ 	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
  
- static void sky2_shutdown(struct pci_dev *pdev)
- {
-+	struct sky2_hw *hw = pci_get_drvdata(pdev);
-+	int port;
++	skb->protocol = htons(ETH_P_IPV6);
 +
-+	for (port = 0; port < hw->ports; port++) {
-+		struct net_device *ndev = hw->dev[port];
-+
-+		rtnl_lock();
-+		if (netif_running(ndev)) {
-+			dev_close(ndev);
-+			netif_device_detach(ndev);
-+		}
-+		rtnl_unlock();
-+	}
- 	sky2_suspend(&pdev->dev);
- 	pci_wake_from_d3(pdev, device_may_wakeup(&pdev->dev));
- 	pci_set_power_state(pdev, PCI_D3hot);
--- 
-2.28.0
-
-
-From 6ef59b986190f07386b062884ab48006c16cf152 Mon Sep 17 00:00:00 2001
-From: WANG Cong <xiyou.wangcong@gmail.com>
-Date: Thu, 17 Nov 2016 15:55:26 -0800
-Subject: [PATCH 05/29] af_unix: conditionally use freezable blocking calls in
- read
-
-[ Upstream commit 06a77b07e3b44aea2b3c0e64de420ea2cfdcbaa9 ]
-
-Commit 2b15af6f95 ("af_unix: use freezable blocking calls in read")
-converts schedule_timeout() to its freezable version, it was probably
-correct at that time, but later, commit 2b514574f7e8
-("net: af_unix: implement splice for stream af_unix sockets") breaks
-the strong requirement for a freezable sleep, according to
-commit 0f9548ca1091:
-
-    We shouldn't try_to_freeze if locks are held.  Holding a lock can cause a
-    deadlock if the lock is later acquired in the suspend or hibernate path
-    (e.g.  by dpm).  Holding a lock can also cause a deadlock in the case of
-    cgroup_freezer if a lock is held inside a frozen cgroup that is later
-    acquired by a process outside that group.
-
-The pipe_lock is still held at that point.
-
-So use freezable version only for the recvmsg call path, avoid impact for
-Android.
-
-Fixes: 2b514574f7e8 ("net: af_unix: implement splice for stream af_unix sockets")
-Reported-by: Dmitry Vyukov <dvyukov@google.com>
-Cc: Tejun Heo <tj@kernel.org>
-Cc: Colin Cross <ccross@android.com>
-Cc: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
-Cc: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/unix/af_unix.c | 17 +++++++++++------
- 1 file changed, 11 insertions(+), 6 deletions(-)
-
-diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
-index 824cc1e160bc..73f75258ce46 100644
---- a/net/unix/af_unix.c
-+++ b/net/unix/af_unix.c
-@@ -2194,7 +2194,8 @@ out:
-  *	Sleep until more data has arrived. But check for races..
-  */
- static long unix_stream_data_wait(struct sock *sk, long timeo,
--				  struct sk_buff *last, unsigned int last_len)
-+				  struct sk_buff *last, unsigned int last_len,
-+				  bool freezable)
- {
- 	struct sk_buff *tail;
- 	DEFINE_WAIT(wait);
-@@ -2215,7 +2216,10 @@ static long unix_stream_data_wait(struct sock *sk, long timeo,
- 
- 		sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
- 		unix_state_unlock(sk);
--		timeo = freezable_schedule_timeout(timeo);
-+		if (freezable)
-+			timeo = freezable_schedule_timeout(timeo);
-+		else
-+			timeo = schedule_timeout(timeo);
- 		unix_state_lock(sk);
- 
- 		if (sock_flag(sk, SOCK_DEAD))
-@@ -2245,7 +2249,8 @@ struct unix_stream_read_state {
- 	unsigned int splice_flags;
- };
- 
--static int unix_stream_read_generic(struct unix_stream_read_state *state)
-+static int unix_stream_read_generic(struct unix_stream_read_state *state,
-+				    bool freezable)
- {
- 	struct scm_cookie scm;
- 	struct socket *sock = state->socket;
-@@ -2324,7 +2329,7 @@ again:
- 			mutex_unlock(&u->iolock);
- 
- 			timeo = unix_stream_data_wait(sk, timeo, last,
--						      last_len);
-+						      last_len, freezable);
- 
- 			if (signal_pending(current)) {
- 				err = sock_intr_errno(timeo);
-@@ -2466,7 +2471,7 @@ static int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
- 		.flags = flags
- 	};
- 
--	return unix_stream_read_generic(&state);
-+	return unix_stream_read_generic(&state, true);
- }
- 
- static ssize_t skb_unix_socket_splice(struct sock *sk,
-@@ -2512,7 +2517,7 @@ static ssize_t unix_stream_splice_read(struct socket *sock,  loff_t *ppos,
- 	    flags & SPLICE_F_NONBLOCK)
- 		state.flags = MSG_DONTWAIT;
- 
--	return unix_stream_read_generic(&state);
-+	return unix_stream_read_generic(&state, false);
- }
- 
- static int unix_shutdown(struct socket *sock, int mode)
--- 
-2.28.0
-
-
-From aece024e38cb38eb5307e35862c5876e817efd33 Mon Sep 17 00:00:00 2001
-From: Sabrina Dubroca <sd@queasysnail.net>
-Date: Fri, 18 Nov 2016 15:50:39 +0100
-Subject: [PATCH 06/29] rtnetlink: fix FDB size computation
-
-[ Upstream commit f82ef3e10a870acc19fa04f80ef5877eaa26f41e ]
-
-Add missing NDA_VLAN attribute's size.
-
-Fixes: 1e53d5bb8878 ("net: Pass VLAN ID to rtnl_fdb_notify.")
-Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/core/rtnetlink.c | 5 ++++-
- 1 file changed, 4 insertions(+), 1 deletion(-)
-
-diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
-index 87b91ffbdec3..b94e165a4f79 100644
---- a/net/core/rtnetlink.c
-+++ b/net/core/rtnetlink.c
-@@ -2600,7 +2600,10 @@ nla_put_failure:
- 
- static inline size_t rtnl_fdb_nlmsg_size(void)
- {
--	return NLMSG_ALIGN(sizeof(struct ndmsg)) + nla_total_size(ETH_ALEN);
-+	return NLMSG_ALIGN(sizeof(struct ndmsg)) +
-+	       nla_total_size(ETH_ALEN) +	/* NDA_LLADDR */
-+	       nla_total_size(sizeof(u16)) +	/* NDA_VLAN */
-+	       0;
- }
- 
- static void rtnl_fdb_notify(struct net_device *dev, u8 *addr, u16 vid, int type)
--- 
-2.28.0
-
-
-From 56366fa0ad46a59abe2460b8acb775f7f84fbf16 Mon Sep 17 00:00:00 2001
-From: Guillaume Nault <g.nault@alphalink.fr>
-Date: Fri, 18 Nov 2016 22:13:00 +0100
-Subject: [PATCH 07/29] l2tp: fix racy SOCK_ZAPPED flag check in
- l2tp_ip{,6}_bind()
-
-[ Upstream commit 32c231164b762dddefa13af5a0101032c70b50ef ]
-
-Lock socket before checking the SOCK_ZAPPED flag in l2tp_ip6_bind().
-Without lock, a concurrent call could modify the socket flags between
-the sock_flag(sk, SOCK_ZAPPED) test and the lock_sock() call. This way,
-a socket could be inserted twice in l2tp_ip6_bind_table. Releasing it
-would then leave a stale pointer there, generating use-after-free
-errors when walking through the list or modifying adjacent entries.
-
-BUG: KASAN: use-after-free in l2tp_ip6_close+0x22e/0x290 at addr ffff8800081b0ed8
-Write of size 8 by task syz-executor/10987
-CPU: 0 PID: 10987 Comm: syz-executor Not tainted 4.8.0+ #39
-Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.8.2-0-g33fbe13 by qemu-project.org 04/01/2014
- ffff880031d97838 ffffffff829f835b ffff88001b5a1640 ffff8800081b0ec0
- ffff8800081b15a0 ffff8800081b6d20 ffff880031d97860 ffffffff8174d3cc
- ffff880031d978f0 ffff8800081b0e80 ffff88001b5a1640 ffff880031d978e0
-Call Trace:
- [<ffffffff829f835b>] dump_stack+0xb3/0x118 lib/dump_stack.c:15
- [<ffffffff8174d3cc>] kasan_object_err+0x1c/0x70 mm/kasan/report.c:156
- [<     inline     >] print_address_description mm/kasan/report.c:194
- [<ffffffff8174d666>] kasan_report_error+0x1f6/0x4d0 mm/kasan/report.c:283
- [<     inline     >] kasan_report mm/kasan/report.c:303
- [<ffffffff8174db7e>] __asan_report_store8_noabort+0x3e/0x40 mm/kasan/report.c:329
- [<     inline     >] __write_once_size ./include/linux/compiler.h:249
- [<     inline     >] __hlist_del ./include/linux/list.h:622
- [<     inline     >] hlist_del_init ./include/linux/list.h:637
- [<ffffffff8579047e>] l2tp_ip6_close+0x22e/0x290 net/l2tp/l2tp_ip6.c:239
- [<ffffffff850b2dfd>] inet_release+0xed/0x1c0 net/ipv4/af_inet.c:415
- [<ffffffff851dc5a0>] inet6_release+0x50/0x70 net/ipv6/af_inet6.c:422
- [<ffffffff84c4581d>] sock_release+0x8d/0x1d0 net/socket.c:570
- [<ffffffff84c45976>] sock_close+0x16/0x20 net/socket.c:1017
- [<ffffffff817a108c>] __fput+0x28c/0x780 fs/file_table.c:208
- [<ffffffff817a1605>] ____fput+0x15/0x20 fs/file_table.c:244
- [<ffffffff813774f9>] task_work_run+0xf9/0x170
- [<ffffffff81324aae>] do_exit+0x85e/0x2a00
- [<ffffffff81326dc8>] do_group_exit+0x108/0x330
- [<ffffffff81348cf7>] get_signal+0x617/0x17a0 kernel/signal.c:2307
- [<ffffffff811b49af>] do_signal+0x7f/0x18f0
- [<ffffffff810039bf>] exit_to_usermode_loop+0xbf/0x150 arch/x86/entry/common.c:156
- [<     inline     >] prepare_exit_to_usermode arch/x86/entry/common.c:190
- [<ffffffff81006060>] syscall_return_slowpath+0x1a0/0x1e0 arch/x86/entry/common.c:259
- [<ffffffff85e4d726>] entry_SYSCALL_64_fastpath+0xc4/0xc6
-Object at ffff8800081b0ec0, in cache L2TP/IPv6 size: 1448
-Allocated:
-PID = 10987
- [ 1116.897025] [<ffffffff811ddcb6>] save_stack_trace+0x16/0x20
- [ 1116.897025] [<ffffffff8174c736>] save_stack+0x46/0xd0
- [ 1116.897025] [<ffffffff8174c9ad>] kasan_kmalloc+0xad/0xe0
- [ 1116.897025] [<ffffffff8174cee2>] kasan_slab_alloc+0x12/0x20
- [ 1116.897025] [<     inline     >] slab_post_alloc_hook mm/slab.h:417
- [ 1116.897025] [<     inline     >] slab_alloc_node mm/slub.c:2708
- [ 1116.897025] [<     inline     >] slab_alloc mm/slub.c:2716
- [ 1116.897025] [<ffffffff817476a8>] kmem_cache_alloc+0xc8/0x2b0 mm/slub.c:2721
- [ 1116.897025] [<ffffffff84c4f6a9>] sk_prot_alloc+0x69/0x2b0 net/core/sock.c:1326
- [ 1116.897025] [<ffffffff84c58ac8>] sk_alloc+0x38/0xae0 net/core/sock.c:1388
- [ 1116.897025] [<ffffffff851ddf67>] inet6_create+0x2d7/0x1000 net/ipv6/af_inet6.c:182
- [ 1116.897025] [<ffffffff84c4af7b>] __sock_create+0x37b/0x640 net/socket.c:1153
- [ 1116.897025] [<     inline     >] sock_create net/socket.c:1193
- [ 1116.897025] [<     inline     >] SYSC_socket net/socket.c:1223
- [ 1116.897025] [<ffffffff84c4b46f>] SyS_socket+0xef/0x1b0 net/socket.c:1203
- [ 1116.897025] [<ffffffff85e4d685>] entry_SYSCALL_64_fastpath+0x23/0xc6
-Freed:
-PID = 10987
- [ 1116.897025] [<ffffffff811ddcb6>] save_stack_trace+0x16/0x20
- [ 1116.897025] [<ffffffff8174c736>] save_stack+0x46/0xd0
- [ 1116.897025] [<ffffffff8174cf61>] kasan_slab_free+0x71/0xb0
- [ 1116.897025] [<     inline     >] slab_free_hook mm/slub.c:1352
- [ 1116.897025] [<     inline     >] slab_free_freelist_hook mm/slub.c:1374
- [ 1116.897025] [<     inline     >] slab_free mm/slub.c:2951
- [ 1116.897025] [<ffffffff81748b28>] kmem_cache_free+0xc8/0x330 mm/slub.c:2973
- [ 1116.897025] [<     inline     >] sk_prot_free net/core/sock.c:1369
- [ 1116.897025] [<ffffffff84c541eb>] __sk_destruct+0x32b/0x4f0 net/core/sock.c:1444
- [ 1116.897025] [<ffffffff84c5aca4>] sk_destruct+0x44/0x80 net/core/sock.c:1452
- [ 1116.897025] [<ffffffff84c5ad33>] __sk_free+0x53/0x220 net/core/sock.c:1460
- [ 1116.897025] [<ffffffff84c5af23>] sk_free+0x23/0x30 net/core/sock.c:1471
- [ 1116.897025] [<ffffffff84c5cb6c>] sk_common_release+0x28c/0x3e0 ./include/net/sock.h:1589
- [ 1116.897025] [<ffffffff8579044e>] l2tp_ip6_close+0x1fe/0x290 net/l2tp/l2tp_ip6.c:243
- [ 1116.897025] [<ffffffff850b2dfd>] inet_release+0xed/0x1c0 net/ipv4/af_inet.c:415
- [ 1116.897025] [<ffffffff851dc5a0>] inet6_release+0x50/0x70 net/ipv6/af_inet6.c:422
- [ 1116.897025] [<ffffffff84c4581d>] sock_release+0x8d/0x1d0 net/socket.c:570
- [ 1116.897025] [<ffffffff84c45976>] sock_close+0x16/0x20 net/socket.c:1017
- [ 1116.897025] [<ffffffff817a108c>] __fput+0x28c/0x780 fs/file_table.c:208
- [ 1116.897025] [<ffffffff817a1605>] ____fput+0x15/0x20 fs/file_table.c:244
- [ 1116.897025] [<ffffffff813774f9>] task_work_run+0xf9/0x170
- [ 1116.897025] [<ffffffff81324aae>] do_exit+0x85e/0x2a00
- [ 1116.897025] [<ffffffff81326dc8>] do_group_exit+0x108/0x330
- [ 1116.897025] [<ffffffff81348cf7>] get_signal+0x617/0x17a0 kernel/signal.c:2307
- [ 1116.897025] [<ffffffff811b49af>] do_signal+0x7f/0x18f0
- [ 1116.897025] [<ffffffff810039bf>] exit_to_usermode_loop+0xbf/0x150 arch/x86/entry/common.c:156
- [ 1116.897025] [<     inline     >] prepare_exit_to_usermode arch/x86/entry/common.c:190
- [ 1116.897025] [<ffffffff81006060>] syscall_return_slowpath+0x1a0/0x1e0 arch/x86/entry/common.c:259
- [ 1116.897025] [<ffffffff85e4d726>] entry_SYSCALL_64_fastpath+0xc4/0xc6
-Memory state around the buggy address:
- ffff8800081b0d80: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
- ffff8800081b0e00: fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc fc
->ffff8800081b0e80: fc fc fc fc fc fc fc fc fb fb fb fb fb fb fb fb
-                                                    ^
- ffff8800081b0f00: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
- ffff8800081b0f80: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
-
-==================================================================
-
-The same issue exists with l2tp_ip_bind() and l2tp_ip_bind_table.
-
-Fixes: c51ce49735c1 ("l2tp: fix oops in L2TP IP sockets for connect() AF_UNSPEC case")
-Reported-by: Baozeng Ding <sploving1@gmail.com>
-Reported-by: Andrey Konovalov <andreyknvl@google.com>
-Tested-by: Baozeng Ding <sploving1@gmail.com>
-Signed-off-by: Guillaume Nault <g.nault@alphalink.fr>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/l2tp/l2tp_ip.c  | 5 +++--
- net/l2tp/l2tp_ip6.c | 5 +++--
- 2 files changed, 6 insertions(+), 4 deletions(-)
-
+ 	return nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT,
+ 		       net, sk, skb, NULL, skb_dst(skb)->dev,
+ 		       dst_output);
 diff --git a/net/l2tp/l2tp_ip.c b/net/l2tp/l2tp_ip.c
 index 42de4ccd159f..d0e906d39642 100644
 --- a/net/l2tp/l2tp_ip.c
@@ -545,148 +608,185 @@ index 9ee4ddb6b397..3c4f867d3633 100644
  	if (sk->sk_state != TCP_CLOSE)
  		goto out_unlock;
  
--- 
-2.28.0
-
-
-From 94de6f2ffb3de28f4a6c92a52e8f8cdcb7046847 Mon Sep 17 00:00:00 2001
-From: Florian Fainelli <f.fainelli@gmail.com>
-Date: Tue, 22 Nov 2016 11:40:58 -0800
-Subject: [PATCH 08/29] net: dsa: bcm_sf2: Ensure we re-negotiate EEE during
- after link change
-
-[ Upstream commit 76da8706d90d8641eeb9b8e579942ed80b6c0880 ]
-
-In case the link change and EEE is enabled or disabled, always try to
-re-negotiate this with the link partner.
-
-Fixes: 450b05c15f9c ("net: dsa: bcm_sf2: add support for controlling EEE")
-Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/dsa/bcm_sf2.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/drivers/net/dsa/bcm_sf2.c b/drivers/net/dsa/bcm_sf2.c
-index 6f946fedbb77..0864f05633a2 100644
---- a/drivers/net/dsa/bcm_sf2.c
-+++ b/drivers/net/dsa/bcm_sf2.c
-@@ -1137,6 +1137,7 @@ static void bcm_sf2_sw_adjust_link(struct dsa_switch *ds, int port,
- 				   struct phy_device *phydev)
- {
- 	struct bcm_sf2_priv *priv = ds_to_priv(ds);
-+	struct ethtool_eee *p = &priv->port_sts[port].eee;
- 	u32 id_mode_dis = 0, port_mode;
- 	const char *str = NULL;
- 	u32 reg;
-@@ -1211,6 +1212,9 @@ force_link:
- 		reg |= DUPLX_MODE;
- 
- 	core_writel(priv, reg, CORE_STS_OVERRIDE_GMIIP_PORT(port));
-+
-+	if (!phydev->is_pseudo_fixed_link)
-+		p->eee_enabled = bcm_sf2_eee_init(ds, port, phydev);
+diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
+index 28fc283c1ec1..360700a2f46c 100644
+--- a/net/netlink/af_netlink.c
++++ b/net/netlink/af_netlink.c
+@@ -931,7 +931,6 @@ static void netlink_sock_destruct(struct sock *sk)
+ 	if (nlk->cb_running) {
+ 		if (nlk->cb.done)
+ 			nlk->cb.done(&nlk->cb);
+-
+ 		module_put(nlk->cb.module);
+ 		kfree_skb(nlk->cb.skb);
+ 	}
+@@ -960,6 +959,14 @@ static void netlink_sock_destruct(struct sock *sk)
+ 	WARN_ON(nlk_sk(sk)->groups);
  }
  
- static void bcm_sf2_sw_fixed_link_update(struct dsa_switch *ds, int port,
--- 
-2.28.0
-
-
-From cfa7c16d4577a6e738bbd2bc83c6c8d7344e2d1a Mon Sep 17 00:00:00 2001
-From: Daniel Borkmann <daniel@iogearbox.net>
-Date: Sun, 27 Nov 2016 01:18:01 +0100
-Subject: [PATCH 09/29] net, sched: respect rcu grace period on cls destruction
-
-[ Upstream commit d936377414fadbafb4d17148d222fe45ca5442d4 ]
-
-Roi reported a crash in flower where tp->root was NULL in ->classify()
-callbacks. Reason is that in ->destroy() tp->root is set to NULL via
-RCU_INIT_POINTER(). It's problematic for some of the classifiers, because
-this doesn't respect RCU grace period for them, and as a result, still
-outstanding readers from tc_classify() will try to blindly dereference
-a NULL tp->root.
-
-The tp->root object is strictly private to the classifier implementation
-and holds internal data the core such as tc_ctl_tfilter() doesn't know
-about. Within some classifiers, such as cls_bpf, cls_basic, etc, tp->root
-is only checked for NULL in ->get() callback, but nowhere else. This is
-misleading and seemed to be copied from old classifier code that was not
-cleaned up properly. For example, d3fa76ee6b4a ("[NET_SCHED]: cls_basic:
-fix NULL pointer dereference") moved tp->root initialization into ->init()
-routine, where before it was part of ->change(), so ->get() had to deal
-with tp->root being NULL back then, so that was indeed a valid case, after
-d3fa76ee6b4a, not really anymore. We used to set tp->root to NULL long
-ago in ->destroy(), see 47a1a1d4be29 ("pkt_sched: remove unnecessary xchg()
-in packet classifiers"); but the NULLifying was reintroduced with the
-RCUification, but it's not correct for every classifier implementation.
-
-In the cases that are fixed here with one exception of cls_cgroup, tp->root
-object is allocated and initialized inside ->init() callback, which is always
-performed at a point in time after we allocate a new tp, which means tp and
-thus tp->root was not globally visible in the tp chain yet (see tc_ctl_tfilter()).
-Also, on destruction tp->root is strictly kfree_rcu()'ed in ->destroy()
-handler, same for the tp which is kfree_rcu()'ed right when we return
-from ->destroy() in tcf_destroy(). This means, the head object's lifetime
-for such classifiers is always tied to the tp lifetime. The RCU callback
-invocation for the two kfree_rcu() could be out of order, but that's fine
-since both are independent.
-
-Dropping the RCU_INIT_POINTER(tp->root, NULL) for these classifiers here
-means that 1) we don't need a useless NULL check in fast-path and, 2) that
-outstanding readers of that tp in tc_classify() can still execute under
-respect with RCU grace period as it is actually expected.
-
-Things that haven't been touched here: cls_fw and cls_route. They each
-handle tp->root being NULL in ->classify() path for historic reasons, so
-their ->destroy() implementation can stay as is. If someone actually
-cares, they could get cleaned up at some point to avoid the test in fast
-path. cls_u32 doesn't set tp->root to NULL. For cls_rsvp, I just added a
-!head should anyone actually be using/testing it, so it at least aligns with
-cls_fw and cls_route. For cls_flower we additionally need to defer rhashtable
-destruction (to a sleepable context) after RCU grace period as concurrent
-readers might still access it. (Note that in this case we need to hold module
-reference to keep work callback address intact, since we only wait on module
-unload for all call_rcu()s to finish.)
-
-This fixes one race to bring RCU grace period guarantees back. Next step
-as worked on by Cong however is to fix 1e052be69d04 ("net_sched: destroy
-proto tp when all filters are gone") to get the order of unlinking the tp
-in tc_ctl_tfilter() for the RTM_DELTFILTER case right by moving
-RCU_INIT_POINTER() before tcf_destroy() and let the notification for
-removal be done through the prior ->delete() callback. Both are independant
-issues. Once we have that right, we can then clean tp->root up for a number
-of classifiers by not making them RCU pointers, which requires a new callback
-(->uninit) that is triggered from tp's RCU callback, where we just kfree()
-tp->root from there.
-
-Fixes: 1f947bf151e9 ("net: sched: rcu'ify cls_bpf")
-Fixes: 9888faefe132 ("net: sched: cls_basic use RCU")
-Fixes: 70da9f0bf999 ("net: sched: cls_flow use RCU")
-Fixes: 77b9900ef53a ("tc: introduce Flower classifier")
-Fixes: bf3994d2ed31 ("net/sched: introduce Match-all classifier")
-Fixes: 952313bd6258 ("net: sched: cls_cgroup use RCU")
-Reported-by: Roi Dayan <roid@mellanox.com>
-Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
-Cc: Cong Wang <xiyou.wangcong@gmail.com>
-Cc: John Fastabend <john.fastabend@gmail.com>
-Cc: Roi Dayan <roid@mellanox.com>
-Cc: Jiri Pirko <jiri@mellanox.com>
-Acked-by: John Fastabend <john.r.fastabend@intel.com>
-Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/sched/cls_basic.c   |  4 ----
- net/sched/cls_bpf.c     |  4 ----
- net/sched/cls_cgroup.c  |  7 +++----
- net/sched/cls_flow.c    |  1 -
- net/sched/cls_flower.c  | 31 ++++++++++++++++++++++++++-----
- net/sched/cls_rsvp.h    |  3 ++-
- net/sched/cls_tcindex.c |  1 -
- 7 files changed, 31 insertions(+), 20 deletions(-)
-
++static void netlink_sock_destruct_work(struct work_struct *work)
++{
++	struct netlink_sock *nlk = container_of(work, struct netlink_sock,
++						work);
++
++	sk_free(&nlk->sk);
++}
++
+ /* This lock without WQ_FLAG_EXCLUSIVE is good on UP and it is _very_ bad on
+  * SMP. Look, when several writers sleep and reader wakes them up, all but one
+  * immediately hit write lock and grab all the cpus. Exclusive sleep solves
+@@ -1265,8 +1272,18 @@ out_module:
+ static void deferred_put_nlk_sk(struct rcu_head *head)
+ {
+ 	struct netlink_sock *nlk = container_of(head, struct netlink_sock, rcu);
++	struct sock *sk = &nlk->sk;
++
++	if (!atomic_dec_and_test(&sk->sk_refcnt))
++		return;
++
++	if (nlk->cb_running && nlk->cb.done) {
++		INIT_WORK(&nlk->work, netlink_sock_destruct_work);
++		schedule_work(&nlk->work);
++		return;
++	}
+ 
+-	sock_put(&nlk->sk);
++	sk_free(sk);
+ }
+ 
+ static int netlink_release(struct socket *sock)
+diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
+index 14437d9b1965..df32cb92d9fc 100644
+--- a/net/netlink/af_netlink.h
++++ b/net/netlink/af_netlink.h
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/rhashtable.h>
+ #include <linux/atomic.h>
++#include <linux/workqueue.h>
+ #include <net/sock.h>
+ 
+ #define NLGRPSZ(x)	(ALIGN(x, sizeof(unsigned long) * 8) / 8)
+@@ -53,6 +54,7 @@ struct netlink_sock {
+ 
+ 	struct rhash_head	node;
+ 	struct rcu_head		rcu;
++	struct work_struct	work;
+ };
+ 
+ static inline struct netlink_sock *nlk_sk(struct sock *sk)
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 34e4fcfd240b..f223d1c80ccf 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -3572,19 +3572,25 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
+ 
+ 		if (optlen != sizeof(val))
+ 			return -EINVAL;
+-		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec)
+-			return -EBUSY;
+ 		if (copy_from_user(&val, optval, sizeof(val)))
+ 			return -EFAULT;
+ 		switch (val) {
+ 		case TPACKET_V1:
+ 		case TPACKET_V2:
+ 		case TPACKET_V3:
+-			po->tp_version = val;
+-			return 0;
++			break;
+ 		default:
+ 			return -EINVAL;
+ 		}
++		lock_sock(sk);
++		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec) {
++			ret = -EBUSY;
++		} else {
++			po->tp_version = val;
++			ret = 0;
++		}
++		release_sock(sk);
++		return ret;
+ 	}
+ 	case PACKET_RESERVE:
+ 	{
+@@ -4067,6 +4073,7 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
+ 	/* Added to avoid minimal code churn */
+ 	struct tpacket_req *req = &req_u->req;
+ 
++	lock_sock(sk);
+ 	/* Opening a Tx-ring is NOT supported in TPACKET_V3 */
+ 	if (!closing && tx_ring && (po->tp_version > TPACKET_V2)) {
+ 		WARN(1, "Tx-ring is not supported.\n");
+@@ -4148,7 +4155,6 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
+ 			goto out;
+ 	}
+ 
+-	lock_sock(sk);
+ 
+ 	/* Detach socket from network */
+ 	spin_lock(&po->bind_lock);
+@@ -4197,11 +4203,11 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
+ 		if (!tx_ring)
+ 			prb_shutdown_retire_blk_timer(po, rb_queue);
+ 	}
+-	release_sock(sk);
+ 
+ 	if (pg_vec)
+ 		free_pg_vec(pg_vec, order, req->tp_block_nr);
+ out:
++	release_sock(sk);
+ 	return err;
+ }
+ 
+diff --git a/net/sched/act_pedit.c b/net/sched/act_pedit.c
+index e38a7701f154..c3434e902445 100644
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@ -104,6 +104,17 @@ static void tcf_pedit_cleanup(struct tc_action *a, int bind)
+ 	kfree(keys);
+ }
+ 
++static bool offset_valid(struct sk_buff *skb, int offset)
++{
++	if (offset > 0 && offset > skb->len)
++		return false;
++
++	if  (offset < 0 && -offset > skb_headroom(skb))
++		return false;
++
++	return true;
++}
++
+ static int tcf_pedit(struct sk_buff *skb, const struct tc_action *a,
+ 		     struct tcf_result *res)
+ {
+@@ -130,6 +141,11 @@ static int tcf_pedit(struct sk_buff *skb, const struct tc_action *a,
+ 			if (tkey->offmask) {
+ 				char *d, _d;
+ 
++				if (!offset_valid(skb, off + tkey->at)) {
++					pr_info("tc filter pedit 'at' offset %d out of bounds\n",
++						off + tkey->at);
++					goto bad;
++				}
+ 				d = skb_header_pointer(skb, off + tkey->at, 1,
+ 						       &_d);
+ 				if (!d)
+@@ -142,10 +158,10 @@ static int tcf_pedit(struct sk_buff *skb, const struct tc_action *a,
+ 					" offset must be on 32 bit boundaries\n");
+ 				goto bad;
+ 			}
+-			if (offset > 0 && offset > skb->len) {
+-				pr_info("tc filter pedit"
+-					" offset %d can't exceed pkt length %d\n",
+-				       offset, skb->len);
++
++			if (!offset_valid(skb, off + offset)) {
++				pr_info("tc filter pedit offset %d out of bounds\n",
++					offset);
+ 				goto bad;
+ 			}
+ 
 diff --git a/net/sched/cls_basic.c b/net/sched/cls_basic.c
 index 0b8c3ace671f..1bf1f4517db6 100644
 --- a/net/sched/cls_basic.c
@@ -851,1269 +951,66 @@ index 944c8ff45055..403746b20263 100644
  	call_rcu(&p->rcu, __tcindex_destroy);
  	return true;
  }
--- 
-2.28.0
-
-
-From 6c42bd6a393c3c7b3be24f9bf57a26608df14739 Mon Sep 17 00:00:00 2001
-From: Amir Vadai <amir@vadai.me>
-Date: Mon, 28 Nov 2016 12:56:40 +0200
-Subject: [PATCH 10/29] net/sched: pedit: make sure that offset is valid
-
-[ Upstream commit 95c2027bfeda21a28eb245121e6a249f38d0788e ]
-
-Add a validation function to make sure offset is valid:
-1. Not below skb head (could happen when offset is negative).
-2. Validate both 'offset' and 'at'.
-
-Signed-off-by: Amir Vadai <amir@vadai.me>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/sched/act_pedit.c | 24 ++++++++++++++++++++----
- 1 file changed, 20 insertions(+), 4 deletions(-)
-
-diff --git a/net/sched/act_pedit.c b/net/sched/act_pedit.c
-index e38a7701f154..c3434e902445 100644
---- a/net/sched/act_pedit.c
-+++ b/net/sched/act_pedit.c
-@@ -104,6 +104,17 @@ static void tcf_pedit_cleanup(struct tc_action *a, int bind)
- 	kfree(keys);
- }
- 
-+static bool offset_valid(struct sk_buff *skb, int offset)
-+{
-+	if (offset > 0 && offset > skb->len)
-+		return false;
-+
-+	if  (offset < 0 && -offset > skb_headroom(skb))
-+		return false;
-+
-+	return true;
-+}
-+
- static int tcf_pedit(struct sk_buff *skb, const struct tc_action *a,
- 		     struct tcf_result *res)
+diff --git a/net/unix/af_unix.c b/net/unix/af_unix.c
+index 824cc1e160bc..73f75258ce46 100644
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@ -2194,7 +2194,8 @@ out:
+  *	Sleep until more data has arrived. But check for races..
+  */
+ static long unix_stream_data_wait(struct sock *sk, long timeo,
+-				  struct sk_buff *last, unsigned int last_len)
++				  struct sk_buff *last, unsigned int last_len,
++				  bool freezable)
  {
-@@ -130,6 +141,11 @@ static int tcf_pedit(struct sk_buff *skb, const struct tc_action *a,
- 			if (tkey->offmask) {
- 				char *d, _d;
+ 	struct sk_buff *tail;
+ 	DEFINE_WAIT(wait);
+@@ -2215,7 +2216,10 @@ static long unix_stream_data_wait(struct sock *sk, long timeo,
  
-+				if (!offset_valid(skb, off + tkey->at)) {
-+					pr_info("tc filter pedit 'at' offset %d out of bounds\n",
-+						off + tkey->at);
-+					goto bad;
-+				}
- 				d = skb_header_pointer(skb, off + tkey->at, 1,
- 						       &_d);
- 				if (!d)
-@@ -142,10 +158,10 @@ static int tcf_pedit(struct sk_buff *skb, const struct tc_action *a,
- 					" offset must be on 32 bit boundaries\n");
- 				goto bad;
- 			}
--			if (offset > 0 && offset > skb->len) {
--				pr_info("tc filter pedit"
--					" offset %d can't exceed pkt length %d\n",
--				       offset, skb->len);
-+
-+			if (!offset_valid(skb, off + offset)) {
-+				pr_info("tc filter pedit offset %d out of bounds\n",
-+					offset);
- 				goto bad;
- 			}
+ 		sk_set_bit(SOCKWQ_ASYNC_WAITDATA, sk);
+ 		unix_state_unlock(sk);
+-		timeo = freezable_schedule_timeout(timeo);
++		if (freezable)
++			timeo = freezable_schedule_timeout(timeo);
++		else
++			timeo = schedule_timeout(timeo);
+ 		unix_state_lock(sk);
  
--- 
-2.28.0
-
-
-From d1ed9c1dba632199c59bb8b1245c2f86e28c7380 Mon Sep 17 00:00:00 2001
-From: Herbert Xu <herbert@gondor.apana.org.au>
-Date: Mon, 28 Nov 2016 19:22:12 +0800
-Subject: [PATCH 11/29] netlink: Call cb->done from a worker thread
-
-[ Upstream commit 707693c8a498697aa8db240b93eb76ec62e30892 ]
-
-The cb->done interface expects to be called in process context.
-This was broken by the netlink RCU conversion.  This patch fixes
-it by adding a worker struct to make the cb->done call where
-necessary.
-
-Fixes: 21e4902aea80 ("netlink: Lockless lookup with RCU grace...")
-Reported-by: Subash Abhinov Kasiviswanathan <subashab@codeaurora.org>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Acked-by: Cong Wang <xiyou.wangcong@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/netlink/af_netlink.c | 27 +++++++++++++++++++++++----
- net/netlink/af_netlink.h |  2 ++
- 2 files changed, 25 insertions(+), 4 deletions(-)
-
-diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
-index 28fc283c1ec1..bbf7d2e3fe17 100644
---- a/net/netlink/af_netlink.c
-+++ b/net/netlink/af_netlink.c
-@@ -924,14 +924,11 @@ static void netlink_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
- 	sk_mem_charge(sk, skb->truesize);
- }
- 
--static void netlink_sock_destruct(struct sock *sk)
-+static void __netlink_sock_destruct(struct sock *sk)
- {
- 	struct netlink_sock *nlk = nlk_sk(sk);
- 
- 	if (nlk->cb_running) {
--		if (nlk->cb.done)
--			nlk->cb.done(&nlk->cb);
--
- 		module_put(nlk->cb.module);
- 		kfree_skb(nlk->cb.skb);
- 	}
-@@ -960,6 +957,28 @@ static void netlink_sock_destruct(struct sock *sk)
- 	WARN_ON(nlk_sk(sk)->groups);
- }
- 
-+static void netlink_sock_destruct_work(struct work_struct *work)
-+{
-+	struct netlink_sock *nlk = container_of(work, struct netlink_sock,
-+						work);
-+
-+	nlk->cb.done(&nlk->cb);
-+	__netlink_sock_destruct(&nlk->sk);
-+}
-+
-+static void netlink_sock_destruct(struct sock *sk)
-+{
-+	struct netlink_sock *nlk = nlk_sk(sk);
-+
-+	if (nlk->cb_running && nlk->cb.done) {
-+		INIT_WORK(&nlk->work, netlink_sock_destruct_work);
-+		schedule_work(&nlk->work);
-+		return;
-+	}
-+
-+	__netlink_sock_destruct(sk);
-+}
-+
- /* This lock without WQ_FLAG_EXCLUSIVE is good on UP and it is _very_ bad on
-  * SMP. Look, when several writers sleep and reader wakes them up, all but one
-  * immediately hit write lock and grab all the cpus. Exclusive sleep solves
-diff --git a/net/netlink/af_netlink.h b/net/netlink/af_netlink.h
-index 14437d9b1965..df32cb92d9fc 100644
---- a/net/netlink/af_netlink.h
-+++ b/net/netlink/af_netlink.h
-@@ -3,6 +3,7 @@
- 
- #include <linux/rhashtable.h>
- #include <linux/atomic.h>
-+#include <linux/workqueue.h>
- #include <net/sock.h>
- 
- #define NLGRPSZ(x)	(ALIGN(x, sizeof(unsigned long) * 8) / 8)
-@@ -53,6 +54,7 @@ struct netlink_sock {
- 
- 	struct rhash_head	node;
- 	struct rcu_head		rcu;
-+	struct work_struct	work;
+ 		if (sock_flag(sk, SOCK_DEAD))
+@@ -2245,7 +2249,8 @@ struct unix_stream_read_state {
+ 	unsigned int splice_flags;
  };
  
- static inline struct netlink_sock *nlk_sk(struct sock *sk)
--- 
-2.28.0
-
-
-From baaf0c65bc8ea9c7a404b09bc8cc3b8a1e4f18df Mon Sep 17 00:00:00 2001
-From: Herbert Xu <herbert@gondor.apana.org.au>
-Date: Mon, 5 Dec 2016 15:28:21 +0800
-Subject: [PATCH 12/29] netlink: Do not schedule work from sk_destruct
-
-[ Upstream commit ed5d7788a934a4b6d6d025e948ed4da496b4f12e ]
-
-It is wrong to schedule a work from sk_destruct using the socket
-as the memory reserve because the socket will be freed immediately
-after the return from sk_destruct.
-
-Instead we should do the deferral prior to sk_free.
-
-This patch does just that.
-
-Fixes: 707693c8a498 ("netlink: Call cb->done from a worker thread")
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Tested-by: Andrey Konovalov <andreyknvl@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/netlink/af_netlink.c | 32 +++++++++++++++-----------------
- 1 file changed, 15 insertions(+), 17 deletions(-)
-
-diff --git a/net/netlink/af_netlink.c b/net/netlink/af_netlink.c
-index bbf7d2e3fe17..360700a2f46c 100644
---- a/net/netlink/af_netlink.c
-+++ b/net/netlink/af_netlink.c
-@@ -924,11 +924,13 @@ static void netlink_skb_set_owner_r(struct sk_buff *skb, struct sock *sk)
- 	sk_mem_charge(sk, skb->truesize);
+-static int unix_stream_read_generic(struct unix_stream_read_state *state)
++static int unix_stream_read_generic(struct unix_stream_read_state *state,
++				    bool freezable)
+ {
+ 	struct scm_cookie scm;
+ 	struct socket *sock = state->socket;
+@@ -2324,7 +2329,7 @@ again:
+ 			mutex_unlock(&u->iolock);
+ 
+ 			timeo = unix_stream_data_wait(sk, timeo, last,
+-						      last_len);
++						      last_len, freezable);
+ 
+ 			if (signal_pending(current)) {
+ 				err = sock_intr_errno(timeo);
+@@ -2466,7 +2471,7 @@ static int unix_stream_recvmsg(struct socket *sock, struct msghdr *msg,
+ 		.flags = flags
+ 	};
+ 
+-	return unix_stream_read_generic(&state);
++	return unix_stream_read_generic(&state, true);
  }
  
--static void __netlink_sock_destruct(struct sock *sk)
-+static void netlink_sock_destruct(struct sock *sk)
- {
- 	struct netlink_sock *nlk = nlk_sk(sk);
+ static ssize_t skb_unix_socket_splice(struct sock *sk,
+@@ -2512,7 +2517,7 @@ static ssize_t unix_stream_splice_read(struct socket *sock,  loff_t *ppos,
+ 	    flags & SPLICE_F_NONBLOCK)
+ 		state.flags = MSG_DONTWAIT;
  
- 	if (nlk->cb_running) {
-+		if (nlk->cb.done)
-+			nlk->cb.done(&nlk->cb);
- 		module_put(nlk->cb.module);
- 		kfree_skb(nlk->cb.skb);
- 	}
-@@ -962,21 +964,7 @@ static void netlink_sock_destruct_work(struct work_struct *work)
- 	struct netlink_sock *nlk = container_of(work, struct netlink_sock,
- 						work);
- 
--	nlk->cb.done(&nlk->cb);
--	__netlink_sock_destruct(&nlk->sk);
--}
--
--static void netlink_sock_destruct(struct sock *sk)
--{
--	struct netlink_sock *nlk = nlk_sk(sk);
--
--	if (nlk->cb_running && nlk->cb.done) {
--		INIT_WORK(&nlk->work, netlink_sock_destruct_work);
--		schedule_work(&nlk->work);
--		return;
--	}
--
--	__netlink_sock_destruct(sk);
-+	sk_free(&nlk->sk);
+-	return unix_stream_read_generic(&state);
++	return unix_stream_read_generic(&state, false);
  }
  
- /* This lock without WQ_FLAG_EXCLUSIVE is good on UP and it is _very_ bad on
-@@ -1284,8 +1272,18 @@ out_module:
- static void deferred_put_nlk_sk(struct rcu_head *head)
- {
- 	struct netlink_sock *nlk = container_of(head, struct netlink_sock, rcu);
-+	struct sock *sk = &nlk->sk;
-+
-+	if (!atomic_dec_and_test(&sk->sk_refcnt))
-+		return;
-+
-+	if (nlk->cb_running && nlk->cb.done) {
-+		INIT_WORK(&nlk->work, netlink_sock_destruct_work);
-+		schedule_work(&nlk->work);
-+		return;
-+	}
- 
--	sock_put(&nlk->sk);
-+	sk_free(sk);
- }
- 
- static int netlink_release(struct socket *sock)
--- 
-2.28.0
-
-
-From 1a15519fdcdb0f908ad1a3785178f9e18a2ebedb Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Mon, 28 Nov 2016 06:26:49 -0800
-Subject: [PATCH 13/29] net/dccp: fix use-after-free in dccp_invalid_packet
-
-[ Upstream commit 648f0c28df282636c0c8a7a19ca3ce5fc80a39c3 ]
-
-pskb_may_pull() can reallocate skb->head, we need to reload dh pointer
-in dccp_invalid_packet() or risk use after free.
-
-Bug found by Andrey Konovalov using syzkaller.
-
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Reported-by: Andrey Konovalov <andreyknvl@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/dccp/ipv4.c | 12 +++++++-----
- 1 file changed, 7 insertions(+), 5 deletions(-)
-
-diff --git a/net/dccp/ipv4.c b/net/dccp/ipv4.c
-index 861e1fa25d5e..0759f5b9180e 100644
---- a/net/dccp/ipv4.c
-+++ b/net/dccp/ipv4.c
-@@ -698,6 +698,7 @@ int dccp_invalid_packet(struct sk_buff *skb)
- {
- 	const struct dccp_hdr *dh;
- 	unsigned int cscov;
-+	u8 dccph_doff;
- 
- 	if (skb->pkt_type != PACKET_HOST)
- 		return 1;
-@@ -719,18 +720,19 @@ int dccp_invalid_packet(struct sk_buff *skb)
- 	/*
- 	 * If P.Data Offset is too small for packet type, drop packet and return
- 	 */
--	if (dh->dccph_doff < dccp_hdr_len(skb) / sizeof(u32)) {
--		DCCP_WARN("P.Data Offset(%u) too small\n", dh->dccph_doff);
-+	dccph_doff = dh->dccph_doff;
-+	if (dccph_doff < dccp_hdr_len(skb) / sizeof(u32)) {
-+		DCCP_WARN("P.Data Offset(%u) too small\n", dccph_doff);
- 		return 1;
- 	}
- 	/*
- 	 * If P.Data Offset is too too large for packet, drop packet and return
- 	 */
--	if (!pskb_may_pull(skb, dh->dccph_doff * sizeof(u32))) {
--		DCCP_WARN("P.Data Offset(%u) too large\n", dh->dccph_doff);
-+	if (!pskb_may_pull(skb, dccph_doff * sizeof(u32))) {
-+		DCCP_WARN("P.Data Offset(%u) too large\n", dccph_doff);
- 		return 1;
- 	}
--
-+	dh = dccp_hdr(skb);
- 	/*
- 	 * If P.type is not Data, Ack, or DataAck and P.X == 0 (the packet
- 	 * has short sequence numbers), drop packet and return
--- 
-2.28.0
-
-
-From 5a01eaf19858278cc22525be118fe9c6a3c86e83 Mon Sep 17 00:00:00 2001
-From: Philip Pettersson <philip.pettersson@gmail.com>
-Date: Wed, 30 Nov 2016 14:55:36 -0800
-Subject: [PATCH 14/29] packet: fix race condition in packet_set_ring
-
-[ Upstream commit 84ac7260236a49c79eede91617700174c2c19b0c ]
-
-When packet_set_ring creates a ring buffer it will initialize a
-struct timer_list if the packet version is TPACKET_V3. This value
-can then be raced by a different thread calling setsockopt to
-set the version to TPACKET_V1 before packet_set_ring has finished.
-
-This leads to a use-after-free on a function pointer in the
-struct timer_list when the socket is closed as the previously
-initialized timer will not be deleted.
-
-The bug is fixed by taking lock_sock(sk) in packet_setsockopt when
-changing the packet version while also taking the lock at the start
-of packet_set_ring.
-
-Fixes: f6fb8f100b80 ("af-packet: TPACKET_V3 flexible buffer implementation.")
-Signed-off-by: Philip Pettersson <philip.pettersson@gmail.com>
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/packet/af_packet.c | 18 ++++++++++++------
- 1 file changed, 12 insertions(+), 6 deletions(-)
-
-diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
-index 34e4fcfd240b..f223d1c80ccf 100644
---- a/net/packet/af_packet.c
-+++ b/net/packet/af_packet.c
-@@ -3572,19 +3572,25 @@ packet_setsockopt(struct socket *sock, int level, int optname, char __user *optv
- 
- 		if (optlen != sizeof(val))
- 			return -EINVAL;
--		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec)
--			return -EBUSY;
- 		if (copy_from_user(&val, optval, sizeof(val)))
- 			return -EFAULT;
- 		switch (val) {
- 		case TPACKET_V1:
- 		case TPACKET_V2:
- 		case TPACKET_V3:
--			po->tp_version = val;
--			return 0;
-+			break;
- 		default:
- 			return -EINVAL;
- 		}
-+		lock_sock(sk);
-+		if (po->rx_ring.pg_vec || po->tx_ring.pg_vec) {
-+			ret = -EBUSY;
-+		} else {
-+			po->tp_version = val;
-+			ret = 0;
-+		}
-+		release_sock(sk);
-+		return ret;
- 	}
- 	case PACKET_RESERVE:
- 	{
-@@ -4067,6 +4073,7 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
- 	/* Added to avoid minimal code churn */
- 	struct tpacket_req *req = &req_u->req;
- 
-+	lock_sock(sk);
- 	/* Opening a Tx-ring is NOT supported in TPACKET_V3 */
- 	if (!closing && tx_ring && (po->tp_version > TPACKET_V2)) {
- 		WARN(1, "Tx-ring is not supported.\n");
-@@ -4148,7 +4155,6 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
- 			goto out;
- 	}
- 
--	lock_sock(sk);
- 
- 	/* Detach socket from network */
- 	spin_lock(&po->bind_lock);
-@@ -4197,11 +4203,11 @@ static int packet_set_ring(struct sock *sk, union tpacket_req_u *req_u,
- 		if (!tx_ring)
- 			prb_shutdown_retire_blk_timer(po, rb_queue);
- 	}
--	release_sock(sk);
- 
- 	if (pg_vec)
- 		free_pg_vec(pg_vec, order, req->tp_block_nr);
- out:
-+	release_sock(sk);
- 	return err;
- }
- 
--- 
-2.28.0
-
-
-From c36a2a14f26dd3ed95ce75ba69fb7435d7da9bf0 Mon Sep 17 00:00:00 2001
-From: Florian Fainelli <f.fainelli@gmail.com>
-Date: Thu, 1 Dec 2016 09:45:45 -0800
-Subject: [PATCH 15/29] net: bcmgenet: Utilize correct struct device for all
- DMA operations
-
-[ Upstream commit 8c4799ac799665065f9bf1364fd71bf4f7dc6a4a ]
-
-__bcmgenet_tx_reclaim() and bcmgenet_free_rx_buffers() are not using the
-same struct device during unmap that was used for the map operation,
-which makes DMA-API debugging warn about it. Fix this by always using
-&priv->pdev->dev throughout the driver, using an identical device
-reference for all map/unmap calls.
-
-Fixes: 1c1008c793fa ("net: bcmgenet: add main driver file")
-Signed-off-by: Florian Fainelli <f.fainelli@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/broadcom/genet/bcmgenet.c | 8 +++++---
- 1 file changed, 5 insertions(+), 3 deletions(-)
-
-diff --git a/drivers/net/ethernet/broadcom/genet/bcmgenet.c b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
-index 0fb3f8de88e9..91627561c58d 100644
---- a/drivers/net/ethernet/broadcom/genet/bcmgenet.c
-+++ b/drivers/net/ethernet/broadcom/genet/bcmgenet.c
-@@ -1168,6 +1168,7 @@ static unsigned int __bcmgenet_tx_reclaim(struct net_device *dev,
- 					  struct bcmgenet_tx_ring *ring)
- {
- 	struct bcmgenet_priv *priv = netdev_priv(dev);
-+	struct device *kdev = &priv->pdev->dev;
- 	struct enet_cb *tx_cb_ptr;
- 	struct netdev_queue *txq;
- 	unsigned int pkts_compl = 0;
-@@ -1195,7 +1196,7 @@ static unsigned int __bcmgenet_tx_reclaim(struct net_device *dev,
- 			pkts_compl++;
- 			dev->stats.tx_packets++;
- 			dev->stats.tx_bytes += tx_cb_ptr->skb->len;
--			dma_unmap_single(&dev->dev,
-+			dma_unmap_single(kdev,
- 					 dma_unmap_addr(tx_cb_ptr, dma_addr),
- 					 dma_unmap_len(tx_cb_ptr, dma_len),
- 					 DMA_TO_DEVICE);
-@@ -1203,7 +1204,7 @@ static unsigned int __bcmgenet_tx_reclaim(struct net_device *dev,
- 		} else if (dma_unmap_addr(tx_cb_ptr, dma_addr)) {
- 			dev->stats.tx_bytes +=
- 				dma_unmap_len(tx_cb_ptr, dma_len);
--			dma_unmap_page(&dev->dev,
-+			dma_unmap_page(kdev,
- 				       dma_unmap_addr(tx_cb_ptr, dma_addr),
- 				       dma_unmap_len(tx_cb_ptr, dma_len),
- 				       DMA_TO_DEVICE);
-@@ -1754,6 +1755,7 @@ static int bcmgenet_alloc_rx_buffers(struct bcmgenet_priv *priv,
- 
- static void bcmgenet_free_rx_buffers(struct bcmgenet_priv *priv)
- {
-+	struct device *kdev = &priv->pdev->dev;
- 	struct enet_cb *cb;
- 	int i;
- 
-@@ -1761,7 +1763,7 @@ static void bcmgenet_free_rx_buffers(struct bcmgenet_priv *priv)
- 		cb = &priv->rx_cbs[i];
- 
- 		if (dma_unmap_addr(cb, dma_addr)) {
--			dma_unmap_single(&priv->dev->dev,
-+			dma_unmap_single(kdev,
- 					 dma_unmap_addr(cb, dma_addr),
- 					 priv->rx_buf_len, DMA_FROM_DEVICE);
- 			dma_unmap_addr_set(cb, dma_addr, 0);
--- 
-2.28.0
-
-
-From a89e2ff894bc317a49b9b46ef70eb62e05a8bf7c Mon Sep 17 00:00:00 2001
-From: Chris Brandt <chris.brandt@renesas.com>
-Date: Thu, 1 Dec 2016 13:32:14 -0500
-Subject: [PATCH 16/29] sh_eth: remove unchecked interrupts for RZ/A1
-
-[ Upstream commit 33d446dbba4d4d6a77e1e900d434fa99e0f02c86 ]
-
-When streaming a lot of data and the RZ/A1 can't keep up, some status bits
-will get set that are not being checked or cleared which cause the
-following messages and the Ethernet driver to stop working. This
-patch fixes that issue.
-
-irq 21: nobody cared (try booting with the "irqpoll" option)
-handlers:
-[<c036b71c>] sh_eth_interrupt
-Disabling IRQ #21
-
-Fixes: db893473d313a4ad ("sh_eth: Add support for r7s72100")
-Signed-off-by: Chris Brandt <chris.brandt@renesas.com>
-Acked-by: Sergei Shtylyov <sergei.shtylyov@cogentembedded.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/renesas/sh_eth.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/net/ethernet/renesas/sh_eth.c b/drivers/net/ethernet/renesas/sh_eth.c
-index 36fc9427418f..480f3dae0780 100644
---- a/drivers/net/ethernet/renesas/sh_eth.c
-+++ b/drivers/net/ethernet/renesas/sh_eth.c
-@@ -832,7 +832,7 @@ static struct sh_eth_cpu_data r7s72100_data = {
- 
- 	.ecsr_value	= ECSR_ICD,
- 	.ecsipr_value	= ECSIPR_ICDIP,
--	.eesipr_value	= 0xff7f009f,
-+	.eesipr_value	= 0xe77f009f,
- 
- 	.tx_check	= EESR_TC1 | EESR_FTC,
- 	.eesr_err_check	= EESR_TWB1 | EESR_TWB | EESR_TABT | EESR_RABT |
--- 
-2.28.0
-
-
-From 6e682c528b3ef046a03994b076d832b2ac029042 Mon Sep 17 00:00:00 2001
-From: Sabrina Dubroca <sd@queasysnail.net>
-Date: Fri, 2 Dec 2016 16:49:29 +0100
-Subject: [PATCH 17/29] geneve: avoid use-after-free of skb->data
-
-[ Upstream commit 5b01014759991887b1e450c9def01e58c02ab81b ]
-
-geneve{,6}_build_skb can end up doing a pskb_expand_head(), which
-makes the ip_hdr(skb) reference we stashed earlier stale. Since it's
-only needed as an argument to ip_tunnel_ecn_encap(), move this
-directly in the function call.
-
-Fixes: 08399efc6319 ("geneve: ensure ECN info is handled properly in all tx/rx paths")
-Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
-Reviewed-by: John W. Linville <linville@tuxdriver.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/geneve.c | 14 ++++----------
- 1 file changed, 4 insertions(+), 10 deletions(-)
-
-diff --git a/drivers/net/geneve.c b/drivers/net/geneve.c
-index 4827c6987ac3..f0961cbaf87e 100644
---- a/drivers/net/geneve.c
-+++ b/drivers/net/geneve.c
-@@ -815,7 +815,6 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
- 	struct geneve_dev *geneve = netdev_priv(dev);
- 	struct geneve_sock *gs4 = geneve->sock4;
- 	struct rtable *rt = NULL;
--	const struct iphdr *iip; /* interior IP header */
- 	int err = -EINVAL;
- 	struct flowi4 fl4;
- 	__u8 tos, ttl;
-@@ -842,8 +841,6 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
- 	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
- 	skb_reset_mac_header(skb);
- 
--	iip = ip_hdr(skb);
--
- 	if (info) {
- 		const struct ip_tunnel_key *key = &info->key;
- 		u8 *opts = NULL;
-@@ -859,7 +856,7 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
- 		if (unlikely(err))
- 			goto err;
- 
--		tos = ip_tunnel_ecn_encap(key->tos, iip, skb);
-+		tos = ip_tunnel_ecn_encap(key->tos, ip_hdr(skb), skb);
- 		ttl = key->ttl;
- 		df = key->tun_flags & TUNNEL_DONT_FRAGMENT ? htons(IP_DF) : 0;
- 	} else {
-@@ -869,7 +866,7 @@ static netdev_tx_t geneve_xmit_skb(struct sk_buff *skb, struct net_device *dev,
- 		if (unlikely(err))
- 			goto err;
- 
--		tos = ip_tunnel_ecn_encap(fl4.flowi4_tos, iip, skb);
-+		tos = ip_tunnel_ecn_encap(fl4.flowi4_tos, ip_hdr(skb), skb);
- 		ttl = geneve->ttl;
- 		if (!ttl && IN_MULTICAST(ntohl(fl4.daddr)))
- 			ttl = 1;
-@@ -903,7 +900,6 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
- 	struct geneve_dev *geneve = netdev_priv(dev);
- 	struct geneve_sock *gs6 = geneve->sock6;
- 	struct dst_entry *dst = NULL;
--	const struct iphdr *iip; /* interior IP header */
- 	int err = -EINVAL;
- 	struct flowi6 fl6;
- 	__u8 prio, ttl;
-@@ -927,8 +923,6 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
- 	sport = udp_flow_src_port(geneve->net, skb, 1, USHRT_MAX, true);
- 	skb_reset_mac_header(skb);
- 
--	iip = ip_hdr(skb);
--
- 	if (info) {
- 		const struct ip_tunnel_key *key = &info->key;
- 		u8 *opts = NULL;
-@@ -945,7 +939,7 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
- 		if (unlikely(err))
- 			goto err;
- 
--		prio = ip_tunnel_ecn_encap(key->tos, iip, skb);
-+		prio = ip_tunnel_ecn_encap(key->tos, ip_hdr(skb), skb);
- 		ttl = key->ttl;
- 	} else {
- 		udp_csum = false;
-@@ -954,7 +948,7 @@ static netdev_tx_t geneve6_xmit_skb(struct sk_buff *skb, struct net_device *dev,
- 		if (unlikely(err))
- 			goto err;
- 
--		prio = ip_tunnel_ecn_encap(fl6.flowi6_tos, iip, skb);
-+		prio = ip_tunnel_ecn_encap(fl6.flowi6_tos, ip_hdr(skb), skb);
- 		ttl = geneve->ttl;
- 		if (!ttl && ipv6_addr_is_multicast(&fl6.daddr))
- 			ttl = 1;
--- 
-2.28.0
-
-
-From 77125815f058d587cac9217ac2c468038a7285c4 Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Fri, 2 Dec 2016 09:44:53 -0800
-Subject: [PATCH 18/29] net: avoid signed overflows for SO_{SND|RCV}BUFFORCE
-
-[ Upstream commit b98b0bc8c431e3ceb4b26b0dfc8db509518fb290 ]
-
-CAP_NET_ADMIN users should not be allowed to set negative
-sk_sndbuf or sk_rcvbuf values, as it can lead to various memory
-corruptions, crashes, OOM...
-
-Note that before commit 82981930125a ("net: cleanups in
-sock_setsockopt()"), the bug was even more serious, since SO_SNDBUF
-and SO_RCVBUF were vulnerable.
-
-This needs to be backported to all known linux kernels.
-
-Again, many thanks to syzkaller team for discovering this gem.
-
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Reported-by: Andrey Konovalov <andreyknvl@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/core/sock.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/net/core/sock.c b/net/core/sock.c
-index 88f017854509..f4c0917e66b5 100644
---- a/net/core/sock.c
-+++ b/net/core/sock.c
-@@ -745,7 +745,7 @@ int sock_setsockopt(struct socket *sock, int level, int optname,
- 		val = min_t(u32, val, sysctl_wmem_max);
- set_sndbuf:
- 		sk->sk_userlocks |= SOCK_SNDBUF_LOCK;
--		sk->sk_sndbuf = max_t(u32, val * 2, SOCK_MIN_SNDBUF);
-+		sk->sk_sndbuf = max_t(int, val * 2, SOCK_MIN_SNDBUF);
- 		/* Wake up sending tasks if we upped the value. */
- 		sk->sk_write_space(sk);
- 		break;
-@@ -781,7 +781,7 @@ set_rcvbuf:
- 		 * returning the value we actually used in getsockopt
- 		 * is the most desirable behavior.
- 		 */
--		sk->sk_rcvbuf = max_t(u32, val * 2, SOCK_MIN_RCVBUF);
-+		sk->sk_rcvbuf = max_t(int, val * 2, SOCK_MIN_RCVBUF);
- 		break;
- 
- 	case SO_RCVBUFFORCE:
--- 
-2.28.0
-
-
-From 06cdad2b6d921dee33c8efc84922533dfb1458c6 Mon Sep 17 00:00:00 2001
-From: Kees Cook <keescook@chromium.org>
-Date: Mon, 5 Dec 2016 10:34:38 -0800
-Subject: [PATCH 19/29] net: ping: check minimum size on ICMP header length
-
-[ Upstream commit 0eab121ef8750a5c8637d51534d5e9143fb0633f ]
-
-Prior to commit c0371da6047a ("put iov_iter into msghdr") in v3.19, there
-was no check that the iovec contained enough bytes for an ICMP header,
-and the read loop would walk across neighboring stack contents. Since the
-iov_iter conversion, bad arguments are noticed, but the returned error is
-EFAULT. Returning EINVAL is a clearer error and also solves the problem
-prior to v3.19.
-
-This was found using trinity with KASAN on v3.18:
-
-BUG: KASAN: stack-out-of-bounds in memcpy_fromiovec+0x60/0x114 at addr ffffffc071077da0
-Read of size 8 by task trinity-c2/9623
-page:ffffffbe034b9a08 count:0 mapcount:0 mapping:          (null) index:0x0
-flags: 0x0()
-page dumped because: kasan: bad access detected
-CPU: 0 PID: 9623 Comm: trinity-c2 Tainted: G    BU         3.18.0-dirty #15
-Hardware name: Google Tegra210 Smaug Rev 1,3+ (DT)
-Call trace:
-[<ffffffc000209c98>] dump_backtrace+0x0/0x1ac arch/arm64/kernel/traps.c:90
-[<ffffffc000209e54>] show_stack+0x10/0x1c arch/arm64/kernel/traps.c:171
-[<     inline     >] __dump_stack lib/dump_stack.c:15
-[<ffffffc000f18dc4>] dump_stack+0x7c/0xd0 lib/dump_stack.c:50
-[<     inline     >] print_address_description mm/kasan/report.c:147
-[<     inline     >] kasan_report_error mm/kasan/report.c:236
-[<ffffffc000373dcc>] kasan_report+0x380/0x4b8 mm/kasan/report.c:259
-[<     inline     >] check_memory_region mm/kasan/kasan.c:264
-[<ffffffc00037352c>] __asan_load8+0x20/0x70 mm/kasan/kasan.c:507
-[<ffffffc0005b9624>] memcpy_fromiovec+0x5c/0x114 lib/iovec.c:15
-[<     inline     >] memcpy_from_msg include/linux/skbuff.h:2667
-[<ffffffc000ddeba0>] ping_common_sendmsg+0x50/0x108 net/ipv4/ping.c:674
-[<ffffffc000dded30>] ping_v4_sendmsg+0xd8/0x698 net/ipv4/ping.c:714
-[<ffffffc000dc91dc>] inet_sendmsg+0xe0/0x12c net/ipv4/af_inet.c:749
-[<     inline     >] __sock_sendmsg_nosec net/socket.c:624
-[<     inline     >] __sock_sendmsg net/socket.c:632
-[<ffffffc000cab61c>] sock_sendmsg+0x124/0x164 net/socket.c:643
-[<     inline     >] SYSC_sendto net/socket.c:1797
-[<ffffffc000cad270>] SyS_sendto+0x178/0x1d8 net/socket.c:1761
-
-CVE-2016-8399
-
-Reported-by: Qidan He <i@flanker017.me>
-Fixes: c319b4d76b9e ("net: ipv4: add IPPROTO_ICMP socket kind")
-Cc: stable@vger.kernel.org
-Signed-off-by: Kees Cook <keescook@chromium.org>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/ping.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
-index aa67e0e64b69..23160d2b3f71 100644
---- a/net/ipv4/ping.c
-+++ b/net/ipv4/ping.c
-@@ -660,6 +660,10 @@ int ping_common_sendmsg(int family, struct msghdr *msg, size_t len,
- 	if (len > 0xFFFF)
- 		return -EMSGSIZE;
- 
-+	/* Must have at least a full ICMP header. */
-+	if (len < icmph_len)
-+		return -EINVAL;
-+
- 	/*
- 	 *	Check the flags.
- 	 */
--- 
-2.28.0
-
-
-From 438e91da24fa63d3b52faafd7302081e9e79207a Mon Sep 17 00:00:00 2001
-From: Andreas Larsson <andreas@gaisler.com>
-Date: Wed, 9 Nov 2016 10:43:05 +0100
-Subject: [PATCH 20/29] sparc32: Fix inverted invalid_frame_pointer checks on
- sigreturns
-
-[ Upstream commit 07b5ab3f71d318e52c18cc3b73c1d44c908aacfa ]
-
-Signed-off-by: Andreas Larsson <andreas@gaisler.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/kernel/signal_32.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/arch/sparc/kernel/signal_32.c b/arch/sparc/kernel/signal_32.c
-index c3c12efe0bc0..9c0c8fd0b292 100644
---- a/arch/sparc/kernel/signal_32.c
-+++ b/arch/sparc/kernel/signal_32.c
-@@ -89,7 +89,7 @@ asmlinkage void do_sigreturn(struct pt_regs *regs)
- 	sf = (struct signal_frame __user *) regs->u_regs[UREG_FP];
- 
- 	/* 1. Make sure we are not getting garbage from the user */
--	if (!invalid_frame_pointer(sf, sizeof(*sf)))
-+	if (invalid_frame_pointer(sf, sizeof(*sf)))
- 		goto segv_and_exit;
- 
- 	if (get_user(ufp, &sf->info.si_regs.u_regs[UREG_FP]))
-@@ -150,7 +150,7 @@ asmlinkage void do_rt_sigreturn(struct pt_regs *regs)
- 
- 	synchronize_user_stack();
- 	sf = (struct rt_signal_frame __user *) regs->u_regs[UREG_FP];
--	if (!invalid_frame_pointer(sf, sizeof(*sf)))
-+	if (invalid_frame_pointer(sf, sizeof(*sf)))
- 		goto segv;
- 
- 	if (get_user(ufp, &sf->regs.u_regs[UREG_FP]))
--- 
-2.28.0
-
-
-From ed7b60db00a17a3bc4705014ebec4c035577b9e5 Mon Sep 17 00:00:00 2001
-From: Thomas Tai <thomas.tai@oracle.com>
-Date: Thu, 3 Nov 2016 09:19:01 -0700
-Subject: [PATCH 21/29] sparc64: Fix find_node warning if numa node cannot be
- found
-
-[ Upstream commit 74a5ed5c4f692df2ff0a2313ea71e81243525519 ]
-
-When booting up LDOM, find_node() warns that a physical address
-doesn't match a NUMA node.
-
-WARNING: CPU: 0 PID: 0 at arch/sparc/mm/init_64.c:835
-find_node+0xf4/0x120 find_node: A physical address doesn't
-match a NUMA node rule. Some physical memory will be
-owned by node 0.Modules linked in:
-
-CPU: 0 PID: 0 Comm: swapper Not tainted 4.9.0-rc3 #4
-Call Trace:
- [0000000000468ba0] __warn+0xc0/0xe0
- [0000000000468c74] warn_slowpath_fmt+0x34/0x60
- [00000000004592f4] find_node+0xf4/0x120
- [0000000000dd0774] add_node_ranges+0x38/0xe4
- [0000000000dd0b1c] numa_parse_mdesc+0x268/0x2e4
- [0000000000dd0e9c] bootmem_init+0xb8/0x160
- [0000000000dd174c] paging_init+0x808/0x8fc
- [0000000000dcb0d0] setup_arch+0x2c8/0x2f0
- [0000000000dc68a0] start_kernel+0x48/0x424
- [0000000000dcb374] start_early_boot+0x27c/0x28c
- [0000000000a32c08] tlb_fixup_done+0x4c/0x64
- [0000000000027f08] 0x27f08
-
-It is because linux use an internal structure node_masks[] to
-keep the best memory latency node only. However, LDOM mdesc can
-contain single latency-group with multiple memory latency nodes.
-
-If the address doesn't match the best latency node within
-node_masks[], it should check for an alternative via mdesc.
-The warning message should only be printed if the address
-doesn't match any node_masks[] nor within mdesc. To minimize
-the impact of searching mdesc every time, the last matched
-mask and index is stored in a variable.
-
-Signed-off-by: Thomas Tai <thomas.tai@oracle.com>
-Reviewed-by: Chris Hyser <chris.hyser@oracle.com>
-Reviewed-by: Liam Merwick <liam.merwick@oracle.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/mm/init_64.c | 65 ++++++++++++++++++++++++++++++++++++++---
- 1 file changed, 61 insertions(+), 4 deletions(-)
-
-diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
-index a5331c336b2a..83bf3418fb56 100644
---- a/arch/sparc/mm/init_64.c
-+++ b/arch/sparc/mm/init_64.c
-@@ -800,6 +800,8 @@ struct mdesc_mblock {
- };
- static struct mdesc_mblock *mblocks;
- static int num_mblocks;
-+static int find_numa_node_for_addr(unsigned long pa,
-+				   struct node_mem_mask *pnode_mask);
- 
- static unsigned long ra_to_pa(unsigned long addr)
- {
-@@ -819,6 +821,9 @@ static unsigned long ra_to_pa(unsigned long addr)
- 
- static int find_node(unsigned long addr)
- {
-+	static bool search_mdesc = true;
-+	static struct node_mem_mask last_mem_mask = { ~0UL, ~0UL };
-+	static int last_index;
- 	int i;
- 
- 	addr = ra_to_pa(addr);
-@@ -828,10 +833,27 @@ static int find_node(unsigned long addr)
- 		if ((addr & p->mask) == p->val)
- 			return i;
- 	}
--	/* The following condition has been observed on LDOM guests.*/
--	WARN_ONCE(1, "find_node: A physical address doesn't match a NUMA node"
--		" rule. Some physical memory will be owned by node 0.");
--	return 0;
-+	/* The following condition has been observed on LDOM guests because
-+	 * node_masks only contains the best latency mask and value.
-+	 * LDOM guest's mdesc can contain a single latency group to
-+	 * cover multiple address range. Print warning message only if the
-+	 * address cannot be found in node_masks nor mdesc.
-+	 */
-+	if ((search_mdesc) &&
-+	    ((addr & last_mem_mask.mask) != last_mem_mask.val)) {
-+		/* find the available node in the mdesc */
-+		last_index = find_numa_node_for_addr(addr, &last_mem_mask);
-+		numadbg("find_node: latency group for address 0x%lx is %d\n",
-+			addr, last_index);
-+		if ((last_index < 0) || (last_index >= num_node_masks)) {
-+			/* WARN_ONCE() and use default group 0 */
-+			WARN_ONCE(1, "find_node: A physical address doesn't match a NUMA node rule. Some physical memory will be owned by node 0.");
-+			search_mdesc = false;
-+			last_index = 0;
-+		}
-+	}
-+
-+	return last_index;
- }
- 
- static u64 memblock_nid_range(u64 start, u64 end, int *nid)
-@@ -1158,6 +1180,41 @@ int __node_distance(int from, int to)
- 	return numa_latency[from][to];
- }
- 
-+static int find_numa_node_for_addr(unsigned long pa,
-+				   struct node_mem_mask *pnode_mask)
-+{
-+	struct mdesc_handle *md = mdesc_grab();
-+	u64 node, arc;
-+	int i = 0;
-+
-+	node = mdesc_node_by_name(md, MDESC_NODE_NULL, "latency-groups");
-+	if (node == MDESC_NODE_NULL)
-+		goto out;
-+
-+	mdesc_for_each_node_by_name(md, node, "group") {
-+		mdesc_for_each_arc(arc, md, node, MDESC_ARC_TYPE_FWD) {
-+			u64 target = mdesc_arc_target(md, arc);
-+			struct mdesc_mlgroup *m = find_mlgroup(target);
-+
-+			if (!m)
-+				continue;
-+			if ((pa & m->mask) == m->match) {
-+				if (pnode_mask) {
-+					pnode_mask->mask = m->mask;
-+					pnode_mask->val = m->match;
-+				}
-+				mdesc_release(md);
-+				return i;
-+			}
-+		}
-+		i++;
-+	}
-+
-+out:
-+	mdesc_release(md);
-+	return -1;
-+}
-+
- static int find_best_numa_node_for_mlgroup(struct mdesc_mlgroup *grp)
- {
- 	int i;
--- 
-2.28.0
-
-
-From 899b60535a2af978cdd798932f688b887decf424 Mon Sep 17 00:00:00 2001
-From: Thomas Tai <thomas.tai@oracle.com>
-Date: Fri, 11 Nov 2016 16:41:00 -0800
-Subject: [PATCH 22/29] sparc64: fix compile warning section mismatch in
- find_node()
-
-[ Upstream commit 87a349f9cc0908bc0cfac0c9ece3179f650ae95a ]
-
-A compile warning is introduced by a commit to fix the find_node().
-This patch fix the compile warning by moving find_node() into __init
-section. Because find_node() is only used by memblock_nid_range() which
-is only used by a __init add_node_ranges(). find_node() and
-memblock_nid_range() should also be inside __init section.
-
-Signed-off-by: Thomas Tai <thomas.tai@oracle.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sparc/mm/init_64.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/arch/sparc/mm/init_64.c b/arch/sparc/mm/init_64.c
-index 83bf3418fb56..3d3414c14792 100644
---- a/arch/sparc/mm/init_64.c
-+++ b/arch/sparc/mm/init_64.c
-@@ -803,7 +803,7 @@ static int num_mblocks;
- static int find_numa_node_for_addr(unsigned long pa,
- 				   struct node_mem_mask *pnode_mask);
- 
--static unsigned long ra_to_pa(unsigned long addr)
-+static unsigned long __init ra_to_pa(unsigned long addr)
- {
- 	int i;
- 
-@@ -819,7 +819,7 @@ static unsigned long ra_to_pa(unsigned long addr)
- 	return addr;
- }
- 
--static int find_node(unsigned long addr)
-+static int __init find_node(unsigned long addr)
- {
- 	static bool search_mdesc = true;
- 	static struct node_mem_mask last_mem_mask = { ~0UL, ~0UL };
-@@ -856,7 +856,7 @@ static int find_node(unsigned long addr)
- 	return last_index;
- }
- 
--static u64 memblock_nid_range(u64 start, u64 end, int *nid)
-+static u64 __init memblock_nid_range(u64 start, u64 end, int *nid)
- {
- 	*nid = find_node(start);
- 	start += PAGE_SIZE;
--- 
-2.28.0
-
-
-From fd1aa12c63400ca7d5b6d189ae98570f47735180 Mon Sep 17 00:00:00 2001
-From: Al Viro <viro@zeniv.linux.org.uk>
-Date: Mon, 10 Oct 2016 13:57:37 -0400
-Subject: [PATCH 23/29] constify iov_iter_count() and iter_is_iovec()
-
-commit b57332b4105abf1d518d93886e547ee2f98cd414 upstream.
-
-[stable note, need this to prevent build warning in commit
-a0ac402cfcdc904f9772e1762b3fda112dcc56a0]
-
-Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/uio.h | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/include/linux/uio.h b/include/linux/uio.h
-index 5f9c59da978b..e2225109b816 100644
---- a/include/linux/uio.h
-+++ b/include/linux/uio.h
-@@ -101,12 +101,12 @@ int iov_iter_npages(const struct iov_iter *i, int maxpages);
- 
- const void *dup_iter(struct iov_iter *new, struct iov_iter *old, gfp_t flags);
- 
--static inline size_t iov_iter_count(struct iov_iter *i)
-+static inline size_t iov_iter_count(const struct iov_iter *i)
- {
- 	return i->count;
- }
- 
--static inline bool iter_is_iovec(struct iov_iter *i)
-+static inline bool iter_is_iovec(const struct iov_iter *i)
- {
- 	return !(i->type & (ITER_BVEC | ITER_KVEC));
- }
--- 
-2.28.0
-
-
-From d41fb2fbb28d3a1085960edada6c046becd1fafd Mon Sep 17 00:00:00 2001
-From: Linus Torvalds <torvalds@linux-foundation.org>
-Date: Tue, 6 Dec 2016 16:18:14 -0800
-Subject: [PATCH 24/29] Don't feed anything but regular iovec's to
- blk_rq_map_user_iov
-
-commit a0ac402cfcdc904f9772e1762b3fda112dcc56a0 upstream.
-
-In theory we could map other things, but there's a reason that function
-is called "user_iov".  Using anything else (like splice can do) just
-confuses it.
-
-Reported-and-tested-by: Johannes Thumshirn <jthumshirn@suse.de>
-Cc: Al Viro <viro@ZenIV.linux.org.uk>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- block/blk-map.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/block/blk-map.c b/block/blk-map.c
-index f565e11f465a..69953bd97e65 100644
---- a/block/blk-map.c
-+++ b/block/blk-map.c
-@@ -90,6 +90,9 @@ int blk_rq_map_user_iov(struct request_queue *q, struct request *rq,
- 	if (!iter || !iter->count)
- 		return -EINVAL;
- 
-+	if (!iter_is_iovec(iter))
-+		return -EINVAL;
-+
- 	iov_for_each(iov, i, *iter) {
- 		unsigned long uaddr = (unsigned long) iov.iov_base;
- 
--- 
-2.28.0
-
-
-From 25d8b7c105e13df4a0b14159a85c448158570909 Mon Sep 17 00:00:00 2001
-From: Eli Cooper <elicooper@gmx.com>
-Date: Thu, 1 Dec 2016 10:05:11 +0800
-Subject: [PATCH 25/29] ipv6: Set skb->protocol properly for local output
-
-commit b4e479a96fc398ccf83bb1cffb4ffef8631beaf1 upstream.
-
-When xfrm is applied to TSO/GSO packets, it follows this path:
-
-    xfrm_output() -> xfrm_output_gso() -> skb_gso_segment()
-
-where skb_gso_segment() relies on skb->protocol to function properly.
-
-This patch sets skb->protocol to ETH_P_IPV6 before dst_output() is called,
-fixing a bug where GSO packets sent through an ipip6 tunnel are dropped
-when xfrm is involved.
-
-Signed-off-by: Eli Cooper <elicooper@gmx.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/output_core.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/net/ipv6/output_core.c b/net/ipv6/output_core.c
-index 462f2a76b5c2..1d184322a7b1 100644
---- a/net/ipv6/output_core.c
-+++ b/net/ipv6/output_core.c
-@@ -148,6 +148,8 @@ int __ip6_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
- 	ipv6_hdr(skb)->payload_len = htons(len);
- 	IP6CB(skb)->nhoff = offsetof(struct ipv6hdr, nexthdr);
- 
-+	skb->protocol = htons(ETH_P_IPV6);
-+
- 	return nf_hook(NFPROTO_IPV6, NF_INET_LOCAL_OUT,
- 		       net, sk, skb, NULL, skb_dst(skb)->dev,
- 		       dst_output);
--- 
-2.28.0
-
-
-From 2176ec1c82eae70a9d43a974455d9bfe3dcd7bd2 Mon Sep 17 00:00:00 2001
-From: Eli Cooper <elicooper@gmx.com>
-Date: Thu, 1 Dec 2016 10:05:10 +0800
-Subject: [PATCH 26/29] ipv4: Set skb->protocol properly for local output
-
-commit f4180439109aa720774baafdd798b3234ab1a0d2 upstream.
-
-When xfrm is applied to TSO/GSO packets, it follows this path:
-
-    xfrm_output() -> xfrm_output_gso() -> skb_gso_segment()
-
-where skb_gso_segment() relies on skb->protocol to function properly.
-
-This patch sets skb->protocol to ETH_P_IP before dst_output() is called,
-fixing a bug where GSO packets sent through a sit tunnel are dropped
-when xfrm is involved.
-
-Signed-off-by: Eli Cooper <elicooper@gmx.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/ip_output.c | 3 +++
- 1 file changed, 3 insertions(+)
-
-diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
-index f2ad5216c438..2b7283303650 100644
---- a/net/ipv4/ip_output.c
-+++ b/net/ipv4/ip_output.c
-@@ -102,6 +102,9 @@ int __ip_local_out(struct net *net, struct sock *sk, struct sk_buff *skb)
- 
- 	iph->tot_len = htons(skb->len);
- 	ip_send_check(iph);
-+
-+	skb->protocol = htons(ETH_P_IP);
-+
- 	return nf_hook(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
- 		       net, sk, skb, NULL, skb_dst(skb)->dev,
- 		       dst_output);
--- 
-2.28.0
-
-
-From 3bf28ce9c7499477aff4e6ecf07071978c2cabcf Mon Sep 17 00:00:00 2001
-From: Tobias Brunner <tobias@strongswan.org>
-Date: Tue, 29 Nov 2016 17:05:20 +0100
-Subject: [PATCH 27/29] esp4: Fix integrity verification when ESN are used
-
-commit 7c7fedd51c02f4418e8b2eed64bdab601f882aa4 upstream.
-
-When handling inbound packets, the two halves of the sequence number
-stored on the skb are already in network order.
-
-Fixes: 7021b2e1cddd ("esp4: Switch to new AEAD interface")
-Signed-off-by: Tobias Brunner <tobias@strongswan.org>
-Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv4/esp4.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/net/ipv4/esp4.c b/net/ipv4/esp4.c
-index d95631d09248..20fb25e3027b 100644
---- a/net/ipv4/esp4.c
-+++ b/net/ipv4/esp4.c
-@@ -476,7 +476,7 @@ static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
- 		esph = (void *)skb_push(skb, 4);
- 		*seqhi = esph->spi;
- 		esph->spi = esph->seq_no;
--		esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.input.hi);
-+		esph->seq_no = XFRM_SKB_CB(skb)->seq.input.hi;
- 		aead_request_set_callback(req, 0, esp_input_done_esn, skb);
- 	}
- 
--- 
-2.28.0
-
-
-From 52783ada69b4741cf0122bd593493cc6c3217b9b Mon Sep 17 00:00:00 2001
-From: Tobias Brunner <tobias@strongswan.org>
-Date: Tue, 29 Nov 2016 17:05:25 +0100
-Subject: [PATCH 28/29] esp6: Fix integrity verification when ESN are used
-
-commit a55e23864d381c5a4ef110df94b00b2fe121a70d upstream.
-
-When handling inbound packets, the two halves of the sequence number
-stored on the skb are already in network order.
-
-Fixes: 000ae7b2690e ("esp6: Switch to new AEAD interface")
-Signed-off-by: Tobias Brunner <tobias@strongswan.org>
-Acked-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/esp6.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/net/ipv6/esp6.c b/net/ipv6/esp6.c
-index 060a60b2f8a6..111ba55fd512 100644
---- a/net/ipv6/esp6.c
-+++ b/net/ipv6/esp6.c
-@@ -418,7 +418,7 @@ static int esp6_input(struct xfrm_state *x, struct sk_buff *skb)
- 		esph = (void *)skb_push(skb, 4);
- 		*seqhi = esph->spi;
- 		esph->spi = esph->seq_no;
--		esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.input.hi);
-+		esph->seq_no = XFRM_SKB_CB(skb)->seq.input.hi;
- 		aead_request_set_callback(req, 0, esp_input_done_esn, skb);
- 	}
- 
--- 
-2.28.0
-
-
-From c95b7f1fab0c76882764a5196119237c8ad436ee Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sat, 10 Dec 2016 19:08:05 +0100
-Subject: [PATCH 29/29] Linux 4.4.38
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index b57ec79b4941..6876efe0d735 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 4
--SUBLEVEL = 37
-+SUBLEVEL = 38
- EXTRAVERSION =
- NAME = Blurry Fish Butt
- 
--- 
-2.28.0
-
+ static int unix_shutdown(struct socket *sock, int mode)

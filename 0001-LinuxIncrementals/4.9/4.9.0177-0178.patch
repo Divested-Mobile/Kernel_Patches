@@ -1,373 +1,18 @@
-From fc7fab70541f70d214448e3f41c9ea2e9854f0f5 Mon Sep 17 00:00:00 2001
-From: Sasha Levin <sashal@kernel.org>
-Date: Thu, 16 May 2019 21:30:49 -0400
-Subject: [PATCH 01/45] net: core: another layer of lists, around PF_MEMALLOC
- skb handling
-
-[ Upstream commit 78ed8cc25986ac5c21762eeddc1e86e94d422e36 ]
-
-First example of a layer splitting the list (rather than merely taking
- individual packets off it).
-Involves new list.h function, list_cut_before(), like list_cut_position()
- but cuts on the other side of the given entry.
-
-Signed-off-by: Edward Cree <ecree@solarflare.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-[sl: cut out non list.h bits, we only want list_cut_before]
-Signed-off-by: Sasha Levin <sashal@kernel.org>
----
- include/linux/list.h | 30 ++++++++++++++++++++++++++++++
- 1 file changed, 30 insertions(+)
-
-diff --git a/include/linux/list.h b/include/linux/list.h
-index 5809e9a2de5b..6f935018ea05 100644
---- a/include/linux/list.h
-+++ b/include/linux/list.h
-@@ -271,6 +271,36 @@ static inline void list_cut_position(struct list_head *list,
- 		__list_cut_position(list, head, entry);
- }
- 
-+/**
-+ * list_cut_before - cut a list into two, before given entry
-+ * @list: a new list to add all removed entries
-+ * @head: a list with entries
-+ * @entry: an entry within head, could be the head itself
-+ *
-+ * This helper moves the initial part of @head, up to but
-+ * excluding @entry, from @head to @list.  You should pass
-+ * in @entry an element you know is on @head.  @list should
-+ * be an empty list or a list you do not care about losing
-+ * its data.
-+ * If @entry == @head, all entries on @head are moved to
-+ * @list.
-+ */
-+static inline void list_cut_before(struct list_head *list,
-+				   struct list_head *head,
-+				   struct list_head *entry)
-+{
-+	if (head->next == entry) {
-+		INIT_LIST_HEAD(list);
-+		return;
-+	}
-+	list->next = head->next;
-+	list->next->prev = list;
-+	list->prev = entry->prev;
-+	list->prev->next = list;
-+	head->next = entry;
-+	entry->prev = head;
-+}
-+
- static inline void __list_splice(const struct list_head *list,
- 				 struct list_head *prev,
- 				 struct list_head *next)
--- 
-2.28.0
-
-
-From e85fab7c4b4a3a3bb54d1294b437326f4288156e Mon Sep 17 00:00:00 2001
-From: Waiman Long <longman@redhat.com>
-Date: Sun, 28 Apr 2019 17:25:38 -0400
-Subject: [PATCH 02/45] locking/rwsem: Prevent decrement of reader count before
- increment
-
-[ Upstream commit a9e9bcb45b1525ba7aea26ed9441e8632aeeda58 ]
-
-During my rwsem testing, it was found that after a down_read(), the
-reader count may occasionally become 0 or even negative. Consequently,
-a writer may steal the lock at that time and execute with the reader
-in parallel thus breaking the mutual exclusion guarantee of the write
-lock. In other words, both readers and writer can become rwsem owners
-simultaneously.
-
-The current reader wakeup code does it in one pass to clear waiter->task
-and put them into wake_q before fully incrementing the reader count.
-Once waiter->task is cleared, the corresponding reader may see it,
-finish the critical section and do unlock to decrement the count before
-the count is incremented. This is not a problem if there is only one
-reader to wake up as the count has been pre-incremented by 1.  It is
-a problem if there are more than one readers to be woken up and writer
-can steal the lock.
-
-The wakeup was actually done in 2 passes before the following v4.9 commit:
-
-  70800c3c0cc5 ("locking/rwsem: Scan the wait_list for readers only once")
-
-To fix this problem, the wakeup is now done in two passes
-again. In the first pass, we collect the readers and count them.
-The reader count is then fully incremented. In the second pass, the
-waiter->task is then cleared and they are put into wake_q to be woken
-up later.
-
-Signed-off-by: Waiman Long <longman@redhat.com>
-Acked-by: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Borislav Petkov <bp@alien8.de>
-Cc: Davidlohr Bueso <dave@stgolabs.net>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: Tim Chen <tim.c.chen@linux.intel.com>
-Cc: Will Deacon <will.deacon@arm.com>
-Cc: huang ying <huang.ying.caritas@gmail.com>
-Fixes: 70800c3c0cc5 ("locking/rwsem: Scan the wait_list for readers only once")
-Link: http://lkml.kernel.org/r/20190428212557.13482-2-longman@redhat.com
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Sasha Levin <sashal@kernel.org>
----
- kernel/locking/rwsem-xadd.c | 44 +++++++++++++++++++++++++------------
- 1 file changed, 30 insertions(+), 14 deletions(-)
-
-diff --git a/kernel/locking/rwsem-xadd.c b/kernel/locking/rwsem-xadd.c
-index be06c45cbe4f..0cdbb636e316 100644
---- a/kernel/locking/rwsem-xadd.c
-+++ b/kernel/locking/rwsem-xadd.c
-@@ -127,6 +127,7 @@ static void __rwsem_mark_wake(struct rw_semaphore *sem,
- {
- 	struct rwsem_waiter *waiter, *tmp;
- 	long oldcount, woken = 0, adjustment = 0;
-+	struct list_head wlist;
- 
- 	/*
- 	 * Take a peek at the queue head waiter such that we can determine
-@@ -185,18 +186,42 @@ static void __rwsem_mark_wake(struct rw_semaphore *sem,
- 	 * of the queue. We know that woken will be at least 1 as we accounted
- 	 * for above. Note we increment the 'active part' of the count by the
- 	 * number of readers before waking any processes up.
-+	 *
-+	 * We have to do wakeup in 2 passes to prevent the possibility that
-+	 * the reader count may be decremented before it is incremented. It
-+	 * is because the to-be-woken waiter may not have slept yet. So it
-+	 * may see waiter->task got cleared, finish its critical section and
-+	 * do an unlock before the reader count increment.
-+	 *
-+	 * 1) Collect the read-waiters in a separate list, count them and
-+	 *    fully increment the reader count in rwsem.
-+	 * 2) For each waiters in the new list, clear waiter->task and
-+	 *    put them into wake_q to be woken up later.
- 	 */
--	list_for_each_entry_safe(waiter, tmp, &sem->wait_list, list) {
--		struct task_struct *tsk;
--
-+	list_for_each_entry(waiter, &sem->wait_list, list) {
- 		if (waiter->type == RWSEM_WAITING_FOR_WRITE)
- 			break;
- 
- 		woken++;
--		tsk = waiter->task;
-+	}
-+	list_cut_before(&wlist, &sem->wait_list, &waiter->list);
-+
-+	adjustment = woken * RWSEM_ACTIVE_READ_BIAS - adjustment;
-+	if (list_empty(&sem->wait_list)) {
-+		/* hit end of list above */
-+		adjustment -= RWSEM_WAITING_BIAS;
-+	}
-+
-+	if (adjustment)
-+		atomic_long_add(adjustment, &sem->count);
-+
-+	/* 2nd pass */
-+	list_for_each_entry_safe(waiter, tmp, &wlist, list) {
-+		struct task_struct *tsk;
- 
-+		tsk = waiter->task;
- 		get_task_struct(tsk);
--		list_del(&waiter->list);
-+
- 		/*
- 		 * Ensure calling get_task_struct() before setting the reader
- 		 * waiter to nil such that rwsem_down_read_failed() cannot
-@@ -212,15 +237,6 @@ static void __rwsem_mark_wake(struct rw_semaphore *sem,
- 		/* wake_q_add() already take the task ref */
- 		put_task_struct(tsk);
- 	}
--
--	adjustment = woken * RWSEM_ACTIVE_READ_BIAS - adjustment;
--	if (list_empty(&sem->wait_list)) {
--		/* hit end of list above */
--		adjustment -= RWSEM_WAITING_BIAS;
--	}
--
--	if (adjustment)
--		atomic_long_add(adjustment, &sem->count);
- }
- 
- /*
--- 
-2.28.0
-
-
-From 7227474b11fcb8e6f2e6061f261446af84a0709b Mon Sep 17 00:00:00 2001
-From: Dexuan Cui <decui@microsoft.com>
-Date: Wed, 15 May 2019 15:42:07 -0700
-Subject: [PATCH 03/45] PCI: hv: Fix a memory leak in hv_eject_device_work()
-
-[ Upstream commit 05f151a73ec2b23ffbff706e5203e729a995cdc2 ]
-
-When a device is created in new_pcichild_device(), hpdev->refs is set
-to 2 (i.e. the initial value of 1 plus the get_pcichild()).
-
-When we hot remove the device from the host, in a Linux VM we first call
-hv_pci_eject_device(), which increases hpdev->refs by get_pcichild() and
-then schedules a work of hv_eject_device_work(), so hpdev->refs becomes
-3 (let's ignore the paired get/put_pcichild() in other places). But in
-hv_eject_device_work(), currently we only call put_pcichild() twice,
-meaning the 'hpdev' struct can't be freed in put_pcichild().
-
-Add one put_pcichild() to fix the memory leak.
-
-The device can also be removed when we run "rmmod pci-hyperv". On this
-path (hv_pci_remove() -> hv_pci_bus_exit() -> hv_pci_devices_present()),
-hpdev->refs is 2, and we do correctly call put_pcichild() twice in
-pci_devices_present_work().
-
-Fixes: 4daace0d8ce8 ("PCI: hv: Add paravirtual PCI front-end for Microsoft Hyper-V VMs")
-Signed-off-by: Dexuan Cui <decui@microsoft.com>
-[lorenzo.pieralisi@arm.com: commit log rework]
-Signed-off-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
-Reviewed-by: Stephen Hemminger <stephen@networkplumber.org>
-Reviewed-by:  Michael Kelley <mikelley@microsoft.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Sasha Levin <sashal@kernel.org>
----
- drivers/pci/host/pci-hyperv.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/pci/host/pci-hyperv.c b/drivers/pci/host/pci-hyperv.c
-index b4d8ccfd9f7c..200b41576526 100644
---- a/drivers/pci/host/pci-hyperv.c
-+++ b/drivers/pci/host/pci-hyperv.c
-@@ -1620,6 +1620,7 @@ static void hv_eject_device_work(struct work_struct *work)
- 	spin_unlock_irqrestore(&hpdev->hbus->device_list_lock, flags);
- 
- 	put_pcichild(hpdev, hv_pcidev_ref_childlist);
-+	put_pcichild(hpdev, hv_pcidev_ref_initial);
- 	put_pcichild(hpdev, hv_pcidev_ref_pnp);
- 	put_hvpcibus(hpdev->hbus);
- }
--- 
-2.28.0
-
-
-From f7154aa582a6a26fab8ba8b54054c610cfee10f3 Mon Sep 17 00:00:00 2001
-From: Andy Lutomirski <luto@kernel.org>
-Date: Tue, 14 May 2019 13:24:39 -0700
-Subject: [PATCH 04/45] x86/speculation/mds: Revert CPU buffer clear on double
- fault exit
-
-commit 88640e1dcd089879530a49a8d212d1814678dfe7 upstream.
-
-The double fault ESPFIX path doesn't return to user mode at all --
-it returns back to the kernel by simulating a #GP fault.
-prepare_exit_to_usermode() will run on the way out of
-general_protection before running user code.
-
-Signed-off-by: Andy Lutomirski <luto@kernel.org>
-Cc: Borislav Petkov <bp@suse.de>
-Cc: Frederic Weisbecker <frederic@kernel.org>
-Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Cc: Jon Masters <jcm@redhat.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: stable@vger.kernel.org
-Fixes: 04dcbdb80578 ("x86/speculation/mds: Clear CPU buffers on exit to user")
-Link: http://lkml.kernel.org/r/ac97612445c0a44ee10374f6ea79c222fe22a5c4.1557865329.git.luto@kernel.org
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- Documentation/x86/mds.rst | 7 -------
- arch/x86/kernel/traps.c   | 8 --------
- 2 files changed, 15 deletions(-)
-
 diff --git a/Documentation/x86/mds.rst b/Documentation/x86/mds.rst
-index 534e9baa4e1d..0dc812bb9249 100644
+index 534e9baa4e1d..5d4330be200f 100644
 --- a/Documentation/x86/mds.rst
 +++ b/Documentation/x86/mds.rst
-@@ -158,13 +158,6 @@ Mitigation points
-      mitigated on the return from do_nmi() to provide almost complete
-      coverage.
- 
--   - Double fault (#DF):
--
--     A double fault is usually fatal, but the ESPFIX workaround, which can
--     be triggered from user space through modify_ldt(2) is a recoverable
--     double fault. #DF uses the paranoid exit path, so explicit mitigation
--     in the double fault handler is required.
--
-    - Machine Check Exception (#MC):
- 
-      Another corner case is a #MC which hits between the CPU buffer clear
-diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
-index ef225fa8e928..5bbfa2f63b8c 100644
---- a/arch/x86/kernel/traps.c
-+++ b/arch/x86/kernel/traps.c
-@@ -62,7 +62,6 @@
- #include <asm/alternative.h>
- #include <asm/fpu/xstate.h>
- #include <asm/trace/mpx.h>
--#include <asm/nospec-branch.h>
- #include <asm/mpx.h>
- #include <asm/vm86.h>
- 
-@@ -341,13 +340,6 @@ dotraplinkage void do_double_fault(struct pt_regs *regs, long error_code)
- 		regs->ip = (unsigned long)general_protection;
- 		regs->sp = (unsigned long)&normal_regs->orig_ax;
- 
--		/*
--		 * This situation can be triggered by userspace via
--		 * modify_ldt(2) and the return does not take the regular
--		 * user space exit, so a CPU buffer clear is required when
--		 * MDS mitigation is enabled.
--		 */
--		mds_user_clear_cpu_buffers();
- 		return;
- 	}
- #endif
--- 
-2.28.0
-
-
-From 2f27bfffb469bd42c8ec07659d846e7e36a0f54c Mon Sep 17 00:00:00 2001
-From: Andy Lutomirski <luto@kernel.org>
-Date: Tue, 14 May 2019 13:24:40 -0700
-Subject: [PATCH 05/45] x86/speculation/mds: Improve CPU buffer clear
- documentation
-
-commit 9d8d0294e78a164d407133dea05caf4b84247d6a upstream.
-
-On x86_64, all returns to usermode go through
-prepare_exit_to_usermode(), with the sole exception of do_nmi().
-This even includes machine checks -- this was added several years
-ago to support MCE recovery.  Update the documentation.
-
-Signed-off-by: Andy Lutomirski <luto@kernel.org>
-Cc: Borislav Petkov <bp@suse.de>
-Cc: Frederic Weisbecker <frederic@kernel.org>
-Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Cc: Jon Masters <jcm@redhat.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: stable@vger.kernel.org
-Fixes: 04dcbdb80578 ("x86/speculation/mds: Clear CPU buffers on exit to user")
-Link: http://lkml.kernel.org/r/999fa9e126ba6a48e9d214d2f18dbde5c62ac55c.1557865329.git.luto@kernel.org
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- Documentation/x86/mds.rst | 39 +++++++--------------------------------
- 1 file changed, 7 insertions(+), 32 deletions(-)
-
-diff --git a/Documentation/x86/mds.rst b/Documentation/x86/mds.rst
-index 0dc812bb9249..5d4330be200f 100644
---- a/Documentation/x86/mds.rst
-+++ b/Documentation/x86/mds.rst
-@@ -142,38 +142,13 @@ Mitigation points
+@@ -142,45 +142,13 @@ Mitigation points
     mds_user_clear.
  
     The mitigation is invoked in prepare_exit_to_usermode() which covers
 -   most of the kernel to user space transitions. There are a few exceptions
 -   which are not invoking prepare_exit_to_usermode() on return to user
 -   space. These exceptions use the paranoid exit code.
--
++   all but one of the kernel to user space transitions.  The exception
++   is when we return from a Non Maskable Interrupt (NMI), which is
++   handled directly in do_nmi().
+ 
 -   - Non Maskable Interrupt (NMI):
 -
 -     Access to sensible data like keys, credentials in the NMI context is
@@ -379,6 +24,13 @@ index 0dc812bb9249..5d4330be200f 100644
 -     already valuable information. So in full mitigation mode, the NMI is
 -     mitigated on the return from do_nmi() to provide almost complete
 -     coverage.
+-
+-   - Double fault (#DF):
+-
+-     A double fault is usually fatal, but the ESPFIX workaround, which can
+-     be triggered from user space through modify_ldt(2) is a recoverable
+-     double fault. #DF uses the paranoid exit path, so explicit mitigation
+-     in the double fault handler is required.
 -
 -   - Machine Check Exception (#MC):
 -
@@ -396,108 +48,46 @@ index 0dc812bb9249..5d4330be200f 100644
 -     This takes the paranoid exit path only when the INT1 breakpoint is in
 -     kernel space. #DB on a user space address takes the regular exit path,
 -     so no extra mitigation required.
-+   all but one of the kernel to user space transitions.  The exception
-+   is when we return from a Non Maskable Interrupt (NMI), which is
-+   handled directly in do_nmi().
-+
 +   (The reason that NMI is special is that prepare_exit_to_usermode() can
 +    enable IRQs.  In NMI context, NMIs are blocked, and we don't want to
 +    enable IRQs with NMIs blocked.)
  
  
  2. C-State transition
--- 
-2.28.0
-
-
-From 15e6da9ae57165505b78d25d2a46df3516171c55 Mon Sep 17 00:00:00 2001
-From: Josh Poimboeuf <jpoimboe@redhat.com>
-Date: Mon, 13 May 2019 12:01:32 -0500
-Subject: [PATCH 06/45] objtool: Fix function fallthrough detection
-
-commit e6f393bc939d566ce3def71232d8013de9aaadde upstream.
-
-When a function falls through to the next function due to a compiler
-bug, objtool prints some obscure warnings.  For example:
-
-  drivers/regulator/core.o: warning: objtool: regulator_count_voltages()+0x95: return with modified stack frame
-  drivers/regulator/core.o: warning: objtool: regulator_count_voltages()+0x0: stack state mismatch: cfa1=7+32 cfa2=7+8
-
-Instead it should be printing:
-
-  drivers/regulator/core.o: warning: objtool: regulator_supply_is_couple() falls through to next function regulator_count_voltages()
-
-This used to work, but was broken by the following commit:
-
-  13810435b9a7 ("objtool: Support GCC 8's cold subfunctions")
-
-The padding nops at the end of a function aren't actually part of the
-function, as defined by the symbol table.  So the 'func' variable in
-validate_branch() is getting cleared to NULL when a padding nop is
-encountered, breaking the fallthrough detection.
-
-If the current instruction doesn't have a function associated with it,
-just consider it to be part of the previously detected function by not
-overwriting the previous value of 'func'.
-
-Reported-by: kbuild test robot <lkp@intel.com>
-Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: <stable@vger.kernel.org>
-Fixes: 13810435b9a7 ("objtool: Support GCC 8's cold subfunctions")
-Link: http://lkml.kernel.org/r/546d143820cd08a46624ae8440d093dd6c902cae.1557766718.git.jpoimboe@redhat.com
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- tools/objtool/check.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/tools/objtool/check.c b/tools/objtool/check.c
-index 3ff025b64527..ae3446768181 100644
---- a/tools/objtool/check.c
-+++ b/tools/objtool/check.c
-@@ -1779,7 +1779,8 @@ static int validate_branch(struct objtool_file *file, struct instruction *first,
- 			return 1;
- 		}
+diff --git a/Makefile b/Makefile
+index ceb8f4bf6245..e9fae7a3c621 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 9
+-SUBLEVEL = 177
++SUBLEVEL = 178
+ EXTRAVERSION =
+ NAME = Roaring Lionus
  
--		func = insn->func ? insn->func->pfunc : NULL;
-+		if (insn->func)
-+			func = insn->func->pfunc;
+diff --git a/arch/arm/crypto/aesbs-glue.c b/arch/arm/crypto/aesbs-glue.c
+index 5d934a0039d7..cb2486a526e6 100644
+--- a/arch/arm/crypto/aesbs-glue.c
++++ b/arch/arm/crypto/aesbs-glue.c
+@@ -265,6 +265,8 @@ static int aesbs_xts_encrypt(struct blkcipher_desc *desc,
  
- 		if (func && insn->ignore) {
- 			WARN_FUNC("BUG: why am I validating an ignored function?",
--- 
-2.28.0
-
-
-From f8646ad101e0dff3aa950743152417e54517e9a2 Mon Sep 17 00:00:00 2001
-From: Wen Yang <wen.yang99@zte.com.cn>
-Date: Tue, 5 Mar 2019 19:33:54 +0800
-Subject: [PATCH 07/45] ARM: exynos: Fix a leaked reference by adding missing
- of_node_put
-
-commit 629266bf7229cd6a550075f5961f95607b823b59 upstream.
-
-The call to of_get_next_child returns a node pointer with refcount
-incremented thus it must be explicitly decremented after the last
-usage.
-
-Detected by coccinelle with warnings like:
-    arch/arm/mach-exynos/firmware.c:201:2-8: ERROR: missing of_node_put;
-        acquired a node pointer with refcount incremented on line 193,
-        but without a corresponding object release within this function.
-
-Cc: stable@vger.kernel.org
-Signed-off-by: Wen Yang <wen.yang99@zte.com.cn>
-Signed-off-by: Krzysztof Kozlowski <krzk@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/mach-exynos/firmware.c | 1 +
- arch/arm/mach-exynos/suspend.c  | 2 ++
- 2 files changed, 3 insertions(+)
-
+ 	blkcipher_walk_init(&walk, dst, src, nbytes);
+ 	err = blkcipher_walk_virt_block(desc, &walk, 8 * AES_BLOCK_SIZE);
++	if (err)
++		return err;
+ 
+ 	/* generate the initial tweak */
+ 	AES_encrypt(walk.iv, walk.iv, &ctx->twkey);
+@@ -289,6 +291,8 @@ static int aesbs_xts_decrypt(struct blkcipher_desc *desc,
+ 
+ 	blkcipher_walk_init(&walk, dst, src, nbytes);
+ 	err = blkcipher_walk_virt_block(desc, &walk, 8 * AES_BLOCK_SIZE);
++	if (err)
++		return err;
+ 
+ 	/* generate the initial tweak */
+ 	AES_encrypt(walk.iv, walk.iv, &ctx->twkey);
 diff --git a/arch/arm/mach-exynos/firmware.c b/arch/arm/mach-exynos/firmware.c
 index fd6da5419b51..2199c3adfd84 100644
 --- a/arch/arm/mach-exynos/firmware.c
@@ -525,87 +115,6 @@ index 3e1430a886b2..81c935ce089b 100644
  
  	pm_data = (const struct exynos_pm_data *) match->data;
  
--- 
-2.28.0
-
-
-From 4bae1935546a935ee11a9f4da2610d6226970f41 Mon Sep 17 00:00:00 2001
-From: "Gustavo A. R. Silva" <gustavo@embeddedor.com>
-Date: Mon, 18 Mar 2019 11:14:39 -0500
-Subject: [PATCH 08/45] power: supply: axp288_charger: Fix unchecked return
- value
-
-commit c3422ad5f84a66739ec6a37251ca27638c85b6be upstream.
-
-Currently there is no check on platform_get_irq() return value
-in case it fails, hence never actually reporting any errors and
-causing unexpected behavior when using such value as argument
-for function regmap_irq_get_virq().
-
-Fix this by adding a proper check, a message reporting any errors
-and returning *pirq*
-
-Addresses-Coverity-ID: 1443940 ("Improper use of negative value")
-Fixes: 843735b788a4 ("power: axp288_charger: axp288 charger driver")
-Cc: stable@vger.kernel.org
-Signed-off-by: Gustavo A. R. Silva <gustavo@embeddedor.com>
-Reviewed-by: Hans de Goede <hdegoede@redhat.com>
-Signed-off-by: Sebastian Reichel <sebastian.reichel@collabora.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/power/supply/axp288_charger.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/drivers/power/supply/axp288_charger.c b/drivers/power/supply/axp288_charger.c
-index 75b8e0c7402b..8a0a8fb915d6 100644
---- a/drivers/power/supply/axp288_charger.c
-+++ b/drivers/power/supply/axp288_charger.c
-@@ -899,6 +899,10 @@ static int axp288_charger_probe(struct platform_device *pdev)
- 	/* Register charger interrupts */
- 	for (i = 0; i < CHRG_INTR_END; i++) {
- 		pirq = platform_get_irq(info->pdev, i);
-+		if (pirq < 0) {
-+			dev_err(&pdev->dev, "Failed to get IRQ: %d\n", pirq);
-+			return pirq;
-+		}
- 		info->irq[i] = regmap_irq_get_virq(info->regmap_irqc, pirq);
- 		if (info->irq[i] < 0) {
- 			dev_warn(&info->pdev->dev,
--- 
-2.28.0
-
-
-From 20230611cef66f08dd4c47f20a3cc6db6380f840 Mon Sep 17 00:00:00 2001
-From: Vincenzo Frascino <vincenzo.frascino@arm.com>
-Date: Mon, 1 Apr 2019 12:30:14 +0100
-Subject: [PATCH 09/45] arm64: compat: Reduce address limit
-
-commit d263119387de9975d2acba1dfd3392f7c5979c18 upstream.
-
-Currently, compat tasks running on arm64 can allocate memory up to
-TASK_SIZE_32 (UL(0x100000000)).
-
-This means that mmap() allocations, if we treat them as returning an
-array, are not compliant with the sections 6.5.8 of the C standard
-(C99) which states that: "If the expression P points to an element of
-an array object and the expression Q points to the last element of the
-same array object, the pointer expression Q+1 compares greater than P".
-
-Redefine TASK_SIZE_32 to address the issue.
-
-Cc: Catalin Marinas <catalin.marinas@arm.com>
-Cc: Will Deacon <will.deacon@arm.com>
-Cc: Jann Horn <jannh@google.com>
-Cc: <stable@vger.kernel.org>
-Reported-by: Jann Horn <jannh@google.com>
-Signed-off-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
-[will: fixed typo in comment]
-Signed-off-by: Will Deacon <will.deacon@arm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm64/include/asm/processor.h | 8 ++++++++
- 1 file changed, 8 insertions(+)
-
 diff --git a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
 index 5917147af0c4..9ee660013e5c 100644
 --- a/arch/arm64/include/asm/processor.h
@@ -626,28 +135,6 @@ index 5917147af0c4..9ee660013e5c 100644
  #define TASK_SIZE		(test_thread_flag(TIF_32BIT) ? \
  				TASK_SIZE_32 : TASK_SIZE_64)
  #define TASK_SIZE_OF(tsk)	(test_tsk_thread_flag(tsk, TIF_32BIT) ? \
--- 
-2.28.0
-
-
-From 621881dfdad1e64705ab17987802f1bba47c575f Mon Sep 17 00:00:00 2001
-From: Jean-Philippe Brucker <jean-philippe.brucker@arm.com>
-Date: Mon, 8 Apr 2019 18:17:18 +0100
-Subject: [PATCH 10/45] arm64: Clear OSDLR_EL1 on CPU boot
-
-commit 6fda41bf12615ee7c3ddac88155099b1a8cf8d00 upstream.
-
-Some firmwares may reboot CPUs with OS Double Lock set. Make sure that
-it is unlocked, in order to use debug exceptions.
-
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Jean-Philippe Brucker <jean-philippe.brucker@arm.com>
-Signed-off-by: Will Deacon <will.deacon@arm.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm64/kernel/debug-monitors.c | 1 +
- 1 file changed, 1 insertion(+)
-
 diff --git a/arch/arm64/kernel/debug-monitors.c b/arch/arm64/kernel/debug-monitors.c
 index 73ae90ef434c..9f1adca3c346 100644
 --- a/arch/arm64/kernel/debug-monitors.c
@@ -660,56 +147,47 @@ index 73ae90ef434c..9f1adca3c346 100644
  	write_sysreg(0, oslar_el1);
  	isb();
  	return 0;
--- 
-2.28.0
-
-
-From 45fe6deee2f2b8889368c5fa5ac832b571c6ea52 Mon Sep 17 00:00:00 2001
-From: Peter Zijlstra <peterz@infradead.org>
-Date: Thu, 14 Feb 2019 10:30:52 +0100
-Subject: [PATCH 11/45] sched/x86: Save [ER]FLAGS on context switch
-
-commit 6690e86be83ac75832e461c141055b5d601c0a6d upstream.
-
-Effectively reverts commit:
-
-  2c7577a75837 ("sched/x86_64: Don't save flags on context switch")
-
-Specifically because SMAP uses FLAGS.AC which invalidates the claim
-that the kernel has clean flags.
-
-In particular; while preemption from interrupt return is fine (the
-IRET frame on the exception stack contains FLAGS) it breaks any code
-that does synchonous scheduling, including preempt_enable().
-
-This has become a significant issue ever since commit:
-
-  5b24a7a2aa20 ("Add 'unsafe' user access functions for batched accesses")
-
-provided for means of having 'normal' C code between STAC / CLAC,
-exposing the FLAGS.AC state. So far this hasn't led to trouble,
-however fix it before it comes apart.
-
-Reported-by: Julien Thierry <julien.thierry@arm.com>
-Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
-Acked-by: Andy Lutomirski <luto@amacapital.net>
-Cc: Borislav Petkov <bp@alien8.de>
-Cc: Josh Poimboeuf <jpoimboe@redhat.com>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: stable@kernel.org
-Fixes: 5b24a7a2aa20 ("Add 'unsafe' user access functions for batched accesses")
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/entry/entry_32.S        | 2 ++
- arch/x86/entry/entry_64.S        | 2 ++
- arch/x86/include/asm/switch_to.h | 1 +
- arch/x86/kernel/process_32.c     | 7 +++++++
- arch/x86/kernel/process_64.c     | 8 ++++++++
- 5 files changed, 20 insertions(+)
-
+diff --git a/arch/x86/crypto/crct10dif-pclmul_glue.c b/arch/x86/crypto/crct10dif-pclmul_glue.c
+index cd4df9322501..7bbfe7d35da7 100644
+--- a/arch/x86/crypto/crct10dif-pclmul_glue.c
++++ b/arch/x86/crypto/crct10dif-pclmul_glue.c
+@@ -76,15 +76,14 @@ static int chksum_final(struct shash_desc *desc, u8 *out)
+ 	return 0;
+ }
+ 
+-static int __chksum_finup(__u16 *crcp, const u8 *data, unsigned int len,
+-			u8 *out)
++static int __chksum_finup(__u16 crc, const u8 *data, unsigned int len, u8 *out)
+ {
+ 	if (irq_fpu_usable()) {
+ 		kernel_fpu_begin();
+-		*(__u16 *)out = crc_t10dif_pcl(*crcp, data, len);
++		*(__u16 *)out = crc_t10dif_pcl(crc, data, len);
+ 		kernel_fpu_end();
+ 	} else
+-		*(__u16 *)out = crc_t10dif_generic(*crcp, data, len);
++		*(__u16 *)out = crc_t10dif_generic(crc, data, len);
+ 	return 0;
+ }
+ 
+@@ -93,15 +92,13 @@ static int chksum_finup(struct shash_desc *desc, const u8 *data,
+ {
+ 	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+ 
+-	return __chksum_finup(&ctx->crc, data, len, out);
++	return __chksum_finup(ctx->crc, data, len, out);
+ }
+ 
+ static int chksum_digest(struct shash_desc *desc, const u8 *data,
+ 			 unsigned int length, u8 *out)
+ {
+-	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+-
+-	return __chksum_finup(&ctx->crc, data, length, out);
++	return __chksum_finup(0, data, length, out);
+ }
+ 
+ static struct shash_alg alg = {
 diff --git a/arch/x86/entry/entry_32.S b/arch/x86/entry/entry_32.S
 index a76dc738ec61..1cf16760f5e3 100644
 --- a/arch/x86/entry/entry_32.S
@@ -799,40 +277,98 @@ index 81eec65fe053..6d6c15cd9b9a 100644
  	frame->bp = 0;
  	frame->ret_addr = (unsigned long) ret_from_fork;
  	p->thread.sp = (unsigned long) fork_frame;
--- 
-2.28.0
-
-
-From fa2876c482820314e26655769d92c67ec87cbdb9 Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Sun, 31 Mar 2019 13:04:16 -0700
-Subject: [PATCH 12/45] crypto: chacha20poly1305 - set cra_name correctly
-
-commit 5e27f38f1f3f45a0c938299c3a34a2d2db77165a upstream.
-
-If the rfc7539 template is instantiated with specific implementations,
-e.g. "rfc7539(chacha20-generic,poly1305-generic)" rather than
-"rfc7539(chacha20,poly1305)", then the implementation names end up
-included in the instance's cra_name.  This is incorrect because it then
-prevents all users from allocating "rfc7539(chacha20,poly1305)", if the
-highest priority implementations of chacha20 and poly1305 were selected.
-Also, the self-tests aren't run on an instance allocated in this way.
-
-Fix it by setting the instance's cra_name from the underlying
-algorithms' actual cra_names, rather than from the requested names.
-This matches what other templates do.
-
-Fixes: 71ebc4d1b27d ("crypto: chacha20poly1305 - Add a ChaCha20-Poly1305 AEAD construction, RFC7539")
-Cc: <stable@vger.kernel.org> # v4.2+
-Cc: Martin Willi <martin@strongswan.org>
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Reviewed-by: Martin Willi <martin@strongswan.org>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/chacha20poly1305.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index ef225fa8e928..5bbfa2f63b8c 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -62,7 +62,6 @@
+ #include <asm/alternative.h>
+ #include <asm/fpu/xstate.h>
+ #include <asm/trace/mpx.h>
+-#include <asm/nospec-branch.h>
+ #include <asm/mpx.h>
+ #include <asm/vm86.h>
+ 
+@@ -341,13 +340,6 @@ dotraplinkage void do_double_fault(struct pt_regs *regs, long error_code)
+ 		regs->ip = (unsigned long)general_protection;
+ 		regs->sp = (unsigned long)&normal_regs->orig_ax;
+ 
+-		/*
+-		 * This situation can be triggered by userspace via
+-		 * modify_ldt(2) and the return does not take the regular
+-		 * user space exit, so a CPU buffer clear is required when
+-		 * MDS mitigation is enabled.
+-		 */
+-		mds_user_clear_cpu_buffers();
+ 		return;
+ 	}
+ #endif
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 8285142556b5..1f32c4e32a00 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -1073,11 +1073,8 @@ static int do_get_msr_feature(struct kvm_vcpu *vcpu, unsigned index, u64 *data)
+ 	return 0;
+ }
+ 
+-bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
++static bool __kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
+ {
+-	if (efer & efer_reserved_bits)
+-		return false;
+-
+ 	if (efer & EFER_FFXSR) {
+ 		struct kvm_cpuid_entry2 *feat;
+ 
+@@ -1095,19 +1092,33 @@ bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
+ 	}
+ 
+ 	return true;
++
++}
++bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
++{
++	if (efer & efer_reserved_bits)
++		return false;
++
++	return __kvm_valid_efer(vcpu, efer);
+ }
+ EXPORT_SYMBOL_GPL(kvm_valid_efer);
+ 
+-static int set_efer(struct kvm_vcpu *vcpu, u64 efer)
++static int set_efer(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ {
+ 	u64 old_efer = vcpu->arch.efer;
++	u64 efer = msr_info->data;
+ 
+-	if (!kvm_valid_efer(vcpu, efer))
+-		return 1;
++	if (efer & efer_reserved_bits)
++		return false;
+ 
+-	if (is_paging(vcpu)
+-	    && (vcpu->arch.efer & EFER_LME) != (efer & EFER_LME))
+-		return 1;
++	if (!msr_info->host_initiated) {
++		if (!__kvm_valid_efer(vcpu, efer))
++			return 1;
++
++		if (is_paging(vcpu) &&
++		    (vcpu->arch.efer & EFER_LME) != (efer & EFER_LME))
++			return 1;
++	}
+ 
+ 	efer &= ~EFER_LMA;
+ 	efer |= vcpu->arch.efer & EFER_LMA;
+@@ -2203,7 +2214,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		vcpu->arch.arch_capabilities = data;
+ 		break;
+ 	case MSR_EFER:
+-		return set_efer(vcpu, data);
++		return set_efer(vcpu, msr_info);
+ 	case MSR_K7_HWCR:
+ 		data &= ~(u64)0x40;	/* ignore flush filter disable */
+ 		data &= ~(u64)0x100;	/* ignore ignne emulation enable */
 diff --git a/crypto/chacha20poly1305.c b/crypto/chacha20poly1305.c
 index cb1c3a3287b0..246905bf00aa 100644
 --- a/crypto/chacha20poly1305.c
@@ -848,99 +384,6 @@ index cb1c3a3287b0..246905bf00aa 100644
  		goto out_drop_chacha;
  	if (snprintf(inst->alg.base.cra_driver_name, CRYPTO_MAX_ALG_NAME,
  		     "%s(%s,%s)", name, chacha->base.cra_driver_name,
--- 
-2.28.0
-
-
-From e8de7b8ec204bd59868ac51f2c0024dfd02f5a22 Mon Sep 17 00:00:00 2001
-From: Daniel Axtens <dja@axtens.net>
-Date: Fri, 15 Mar 2019 13:09:01 +1100
-Subject: [PATCH 13/45] crypto: vmx - fix copy-paste error in CTR mode
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit dcf7b48212c0fab7df69e84fab22d6cb7c8c0fb9 upstream.
-
-The original assembly imported from OpenSSL has two copy-paste
-errors in handling CTR mode. When dealing with a 2 or 3 block tail,
-the code branches to the CBC decryption exit path, rather than to
-the CTR exit path.
-
-This leads to corruption of the IV, which leads to subsequent blocks
-being corrupted.
-
-This can be detected with libkcapi test suite, which is available at
-https://github.com/smuellerDD/libkcapi
-
-Reported-by: Ondrej Mosnáček <omosnacek@gmail.com>
-Fixes: 5c380d623ed3 ("crypto: vmx - Add support for VMS instructions by ASM")
-Cc: stable@vger.kernel.org
-Signed-off-by: Daniel Axtens <dja@axtens.net>
-Tested-by: Michael Ellerman <mpe@ellerman.id.au>
-Tested-by: Ondrej Mosnacek <omosnacek@gmail.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/crypto/vmx/aesp8-ppc.pl | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/crypto/vmx/aesp8-ppc.pl b/drivers/crypto/vmx/aesp8-ppc.pl
-index 0b4a293b8a1e..d9281a28818d 100644
---- a/drivers/crypto/vmx/aesp8-ppc.pl
-+++ b/drivers/crypto/vmx/aesp8-ppc.pl
-@@ -1815,7 +1815,7 @@ Lctr32_enc8x_three:
- 	stvx_u		$out1,$x10,$out
- 	stvx_u		$out2,$x20,$out
- 	addi		$out,$out,0x30
--	b		Lcbc_dec8x_done
-+	b		Lctr32_enc8x_done
- 
- .align	5
- Lctr32_enc8x_two:
-@@ -1827,7 +1827,7 @@ Lctr32_enc8x_two:
- 	stvx_u		$out0,$x00,$out
- 	stvx_u		$out1,$x10,$out
- 	addi		$out,$out,0x20
--	b		Lcbc_dec8x_done
-+	b		Lctr32_enc8x_done
- 
- .align	5
- Lctr32_enc8x_one:
--- 
-2.28.0
-
-
-From ccb5b8fee774cb5f419adbdd30c5a9bdfd2470e4 Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Sun, 31 Mar 2019 13:04:12 -0700
-Subject: [PATCH 14/45] crypto: crct10dif-generic - fix use via
- crypto_shash_digest()
-
-commit 307508d1072979f4435416f87936f87eaeb82054 upstream.
-
-The ->digest() method of crct10dif-generic reads the current CRC value
-from the shash_desc context.  But this value is uninitialized, causing
-crypto_shash_digest() to compute the wrong result.  Fix it.
-
-Probably this wasn't noticed before because lib/crc-t10dif.c only uses
-crypto_shash_update(), not crypto_shash_digest().  Likewise,
-crypto_shash_digest() is not yet tested by the crypto self-tests because
-those only test the ahash API which only uses shash init/update/final.
-
-This bug was detected by my patches that improve testmgr to fuzz
-algorithms against their generic implementation.
-
-Fixes: 2d31e518a428 ("crypto: crct10dif - Wrap crc_t10dif function all to use crypto transform framework")
-Cc: <stable@vger.kernel.org> # v3.11+
-Cc: Tim Chen <tim.c.chen@linux.intel.com>
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/crct10dif_generic.c | 11 ++++-------
- 1 file changed, 4 insertions(+), 7 deletions(-)
-
 diff --git a/crypto/crct10dif_generic.c b/crypto/crct10dif_generic.c
 index 8e94e29dc6fc..d08048ae5552 100644
 --- a/crypto/crct10dif_generic.c
@@ -976,216 +419,914 @@ index 8e94e29dc6fc..d08048ae5552 100644
  }
  
  static struct shash_alg alg = {
--- 
-2.28.0
-
-
-From ec51ec92987763ed69ed162d5ee0c4fb8aa25afc Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Sun, 31 Mar 2019 13:04:13 -0700
-Subject: [PATCH 15/45] crypto: x86/crct10dif-pcl - fix use via
- crypto_shash_digest()
-
-commit dec3d0b1071a0f3194e66a83d26ecf4aa8c5910e upstream.
-
-The ->digest() method of crct10dif-pclmul reads the current CRC value
-from the shash_desc context.  But this value is uninitialized, causing
-crypto_shash_digest() to compute the wrong result.  Fix it.
-
-Probably this wasn't noticed before because lib/crc-t10dif.c only uses
-crypto_shash_update(), not crypto_shash_digest().  Likewise,
-crypto_shash_digest() is not yet tested by the crypto self-tests because
-those only test the ahash API which only uses shash init/update/final.
-
-Fixes: 0b95a7f85718 ("crypto: crct10dif - Glue code to cast accelerated CRCT10DIF assembly as a crypto transform")
-Cc: <stable@vger.kernel.org> # v3.11+
-Cc: Tim Chen <tim.c.chen@linux.intel.com>
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/crypto/crct10dif-pclmul_glue.c | 13 +++++--------
- 1 file changed, 5 insertions(+), 8 deletions(-)
-
-diff --git a/arch/x86/crypto/crct10dif-pclmul_glue.c b/arch/x86/crypto/crct10dif-pclmul_glue.c
-index cd4df9322501..7bbfe7d35da7 100644
---- a/arch/x86/crypto/crct10dif-pclmul_glue.c
-+++ b/arch/x86/crypto/crct10dif-pclmul_glue.c
-@@ -76,15 +76,14 @@ static int chksum_final(struct shash_desc *desc, u8 *out)
- 	return 0;
- }
+diff --git a/crypto/gcm.c b/crypto/gcm.c
+index dd33fbd2d868..398f048c452a 100644
+--- a/crypto/gcm.c
++++ b/crypto/gcm.c
+@@ -616,7 +616,6 @@ static void crypto_gcm_free(struct aead_instance *inst)
  
--static int __chksum_finup(__u16 *crcp, const u8 *data, unsigned int len,
--			u8 *out)
-+static int __chksum_finup(__u16 crc, const u8 *data, unsigned int len, u8 *out)
+ static int crypto_gcm_create_common(struct crypto_template *tmpl,
+ 				    struct rtattr **tb,
+-				    const char *full_name,
+ 				    const char *ctr_name,
+ 				    const char *ghash_name)
  {
- 	if (irq_fpu_usable()) {
- 		kernel_fpu_begin();
--		*(__u16 *)out = crc_t10dif_pcl(*crcp, data, len);
-+		*(__u16 *)out = crc_t10dif_pcl(crc, data, len);
- 		kernel_fpu_end();
- 	} else
--		*(__u16 *)out = crc_t10dif_generic(*crcp, data, len);
-+		*(__u16 *)out = crc_t10dif_generic(crc, data, len);
- 	return 0;
- }
+@@ -657,7 +656,8 @@ static int crypto_gcm_create_common(struct crypto_template *tmpl,
+ 		goto err_free_inst;
  
-@@ -93,15 +92,13 @@ static int chksum_finup(struct shash_desc *desc, const u8 *data,
- {
- 	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+ 	err = -EINVAL;
+-	if (ghash->digestsize != 16)
++	if (strcmp(ghash->base.cra_name, "ghash") != 0 ||
++	    ghash->digestsize != 16)
+ 		goto err_drop_ghash;
  
--	return __chksum_finup(&ctx->crc, data, len, out);
-+	return __chksum_finup(ctx->crc, data, len, out);
- }
+ 	crypto_set_skcipher_spawn(&ctx->ctr, aead_crypto_instance(inst));
+@@ -669,24 +669,24 @@ static int crypto_gcm_create_common(struct crypto_template *tmpl,
  
- static int chksum_digest(struct shash_desc *desc, const u8 *data,
- 			 unsigned int length, u8 *out)
- {
--	struct chksum_desc_ctx *ctx = shash_desc_ctx(desc);
+ 	ctr = crypto_spawn_skcipher_alg(&ctx->ctr);
+ 
+-	/* We only support 16-byte blocks. */
+-	if (crypto_skcipher_alg_ivsize(ctr) != 16)
+-		goto out_put_ctr;
 -
--	return __chksum_finup(&ctx->crc, data, length, out);
-+	return __chksum_finup(0, data, length, out);
+-	/* Not a stream cipher? */
++	/* The skcipher algorithm must be CTR mode, using 16-byte blocks. */
+ 	err = -EINVAL;
+-	if (ctr->base.cra_blocksize != 1)
++	if (strncmp(ctr->base.cra_name, "ctr(", 4) != 0 ||
++	    crypto_skcipher_alg_ivsize(ctr) != 16 ||
++	    ctr->base.cra_blocksize != 1)
+ 		goto out_put_ctr;
+ 
+ 	err = -ENAMETOOLONG;
++	if (snprintf(inst->alg.base.cra_name, CRYPTO_MAX_ALG_NAME,
++		     "gcm(%s", ctr->base.cra_name + 4) >= CRYPTO_MAX_ALG_NAME)
++		goto out_put_ctr;
++
+ 	if (snprintf(inst->alg.base.cra_driver_name, CRYPTO_MAX_ALG_NAME,
+ 		     "gcm_base(%s,%s)", ctr->base.cra_driver_name,
+ 		     ghash_alg->cra_driver_name) >=
+ 	    CRYPTO_MAX_ALG_NAME)
+ 		goto out_put_ctr;
+ 
+-	memcpy(inst->alg.base.cra_name, full_name, CRYPTO_MAX_ALG_NAME);
+-
+ 	inst->alg.base.cra_flags = (ghash->base.cra_flags |
+ 				    ctr->base.cra_flags) & CRYPTO_ALG_ASYNC;
+ 	inst->alg.base.cra_priority = (ghash->base.cra_priority +
+@@ -728,7 +728,6 @@ static int crypto_gcm_create(struct crypto_template *tmpl, struct rtattr **tb)
+ {
+ 	const char *cipher_name;
+ 	char ctr_name[CRYPTO_MAX_ALG_NAME];
+-	char full_name[CRYPTO_MAX_ALG_NAME];
+ 
+ 	cipher_name = crypto_attr_alg_name(tb[1]);
+ 	if (IS_ERR(cipher_name))
+@@ -738,12 +737,7 @@ static int crypto_gcm_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	    CRYPTO_MAX_ALG_NAME)
+ 		return -ENAMETOOLONG;
+ 
+-	if (snprintf(full_name, CRYPTO_MAX_ALG_NAME, "gcm(%s)", cipher_name) >=
+-	    CRYPTO_MAX_ALG_NAME)
+-		return -ENAMETOOLONG;
+-
+-	return crypto_gcm_create_common(tmpl, tb, full_name,
+-					ctr_name, "ghash");
++	return crypto_gcm_create_common(tmpl, tb, ctr_name, "ghash");
  }
  
- static struct shash_alg alg = {
--- 
-2.28.0
-
-
-From f934bf3f57769282c371c978eb9bbe3930f6ed35 Mon Sep 17 00:00:00 2001
-From: Wenwen Wang <wang6495@umn.edu>
-Date: Sat, 27 Apr 2019 01:06:46 -0500
-Subject: [PATCH 16/45] ALSA: usb-audio: Fix a memory leak bug
-
-commit cb5173594d50c72b7bfa14113dfc5084b4d2f726 upstream.
-
-In parse_audio_selector_unit(), the string array 'namelist' is allocated
-through kmalloc_array(), and each string pointer in this array, i.e.,
-'namelist[]', is allocated through kmalloc() in the following for loop.
-Then, a control instance 'kctl' is created by invoking snd_ctl_new1(). If
-an error occurs during the creation process, the string array 'namelist',
-including all string pointers in the array 'namelist[]', should be freed,
-before the error code ENOMEM is returned. However, the current code does
-not free 'namelist[]', resulting in memory leaks.
-
-To fix the above issue, free all string pointers 'namelist[]' in a loop.
-
-Signed-off-by: Wenwen Wang <wang6495@umn.edu>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/usb/mixer.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
-index 64b90b8ec661..248a4bd82397 100644
---- a/sound/usb/mixer.c
-+++ b/sound/usb/mixer.c
-@@ -2178,6 +2178,8 @@ static int parse_audio_selector_unit(struct mixer_build *state, int unitid,
- 	kctl = snd_ctl_new1(&mixer_selectunit_ctl, cval);
- 	if (! kctl) {
- 		usb_audio_err(state->chip, "cannot malloc kcontrol\n");
-+		for (i = 0; i < desc->bNrInPins; i++)
-+			kfree(namelist[i]);
- 		kfree(namelist);
- 		kfree(cval);
- 		return -ENOMEM;
--- 
-2.28.0
-
-
-From 5c767fc6a9623f97c141b8e164bafc0dfe8c13e3 Mon Sep 17 00:00:00 2001
-From: Hui Wang <hui.wang@canonical.com>
-Date: Mon, 6 May 2019 22:09:31 +0800
-Subject: [PATCH 17/45] ALSA: hda/hdmi - Read the pin sense from register when
- repolling
-
-commit 8c2e6728c2bf95765b724e07d0278ae97cd1ee0d upstream.
-
-The driver will check the monitor presence when resuming from suspend,
-starting poll or interrupt triggers. In these 3 situations, the
-jack_dirty will be set to 1 first, then the hda_jack.c reads the
-pin_sense from register, after reading the register, the jack_dirty
-will be set to 0. But hdmi_repoll_work() is enabled in these 3
-situations, It will read the pin_sense a couple of times subsequently,
-since the jack_dirty is 0 now, It does not read the register anymore,
-instead it uses the shadow pin_sense which is read at the first time.
-
-It is meaningless to check the shadow pin_sense a couple of times,
-we need to read the register to check the real plugging state, so
-we set the jack_dirty to 1 in the hdmi_repoll_work().
-
-Signed-off-by: Hui Wang <hui.wang@canonical.com>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/hda/patch_hdmi.c | 5 +++++
- 1 file changed, 5 insertions(+)
-
-diff --git a/sound/pci/hda/patch_hdmi.c b/sound/pci/hda/patch_hdmi.c
-index 76ae627e3f93..52afab985f24 100644
---- a/sound/pci/hda/patch_hdmi.c
-+++ b/sound/pci/hda/patch_hdmi.c
-@@ -1554,6 +1554,11 @@ static void hdmi_repoll_eld(struct work_struct *work)
- 	container_of(to_delayed_work(work), struct hdmi_spec_per_pin, work);
- 	struct hda_codec *codec = per_pin->codec;
- 	struct hdmi_spec *spec = codec->spec;
-+	struct hda_jack_tbl *jack;
-+
-+	jack = snd_hda_jack_tbl_get(codec, per_pin->pin_nid);
-+	if (jack)
-+		jack->jack_dirty = 1;
+ static struct crypto_template crypto_gcm_tmpl = {
+@@ -757,7 +751,6 @@ static int crypto_gcm_base_create(struct crypto_template *tmpl,
+ {
+ 	const char *ctr_name;
+ 	const char *ghash_name;
+-	char full_name[CRYPTO_MAX_ALG_NAME];
  
- 	if (per_pin->repoll_count++ > 6)
- 		per_pin->repoll_count = 0;
--- 
-2.28.0
-
-
-From 72cd3810e52c606595f9e1a2d442a4cc6e6a3551 Mon Sep 17 00:00:00 2001
-From: Hui Wang <hui.wang@canonical.com>
-Date: Mon, 6 May 2019 22:09:32 +0800
-Subject: [PATCH 18/45] ALSA: hda/hdmi - Consider eld_valid when reporting jack
- event
-
-commit 7f641e26a6df9269cb25dd7a4b0a91d6586ed441 upstream.
-
-On the machines with AMD GPU or Nvidia GPU, we often meet this issue:
-after s3, there are 4 HDMI/DP audio devices in the gnome-sound-setting
-even there is no any monitors plugged.
-
-When this problem happens, we check the /proc/asound/cardX/eld#N.M, we
-will find the monitor_present=1, eld_valid=0.
-
-The root cause is BIOS or GPU driver makes the PRESENCE valid even no
-monitor plugged, and of course the driver will not get the valid
-eld_data subsequently.
-
-In this situation, we should not report the jack_plugged event, to do
-so, let us change the function hdmi_present_sense_via_verbs(). In this
-function, it reads the pin_sense via snd_hda_pin_sense(), after
-calling this function, the jack_dirty is 0, and before exiting
-via_verbs(), we change the shadow pin_sense according to both
-monitor_present and eld_valid, then in the snd_hda_jack_report_sync(),
-since the jack_dirty is still 0, it will report jack event according
-to this modified shadow pin_sense.
-
-After this change, the driver will not report Jack_is_plugged event
-through hdmi_present_sense_via_verbs() if monitor_present is 1 and
-eld_valid is 0.
-
-Signed-off-by: Hui Wang <hui.wang@canonical.com>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/hda/patch_hdmi.c | 6 ++++--
- 1 file changed, 4 insertions(+), 2 deletions(-)
-
+ 	ctr_name = crypto_attr_alg_name(tb[1]);
+ 	if (IS_ERR(ctr_name))
+@@ -767,12 +760,7 @@ static int crypto_gcm_base_create(struct crypto_template *tmpl,
+ 	if (IS_ERR(ghash_name))
+ 		return PTR_ERR(ghash_name);
+ 
+-	if (snprintf(full_name, CRYPTO_MAX_ALG_NAME, "gcm_base(%s,%s)",
+-		     ctr_name, ghash_name) >= CRYPTO_MAX_ALG_NAME)
+-		return -ENAMETOOLONG;
+-
+-	return crypto_gcm_create_common(tmpl, tb, full_name,
+-					ctr_name, ghash_name);
++	return crypto_gcm_create_common(tmpl, tb, ctr_name, ghash_name);
+ }
+ 
+ static struct crypto_template crypto_gcm_base_tmpl = {
+diff --git a/crypto/salsa20_generic.c b/crypto/salsa20_generic.c
+index d7da0eea5622..319d9962552e 100644
+--- a/crypto/salsa20_generic.c
++++ b/crypto/salsa20_generic.c
+@@ -186,7 +186,7 @@ static int encrypt(struct blkcipher_desc *desc,
+ 	blkcipher_walk_init(&walk, dst, src, nbytes);
+ 	err = blkcipher_walk_virt_block(desc, &walk, 64);
+ 
+-	salsa20_ivsetup(ctx, walk.iv);
++	salsa20_ivsetup(ctx, desc->info);
+ 
+ 	while (walk.nbytes >= 64) {
+ 		salsa20_encrypt_bytes(ctx, walk.dst.virt.addr,
+diff --git a/drivers/char/ipmi/ipmi_ssif.c b/drivers/char/ipmi/ipmi_ssif.c
+index dac36ef450ba..996b9ae15404 100644
+--- a/drivers/char/ipmi/ipmi_ssif.c
++++ b/drivers/char/ipmi/ipmi_ssif.c
+@@ -699,12 +699,16 @@ static void msg_done_handler(struct ssif_info *ssif_info, int result,
+ 			/* End of read */
+ 			len = ssif_info->multi_len;
+ 			data = ssif_info->data;
+-		} else if (blocknum != ssif_info->multi_pos) {
++		} else if (blocknum + 1 != ssif_info->multi_pos) {
+ 			/*
+ 			 * Out of sequence block, just abort.  Block
+ 			 * numbers start at zero for the second block,
+ 			 * but multi_pos starts at one, so the +1.
+ 			 */
++			if (ssif_info->ssif_debug & SSIF_DEBUG_MSG)
++				dev_dbg(&ssif_info->client->dev,
++					"Received message out of sequence, expected %u, got %u\n",
++					ssif_info->multi_pos - 1, blocknum);
+ 			result = -EIO;
+ 		} else {
+ 			ssif_inc_stat(ssif_info, received_message_parts);
+diff --git a/drivers/crypto/vmx/aesp8-ppc.pl b/drivers/crypto/vmx/aesp8-ppc.pl
+index 0b4a293b8a1e..d9281a28818d 100644
+--- a/drivers/crypto/vmx/aesp8-ppc.pl
++++ b/drivers/crypto/vmx/aesp8-ppc.pl
+@@ -1815,7 +1815,7 @@ Lctr32_enc8x_three:
+ 	stvx_u		$out1,$x10,$out
+ 	stvx_u		$out2,$x20,$out
+ 	addi		$out,$out,0x30
+-	b		Lcbc_dec8x_done
++	b		Lctr32_enc8x_done
+ 
+ .align	5
+ Lctr32_enc8x_two:
+@@ -1827,7 +1827,7 @@ Lctr32_enc8x_two:
+ 	stvx_u		$out0,$x00,$out
+ 	stvx_u		$out1,$x10,$out
+ 	addi		$out,$out,0x20
+-	b		Lcbc_dec8x_done
++	b		Lctr32_enc8x_done
+ 
+ .align	5
+ Lctr32_enc8x_one:
+diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
+index 08f20b7cd199..c76a0176b5c6 100644
+--- a/drivers/md/bcache/journal.c
++++ b/drivers/md/bcache/journal.c
+@@ -513,11 +513,11 @@ static void journal_reclaim(struct cache_set *c)
+ 				  ca->sb.nr_this_dev);
+ 	}
+ 
+-	bkey_init(k);
+-	SET_KEY_PTRS(k, n);
+-
+-	if (n)
++	if (n) {
++		bkey_init(k);
++		SET_KEY_PTRS(k, n);
+ 		c->journal.blocks_free = c->sb.bucket_size >> c->block_bits;
++	}
+ out:
+ 	if (!journal_full(&c->journal))
+ 		__closure_wake_up(&c->journal.wait);
+@@ -642,6 +642,9 @@ static void journal_write_unlocked(struct closure *cl)
+ 		ca->journal.seq[ca->journal.cur_idx] = w->data->seq;
+ 	}
+ 
++	/* If KEY_PTRS(k) == 0, this jset gets lost in air */
++	BUG_ON(i == 0);
++
+ 	atomic_dec_bug(&fifo_back(&c->journal.pin));
+ 	bch_journal_next(&c->journal);
+ 	journal_reclaim(c);
+diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
+index 894992ae9be0..362efc8dd16f 100644
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@ -1357,6 +1357,7 @@ static void cache_set_free(struct closure *cl)
+ 	bch_btree_cache_free(c);
+ 	bch_journal_free(c);
+ 
++	mutex_lock(&bch_register_lock);
+ 	for_each_cache(ca, c, i)
+ 		if (ca) {
+ 			ca->set = NULL;
+@@ -1379,7 +1380,6 @@ static void cache_set_free(struct closure *cl)
+ 		mempool_destroy(c->search);
+ 	kfree(c->devices);
+ 
+-	mutex_lock(&bch_register_lock);
+ 	list_del(&c->list);
+ 	mutex_unlock(&bch_register_lock);
+ 
+diff --git a/drivers/pci/host/pci-hyperv.c b/drivers/pci/host/pci-hyperv.c
+index b4d8ccfd9f7c..200b41576526 100644
+--- a/drivers/pci/host/pci-hyperv.c
++++ b/drivers/pci/host/pci-hyperv.c
+@@ -1620,6 +1620,7 @@ static void hv_eject_device_work(struct work_struct *work)
+ 	spin_unlock_irqrestore(&hpdev->hbus->device_list_lock, flags);
+ 
+ 	put_pcichild(hpdev, hv_pcidev_ref_childlist);
++	put_pcichild(hpdev, hv_pcidev_ref_initial);
+ 	put_pcichild(hpdev, hv_pcidev_ref_pnp);
+ 	put_hvpcibus(hpdev->hbus);
+ }
+diff --git a/drivers/power/supply/axp288_charger.c b/drivers/power/supply/axp288_charger.c
+index 75b8e0c7402b..8a0a8fb915d6 100644
+--- a/drivers/power/supply/axp288_charger.c
++++ b/drivers/power/supply/axp288_charger.c
+@@ -899,6 +899,10 @@ static int axp288_charger_probe(struct platform_device *pdev)
+ 	/* Register charger interrupts */
+ 	for (i = 0; i < CHRG_INTR_END; i++) {
+ 		pirq = platform_get_irq(info->pdev, i);
++		if (pirq < 0) {
++			dev_err(&pdev->dev, "Failed to get IRQ: %d\n", pirq);
++			return pirq;
++		}
+ 		info->irq[i] = regmap_irq_get_virq(info->regmap_irqc, pirq);
+ 		if (info->irq[i] < 0) {
+ 			dev_warn(&info->pdev->dev,
+diff --git a/drivers/tty/vt/keyboard.c b/drivers/tty/vt/keyboard.c
+index ece10e6b731b..e8a917a23ed9 100644
+--- a/drivers/tty/vt/keyboard.c
++++ b/drivers/tty/vt/keyboard.c
+@@ -121,6 +121,7 @@ static const int NR_TYPES = ARRAY_SIZE(max_vals);
+ static struct input_handler kbd_handler;
+ static DEFINE_SPINLOCK(kbd_event_lock);
+ static DEFINE_SPINLOCK(led_lock);
++static DEFINE_SPINLOCK(func_buf_lock); /* guard 'func_buf'  and friends */
+ static unsigned long key_down[BITS_TO_LONGS(KEY_CNT)];	/* keyboard key bitmap */
+ static unsigned char shift_down[NR_SHIFT];		/* shift state counters.. */
+ static bool dead_key_next;
+@@ -1959,11 +1960,12 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
+ 	char *p;
+ 	u_char *q;
+ 	u_char __user *up;
+-	int sz;
++	int sz, fnw_sz;
+ 	int delta;
+ 	char *first_free, *fj, *fnw;
+ 	int i, j, k;
+ 	int ret;
++	unsigned long flags;
+ 
+ 	if (!capable(CAP_SYS_TTY_CONFIG))
+ 		perm = 0;
+@@ -2006,7 +2008,14 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
+ 			goto reterr;
+ 		}
+ 
++		fnw = NULL;
++		fnw_sz = 0;
++		/* race aginst other writers */
++		again:
++		spin_lock_irqsave(&func_buf_lock, flags);
+ 		q = func_table[i];
++
++		/* fj pointer to next entry after 'q' */
+ 		first_free = funcbufptr + (funcbufsize - funcbufleft);
+ 		for (j = i+1; j < MAX_NR_FUNC && !func_table[j]; j++)
+ 			;
+@@ -2014,10 +2023,12 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
+ 			fj = func_table[j];
+ 		else
+ 			fj = first_free;
+-
++		/* buffer usage increase by new entry */
+ 		delta = (q ? -strlen(q) : 1) + strlen(kbs->kb_string);
++
+ 		if (delta <= funcbufleft) { 	/* it fits in current buf */
+ 		    if (j < MAX_NR_FUNC) {
++			/* make enough space for new entry at 'fj' */
+ 			memmove(fj + delta, fj, first_free - fj);
+ 			for (k = j; k < MAX_NR_FUNC; k++)
+ 			    if (func_table[k])
+@@ -2030,20 +2041,28 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
+ 		    sz = 256;
+ 		    while (sz < funcbufsize - funcbufleft + delta)
+ 		      sz <<= 1;
+-		    fnw = kmalloc(sz, GFP_KERNEL);
+-		    if(!fnw) {
+-		      ret = -ENOMEM;
+-		      goto reterr;
++		    if (fnw_sz != sz) {
++		      spin_unlock_irqrestore(&func_buf_lock, flags);
++		      kfree(fnw);
++		      fnw = kmalloc(sz, GFP_KERNEL);
++		      fnw_sz = sz;
++		      if (!fnw) {
++			ret = -ENOMEM;
++			goto reterr;
++		      }
++		      goto again;
+ 		    }
+ 
+ 		    if (!q)
+ 		      func_table[i] = fj;
++		    /* copy data before insertion point to new location */
+ 		    if (fj > funcbufptr)
+ 			memmove(fnw, funcbufptr, fj - funcbufptr);
+ 		    for (k = 0; k < j; k++)
+ 		      if (func_table[k])
+ 			func_table[k] = fnw + (func_table[k] - funcbufptr);
+ 
++		    /* copy data after insertion point to new location */
+ 		    if (first_free > fj) {
+ 			memmove(fnw + (fj - funcbufptr) + delta, fj, first_free - fj);
+ 			for (k = j; k < MAX_NR_FUNC; k++)
+@@ -2056,7 +2075,9 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
+ 		    funcbufleft = funcbufleft - delta + sz - funcbufsize;
+ 		    funcbufsize = sz;
+ 		}
++		/* finally insert item itself */
+ 		strcpy(func_table[i], kbs->kb_string);
++		spin_unlock_irqrestore(&func_buf_lock, flags);
+ 		break;
+ 	}
+ 	ret = 0;
+diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
+index 85dc7ab8f89e..2973d256bb44 100644
+--- a/fs/btrfs/backref.c
++++ b/fs/btrfs/backref.c
+@@ -2018,13 +2018,19 @@ int iterate_extent_inodes(struct btrfs_fs_info *fs_info,
+ 			extent_item_objectid);
+ 
+ 	if (!search_commit_root) {
+-		trans = btrfs_join_transaction(fs_info->extent_root);
+-		if (IS_ERR(trans))
+-			return PTR_ERR(trans);
++		trans = btrfs_attach_transaction(fs_info->extent_root);
++		if (IS_ERR(trans)) {
++			if (PTR_ERR(trans) != -ENOENT &&
++			    PTR_ERR(trans) != -EROFS)
++				return PTR_ERR(trans);
++			trans = NULL;
++		}
++	}
++
++	if (trans)
+ 		btrfs_get_tree_mod_seq(fs_info, &tree_mod_seq_elem);
+-	} else {
++	else
+ 		down_read(&fs_info->commit_root_sem);
+-	}
+ 
+ 	ret = btrfs_find_all_leafs(trans, fs_info, extent_item_objectid,
+ 				   tree_mod_seq_elem.seq, &refs,
+@@ -2056,7 +2062,7 @@ int iterate_extent_inodes(struct btrfs_fs_info *fs_info,
+ 
+ 	free_leaf_list(refs);
+ out:
+-	if (!search_commit_root) {
++	if (trans) {
+ 		btrfs_put_tree_mod_seq(fs_info, &tree_mod_seq_elem);
+ 		btrfs_end_transaction(trans, fs_info->extent_root);
+ 	} else {
+diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
+index 106a5bb3ae68..b2ba9955fa11 100644
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@ -1047,6 +1047,7 @@ static int ext4_ext_split(handle_t *handle, struct inode *inode,
+ 	__le32 border;
+ 	ext4_fsblk_t *ablocks = NULL; /* array of allocated blocks */
+ 	int err = 0;
++	size_t ext_size = 0;
+ 
+ 	/* make decision: where to split? */
+ 	/* FIXME: now decision is simplest: at current extent */
+@@ -1138,6 +1139,10 @@ static int ext4_ext_split(handle_t *handle, struct inode *inode,
+ 		le16_add_cpu(&neh->eh_entries, m);
+ 	}
+ 
++	/* zero out unused area in the extent block */
++	ext_size = sizeof(struct ext4_extent_header) +
++		sizeof(struct ext4_extent) * le16_to_cpu(neh->eh_entries);
++	memset(bh->b_data + ext_size, 0, inode->i_sb->s_blocksize - ext_size);
+ 	ext4_extent_block_csum_set(inode, neh);
+ 	set_buffer_uptodate(bh);
+ 	unlock_buffer(bh);
+@@ -1217,6 +1222,11 @@ static int ext4_ext_split(handle_t *handle, struct inode *inode,
+ 				sizeof(struct ext4_extent_idx) * m);
+ 			le16_add_cpu(&neh->eh_entries, m);
+ 		}
++		/* zero out unused area in the extent block */
++		ext_size = sizeof(struct ext4_extent_header) +
++		   (sizeof(struct ext4_extent) * le16_to_cpu(neh->eh_entries));
++		memset(bh->b_data + ext_size, 0,
++			inode->i_sb->s_blocksize - ext_size);
+ 		ext4_extent_block_csum_set(inode, neh);
+ 		set_buffer_uptodate(bh);
+ 		unlock_buffer(bh);
+@@ -1282,6 +1292,7 @@ static int ext4_ext_grow_indepth(handle_t *handle, struct inode *inode,
+ 	ext4_fsblk_t newblock, goal = 0;
+ 	struct ext4_super_block *es = EXT4_SB(inode->i_sb)->s_es;
+ 	int err = 0;
++	size_t ext_size = 0;
+ 
+ 	/* Try to prepend new index to old one */
+ 	if (ext_depth(inode))
+@@ -1307,9 +1318,11 @@ static int ext4_ext_grow_indepth(handle_t *handle, struct inode *inode,
+ 		goto out;
+ 	}
+ 
++	ext_size = sizeof(EXT4_I(inode)->i_data);
+ 	/* move top-level index/leaf into new block */
+-	memmove(bh->b_data, EXT4_I(inode)->i_data,
+-		sizeof(EXT4_I(inode)->i_data));
++	memmove(bh->b_data, EXT4_I(inode)->i_data, ext_size);
++	/* zero out unused area in the extent block */
++	memset(bh->b_data + ext_size, 0, inode->i_sb->s_blocksize - ext_size);
+ 
+ 	/* set size of new block */
+ 	neh = ext_block_hdr(bh);
+diff --git a/fs/ext4/file.c b/fs/ext4/file.c
+index fe76d0957a1f..59d3ea7094a0 100644
+--- a/fs/ext4/file.c
++++ b/fs/ext4/file.c
+@@ -163,6 +163,13 @@ ext4_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 	}
+ 
+ 	ret = __generic_file_write_iter(iocb, from);
++	/*
++	 * Unaligned direct AIO must be the only IO in flight. Otherwise
++	 * overlapping aligned IO after unaligned might result in data
++	 * corruption.
++	 */
++	if (ret == -EIOCBQUEUED && unaligned_aio)
++		ext4_unwritten_wait(inode);
+ 	inode_unlock(inode);
+ 
+ 	if (ret > 0)
+diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
+index 2ce73287b53c..baa2f6375226 100644
+--- a/fs/ext4/ioctl.c
++++ b/fs/ext4/ioctl.c
+@@ -727,7 +727,7 @@ group_add_out:
+ 		if (err == 0)
+ 			err = err2;
+ 		mnt_drop_write_file(filp);
+-		if (!err && (o_group > EXT4_SB(sb)->s_groups_count) &&
++		if (!err && (o_group < EXT4_SB(sb)->s_groups_count) &&
+ 		    ext4_has_group_desc_csum(sb) &&
+ 		    test_opt(sb, INIT_INODE_TABLE))
+ 			err = ext4_register_li_request(sb, o_group);
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index a6c7ace9cfd1..3261478bfc32 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -4034,7 +4034,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ 				 "data=, fs mounted w/o journal");
+ 			goto failed_mount_wq;
+ 		}
+-		sbi->s_def_mount_opt &= EXT4_MOUNT_JOURNAL_CHECKSUM;
++		sbi->s_def_mount_opt &= ~EXT4_MOUNT_JOURNAL_CHECKSUM;
+ 		clear_opt(sb, JOURNAL_CHECKSUM);
+ 		clear_opt(sb, DATA_FLAGS);
+ 		sbi->s_journal = NULL;
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index f3aea1b8702c..8b93d4b98428 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -331,11 +331,22 @@ struct inode_switch_wbs_context {
+ 	struct work_struct	work;
+ };
+ 
++static void bdi_down_write_wb_switch_rwsem(struct backing_dev_info *bdi)
++{
++	down_write(&bdi->wb_switch_rwsem);
++}
++
++static void bdi_up_write_wb_switch_rwsem(struct backing_dev_info *bdi)
++{
++	up_write(&bdi->wb_switch_rwsem);
++}
++
+ static void inode_switch_wbs_work_fn(struct work_struct *work)
+ {
+ 	struct inode_switch_wbs_context *isw =
+ 		container_of(work, struct inode_switch_wbs_context, work);
+ 	struct inode *inode = isw->inode;
++	struct backing_dev_info *bdi = inode_to_bdi(inode);
+ 	struct address_space *mapping = inode->i_mapping;
+ 	struct bdi_writeback *old_wb = inode->i_wb;
+ 	struct bdi_writeback *new_wb = isw->new_wb;
+@@ -343,6 +354,12 @@ static void inode_switch_wbs_work_fn(struct work_struct *work)
+ 	bool switched = false;
+ 	void **slot;
+ 
++	/*
++	 * If @inode switches cgwb membership while sync_inodes_sb() is
++	 * being issued, sync_inodes_sb() might miss it.  Synchronize.
++	 */
++	down_read(&bdi->wb_switch_rwsem);
++
+ 	/*
+ 	 * By the time control reaches here, RCU grace period has passed
+ 	 * since I_WB_SWITCH assertion and all wb stat update transactions
+@@ -435,6 +452,8 @@ skip_switch:
+ 	spin_unlock(&new_wb->list_lock);
+ 	spin_unlock(&old_wb->list_lock);
+ 
++	up_read(&bdi->wb_switch_rwsem);
++
+ 	if (switched) {
+ 		wb_wakeup(new_wb);
+ 		wb_put(old_wb);
+@@ -475,9 +494,18 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
+ 	if (inode->i_state & I_WB_SWITCH)
+ 		return;
+ 
++	/*
++	 * Avoid starting new switches while sync_inodes_sb() is in
++	 * progress.  Otherwise, if the down_write protected issue path
++	 * blocks heavily, we might end up starting a large number of
++	 * switches which will block on the rwsem.
++	 */
++	if (!down_read_trylock(&bdi->wb_switch_rwsem))
++		return;
++
+ 	isw = kzalloc(sizeof(*isw), GFP_ATOMIC);
+ 	if (!isw)
+-		return;
++		goto out_unlock;
+ 
+ 	/* find and pin the new wb */
+ 	rcu_read_lock();
+@@ -502,8 +530,6 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
+ 
+ 	isw->inode = inode;
+ 
+-	atomic_inc(&isw_nr_in_flight);
+-
+ 	/*
+ 	 * In addition to synchronizing among switchers, I_WB_SWITCH tells
+ 	 * the RCU protected stat update paths to grab the mapping's
+@@ -511,12 +537,17 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
+ 	 * Let's continue after I_WB_SWITCH is guaranteed to be visible.
+ 	 */
+ 	call_rcu(&isw->rcu_head, inode_switch_wbs_rcu_fn);
+-	return;
++
++	atomic_inc(&isw_nr_in_flight);
++
++	goto out_unlock;
+ 
+ out_free:
+ 	if (isw->new_wb)
+ 		wb_put(isw->new_wb);
+ 	kfree(isw);
++out_unlock:
++	up_read(&bdi->wb_switch_rwsem);
+ }
+ 
+ /**
+@@ -878,7 +909,11 @@ restart:
+ void cgroup_writeback_umount(void)
+ {
+ 	if (atomic_read(&isw_nr_in_flight)) {
+-		synchronize_rcu();
++		/*
++		 * Use rcu_barrier() to wait for all pending callbacks to
++		 * ensure that all in-flight wb switches are in the workqueue.
++		 */
++		rcu_barrier();
+ 		flush_workqueue(isw_wq);
+ 	}
+ }
+@@ -894,6 +929,9 @@ fs_initcall(cgroup_writeback_init);
+ 
+ #else	/* CONFIG_CGROUP_WRITEBACK */
+ 
++static void bdi_down_write_wb_switch_rwsem(struct backing_dev_info *bdi) { }
++static void bdi_up_write_wb_switch_rwsem(struct backing_dev_info *bdi) { }
++
+ static struct bdi_writeback *
+ locked_inode_to_wb_and_lock_list(struct inode *inode)
+ 	__releases(&inode->i_lock)
+@@ -2408,8 +2446,11 @@ void sync_inodes_sb(struct super_block *sb)
+ 		return;
+ 	WARN_ON(!rwsem_is_locked(&sb->s_umount));
+ 
++	/* protect against inode wb switch, see inode_switch_wbs_work_fn() */
++	bdi_down_write_wb_switch_rwsem(bdi);
+ 	bdi_split_work_to_wbs(bdi, &work, false);
+ 	wb_wait_for_completion(bdi, &done);
++	bdi_up_write_wb_switch_rwsem(bdi);
+ 
+ 	wait_sb_inodes(sb);
+ }
+diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
+index d10bb2c30bf8..3cbcf649ac66 100644
+--- a/fs/jbd2/journal.c
++++ b/fs/jbd2/journal.c
+@@ -1339,6 +1339,10 @@ static int jbd2_write_superblock(journal_t *journal, int write_flags)
+ 	journal_superblock_t *sb = journal->j_superblock;
+ 	int ret;
+ 
++	/* Buffer got discarded which means block device got invalidated */
++	if (!buffer_mapped(bh))
++		return -EIO;
++
+ 	trace_jbd2_write_superblock(journal, write_flags);
+ 	if (!(journal->j_flags & JBD2_BARRIER))
+ 		write_flags &= ~(REQ_FUA | REQ_PREFLUSH);
+diff --git a/fs/ocfs2/export.c b/fs/ocfs2/export.c
+index 3494e220b510..bed15dec3c16 100644
+--- a/fs/ocfs2/export.c
++++ b/fs/ocfs2/export.c
+@@ -148,16 +148,24 @@ static struct dentry *ocfs2_get_parent(struct dentry *child)
+ 	u64 blkno;
+ 	struct dentry *parent;
+ 	struct inode *dir = d_inode(child);
++	int set;
+ 
+ 	trace_ocfs2_get_parent(child, child->d_name.len, child->d_name.name,
+ 			       (unsigned long long)OCFS2_I(dir)->ip_blkno);
+ 
++	status = ocfs2_nfs_sync_lock(OCFS2_SB(dir->i_sb), 1);
++	if (status < 0) {
++		mlog(ML_ERROR, "getting nfs sync lock(EX) failed %d\n", status);
++		parent = ERR_PTR(status);
++		goto bail;
++	}
++
+ 	status = ocfs2_inode_lock(dir, NULL, 0);
+ 	if (status < 0) {
+ 		if (status != -ENOENT)
+ 			mlog_errno(status);
+ 		parent = ERR_PTR(status);
+-		goto bail;
++		goto unlock_nfs_sync;
+ 	}
+ 
+ 	status = ocfs2_lookup_ino_from_name(dir, "..", 2, &blkno);
+@@ -166,11 +174,31 @@ static struct dentry *ocfs2_get_parent(struct dentry *child)
+ 		goto bail_unlock;
+ 	}
+ 
++	status = ocfs2_test_inode_bit(OCFS2_SB(dir->i_sb), blkno, &set);
++	if (status < 0) {
++		if (status == -EINVAL) {
++			status = -ESTALE;
++		} else
++			mlog(ML_ERROR, "test inode bit failed %d\n", status);
++		parent = ERR_PTR(status);
++		goto bail_unlock;
++	}
++
++	trace_ocfs2_get_dentry_test_bit(status, set);
++	if (!set) {
++		status = -ESTALE;
++		parent = ERR_PTR(status);
++		goto bail_unlock;
++	}
++
+ 	parent = d_obtain_alias(ocfs2_iget(OCFS2_SB(dir->i_sb), blkno, 0, 0));
+ 
+ bail_unlock:
+ 	ocfs2_inode_unlock(dir, 0);
+ 
++unlock_nfs_sync:
++	ocfs2_nfs_sync_unlock(OCFS2_SB(dir->i_sb), 1);
++
+ bail:
+ 	trace_ocfs2_get_parent_end(parent);
+ 
+diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
+index 4ea779b25a51..34056ec64c7c 100644
+--- a/include/linux/backing-dev-defs.h
++++ b/include/linux/backing-dev-defs.h
+@@ -157,6 +157,7 @@ struct backing_dev_info {
+ 	struct radix_tree_root cgwb_tree; /* radix tree of active cgroup wbs */
+ 	struct rb_root cgwb_congested_tree; /* their congested states */
+ 	atomic_t usage_cnt; /* counts both cgwbs and cgwb_contested's */
++	struct rw_semaphore wb_switch_rwsem; /* no cgwb switch while syncing */
+ #else
+ 	struct bdi_writeback_congested *wb_congested;
+ #endif
+diff --git a/include/linux/list.h b/include/linux/list.h
+index 5809e9a2de5b..6f935018ea05 100644
+--- a/include/linux/list.h
++++ b/include/linux/list.h
+@@ -271,6 +271,36 @@ static inline void list_cut_position(struct list_head *list,
+ 		__list_cut_position(list, head, entry);
+ }
+ 
++/**
++ * list_cut_before - cut a list into two, before given entry
++ * @list: a new list to add all removed entries
++ * @head: a list with entries
++ * @entry: an entry within head, could be the head itself
++ *
++ * This helper moves the initial part of @head, up to but
++ * excluding @entry, from @head to @list.  You should pass
++ * in @entry an element you know is on @head.  @list should
++ * be an empty list or a list you do not care about losing
++ * its data.
++ * If @entry == @head, all entries on @head are moved to
++ * @list.
++ */
++static inline void list_cut_before(struct list_head *list,
++				   struct list_head *head,
++				   struct list_head *entry)
++{
++	if (head->next == entry) {
++		INIT_LIST_HEAD(list);
++		return;
++	}
++	list->next = head->next;
++	list->next->prev = list;
++	list->prev = entry->prev;
++	list->prev->next = list;
++	head->next = entry;
++	entry->prev = head;
++}
++
+ static inline void __list_splice(const struct list_head *list,
+ 				 struct list_head *prev,
+ 				 struct list_head *next)
+diff --git a/include/linux/mfd/da9063/registers.h b/include/linux/mfd/da9063/registers.h
+index 5d42859cb441..844fc2973392 100644
+--- a/include/linux/mfd/da9063/registers.h
++++ b/include/linux/mfd/da9063/registers.h
+@@ -215,9 +215,9 @@
+ 
+ /* DA9063 Configuration registers */
+ /* OTP */
+-#define	DA9063_REG_OPT_COUNT		0x101
+-#define	DA9063_REG_OPT_ADDR		0x102
+-#define	DA9063_REG_OPT_DATA		0x103
++#define	DA9063_REG_OTP_CONT		0x101
++#define	DA9063_REG_OTP_ADDR		0x102
++#define	DA9063_REG_OTP_DATA		0x103
+ 
+ /* Customer Trim and Configuration */
+ #define	DA9063_REG_T_OFFSET		0x104
+diff --git a/include/linux/mfd/max77620.h b/include/linux/mfd/max77620.h
+index 3ca0af07fc78..0a68dc8fc25f 100644
+--- a/include/linux/mfd/max77620.h
++++ b/include/linux/mfd/max77620.h
+@@ -136,8 +136,8 @@
+ #define MAX77620_FPS_PERIOD_MIN_US		40
+ #define MAX20024_FPS_PERIOD_MIN_US		20
+ 
+-#define MAX77620_FPS_PERIOD_MAX_US		2560
+-#define MAX20024_FPS_PERIOD_MAX_US		5120
++#define MAX20024_FPS_PERIOD_MAX_US		2560
++#define MAX77620_FPS_PERIOD_MAX_US		5120
+ 
+ #define MAX77620_REG_FPS_GPIO1			0x54
+ #define MAX77620_REG_FPS_GPIO2			0x55
+diff --git a/kernel/locking/rwsem-xadd.c b/kernel/locking/rwsem-xadd.c
+index be06c45cbe4f..0cdbb636e316 100644
+--- a/kernel/locking/rwsem-xadd.c
++++ b/kernel/locking/rwsem-xadd.c
+@@ -127,6 +127,7 @@ static void __rwsem_mark_wake(struct rw_semaphore *sem,
+ {
+ 	struct rwsem_waiter *waiter, *tmp;
+ 	long oldcount, woken = 0, adjustment = 0;
++	struct list_head wlist;
+ 
+ 	/*
+ 	 * Take a peek at the queue head waiter such that we can determine
+@@ -185,18 +186,42 @@ static void __rwsem_mark_wake(struct rw_semaphore *sem,
+ 	 * of the queue. We know that woken will be at least 1 as we accounted
+ 	 * for above. Note we increment the 'active part' of the count by the
+ 	 * number of readers before waking any processes up.
++	 *
++	 * We have to do wakeup in 2 passes to prevent the possibility that
++	 * the reader count may be decremented before it is incremented. It
++	 * is because the to-be-woken waiter may not have slept yet. So it
++	 * may see waiter->task got cleared, finish its critical section and
++	 * do an unlock before the reader count increment.
++	 *
++	 * 1) Collect the read-waiters in a separate list, count them and
++	 *    fully increment the reader count in rwsem.
++	 * 2) For each waiters in the new list, clear waiter->task and
++	 *    put them into wake_q to be woken up later.
+ 	 */
+-	list_for_each_entry_safe(waiter, tmp, &sem->wait_list, list) {
+-		struct task_struct *tsk;
+-
++	list_for_each_entry(waiter, &sem->wait_list, list) {
+ 		if (waiter->type == RWSEM_WAITING_FOR_WRITE)
+ 			break;
+ 
+ 		woken++;
+-		tsk = waiter->task;
++	}
++	list_cut_before(&wlist, &sem->wait_list, &waiter->list);
++
++	adjustment = woken * RWSEM_ACTIVE_READ_BIAS - adjustment;
++	if (list_empty(&sem->wait_list)) {
++		/* hit end of list above */
++		adjustment -= RWSEM_WAITING_BIAS;
++	}
++
++	if (adjustment)
++		atomic_long_add(adjustment, &sem->count);
++
++	/* 2nd pass */
++	list_for_each_entry_safe(waiter, tmp, &wlist, list) {
++		struct task_struct *tsk;
+ 
++		tsk = waiter->task;
+ 		get_task_struct(tsk);
+-		list_del(&waiter->list);
++
+ 		/*
+ 		 * Ensure calling get_task_struct() before setting the reader
+ 		 * waiter to nil such that rwsem_down_read_failed() cannot
+@@ -212,15 +237,6 @@ static void __rwsem_mark_wake(struct rw_semaphore *sem,
+ 		/* wake_q_add() already take the task ref */
+ 		put_task_struct(tsk);
+ 	}
+-
+-	adjustment = woken * RWSEM_ACTIVE_READ_BIAS - adjustment;
+-	if (list_empty(&sem->wait_list)) {
+-		/* hit end of list above */
+-		adjustment -= RWSEM_WAITING_BIAS;
+-	}
+-
+-	if (adjustment)
+-		atomic_long_add(adjustment, &sem->count);
+ }
+ 
+ /*
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index 6ff2d7744223..113b7d317079 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -669,6 +669,7 @@ static int cgwb_bdi_init(struct backing_dev_info *bdi)
+ 	INIT_RADIX_TREE(&bdi->cgwb_tree, GFP_ATOMIC);
+ 	bdi->cgwb_congested_tree = RB_ROOT;
+ 	atomic_set(&bdi->usage_cnt, 1);
++	init_rwsem(&bdi->wb_switch_rwsem);
+ 
+ 	ret = wb_init(&bdi->wb, bdi, 1, GFP_KERNEL);
+ 	if (!ret) {
+diff --git a/mm/mincore.c b/mm/mincore.c
+index bfb866435478..3b6a883d0926 100644
+--- a/mm/mincore.c
++++ b/mm/mincore.c
+@@ -167,6 +167,22 @@ out:
+ 	return 0;
+ }
+ 
++static inline bool can_do_mincore(struct vm_area_struct *vma)
++{
++	if (vma_is_anonymous(vma))
++		return true;
++	if (!vma->vm_file)
++		return false;
++	/*
++	 * Reveal pagecache information only for non-anonymous mappings that
++	 * correspond to the files the calling process could (if tried) open
++	 * for writing; otherwise we'd be including shared non-exclusive
++	 * mappings, which opens a side channel.
++	 */
++	return inode_owner_or_capable(file_inode(vma->vm_file)) ||
++		inode_permission(file_inode(vma->vm_file), MAY_WRITE) == 0;
++}
++
+ /*
+  * Do a chunk of "sys_mincore()". We've already checked
+  * all the arguments, we hold the mmap semaphore: we should
+@@ -187,8 +203,13 @@ static long do_mincore(unsigned long addr, unsigned long pages, unsigned char *v
+ 	vma = find_vma(current->mm, addr);
+ 	if (!vma || addr < vma->vm_start)
+ 		return -ENOMEM;
+-	mincore_walk.mm = vma->vm_mm;
+ 	end = min(vma->vm_end, addr + (pages << PAGE_SHIFT));
++	if (!can_do_mincore(vma)) {
++		unsigned long pages = DIV_ROUND_UP(end - addr, PAGE_SIZE);
++		memset(vec, 1, pages);
++		return pages;
++	}
++	mincore_walk.mm = vma->vm_mm;
+ 	err = walk_page_range(addr, end, &mincore_walk);
+ 	if (err < 0)
+ 		return err;
+diff --git a/net/core/fib_rules.c b/net/core/fib_rules.c
+index bb26457e8c21..c03dd2104d33 100644
+--- a/net/core/fib_rules.c
++++ b/net/core/fib_rules.c
+@@ -430,6 +430,7 @@ int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr *nlh)
+ 		goto errout_free;
+ 
+ 	if (rule_exists(ops, frh, tb, rule)) {
++		err = 0;
+ 		if (nlh->nlmsg_flags & NLM_F_EXCL)
+ 			err = -EEXIST;
+ 		goto errout_free;
 diff --git a/sound/pci/hda/patch_hdmi.c b/sound/pci/hda/patch_hdmi.c
-index 52afab985f24..7a2943a338bf 100644
+index 76ae627e3f93..7a2943a338bf 100644
 --- a/sound/pci/hda/patch_hdmi.c
 +++ b/sound/pci/hda/patch_hdmi.c
 @@ -1447,9 +1447,11 @@ static bool hdmi_present_sense_via_verbs(struct hdmi_spec_per_pin *per_pin,
@@ -1202,34 +1343,20 @@ index 52afab985f24..7a2943a338bf 100644
  	mutex_unlock(&per_pin->lock);
  	return ret;
  }
--- 
-2.28.0
-
-
-From 595a6a53c790a798d7ad61339487177d2a3de86a Mon Sep 17 00:00:00 2001
-From: Kailang Yang <kailang@realtek.com>
-Date: Fri, 26 Apr 2019 16:35:41 +0800
-Subject: [PATCH 19/45] ALSA: hda/realtek - EAPD turn on later
-
-commit 607ca3bd220f4022e6f5356026b19dafc363863a upstream.
-
-Let EAPD turn on after set pin output.
-
-[ NOTE: This change is supposed to reduce the possible click noises at
-  (runtime) PM resume.  The functionality should be same (i.e. the
-  verbs are executed correctly) no matter which order is, so this
-  should be safe to apply for all codecs -- tiwai ]
-
-Signed-off-by: Kailang Yang <kailang@realtek.com>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/hda/patch_realtek.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
+@@ -1554,6 +1556,11 @@ static void hdmi_repoll_eld(struct work_struct *work)
+ 	container_of(to_delayed_work(work), struct hdmi_spec_per_pin, work);
+ 	struct hda_codec *codec = per_pin->codec;
+ 	struct hdmi_spec *spec = codec->spec;
++	struct hda_jack_tbl *jack;
++
++	jack = snd_hda_jack_tbl_get(codec, per_pin->pin_nid);
++	if (jack)
++		jack->jack_dirty = 1;
+ 
+ 	if (per_pin->repoll_count++ > 6)
+ 		per_pin->repoll_count = 0;
 diff --git a/sound/pci/hda/patch_realtek.c b/sound/pci/hda/patch_realtek.c
-index 0fc05ebdf81a..1d3fbcdd1699 100644
+index 0fc05ebdf81a..822650d907fa 100644
 --- a/sound/pci/hda/patch_realtek.c
 +++ b/sound/pci/hda/patch_realtek.c
 @@ -773,11 +773,10 @@ static int alc_init(struct hda_codec *codec)
@@ -1245,37 +1372,15 @@ index 0fc05ebdf81a..1d3fbcdd1699 100644
  	snd_hda_apply_fixup(codec, HDA_FIXUP_ACT_INIT);
  
  	return 0;
--- 
-2.28.0
-
-
-From cfdfd0e9a3a4f819d06650dc7b438dd268783c94 Mon Sep 17 00:00:00 2001
-From: Jon Hunter <jonathanh@nvidia.com>
-Date: Wed, 1 May 2019 15:29:38 +0100
-Subject: [PATCH 20/45] ASoC: max98090: Fix restore of DAPM Muxes
-
-commit ecb2795c08bc825ebd604997e5be440b060c5b18 upstream.
-
-The max98090 driver defines 3 DAPM muxes; one for the right line output
-(LINMOD Mux), one for the left headphone mixer source (MIXHPLSEL Mux)
-and one for the right headphone mixer source (MIXHPRSEL Mux). The same
-bit is used for the mux as well as the DAPM enable, and although the mux
-can be correctly configured, after playback has completed, the mux will
-be reset during the disable phase. This is preventing the state of these
-muxes from being saved and restored correctly on system reboot. Fix this
-by marking these muxes as SND_SOC_NOPM.
-
-Note this has been verified this on the Tegra124 Nyan Big which features
-the MAX98090 codec.
-
-Signed-off-by: Jon Hunter <jonathanh@nvidia.com>
-Signed-off-by: Mark Brown <broonie@kernel.org>
-Cc: stable@vger.kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/codecs/max98090.c | 12 ++++++------
- 1 file changed, 6 insertions(+), 6 deletions(-)
-
+@@ -5855,7 +5854,7 @@ static const struct snd_pci_quirk alc269_fixup_tbl[] = {
+ 	SND_PCI_QUIRK(0x17aa, 0x3112, "ThinkCentre AIO", ALC233_FIXUP_LENOVO_LINE2_MIC_HOTKEY),
+ 	SND_PCI_QUIRK(0x17aa, 0x3902, "Lenovo E50-80", ALC269_FIXUP_DMIC_THINKPAD_ACPI),
+ 	SND_PCI_QUIRK(0x17aa, 0x3977, "IdeaPad S210", ALC283_FIXUP_INT_MIC),
+-	SND_PCI_QUIRK(0x17aa, 0x3978, "IdeaPad Y410P", ALC269_FIXUP_NO_SHUTUP),
++	SND_PCI_QUIRK(0x17aa, 0x3978, "Lenovo B50-70", ALC269_FIXUP_DMIC_THINKPAD_ACPI),
+ 	SND_PCI_QUIRK(0x17aa, 0x5013, "Thinkpad", ALC269_FIXUP_LIMIT_INT_MIC_BOOST),
+ 	SND_PCI_QUIRK(0x17aa, 0x501a, "Thinkpad", ALC283_FIXUP_INT_MIC),
+ 	SND_PCI_QUIRK(0x17aa, 0x501e, "Thinkpad L440", ALC292_FIXUP_TPT440_DOCK),
 diff --git a/sound/soc/codecs/max98090.c b/sound/soc/codecs/max98090.c
 index 584aab83e478..3e65dc74eb33 100644
 --- a/sound/soc/codecs/max98090.c
@@ -1301,37 +1406,6 @@ index 584aab83e478..3e65dc74eb33 100644
  
  	SND_SOC_DAPM_PGA("HP Left Out", M98090_REG_OUTPUT_ENABLE,
  		M98090_HPLEN_SHIFT, 0, NULL, 0),
--- 
-2.28.0
-
-
-From 63a3811e274ec1763a9c93797189ee7ba4905322 Mon Sep 17 00:00:00 2001
-From: Curtis Malainey <cujomalainey@chromium.org>
-Date: Fri, 3 May 2019 12:32:14 -0700
-Subject: [PATCH 21/45] ASoC: RT5677-SPI: Disable 16Bit SPI Transfers
-
-commit a46eb523220e242affb9a6bc9bb8efc05f4f7459 upstream.
-
-The current algorithm allows 3 types of transfers, 16bit, 32bit and
-burst. According to Realtek, 16bit transfers have a special restriction
-in that it is restricted to the memory region of
-0x18020000 ~ 0x18021000. This region is the memory location of the I2C
-registers. The current algorithm does not uphold this restriction and
-therefore fails to complete writes.
-
-Since this has been broken for some time it likely no one is using it.
-Better to simply disable the 16 bit writes. This will allow users to
-properly load firmware over SPI without data corruption.
-
-Signed-off-by: Curtis Malainey <cujomalainey@chromium.org>
-Reviewed-by: Ben Zhang <benzh@chromium.org>
-Signed-off-by: Mark Brown <broonie@kernel.org>
-Cc: stable@vger.kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/codecs/rt5677-spi.c | 35 ++++++++++++++++-------------------
- 1 file changed, 16 insertions(+), 19 deletions(-)
-
 diff --git a/sound/soc/codecs/rt5677-spi.c b/sound/soc/codecs/rt5677-spi.c
 index 91879ea95415..01aa75cde571 100644
 --- a/sound/soc/codecs/rt5677-spi.c
@@ -1435,1924 +1509,30 @@ index 91879ea95415..01aa75cde571 100644
  
  		/* Construct SPI message header */
  		buf[0] = spi_cmd;
--- 
-2.28.0
-
-
-From fef85fb00224cb22f9efec262e9ffe8970e555ee Mon Sep 17 00:00:00 2001
-From: Jiri Kosina <jkosina@suse.cz>
-Date: Tue, 14 May 2019 15:41:38 -0700
-Subject: [PATCH 22/45] mm/mincore.c: make mincore() more conservative
-
-commit 134fca9063ad4851de767d1768180e5dede9a881 upstream.
-
-The semantics of what mincore() considers to be resident is not
-completely clear, but Linux has always (since 2.3.52, which is when
-mincore() was initially done) treated it as "page is available in page
-cache".
-
-That's potentially a problem, as that [in]directly exposes
-meta-information about pagecache / memory mapping state even about
-memory not strictly belonging to the process executing the syscall,
-opening possibilities for sidechannel attacks.
-
-Change the semantics of mincore() so that it only reveals pagecache
-information for non-anonymous mappings that belog to files that the
-calling process could (if it tried to) successfully open for writing;
-otherwise we'd be including shared non-exclusive mappings, which
-
- - is the sidechannel
-
- - is not the usecase for mincore(), as that's primarily used for data,
-   not (shared) text
-
-[jkosina@suse.cz: v2]
-  Link: http://lkml.kernel.org/r/20190312141708.6652-2-vbabka@suse.cz
-[mhocko@suse.com: restructure can_do_mincore() conditions]
-Link: http://lkml.kernel.org/r/nycvar.YFH.7.76.1903062342020.19912@cbobk.fhfr.pm
-Signed-off-by: Jiri Kosina <jkosina@suse.cz>
-Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
-Acked-by: Josh Snyder <joshs@netflix.com>
-Acked-by: Michal Hocko <mhocko@suse.com>
-Originally-by: Linus Torvalds <torvalds@linux-foundation.org>
-Originally-by: Dominique Martinet <asmadeus@codewreck.org>
-Cc: Andy Lutomirski <luto@amacapital.net>
-Cc: Dave Chinner <david@fromorbit.com>
-Cc: Kevin Easton <kevin@guarana.org>
-Cc: Matthew Wilcox <willy@infradead.org>
-Cc: Cyril Hrubis <chrubis@suse.cz>
-Cc: Tejun Heo <tj@kernel.org>
-Cc: Kirill A. Shutemov <kirill@shutemov.name>
-Cc: Daniel Gruss <daniel@gruss.cc>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/mincore.c | 23 ++++++++++++++++++++++-
- 1 file changed, 22 insertions(+), 1 deletion(-)
-
-diff --git a/mm/mincore.c b/mm/mincore.c
-index bfb866435478..3b6a883d0926 100644
---- a/mm/mincore.c
-+++ b/mm/mincore.c
-@@ -167,6 +167,22 @@ static int mincore_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
- 	return 0;
- }
- 
-+static inline bool can_do_mincore(struct vm_area_struct *vma)
-+{
-+	if (vma_is_anonymous(vma))
-+		return true;
-+	if (!vma->vm_file)
-+		return false;
-+	/*
-+	 * Reveal pagecache information only for non-anonymous mappings that
-+	 * correspond to the files the calling process could (if tried) open
-+	 * for writing; otherwise we'd be including shared non-exclusive
-+	 * mappings, which opens a side channel.
-+	 */
-+	return inode_owner_or_capable(file_inode(vma->vm_file)) ||
-+		inode_permission(file_inode(vma->vm_file), MAY_WRITE) == 0;
-+}
-+
- /*
-  * Do a chunk of "sys_mincore()". We've already checked
-  * all the arguments, we hold the mmap semaphore: we should
-@@ -187,8 +203,13 @@ static long do_mincore(unsigned long addr, unsigned long pages, unsigned char *v
- 	vma = find_vma(current->mm, addr);
- 	if (!vma || addr < vma->vm_start)
+diff --git a/sound/usb/mixer.c b/sound/usb/mixer.c
+index 64b90b8ec661..248a4bd82397 100644
+--- a/sound/usb/mixer.c
++++ b/sound/usb/mixer.c
+@@ -2178,6 +2178,8 @@ static int parse_audio_selector_unit(struct mixer_build *state, int unitid,
+ 	kctl = snd_ctl_new1(&mixer_selectunit_ctl, cval);
+ 	if (! kctl) {
+ 		usb_audio_err(state->chip, "cannot malloc kcontrol\n");
++		for (i = 0; i < desc->bNrInPins; i++)
++			kfree(namelist[i]);
+ 		kfree(namelist);
+ 		kfree(cval);
  		return -ENOMEM;
--	mincore_walk.mm = vma->vm_mm;
- 	end = min(vma->vm_end, addr + (pages << PAGE_SHIFT));
-+	if (!can_do_mincore(vma)) {
-+		unsigned long pages = DIV_ROUND_UP(end - addr, PAGE_SIZE);
-+		memset(vec, 1, pages);
-+		return pages;
-+	}
-+	mincore_walk.mm = vma->vm_mm;
- 	err = walk_page_range(addr, end, &mincore_walk);
- 	if (err < 0)
- 		return err;
--- 
-2.28.0
-
-
-From a11b4df7f604c1da4b45a2afe12ab9b0f72560be Mon Sep 17 00:00:00 2001
-From: Shuning Zhang <sunny.s.zhang@oracle.com>
-Date: Mon, 13 May 2019 17:15:56 -0700
-Subject: [PATCH 23/45] ocfs2: fix ocfs2 read inode data panic in ocfs2_iget
-
-commit e091eab028f9253eac5c04f9141bbc9d170acab3 upstream.
-
-In some cases, ocfs2_iget() reads the data of inode, which has been
-deleted for some reason.  That will make the system panic.  So We should
-judge whether this inode has been deleted, and tell the caller that the
-inode is a bad inode.
-
-For example, the ocfs2 is used as the backed of nfs, and the client is
-nfsv3.  This issue can be reproduced by the following steps.
-
-on the nfs server side,
-..../patha/pathb
-
-Step 1: The process A was scheduled before calling the function fh_verify.
-
-Step 2: The process B is removing the 'pathb', and just completed the call
-to function dput.  Then the dentry of 'pathb' has been deleted from the
-dcache, and all ancestors have been deleted also.  The relationship of
-dentry and inode was deleted through the function hlist_del_init.  The
-following is the call stack.
-dentry_iput->hlist_del_init(&dentry->d_u.d_alias)
-
-At this time, the inode is still in the dcache.
-
-Step 3: The process A call the function ocfs2_get_dentry, which get the
-inode from dcache.  Then the refcount of inode is 1.  The following is the
-call stack.
-nfsd3_proc_getacl->fh_verify->exportfs_decode_fh->fh_to_dentry(ocfs2_get_dentry)
-
-Step 4: Dirty pages are flushed by bdi threads.  So the inode of 'patha'
-is evicted, and this directory was deleted.  But the inode of 'pathb'
-can't be evicted, because the refcount of the inode was 1.
-
-Step 5: The process A keep running, and call the function
-reconnect_path(in exportfs_decode_fh), which call function
-ocfs2_get_parent of ocfs2.  Get the block number of parent
-directory(patha) by the name of ...  Then read the data from disk by the
-block number.  But this inode has been deleted, so the system panic.
-
-Process A                                             Process B
-1. in nfsd3_proc_getacl                   |
-2.                                        |        dput
-3. fh_to_dentry(ocfs2_get_dentry)         |
-4. bdi flush dirty cache                  |
-5. ocfs2_iget                             |
-
-[283465.542049] OCFS2: ERROR (device sdp): ocfs2_validate_inode_block:
-Invalid dinode #580640: OCFS2_VALID_FL not set
-
-[283465.545490] Kernel panic - not syncing: OCFS2: (device sdp): panic forced
-after error
-
-[283465.546889] CPU: 5 PID: 12416 Comm: nfsd Tainted: G        W
-4.1.12-124.18.6.el6uek.bug28762940v3.x86_64 #2
-[283465.548382] Hardware name: VMware, Inc. VMware Virtual Platform/440BX
-Desktop Reference Platform, BIOS 6.00 09/21/2015
-[283465.549657]  0000000000000000 ffff8800a56fb7b8 ffffffff816e839c
-ffffffffa0514758
-[283465.550392]  000000000008dc20 ffff8800a56fb838 ffffffff816e62d3
-0000000000000008
-[283465.551056]  ffff880000000010 ffff8800a56fb848 ffff8800a56fb7e8
-ffff88005df9f000
-[283465.551710] Call Trace:
-[283465.552516]  [<ffffffff816e839c>] dump_stack+0x63/0x81
-[283465.553291]  [<ffffffff816e62d3>] panic+0xcb/0x21b
-[283465.554037]  [<ffffffffa04e66b0>] ocfs2_handle_error+0xf0/0xf0 [ocfs2]
-[283465.554882]  [<ffffffffa04e7737>] __ocfs2_error+0x67/0x70 [ocfs2]
-[283465.555768]  [<ffffffffa049c0f9>] ocfs2_validate_inode_block+0x229/0x230
-[ocfs2]
-[283465.556683]  [<ffffffffa047bcbc>] ocfs2_read_blocks+0x46c/0x7b0 [ocfs2]
-[283465.557408]  [<ffffffffa049bed0>] ? ocfs2_inode_cache_io_unlock+0x20/0x20
-[ocfs2]
-[283465.557973]  [<ffffffffa049f0eb>] ocfs2_read_inode_block_full+0x3b/0x60
-[ocfs2]
-[283465.558525]  [<ffffffffa049f5ba>] ocfs2_iget+0x4aa/0x880 [ocfs2]
-[283465.559082]  [<ffffffffa049146e>] ocfs2_get_parent+0x9e/0x220 [ocfs2]
-[283465.559622]  [<ffffffff81297c05>] reconnect_path+0xb5/0x300
-[283465.560156]  [<ffffffff81297f46>] exportfs_decode_fh+0xf6/0x2b0
-[283465.560708]  [<ffffffffa062faf0>] ? nfsd_proc_getattr+0xa0/0xa0 [nfsd]
-[283465.561262]  [<ffffffff810a8196>] ? prepare_creds+0x26/0x110
-[283465.561932]  [<ffffffffa0630860>] fh_verify+0x350/0x660 [nfsd]
-[283465.562862]  [<ffffffffa0637804>] ? nfsd_cache_lookup+0x44/0x630 [nfsd]
-[283465.563697]  [<ffffffffa063a8b9>] nfsd3_proc_getattr+0x69/0xf0 [nfsd]
-[283465.564510]  [<ffffffffa062cf60>] nfsd_dispatch+0xe0/0x290 [nfsd]
-[283465.565358]  [<ffffffffa05eb892>] ? svc_tcp_adjust_wspace+0x12/0x30
-[sunrpc]
-[283465.566272]  [<ffffffffa05ea652>] svc_process_common+0x412/0x6a0 [sunrpc]
-[283465.567155]  [<ffffffffa05eaa03>] svc_process+0x123/0x210 [sunrpc]
-[283465.568020]  [<ffffffffa062c90f>] nfsd+0xff/0x170 [nfsd]
-[283465.568962]  [<ffffffffa062c810>] ? nfsd_destroy+0x80/0x80 [nfsd]
-[283465.570112]  [<ffffffff810a622b>] kthread+0xcb/0xf0
-[283465.571099]  [<ffffffff810a6160>] ? kthread_create_on_node+0x180/0x180
-[283465.572114]  [<ffffffff816f11b8>] ret_from_fork+0x58/0x90
-[283465.573156]  [<ffffffff810a6160>] ? kthread_create_on_node+0x180/0x180
-
-Link: http://lkml.kernel.org/r/1554185919-3010-1-git-send-email-sunny.s.zhang@oracle.com
-Signed-off-by: Shuning Zhang <sunny.s.zhang@oracle.com>
-Reviewed-by: Joseph Qi <jiangqi903@gmail.com>
-Cc: Mark Fasheh <mark@fasheh.com>
-Cc: Joel Becker <jlbec@evilplan.org>
-Cc: Junxiao Bi <junxiao.bi@oracle.com>
-Cc: Changwei Ge <gechangwei@live.cn>
-Cc: piaojun <piaojun@huawei.com>
-Cc: "Gang He" <ghe@suse.com>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ocfs2/export.c | 30 +++++++++++++++++++++++++++++-
- 1 file changed, 29 insertions(+), 1 deletion(-)
-
-diff --git a/fs/ocfs2/export.c b/fs/ocfs2/export.c
-index 3494e220b510..bed15dec3c16 100644
---- a/fs/ocfs2/export.c
-+++ b/fs/ocfs2/export.c
-@@ -148,16 +148,24 @@ static struct dentry *ocfs2_get_parent(struct dentry *child)
- 	u64 blkno;
- 	struct dentry *parent;
- 	struct inode *dir = d_inode(child);
-+	int set;
- 
- 	trace_ocfs2_get_parent(child, child->d_name.len, child->d_name.name,
- 			       (unsigned long long)OCFS2_I(dir)->ip_blkno);
- 
-+	status = ocfs2_nfs_sync_lock(OCFS2_SB(dir->i_sb), 1);
-+	if (status < 0) {
-+		mlog(ML_ERROR, "getting nfs sync lock(EX) failed %d\n", status);
-+		parent = ERR_PTR(status);
-+		goto bail;
-+	}
-+
- 	status = ocfs2_inode_lock(dir, NULL, 0);
- 	if (status < 0) {
- 		if (status != -ENOENT)
- 			mlog_errno(status);
- 		parent = ERR_PTR(status);
--		goto bail;
-+		goto unlock_nfs_sync;
- 	}
- 
- 	status = ocfs2_lookup_ino_from_name(dir, "..", 2, &blkno);
-@@ -166,11 +174,31 @@ static struct dentry *ocfs2_get_parent(struct dentry *child)
- 		goto bail_unlock;
- 	}
- 
-+	status = ocfs2_test_inode_bit(OCFS2_SB(dir->i_sb), blkno, &set);
-+	if (status < 0) {
-+		if (status == -EINVAL) {
-+			status = -ESTALE;
-+		} else
-+			mlog(ML_ERROR, "test inode bit failed %d\n", status);
-+		parent = ERR_PTR(status);
-+		goto bail_unlock;
-+	}
-+
-+	trace_ocfs2_get_dentry_test_bit(status, set);
-+	if (!set) {
-+		status = -ESTALE;
-+		parent = ERR_PTR(status);
-+		goto bail_unlock;
-+	}
-+
- 	parent = d_obtain_alias(ocfs2_iget(OCFS2_SB(dir->i_sb), blkno, 0, 0));
- 
- bail_unlock:
- 	ocfs2_inode_unlock(dir, 0);
- 
-+unlock_nfs_sync:
-+	ocfs2_nfs_sync_unlock(OCFS2_SB(dir->i_sb), 1);
-+
- bail:
- 	trace_ocfs2_get_parent_end(parent);
- 
--- 
-2.28.0
-
-
-From 56c8a5d5ec6f28440cb3291978264ec08f8da2ff Mon Sep 17 00:00:00 2001
-From: Steve Twiss <stwiss.opensource@diasemi.com>
-Date: Fri, 26 Apr 2019 14:33:35 +0100
-Subject: [PATCH 24/45] mfd: da9063: Fix OTP control register names to match
- datasheets for DA9063/63L
-
-commit 6b4814a9451add06d457e198be418bf6a3e6a990 upstream.
-
-Mismatch between what is found in the Datasheets for DA9063 and DA9063L
-provided by Dialog Semiconductor, and the register names provided in the
-MFD registers file. The changes are for the OTP (one-time-programming)
-control registers. The two naming errors are OPT instead of OTP, and
-COUNT instead of CONT (i.e. control).
-
-Cc: Stable <stable@vger.kernel.org>
-Signed-off-by: Steve Twiss <stwiss.opensource@diasemi.com>
-Signed-off-by: Lee Jones <lee.jones@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/mfd/da9063/registers.h | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/include/linux/mfd/da9063/registers.h b/include/linux/mfd/da9063/registers.h
-index 5d42859cb441..844fc2973392 100644
---- a/include/linux/mfd/da9063/registers.h
-+++ b/include/linux/mfd/da9063/registers.h
-@@ -215,9 +215,9 @@
- 
- /* DA9063 Configuration registers */
- /* OTP */
--#define	DA9063_REG_OPT_COUNT		0x101
--#define	DA9063_REG_OPT_ADDR		0x102
--#define	DA9063_REG_OPT_DATA		0x103
-+#define	DA9063_REG_OTP_CONT		0x101
-+#define	DA9063_REG_OTP_ADDR		0x102
-+#define	DA9063_REG_OTP_DATA		0x103
- 
- /* Customer Trim and Configuration */
- #define	DA9063_REG_T_OFFSET		0x104
--- 
-2.28.0
-
-
-From db4a55c04efea7d7770fde40d8b86b330f79dc70 Mon Sep 17 00:00:00 2001
-From: Dmitry Osipenko <digetx@gmail.com>
-Date: Sun, 5 May 2019 18:43:22 +0300
-Subject: [PATCH 25/45] mfd: max77620: Fix swapped FPS_PERIOD_MAX_US values
-
-commit ea611d1cc180fbb56982c83cd5142a2b34881f5c upstream.
-
-The FPS_PERIOD_MAX_US definitions are swapped for MAX20024 and MAX77620,
-fix it.
-
-Cc: stable <stable@vger.kernel.org>
-Signed-off-by: Dmitry Osipenko <digetx@gmail.com>
-Signed-off-by: Lee Jones <lee.jones@linaro.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- include/linux/mfd/max77620.h | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/include/linux/mfd/max77620.h b/include/linux/mfd/max77620.h
-index 3ca0af07fc78..0a68dc8fc25f 100644
---- a/include/linux/mfd/max77620.h
-+++ b/include/linux/mfd/max77620.h
-@@ -136,8 +136,8 @@
- #define MAX77620_FPS_PERIOD_MIN_US		40
- #define MAX20024_FPS_PERIOD_MIN_US		20
- 
--#define MAX77620_FPS_PERIOD_MAX_US		2560
--#define MAX20024_FPS_PERIOD_MAX_US		5120
-+#define MAX20024_FPS_PERIOD_MAX_US		2560
-+#define MAX77620_FPS_PERIOD_MAX_US		5120
- 
- #define MAX77620_REG_FPS_GPIO1			0x54
- #define MAX77620_REG_FPS_GPIO2			0x55
--- 
-2.28.0
-
-
-From 948c9cec0457f27e7810a88493e6292178c331a8 Mon Sep 17 00:00:00 2001
-From: Sergei Trofimovich <slyfox@gentoo.org>
-Date: Sun, 10 Mar 2019 21:24:15 +0000
-Subject: [PATCH 26/45] tty/vt: fix write/write race in ioctl(KDSKBSENT)
- handler
-
-commit 46ca3f735f345c9d87383dd3a09fa5d43870770e upstream.
-
-The bug manifests as an attempt to access deallocated memory:
-
-    BUG: unable to handle kernel paging request at ffff9c8735448000
-    #PF error: [PROT] [WRITE]
-    PGD 288a05067 P4D 288a05067 PUD 288a07067 PMD 7f60c2063 PTE 80000007f5448161
-    Oops: 0003 [#1] PREEMPT SMP
-    CPU: 6 PID: 388 Comm: loadkeys Tainted: G         C        5.0.0-rc6-00153-g5ded5871030e #91
-    Hardware name: Gigabyte Technology Co., Ltd. To be filled by O.E.M./H77M-D3H, BIOS F12 11/14/2013
-    RIP: 0010:__memmove+0x81/0x1a0
-    Code: 4c 89 4f 10 4c 89 47 18 48 8d 7f 20 73 d4 48 83 c2 20 e9 a2 00 00 00 66 90 48 89 d1 4c 8b 5c 16 f8 4c 8d 54 17 f8 48 c1 e9 03 <f3> 48 a5 4d 89 1a e9 0c 01 00 00 0f 1f 40 00 48 89 d1 4c 8b 1e 49
-    RSP: 0018:ffffa1b9002d7d08 EFLAGS: 00010203
-    RAX: ffff9c873541af43 RBX: ffff9c873541af43 RCX: 00000c6f105cd6bf
-    RDX: 0000637882e986b6 RSI: ffff9c8735447ffb RDI: ffff9c8735447ffb
-    RBP: ffff9c8739cd3800 R08: ffff9c873b802f00 R09: 00000000fffff73b
-    R10: ffffffffb82b35f1 R11: 00505b1b004d5b1b R12: 0000000000000000
-    R13: ffff9c873541af3d R14: 000000000000000b R15: 000000000000000c
-    FS:  00007f450c390580(0000) GS:ffff9c873f180000(0000) knlGS:0000000000000000
-    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-    CR2: ffff9c8735448000 CR3: 00000007e213c002 CR4: 00000000000606e0
-    Call Trace:
-     vt_do_kdgkb_ioctl+0x34d/0x440
-     vt_ioctl+0xba3/0x1190
-     ? __bpf_prog_run32+0x39/0x60
-     ? mem_cgroup_commit_charge+0x7b/0x4e0
-     tty_ioctl+0x23f/0x920
-     ? preempt_count_sub+0x98/0xe0
-     ? __seccomp_filter+0x67/0x600
-     do_vfs_ioctl+0xa2/0x6a0
-     ? syscall_trace_enter+0x192/0x2d0
-     ksys_ioctl+0x3a/0x70
-     __x64_sys_ioctl+0x16/0x20
-     do_syscall_64+0x54/0xe0
-     entry_SYSCALL_64_after_hwframe+0x49/0xbe
-
-The bug manifests on systemd systems with multiple vtcon devices:
-  # cat /sys/devices/virtual/vtconsole/vtcon0/name
-  (S) dummy device
-  # cat /sys/devices/virtual/vtconsole/vtcon1/name
-  (M) frame buffer device
-
-There systemd runs 'loadkeys' tool in tapallel for each vtcon
-instance. This causes two parallel ioctl(KDSKBSENT) calls to
-race into adding the same entry into 'func_table' array at:
-
-    drivers/tty/vt/keyboard.c:vt_do_kdgkb_ioctl()
-
-The function has no locking around writes to 'func_table'.
-
-The simplest reproducer is to have initrams with the following
-init on a 8-CPU machine x86_64:
-
-    #!/bin/sh
-
-    loadkeys -q windowkeys ru4 &
-    loadkeys -q windowkeys ru4 &
-    loadkeys -q windowkeys ru4 &
-    loadkeys -q windowkeys ru4 &
-
-    loadkeys -q windowkeys ru4 &
-    loadkeys -q windowkeys ru4 &
-    loadkeys -q windowkeys ru4 &
-    loadkeys -q windowkeys ru4 &
-    wait
-
-The change adds lock on write path only. Reads are still racy.
-
-CC: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-CC: Jiri Slaby <jslaby@suse.com>
-Link: https://lkml.org/lkml/2019/2/17/256
-Signed-off-by: Sergei Trofimovich <slyfox@gentoo.org>
-Cc: stable <stable@vger.kernel.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/tty/vt/keyboard.c | 33 +++++++++++++++++++++++++++------
- 1 file changed, 27 insertions(+), 6 deletions(-)
-
-diff --git a/drivers/tty/vt/keyboard.c b/drivers/tty/vt/keyboard.c
-index ece10e6b731b..e8a917a23ed9 100644
---- a/drivers/tty/vt/keyboard.c
-+++ b/drivers/tty/vt/keyboard.c
-@@ -121,6 +121,7 @@ static const int NR_TYPES = ARRAY_SIZE(max_vals);
- static struct input_handler kbd_handler;
- static DEFINE_SPINLOCK(kbd_event_lock);
- static DEFINE_SPINLOCK(led_lock);
-+static DEFINE_SPINLOCK(func_buf_lock); /* guard 'func_buf'  and friends */
- static unsigned long key_down[BITS_TO_LONGS(KEY_CNT)];	/* keyboard key bitmap */
- static unsigned char shift_down[NR_SHIFT];		/* shift state counters.. */
- static bool dead_key_next;
-@@ -1959,11 +1960,12 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
- 	char *p;
- 	u_char *q;
- 	u_char __user *up;
--	int sz;
-+	int sz, fnw_sz;
- 	int delta;
- 	char *first_free, *fj, *fnw;
- 	int i, j, k;
- 	int ret;
-+	unsigned long flags;
- 
- 	if (!capable(CAP_SYS_TTY_CONFIG))
- 		perm = 0;
-@@ -2006,7 +2008,14 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
- 			goto reterr;
+diff --git a/tools/objtool/check.c b/tools/objtool/check.c
+index 3ff025b64527..ae3446768181 100644
+--- a/tools/objtool/check.c
++++ b/tools/objtool/check.c
+@@ -1779,7 +1779,8 @@ static int validate_branch(struct objtool_file *file, struct instruction *first,
+ 			return 1;
  		}
  
-+		fnw = NULL;
-+		fnw_sz = 0;
-+		/* race aginst other writers */
-+		again:
-+		spin_lock_irqsave(&func_buf_lock, flags);
- 		q = func_table[i];
-+
-+		/* fj pointer to next entry after 'q' */
- 		first_free = funcbufptr + (funcbufsize - funcbufleft);
- 		for (j = i+1; j < MAX_NR_FUNC && !func_table[j]; j++)
- 			;
-@@ -2014,10 +2023,12 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
- 			fj = func_table[j];
- 		else
- 			fj = first_free;
--
-+		/* buffer usage increase by new entry */
- 		delta = (q ? -strlen(q) : 1) + strlen(kbs->kb_string);
-+
- 		if (delta <= funcbufleft) { 	/* it fits in current buf */
- 		    if (j < MAX_NR_FUNC) {
-+			/* make enough space for new entry at 'fj' */
- 			memmove(fj + delta, fj, first_free - fj);
- 			for (k = j; k < MAX_NR_FUNC; k++)
- 			    if (func_table[k])
-@@ -2030,20 +2041,28 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
- 		    sz = 256;
- 		    while (sz < funcbufsize - funcbufleft + delta)
- 		      sz <<= 1;
--		    fnw = kmalloc(sz, GFP_KERNEL);
--		    if(!fnw) {
--		      ret = -ENOMEM;
--		      goto reterr;
-+		    if (fnw_sz != sz) {
-+		      spin_unlock_irqrestore(&func_buf_lock, flags);
-+		      kfree(fnw);
-+		      fnw = kmalloc(sz, GFP_KERNEL);
-+		      fnw_sz = sz;
-+		      if (!fnw) {
-+			ret = -ENOMEM;
-+			goto reterr;
-+		      }
-+		      goto again;
- 		    }
- 
- 		    if (!q)
- 		      func_table[i] = fj;
-+		    /* copy data before insertion point to new location */
- 		    if (fj > funcbufptr)
- 			memmove(fnw, funcbufptr, fj - funcbufptr);
- 		    for (k = 0; k < j; k++)
- 		      if (func_table[k])
- 			func_table[k] = fnw + (func_table[k] - funcbufptr);
- 
-+		    /* copy data after insertion point to new location */
- 		    if (first_free > fj) {
- 			memmove(fnw + (fj - funcbufptr) + delta, fj, first_free - fj);
- 			for (k = j; k < MAX_NR_FUNC; k++)
-@@ -2056,7 +2075,9 @@ int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb, int perm)
- 		    funcbufleft = funcbufleft - delta + sz - funcbufsize;
- 		    funcbufsize = sz;
- 		}
-+		/* finally insert item itself */
- 		strcpy(func_table[i], kbs->kb_string);
-+		spin_unlock_irqrestore(&func_buf_lock, flags);
- 		break;
- 	}
- 	ret = 0;
--- 
-2.28.0
-
-
-From bd8f3bc216023ea9e99e7971addcc90651eee251 Mon Sep 17 00:00:00 2001
-From: Jiufei Xue <jiufei.xue@linux.alibaba.com>
-Date: Sat, 6 Apr 2019 18:57:40 -0400
-Subject: [PATCH 27/45] jbd2: check superblock mapped prior to committing
-
-commit 742b06b5628f2cd23cb51a034cb54dc33c6162c5 upstream.
-
-We hit a BUG at fs/buffer.c:3057 if we detached the nbd device
-before unmounting ext4 filesystem.
-
-The typical chain of events leading to the BUG:
-jbd2_write_superblock
-  submit_bh
-    submit_bh_wbc
-      BUG_ON(!buffer_mapped(bh));
-
-The block device is removed and all the pages are invalidated. JBD2
-was trying to write journal superblock to the block device which is
-no longer present.
-
-Fix this by checking the journal superblock's buffer head prior to
-submitting.
-
-Reported-by: Eric Ren <renzhen@linux.alibaba.com>
-Signed-off-by: Jiufei Xue <jiufei.xue@linux.alibaba.com>
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Reviewed-by: Jan Kara <jack@suse.cz>
-Cc: stable@kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/jbd2/journal.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/fs/jbd2/journal.c b/fs/jbd2/journal.c
-index d10bb2c30bf8..3cbcf649ac66 100644
---- a/fs/jbd2/journal.c
-+++ b/fs/jbd2/journal.c
-@@ -1339,6 +1339,10 @@ static int jbd2_write_superblock(journal_t *journal, int write_flags)
- 	journal_superblock_t *sb = journal->j_superblock;
- 	int ret;
- 
-+	/* Buffer got discarded which means block device got invalidated */
-+	if (!buffer_mapped(bh))
-+		return -EIO;
-+
- 	trace_jbd2_write_superblock(journal, write_flags);
- 	if (!(journal->j_flags & JBD2_BARRIER))
- 		write_flags &= ~(REQ_FUA | REQ_PREFLUSH);
--- 
-2.28.0
-
-
-From 083b19c7dddef7504346c4ae233ce3ea43ebf60f Mon Sep 17 00:00:00 2001
-From: Kirill Tkhai <ktkhai@virtuozzo.com>
-Date: Thu, 25 Apr 2019 13:06:18 -0400
-Subject: [PATCH 28/45] ext4: actually request zeroing of inode table after
- grow
-
-commit 310a997fd74de778b9a4848a64be9cda9f18764a upstream.
-
-It is never possible, that number of block groups decreases,
-since only online grow is supported.
-
-But after a growing occured, we have to zero inode tables
-for just created new block groups.
-
-Fixes: 19c5246d2516 ("ext4: add new online resize interface")
-Signed-off-by: Kirill Tkhai <ktkhai@virtuozzo.com>
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Reviewed-by: Jan Kara <jack@suse.cz>
-Cc: stable@kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ext4/ioctl.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/fs/ext4/ioctl.c b/fs/ext4/ioctl.c
-index 2ce73287b53c..baa2f6375226 100644
---- a/fs/ext4/ioctl.c
-+++ b/fs/ext4/ioctl.c
-@@ -727,7 +727,7 @@ long ext4_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
- 		if (err == 0)
- 			err = err2;
- 		mnt_drop_write_file(filp);
--		if (!err && (o_group > EXT4_SB(sb)->s_groups_count) &&
-+		if (!err && (o_group < EXT4_SB(sb)->s_groups_count) &&
- 		    ext4_has_group_desc_csum(sb) &&
- 		    test_opt(sb, INIT_INODE_TABLE))
- 			err = ext4_register_li_request(sb, o_group);
--- 
-2.28.0
-
-
-From d5258b8a233350bc6cdfd2113d53cf0f1fb3cc1c Mon Sep 17 00:00:00 2001
-From: Debabrata Banerjee <dbanerje@akamai.com>
-Date: Tue, 30 Apr 2019 23:08:15 -0400
-Subject: [PATCH 29/45] ext4: fix ext4_show_options for file systems w/o
- journal
-
-commit 50b29d8f033a7c88c5bc011abc2068b1691ab755 upstream.
-
-Instead of removing EXT4_MOUNT_JOURNAL_CHECKSUM from s_def_mount_opt as
-I assume was intended, all other options were blown away leading to
-_ext4_show_options() output being incorrect.
-
-Fixes: 1e381f60dad9 ("ext4: do not allow journal_opts for fs w/o journal")
-Signed-off-by: Debabrata Banerjee <dbanerje@akamai.com>
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Reviewed-by: Jan Kara <jack@suse.cz>
-Cc: stable@kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ext4/super.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/fs/ext4/super.c b/fs/ext4/super.c
-index a6c7ace9cfd1..3261478bfc32 100644
---- a/fs/ext4/super.c
-+++ b/fs/ext4/super.c
-@@ -4034,7 +4034,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
- 				 "data=, fs mounted w/o journal");
- 			goto failed_mount_wq;
- 		}
--		sbi->s_def_mount_opt &= EXT4_MOUNT_JOURNAL_CHECKSUM;
-+		sbi->s_def_mount_opt &= ~EXT4_MOUNT_JOURNAL_CHECKSUM;
- 		clear_opt(sb, JOURNAL_CHECKSUM);
- 		clear_opt(sb, DATA_FLAGS);
- 		sbi->s_journal = NULL;
--- 
-2.28.0
-
-
-From c44e237ea9e883729cf5c28f457a06178eaf279a Mon Sep 17 00:00:00 2001
-From: Filipe Manana <fdmanana@suse.com>
-Date: Wed, 17 Apr 2019 11:30:30 +0100
-Subject: [PATCH 30/45] Btrfs: do not start a transaction at
- iterate_extent_inodes()
-
-commit bfc61c36260ca990937539cd648ede3cd749bc10 upstream.
-
-When finding out which inodes have references on a particular extent, done
-by backref.c:iterate_extent_inodes(), from the BTRFS_IOC_LOGICAL_INO (both
-v1 and v2) ioctl and from scrub we use the transaction join API to grab a
-reference on the currently running transaction, since in order to give
-accurate results we need to inspect the delayed references of the currently
-running transaction.
-
-However, if there is currently no running transaction, the join operation
-will create a new transaction. This is inefficient as the transaction will
-eventually be committed, doing unnecessary IO and introducing a potential
-point of failure that will lead to a transaction abort due to -ENOSPC, as
-recently reported [1].
-
-That's because the join, creates the transaction but does not reserve any
-space, so when attempting to update the root item of the root passed to
-btrfs_join_transaction(), during the transaction commit, we can end up
-failling with -ENOSPC. Users of a join operation are supposed to actually
-do some filesystem changes and reserve space by some means, which is not
-the case of iterate_extent_inodes(), it is a read-only operation for all
-contextes from which it is called.
-
-The reported [1] -ENOSPC failure stack trace is the following:
-
- heisenberg kernel: ------------[ cut here ]------------
- heisenberg kernel: BTRFS: Transaction aborted (error -28)
- heisenberg kernel: WARNING: CPU: 0 PID: 7137 at fs/btrfs/root-tree.c:136 btrfs_update_root+0x22b/0x320 [btrfs]
-(...)
- heisenberg kernel: CPU: 0 PID: 7137 Comm: btrfs-transacti Not tainted 4.19.0-4-amd64 #1 Debian 4.19.28-2
- heisenberg kernel: Hardware name: FUJITSU LIFEBOOK U757/FJNB2A5, BIOS Version 1.21 03/19/2018
- heisenberg kernel: RIP: 0010:btrfs_update_root+0x22b/0x320 [btrfs]
-(...)
- heisenberg kernel: RSP: 0018:ffffb5448828bd40 EFLAGS: 00010286
- heisenberg kernel: RAX: 0000000000000000 RBX: ffff8ed56bccef50 RCX: 0000000000000006
- heisenberg kernel: RDX: 0000000000000007 RSI: 0000000000000092 RDI: ffff8ed6bda166a0
- heisenberg kernel: RBP: 00000000ffffffe4 R08: 00000000000003df R09: 0000000000000007
- heisenberg kernel: R10: 0000000000000000 R11: 0000000000000001 R12: ffff8ed63396a078
- heisenberg kernel: R13: ffff8ed092d7c800 R14: ffff8ed64f5db028 R15: ffff8ed6bd03d068
- heisenberg kernel: FS:  0000000000000000(0000) GS:ffff8ed6bda00000(0000) knlGS:0000000000000000
- heisenberg kernel: CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
- heisenberg kernel: CR2: 00007f46f75f8000 CR3: 0000000310a0a002 CR4: 00000000003606f0
- heisenberg kernel: DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
- heisenberg kernel: DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
- heisenberg kernel: Call Trace:
- heisenberg kernel:  commit_fs_roots+0x166/0x1d0 [btrfs]
- heisenberg kernel:  ? _cond_resched+0x15/0x30
- heisenberg kernel:  ? btrfs_run_delayed_refs+0xac/0x180 [btrfs]
- heisenberg kernel:  btrfs_commit_transaction+0x2bd/0x870 [btrfs]
- heisenberg kernel:  ? start_transaction+0x9d/0x3f0 [btrfs]
- heisenberg kernel:  transaction_kthread+0x147/0x180 [btrfs]
- heisenberg kernel:  ? btrfs_cleanup_transaction+0x530/0x530 [btrfs]
- heisenberg kernel:  kthread+0x112/0x130
- heisenberg kernel:  ? kthread_bind+0x30/0x30
- heisenberg kernel:  ret_from_fork+0x35/0x40
- heisenberg kernel: ---[ end trace 05de912e30e012d9 ]---
-
-So fix that by using the attach API, which does not create a transaction
-when there is currently no running transaction.
-
-[1] https://lore.kernel.org/linux-btrfs/b2a668d7124f1d3e410367f587926f622b3f03a4.camel@scientia.net/
-
-Reported-by: Zygo Blaxell <ce3g8jdj@umail.furryterror.org>
-CC: stable@vger.kernel.org # 4.4+
-Signed-off-by: Filipe Manana <fdmanana@suse.com>
-Reviewed-by: David Sterba <dsterba@suse.com>
-Signed-off-by: David Sterba <dsterba@suse.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/btrfs/backref.c | 18 ++++++++++++------
- 1 file changed, 12 insertions(+), 6 deletions(-)
-
-diff --git a/fs/btrfs/backref.c b/fs/btrfs/backref.c
-index 85dc7ab8f89e..2973d256bb44 100644
---- a/fs/btrfs/backref.c
-+++ b/fs/btrfs/backref.c
-@@ -2018,13 +2018,19 @@ int iterate_extent_inodes(struct btrfs_fs_info *fs_info,
- 			extent_item_objectid);
- 
- 	if (!search_commit_root) {
--		trans = btrfs_join_transaction(fs_info->extent_root);
--		if (IS_ERR(trans))
--			return PTR_ERR(trans);
-+		trans = btrfs_attach_transaction(fs_info->extent_root);
-+		if (IS_ERR(trans)) {
-+			if (PTR_ERR(trans) != -ENOENT &&
-+			    PTR_ERR(trans) != -EROFS)
-+				return PTR_ERR(trans);
-+			trans = NULL;
-+		}
-+	}
-+
-+	if (trans)
- 		btrfs_get_tree_mod_seq(fs_info, &tree_mod_seq_elem);
--	} else {
-+	else
- 		down_read(&fs_info->commit_root_sem);
--	}
- 
- 	ret = btrfs_find_all_leafs(trans, fs_info, extent_item_objectid,
- 				   tree_mod_seq_elem.seq, &refs,
-@@ -2056,7 +2062,7 @@ int iterate_extent_inodes(struct btrfs_fs_info *fs_info,
- 
- 	free_leaf_list(refs);
- out:
--	if (!search_commit_root) {
-+	if (trans) {
- 		btrfs_put_tree_mod_seq(fs_info, &tree_mod_seq_elem);
- 		btrfs_end_transaction(trans, fs_info->extent_root);
- 	} else {
--- 
-2.28.0
-
-
-From 3946cbbed014e994d9a91c2e586dbc23b762a35f Mon Sep 17 00:00:00 2001
-From: Liang Chen <liangchen.linux@gmail.com>
-Date: Thu, 25 Apr 2019 00:48:31 +0800
-Subject: [PATCH 31/45] bcache: fix a race between cache register and cacheset
- unregister
-
-commit a4b732a248d12cbdb46999daf0bf288c011335eb upstream.
-
-There is a race between cache device register and cache set unregister.
-For an already registered cache device, register_bcache will call
-bch_is_open to iterate through all cachesets and check every cache
-there. The race occurs if cache_set_free executes at the same time and
-clears the caches right before ca is dereferenced in bch_is_open_cache.
-To close the race, let's make sure the clean up work is protected by
-the bch_register_lock as well.
-
-This issue can be reproduced as follows,
-while true; do echo /dev/XXX> /sys/fs/bcache/register ; done&
-while true; do echo 1> /sys/block/XXX/bcache/set/unregister ; done &
-
-and results in the following oops,
-
-[  +0.000053] BUG: unable to handle kernel NULL pointer dereference at 0000000000000998
-[  +0.000457] #PF error: [normal kernel read fault]
-[  +0.000464] PGD 800000003ca9d067 P4D 800000003ca9d067 PUD 3ca9c067 PMD 0
-[  +0.000388] Oops: 0000 [#1] SMP PTI
-[  +0.000269] CPU: 1 PID: 3266 Comm: bash Not tainted 5.0.0+ #6
-[  +0.000346] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.11.0-2.fc28 04/01/2014
-[  +0.000472] RIP: 0010:register_bcache+0x1829/0x1990 [bcache]
-[  +0.000344] Code: b0 48 83 e8 50 48 81 fa e0 e1 10 c0 0f 84 a9 00 00 00 48 89 c6 48 89 ca 0f b7 ba 54 04 00 00 4c 8b 82 60 0c 00 00 85 ff 74 2f <49> 3b a8 98 09 00 00 74 4e 44 8d 47 ff 31 ff 49 c1 e0 03 eb 0d
-[  +0.000839] RSP: 0018:ffff92ee804cbd88 EFLAGS: 00010202
-[  +0.000328] RAX: ffffffffc010e190 RBX: ffff918b5c6b5000 RCX: ffff918b7d8e0000
-[  +0.000399] RDX: ffff918b7d8e0000 RSI: ffffffffc010e190 RDI: 0000000000000001
-[  +0.000398] RBP: ffff918b7d318340 R08: 0000000000000000 R09: ffffffffb9bd2d7a
-[  +0.000385] R10: ffff918b7eb253c0 R11: ffffb95980f51200 R12: ffffffffc010e1a0
-[  +0.000411] R13: fffffffffffffff2 R14: 000000000000000b R15: ffff918b7e232620
-[  +0.000384] FS:  00007f955bec2740(0000) GS:ffff918b7eb00000(0000) knlGS:0000000000000000
-[  +0.000420] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-[  +0.000801] CR2: 0000000000000998 CR3: 000000003cad6000 CR4: 00000000001406e0
-[  +0.000837] Call Trace:
-[  +0.000682]  ? _cond_resched+0x10/0x20
-[  +0.000691]  ? __kmalloc+0x131/0x1b0
-[  +0.000710]  kernfs_fop_write+0xfa/0x170
-[  +0.000733]  __vfs_write+0x2e/0x190
-[  +0.000688]  ? inode_security+0x10/0x30
-[  +0.000698]  ? selinux_file_permission+0xd2/0x120
-[  +0.000752]  ? security_file_permission+0x2b/0x100
-[  +0.000753]  vfs_write+0xa8/0x1a0
-[  +0.000676]  ksys_write+0x4d/0xb0
-[  +0.000699]  do_syscall_64+0x3a/0xf0
-[  +0.000692]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
-
-Signed-off-by: Liang Chen <liangchen.linux@gmail.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Coly Li <colyli@suse.de>
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/md/bcache/super.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/md/bcache/super.c b/drivers/md/bcache/super.c
-index 894992ae9be0..362efc8dd16f 100644
---- a/drivers/md/bcache/super.c
-+++ b/drivers/md/bcache/super.c
-@@ -1357,6 +1357,7 @@ static void cache_set_free(struct closure *cl)
- 	bch_btree_cache_free(c);
- 	bch_journal_free(c);
- 
-+	mutex_lock(&bch_register_lock);
- 	for_each_cache(ca, c, i)
- 		if (ca) {
- 			ca->set = NULL;
-@@ -1379,7 +1380,6 @@ static void cache_set_free(struct closure *cl)
- 		mempool_destroy(c->search);
- 	kfree(c->devices);
- 
--	mutex_lock(&bch_register_lock);
- 	list_del(&c->list);
- 	mutex_unlock(&bch_register_lock);
- 
--- 
-2.28.0
-
-
-From 7366d0cd181ab6093f5758dc724bc9eeecca7d88 Mon Sep 17 00:00:00 2001
-From: Coly Li <colyli@suse.de>
-Date: Thu, 25 Apr 2019 00:48:33 +0800
-Subject: [PATCH 32/45] bcache: never set KEY_PTRS of journal key to 0 in
- journal_reclaim()
-
-commit 1bee2addc0c8470c8aaa65ef0599eeae96dd88bc upstream.
-
-In journal_reclaim() ja->cur_idx of each cache will be update to
-reclaim available journal buckets. Variable 'int n' is used to count how
-many cache is successfully reclaimed, then n is set to c->journal.key
-by SET_KEY_PTRS(). Later in journal_write_unlocked(), a for_each_cache()
-loop will write the jset data onto each cache.
-
-The problem is, if all jouranl buckets on each cache is full, the
-following code in journal_reclaim(),
-
-529 for_each_cache(ca, c, iter) {
-530       struct journal_device *ja = &ca->journal;
-531       unsigned int next = (ja->cur_idx + 1) % ca->sb.njournal_buckets;
-532
-533       /* No space available on this device */
-534       if (next == ja->discard_idx)
-535               continue;
-536
-537       ja->cur_idx = next;
-538       k->ptr[n++] = MAKE_PTR(0,
-539                         bucket_to_sector(c, ca->sb.d[ja->cur_idx]),
-540                         ca->sb.nr_this_dev);
-541 }
-542
-543 bkey_init(k);
-544 SET_KEY_PTRS(k, n);
-
-If there is no available bucket to reclaim, the if() condition at line
-534 will always true, and n remains 0. Then at line 544, SET_KEY_PTRS()
-will set KEY_PTRS field of c->journal.key to 0.
-
-Setting KEY_PTRS field of c->journal.key to 0 is wrong. Because in
-journal_write_unlocked() the journal data is written in following loop,
-
-649	for (i = 0; i < KEY_PTRS(k); i++) {
-650-671		submit journal data to cache device
-672	}
-
-If KEY_PTRS field is set to 0 in jouranl_reclaim(), the journal data
-won't be written to cache device here. If system crahed or rebooted
-before bkeys of the lost journal entries written into btree nodes, data
-corruption will be reported during bcache reload after rebooting the
-system.
-
-Indeed there is only one cache in a cache set, there is no need to set
-KEY_PTRS field in journal_reclaim() at all. But in order to keep the
-for_each_cache() logic consistent for now, this patch fixes the above
-problem by not setting 0 KEY_PTRS of journal key, if there is no bucket
-available to reclaim.
-
-Signed-off-by: Coly Li <colyli@suse.de>
-Reviewed-by: Hannes Reinecke <hare@suse.com>
-Cc: stable@vger.kernel.org
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/md/bcache/journal.c | 11 +++++++----
- 1 file changed, 7 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/md/bcache/journal.c b/drivers/md/bcache/journal.c
-index 08f20b7cd199..c76a0176b5c6 100644
---- a/drivers/md/bcache/journal.c
-+++ b/drivers/md/bcache/journal.c
-@@ -513,11 +513,11 @@ static void journal_reclaim(struct cache_set *c)
- 				  ca->sb.nr_this_dev);
- 	}
- 
--	bkey_init(k);
--	SET_KEY_PTRS(k, n);
--
--	if (n)
-+	if (n) {
-+		bkey_init(k);
-+		SET_KEY_PTRS(k, n);
- 		c->journal.blocks_free = c->sb.bucket_size >> c->block_bits;
-+	}
- out:
- 	if (!journal_full(&c->journal))
- 		__closure_wake_up(&c->journal.wait);
-@@ -642,6 +642,9 @@ static void journal_write_unlocked(struct closure *cl)
- 		ca->journal.seq[ca->journal.cur_idx] = w->data->seq;
- 	}
- 
-+	/* If KEY_PTRS(k) == 0, this jset gets lost in air */
-+	BUG_ON(i == 0);
-+
- 	atomic_dec_bug(&fifo_back(&c->journal.pin));
- 	bch_journal_next(&c->journal);
- 	journal_reclaim(c);
--- 
-2.28.0
-
-
-From a2a2a146ec882912dae3e0e3864c60105220532d Mon Sep 17 00:00:00 2001
-From: Kamlakant Patel <kamlakantp@marvell.com>
-Date: Wed, 24 Apr 2019 11:50:43 +0000
-Subject: [PATCH 33/45] ipmi:ssif: compare block number correctly for
- multi-part return messages
-
-commit 55be8658c7e2feb11a5b5b33ee031791dbd23a69 upstream.
-
-According to ipmi spec, block number is a number that is incremented,
-starting with 0, for each new block of message data returned using the
-middle transaction.
-
-Here, the 'blocknum' is data[0] which always starts from zero(0) and
-'ssif_info->multi_pos' starts from 1.
-So, we need to add +1 to blocknum while comparing with multi_pos.
-
-Fixes: 7d6380cd40f79 ("ipmi:ssif: Fix handling of multi-part return messages").
-Reported-by: Kiran Kolukuluru <kirank@ami.com>
-Signed-off-by: Kamlakant Patel <kamlakantp@marvell.com>
-Message-Id: <1556106615-18722-1-git-send-email-kamlakantp@marvell.com>
-[Also added a debug log if the block numbers don't match.]
-Signed-off-by: Corey Minyard <cminyard@mvista.com>
-Cc: stable@vger.kernel.org # 4.4
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/char/ipmi/ipmi_ssif.c | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/char/ipmi/ipmi_ssif.c b/drivers/char/ipmi/ipmi_ssif.c
-index dac36ef450ba..996b9ae15404 100644
---- a/drivers/char/ipmi/ipmi_ssif.c
-+++ b/drivers/char/ipmi/ipmi_ssif.c
-@@ -699,12 +699,16 @@ static void msg_done_handler(struct ssif_info *ssif_info, int result,
- 			/* End of read */
- 			len = ssif_info->multi_len;
- 			data = ssif_info->data;
--		} else if (blocknum != ssif_info->multi_pos) {
-+		} else if (blocknum + 1 != ssif_info->multi_pos) {
- 			/*
- 			 * Out of sequence block, just abort.  Block
- 			 * numbers start at zero for the second block,
- 			 * but multi_pos starts at one, so the +1.
- 			 */
-+			if (ssif_info->ssif_debug & SSIF_DEBUG_MSG)
-+				dev_dbg(&ssif_info->client->dev,
-+					"Received message out of sequence, expected %u, got %u\n",
-+					ssif_info->multi_pos - 1, blocknum);
- 			result = -EIO;
- 		} else {
- 			ssif_inc_stat(ssif_info, received_message_parts);
--- 
-2.28.0
-
-
-From 2f95ee0b226814cf7ed0fc1b9895f88f617e2097 Mon Sep 17 00:00:00 2001
-From: Wei Yongjun <weiyongjun1@huawei.com>
-Date: Mon, 17 Oct 2016 15:10:06 +0000
-Subject: [PATCH 34/45] crypto: gcm - Fix error return code in
- crypto_gcm_create_common()
-
-commit 9b40f79c08e81234d759f188b233980d7e81df6c upstream.
-
-Fix to return error code -EINVAL from the invalid alg ivsize error
-handling case instead of 0, as done elsewhere in this function.
-
-Signed-off-by: Wei Yongjun <weiyongjun1@huawei.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/gcm.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/crypto/gcm.c b/crypto/gcm.c
-index dd33fbd2d868..122f5e95a04b 100644
---- a/crypto/gcm.c
-+++ b/crypto/gcm.c
-@@ -670,11 +670,11 @@ static int crypto_gcm_create_common(struct crypto_template *tmpl,
- 	ctr = crypto_spawn_skcipher_alg(&ctx->ctr);
- 
- 	/* We only support 16-byte blocks. */
-+	err = -EINVAL;
- 	if (crypto_skcipher_alg_ivsize(ctr) != 16)
- 		goto out_put_ctr;
- 
- 	/* Not a stream cipher? */
--	err = -EINVAL;
- 	if (ctr->base.cra_blocksize != 1)
- 		goto out_put_ctr;
- 
--- 
-2.28.0
-
-
-From 62d629a5a9577546ce74db68de69863f04b99f3a Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Thu, 18 Apr 2019 14:43:02 -0700
-Subject: [PATCH 35/45] crypto: gcm - fix incompatibility between "gcm" and
- "gcm_base"
-
-commit f699594d436960160f6d5ba84ed4a222f20d11cd upstream.
-
-GCM instances can be created by either the "gcm" template, which only
-allows choosing the block cipher, e.g. "gcm(aes)"; or by "gcm_base",
-which allows choosing the ctr and ghash implementations, e.g.
-"gcm_base(ctr(aes-generic),ghash-generic)".
-
-However, a "gcm_base" instance prevents a "gcm" instance from being
-registered using the same implementations.  Nor will the instance be
-found by lookups of "gcm".  This can be used as a denial of service.
-Moreover, "gcm_base" instances are never tested by the crypto
-self-tests, even if there are compatible "gcm" tests.
-
-The root cause of these problems is that instances of the two templates
-use different cra_names.  Therefore, fix these problems by making
-"gcm_base" instances set the same cra_name as "gcm" instances, e.g.
-"gcm(aes)" instead of "gcm_base(ctr(aes-generic),ghash-generic)".
-
-This requires extracting the block cipher name from the name of the ctr
-algorithm.  It also requires starting to verify that the algorithms are
-really ctr and ghash, not something else entirely.  But it would be
-bizarre if anyone were actually using non-gcm-compatible algorithms with
-gcm_base, so this shouldn't break anyone in practice.
-
-Fixes: d00aa19b507b ("[CRYPTO] gcm: Allow block cipher parameter")
-Cc: stable@vger.kernel.org
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/gcm.c | 34 +++++++++++-----------------------
- 1 file changed, 11 insertions(+), 23 deletions(-)
-
-diff --git a/crypto/gcm.c b/crypto/gcm.c
-index 122f5e95a04b..398f048c452a 100644
---- a/crypto/gcm.c
-+++ b/crypto/gcm.c
-@@ -616,7 +616,6 @@ static void crypto_gcm_free(struct aead_instance *inst)
- 
- static int crypto_gcm_create_common(struct crypto_template *tmpl,
- 				    struct rtattr **tb,
--				    const char *full_name,
- 				    const char *ctr_name,
- 				    const char *ghash_name)
- {
-@@ -657,7 +656,8 @@ static int crypto_gcm_create_common(struct crypto_template *tmpl,
- 		goto err_free_inst;
- 
- 	err = -EINVAL;
--	if (ghash->digestsize != 16)
-+	if (strcmp(ghash->base.cra_name, "ghash") != 0 ||
-+	    ghash->digestsize != 16)
- 		goto err_drop_ghash;
- 
- 	crypto_set_skcipher_spawn(&ctx->ctr, aead_crypto_instance(inst));
-@@ -669,24 +669,24 @@ static int crypto_gcm_create_common(struct crypto_template *tmpl,
- 
- 	ctr = crypto_spawn_skcipher_alg(&ctx->ctr);
- 
--	/* We only support 16-byte blocks. */
-+	/* The skcipher algorithm must be CTR mode, using 16-byte blocks. */
- 	err = -EINVAL;
--	if (crypto_skcipher_alg_ivsize(ctr) != 16)
-+	if (strncmp(ctr->base.cra_name, "ctr(", 4) != 0 ||
-+	    crypto_skcipher_alg_ivsize(ctr) != 16 ||
-+	    ctr->base.cra_blocksize != 1)
- 		goto out_put_ctr;
- 
--	/* Not a stream cipher? */
--	if (ctr->base.cra_blocksize != 1)
-+	err = -ENAMETOOLONG;
-+	if (snprintf(inst->alg.base.cra_name, CRYPTO_MAX_ALG_NAME,
-+		     "gcm(%s", ctr->base.cra_name + 4) >= CRYPTO_MAX_ALG_NAME)
- 		goto out_put_ctr;
- 
--	err = -ENAMETOOLONG;
- 	if (snprintf(inst->alg.base.cra_driver_name, CRYPTO_MAX_ALG_NAME,
- 		     "gcm_base(%s,%s)", ctr->base.cra_driver_name,
- 		     ghash_alg->cra_driver_name) >=
- 	    CRYPTO_MAX_ALG_NAME)
- 		goto out_put_ctr;
- 
--	memcpy(inst->alg.base.cra_name, full_name, CRYPTO_MAX_ALG_NAME);
--
- 	inst->alg.base.cra_flags = (ghash->base.cra_flags |
- 				    ctr->base.cra_flags) & CRYPTO_ALG_ASYNC;
- 	inst->alg.base.cra_priority = (ghash->base.cra_priority +
-@@ -728,7 +728,6 @@ static int crypto_gcm_create(struct crypto_template *tmpl, struct rtattr **tb)
- {
- 	const char *cipher_name;
- 	char ctr_name[CRYPTO_MAX_ALG_NAME];
--	char full_name[CRYPTO_MAX_ALG_NAME];
- 
- 	cipher_name = crypto_attr_alg_name(tb[1]);
- 	if (IS_ERR(cipher_name))
-@@ -738,12 +737,7 @@ static int crypto_gcm_create(struct crypto_template *tmpl, struct rtattr **tb)
- 	    CRYPTO_MAX_ALG_NAME)
- 		return -ENAMETOOLONG;
- 
--	if (snprintf(full_name, CRYPTO_MAX_ALG_NAME, "gcm(%s)", cipher_name) >=
--	    CRYPTO_MAX_ALG_NAME)
--		return -ENAMETOOLONG;
--
--	return crypto_gcm_create_common(tmpl, tb, full_name,
--					ctr_name, "ghash");
-+	return crypto_gcm_create_common(tmpl, tb, ctr_name, "ghash");
- }
- 
- static struct crypto_template crypto_gcm_tmpl = {
-@@ -757,7 +751,6 @@ static int crypto_gcm_base_create(struct crypto_template *tmpl,
- {
- 	const char *ctr_name;
- 	const char *ghash_name;
--	char full_name[CRYPTO_MAX_ALG_NAME];
- 
- 	ctr_name = crypto_attr_alg_name(tb[1]);
- 	if (IS_ERR(ctr_name))
-@@ -767,12 +760,7 @@ static int crypto_gcm_base_create(struct crypto_template *tmpl,
- 	if (IS_ERR(ghash_name))
- 		return PTR_ERR(ghash_name);
- 
--	if (snprintf(full_name, CRYPTO_MAX_ALG_NAME, "gcm_base(%s,%s)",
--		     ctr_name, ghash_name) >= CRYPTO_MAX_ALG_NAME)
--		return -ENAMETOOLONG;
--
--	return crypto_gcm_create_common(tmpl, tb, full_name,
--					ctr_name, ghash_name);
-+	return crypto_gcm_create_common(tmpl, tb, ctr_name, ghash_name);
- }
- 
- static struct crypto_template crypto_gcm_base_tmpl = {
--- 
-2.28.0
-
-
-From 91078439cc1c5c2f061cf7bac465ccf203933e84 Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Tue, 9 Apr 2019 23:46:30 -0700
-Subject: [PATCH 36/45] crypto: salsa20 - don't access already-freed walk.iv
-
-commit edaf28e996af69222b2cb40455dbb5459c2b875a upstream.
-
-If the user-provided IV needs to be aligned to the algorithm's
-alignmask, then skcipher_walk_virt() copies the IV into a new aligned
-buffer walk.iv.  But skcipher_walk_virt() can fail afterwards, and then
-if the caller unconditionally accesses walk.iv, it's a use-after-free.
-
-salsa20-generic doesn't set an alignmask, so currently it isn't affected
-by this despite unconditionally accessing walk.iv.  However this is more
-subtle than desired, and it was actually broken prior to the alignmask
-being removed by commit b62b3db76f73 ("crypto: salsa20-generic - cleanup
-and convert to skcipher API").
-
-Since salsa20-generic does not update the IV and does not need any IV
-alignment, update it to use req->iv instead of walk.iv.
-
-Fixes: 2407d60872dd ("[CRYPTO] salsa20: Salsa20 stream cipher")
-Cc: stable@vger.kernel.org
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- crypto/salsa20_generic.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/crypto/salsa20_generic.c b/crypto/salsa20_generic.c
-index d7da0eea5622..319d9962552e 100644
---- a/crypto/salsa20_generic.c
-+++ b/crypto/salsa20_generic.c
-@@ -186,7 +186,7 @@ static int encrypt(struct blkcipher_desc *desc,
- 	blkcipher_walk_init(&walk, dst, src, nbytes);
- 	err = blkcipher_walk_virt_block(desc, &walk, 64);
- 
--	salsa20_ivsetup(ctx, walk.iv);
-+	salsa20_ivsetup(ctx, desc->info);
- 
- 	while (walk.nbytes >= 64) {
- 		salsa20_encrypt_bytes(ctx, walk.dst.virt.addr,
--- 
-2.28.0
-
-
-From 7f9290f72168ad4179bfbf03b9e26d9c75bfc446 Mon Sep 17 00:00:00 2001
-From: Eric Biggers <ebiggers@google.com>
-Date: Tue, 9 Apr 2019 23:46:31 -0700
-Subject: [PATCH 37/45] crypto: arm/aes-neonbs - don't access already-freed
- walk.iv
-
-commit 767f015ea0b7ab9d60432ff6cd06b664fd71f50f upstream.
-
-If the user-provided IV needs to be aligned to the algorithm's
-alignmask, then skcipher_walk_virt() copies the IV into a new aligned
-buffer walk.iv.  But skcipher_walk_virt() can fail afterwards, and then
-if the caller unconditionally accesses walk.iv, it's a use-after-free.
-
-arm32 xts-aes-neonbs doesn't set an alignmask, so currently it isn't
-affected by this despite unconditionally accessing walk.iv.  However
-this is more subtle than desired, and it was actually broken prior to
-the alignmask being removed by commit cc477bf64573 ("crypto: arm/aes -
-replace bit-sliced OpenSSL NEON code").  Thus, update xts-aes-neonbs to
-start checking the return value of skcipher_walk_virt().
-
-Fixes: e4e7f10bfc40 ("ARM: add support for bit sliced AES using NEON instructions")
-Cc: <stable@vger.kernel.org> # v3.13+
-Signed-off-by: Eric Biggers <ebiggers@google.com>
-Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/crypto/aesbs-glue.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/arch/arm/crypto/aesbs-glue.c b/arch/arm/crypto/aesbs-glue.c
-index 5d934a0039d7..cb2486a526e6 100644
---- a/arch/arm/crypto/aesbs-glue.c
-+++ b/arch/arm/crypto/aesbs-glue.c
-@@ -265,6 +265,8 @@ static int aesbs_xts_encrypt(struct blkcipher_desc *desc,
- 
- 	blkcipher_walk_init(&walk, dst, src, nbytes);
- 	err = blkcipher_walk_virt_block(desc, &walk, 8 * AES_BLOCK_SIZE);
-+	if (err)
-+		return err;
- 
- 	/* generate the initial tweak */
- 	AES_encrypt(walk.iv, walk.iv, &ctx->twkey);
-@@ -289,6 +291,8 @@ static int aesbs_xts_decrypt(struct blkcipher_desc *desc,
- 
- 	blkcipher_walk_init(&walk, dst, src, nbytes);
- 	err = blkcipher_walk_virt_block(desc, &walk, 8 * AES_BLOCK_SIZE);
-+	if (err)
-+		return err;
- 
- 	/* generate the initial tweak */
- 	AES_encrypt(walk.iv, walk.iv, &ctx->twkey);
--- 
-2.28.0
-
-
-From d5c71a7c533e88a9fcc74fe1b5c25743868fa300 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Mon, 20 May 2019 11:07:29 +0200
-Subject: [PATCH 38/45] fib_rules: fix error in backport of e9919a24d302
- ("fib_rules: return 0...")
-
-When commit e9919a24d302 ("fib_rules: return 0 directly if an exactly
-same rule exists when NLM_F_EXCL not supplied") was backported to 4.9.y,
-it changed the logic a bit as err should have been reset before exiting
-the test, like it happens in the original logic.
-
-If this is not set, errors happen :(
-
-Reported-by: Nathan Chancellor <natechancellor@gmail.com>
-Reported-by: David Ahern <dsahern@gmail.com>
-Reported-by: Florian Westphal <fw@strlen.de>
-Cc: Hangbin Liu <liuhangbin@gmail.com>
-Cc: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/core/fib_rules.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/net/core/fib_rules.c b/net/core/fib_rules.c
-index bb26457e8c21..c03dd2104d33 100644
---- a/net/core/fib_rules.c
-+++ b/net/core/fib_rules.c
-@@ -430,6 +430,7 @@ int fib_nl_newrule(struct sk_buff *skb, struct nlmsghdr *nlh)
- 		goto errout_free;
- 
- 	if (rule_exists(ops, frh, tb, rule)) {
-+		err = 0;
- 		if (nlh->nlmsg_flags & NLM_F_EXCL)
- 			err = -EEXIST;
- 		goto errout_free;
--- 
-2.28.0
-
-
-From 1cfaba5b49a5e9133b28da6d1a459240c1f61993 Mon Sep 17 00:00:00 2001
-From: Tejun Heo <tj@kernel.org>
-Date: Tue, 12 Dec 2017 08:38:30 -0800
-Subject: [PATCH 39/45] writeback: synchronize sync(2) against cgroup writeback
- membership switches
-
-commit 7fc5854f8c6efae9e7624970ab49a1eac2faefb1 upstream.
-
-sync_inodes_sb() can race against cgwb (cgroup writeback) membership
-switches and fail to writeback some inodes.  For example, if an inode
-switches to another wb while sync_inodes_sb() is in progress, the new
-wb might not be visible to bdi_split_work_to_wbs() at all or the inode
-might jump from a wb which hasn't issued writebacks yet to one which
-already has.
-
-This patch adds backing_dev_info->wb_switch_rwsem to synchronize cgwb
-switch path against sync_inodes_sb() so that sync_inodes_sb() is
-guaranteed to see all the target wbs and inodes can't jump wbs to
-escape syncing.
-
-v2: Fixed misplaced rwsem init.  Spotted by Jiufei.
-
-Signed-off-by: Tejun Heo <tj@kernel.org>
-Reported-by: Jiufei Xue <xuejiufei@gmail.com>
-Link: http://lkml.kernel.org/r/dc694ae2-f07f-61e1-7097-7c8411cee12d@gmail.com
-Acked-by: Jan Kara <jack@suse.cz>
-Signed-off-by: Jens Axboe <axboe@kernel.dk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/fs-writeback.c                | 40 ++++++++++++++++++++++++++++++--
- include/linux/backing-dev-defs.h |  1 +
- mm/backing-dev.c                 |  1 +
- 3 files changed, 40 insertions(+), 2 deletions(-)
-
-diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
-index f3aea1b8702c..55bff21c71ae 100644
---- a/fs/fs-writeback.c
-+++ b/fs/fs-writeback.c
-@@ -331,11 +331,22 @@ struct inode_switch_wbs_context {
- 	struct work_struct	work;
- };
- 
-+static void bdi_down_write_wb_switch_rwsem(struct backing_dev_info *bdi)
-+{
-+	down_write(&bdi->wb_switch_rwsem);
-+}
-+
-+static void bdi_up_write_wb_switch_rwsem(struct backing_dev_info *bdi)
-+{
-+	up_write(&bdi->wb_switch_rwsem);
-+}
-+
- static void inode_switch_wbs_work_fn(struct work_struct *work)
- {
- 	struct inode_switch_wbs_context *isw =
- 		container_of(work, struct inode_switch_wbs_context, work);
- 	struct inode *inode = isw->inode;
-+	struct backing_dev_info *bdi = inode_to_bdi(inode);
- 	struct address_space *mapping = inode->i_mapping;
- 	struct bdi_writeback *old_wb = inode->i_wb;
- 	struct bdi_writeback *new_wb = isw->new_wb;
-@@ -343,6 +354,12 @@ static void inode_switch_wbs_work_fn(struct work_struct *work)
- 	bool switched = false;
- 	void **slot;
- 
-+	/*
-+	 * If @inode switches cgwb membership while sync_inodes_sb() is
-+	 * being issued, sync_inodes_sb() might miss it.  Synchronize.
-+	 */
-+	down_read(&bdi->wb_switch_rwsem);
-+
- 	/*
- 	 * By the time control reaches here, RCU grace period has passed
- 	 * since I_WB_SWITCH assertion and all wb stat update transactions
-@@ -435,6 +452,8 @@ static void inode_switch_wbs_work_fn(struct work_struct *work)
- 	spin_unlock(&new_wb->list_lock);
- 	spin_unlock(&old_wb->list_lock);
- 
-+	up_read(&bdi->wb_switch_rwsem);
-+
- 	if (switched) {
- 		wb_wakeup(new_wb);
- 		wb_put(old_wb);
-@@ -475,9 +494,18 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
- 	if (inode->i_state & I_WB_SWITCH)
- 		return;
- 
-+	/*
-+	 * Avoid starting new switches while sync_inodes_sb() is in
-+	 * progress.  Otherwise, if the down_write protected issue path
-+	 * blocks heavily, we might end up starting a large number of
-+	 * switches which will block on the rwsem.
-+	 */
-+	if (!down_read_trylock(&bdi->wb_switch_rwsem))
-+		return;
-+
- 	isw = kzalloc(sizeof(*isw), GFP_ATOMIC);
- 	if (!isw)
--		return;
-+		goto out_unlock;
- 
- 	/* find and pin the new wb */
- 	rcu_read_lock();
-@@ -511,12 +539,14 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
- 	 * Let's continue after I_WB_SWITCH is guaranteed to be visible.
- 	 */
- 	call_rcu(&isw->rcu_head, inode_switch_wbs_rcu_fn);
--	return;
-+	goto out_unlock;
- 
- out_free:
- 	if (isw->new_wb)
- 		wb_put(isw->new_wb);
- 	kfree(isw);
-+out_unlock:
-+	up_read(&bdi->wb_switch_rwsem);
- }
- 
- /**
-@@ -894,6 +924,9 @@ fs_initcall(cgroup_writeback_init);
- 
- #else	/* CONFIG_CGROUP_WRITEBACK */
- 
-+static void bdi_down_write_wb_switch_rwsem(struct backing_dev_info *bdi) { }
-+static void bdi_up_write_wb_switch_rwsem(struct backing_dev_info *bdi) { }
-+
- static struct bdi_writeback *
- locked_inode_to_wb_and_lock_list(struct inode *inode)
- 	__releases(&inode->i_lock)
-@@ -2408,8 +2441,11 @@ void sync_inodes_sb(struct super_block *sb)
- 		return;
- 	WARN_ON(!rwsem_is_locked(&sb->s_umount));
- 
-+	/* protect against inode wb switch, see inode_switch_wbs_work_fn() */
-+	bdi_down_write_wb_switch_rwsem(bdi);
- 	bdi_split_work_to_wbs(bdi, &work, false);
- 	wb_wait_for_completion(bdi, &done);
-+	bdi_up_write_wb_switch_rwsem(bdi);
- 
- 	wait_sb_inodes(sb);
- }
-diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
-index 4ea779b25a51..34056ec64c7c 100644
---- a/include/linux/backing-dev-defs.h
-+++ b/include/linux/backing-dev-defs.h
-@@ -157,6 +157,7 @@ struct backing_dev_info {
- 	struct radix_tree_root cgwb_tree; /* radix tree of active cgroup wbs */
- 	struct rb_root cgwb_congested_tree; /* their congested states */
- 	atomic_t usage_cnt; /* counts both cgwbs and cgwb_contested's */
-+	struct rw_semaphore wb_switch_rwsem; /* no cgwb switch while syncing */
- #else
- 	struct bdi_writeback_congested *wb_congested;
- #endif
-diff --git a/mm/backing-dev.c b/mm/backing-dev.c
-index 6ff2d7744223..113b7d317079 100644
---- a/mm/backing-dev.c
-+++ b/mm/backing-dev.c
-@@ -669,6 +669,7 @@ static int cgwb_bdi_init(struct backing_dev_info *bdi)
- 	INIT_RADIX_TREE(&bdi->cgwb_tree, GFP_ATOMIC);
- 	bdi->cgwb_congested_tree = RB_ROOT;
- 	atomic_set(&bdi->usage_cnt, 1);
-+	init_rwsem(&bdi->wb_switch_rwsem);
- 
- 	ret = wb_init(&bdi->wb, bdi, 1, GFP_KERNEL);
- 	if (!ret) {
--- 
-2.28.0
-
-
-From 54e35658dd06e3768b19b6e0f81bea362f3ae3fa Mon Sep 17 00:00:00 2001
-From: Jiufei Xue <jiufei.xue@linux.alibaba.com>
-Date: Fri, 17 May 2019 14:31:44 -0700
-Subject: [PATCH 40/45] fs/writeback.c: use rcu_barrier() to wait for inflight
- wb switches going into workqueue when umount
-
-commit ec084de929e419e51bcdafaafe567d9e7d0273b7 upstream.
-
-synchronize_rcu() didn't wait for call_rcu() callbacks, so inode wb
-switch may not go to the workqueue after synchronize_rcu().  Thus
-previous scheduled switches was not finished even flushing the
-workqueue, which will cause a NULL pointer dereferenced followed below.
-
-  VFS: Busy inodes after unmount of vdd. Self-destruct in 5 seconds.  Have a nice day...
-  BUG: unable to handle kernel NULL pointer dereference at 0000000000000278
-    evict+0xb3/0x180
-    iput+0x1b0/0x230
-    inode_switch_wbs_work_fn+0x3c0/0x6a0
-    worker_thread+0x4e/0x490
-    ? process_one_work+0x410/0x410
-    kthread+0xe6/0x100
-    ret_from_fork+0x39/0x50
-
-Replace the synchronize_rcu() call with a rcu_barrier() to wait for all
-pending callbacks to finish.  And inc isw_nr_in_flight after call_rcu()
-in inode_switch_wbs() to make more sense.
-
-Link: http://lkml.kernel.org/r/20190429024108.54150-1-jiufei.xue@linux.alibaba.com
-Signed-off-by: Jiufei Xue <jiufei.xue@linux.alibaba.com>
-Acked-by: Tejun Heo <tj@kernel.org>
-Suggested-by: Tejun Heo <tj@kernel.org>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/fs-writeback.c | 11 ++++++++---
- 1 file changed, 8 insertions(+), 3 deletions(-)
-
-diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
-index 55bff21c71ae..8b93d4b98428 100644
---- a/fs/fs-writeback.c
-+++ b/fs/fs-writeback.c
-@@ -530,8 +530,6 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
- 
- 	isw->inode = inode;
- 
--	atomic_inc(&isw_nr_in_flight);
--
- 	/*
- 	 * In addition to synchronizing among switchers, I_WB_SWITCH tells
- 	 * the RCU protected stat update paths to grab the mapping's
-@@ -539,6 +537,9 @@ static void inode_switch_wbs(struct inode *inode, int new_wb_id)
- 	 * Let's continue after I_WB_SWITCH is guaranteed to be visible.
- 	 */
- 	call_rcu(&isw->rcu_head, inode_switch_wbs_rcu_fn);
-+
-+	atomic_inc(&isw_nr_in_flight);
-+
- 	goto out_unlock;
- 
- out_free:
-@@ -908,7 +909,11 @@ static void bdi_split_work_to_wbs(struct backing_dev_info *bdi,
- void cgroup_writeback_umount(void)
- {
- 	if (atomic_read(&isw_nr_in_flight)) {
--		synchronize_rcu();
-+		/*
-+		 * Use rcu_barrier() to wait for all pending callbacks to
-+		 * ensure that all in-flight wb switches are in the workqueue.
-+		 */
-+		rcu_barrier();
- 		flush_workqueue(isw_wq);
- 	}
- }
--- 
-2.28.0
-
-
-From ab6d14e83db6e08c39a867a4cba378f7a774d273 Mon Sep 17 00:00:00 2001
-From: Sriram Rajagopalan <sriramr@arista.com>
-Date: Fri, 10 May 2019 19:28:06 -0400
-Subject: [PATCH 41/45] ext4: zero out the unused memory region in the extent
- tree block
-
-commit 592acbf16821288ecdc4192c47e3774a4c48bb64 upstream.
-
-This commit zeroes out the unused memory region in the buffer_head
-corresponding to the extent metablock after writing the extent header
-and the corresponding extent node entries.
-
-This is done to prevent random uninitialized data from getting into
-the filesystem when the extent block is synced.
-
-This fixes CVE-2019-11833.
-
-Signed-off-by: Sriram Rajagopalan <sriramr@arista.com>
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Cc: stable@kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ext4/extents.c | 17 +++++++++++++++--
- 1 file changed, 15 insertions(+), 2 deletions(-)
-
-diff --git a/fs/ext4/extents.c b/fs/ext4/extents.c
-index 106a5bb3ae68..b2ba9955fa11 100644
---- a/fs/ext4/extents.c
-+++ b/fs/ext4/extents.c
-@@ -1047,6 +1047,7 @@ static int ext4_ext_split(handle_t *handle, struct inode *inode,
- 	__le32 border;
- 	ext4_fsblk_t *ablocks = NULL; /* array of allocated blocks */
- 	int err = 0;
-+	size_t ext_size = 0;
- 
- 	/* make decision: where to split? */
- 	/* FIXME: now decision is simplest: at current extent */
-@@ -1138,6 +1139,10 @@ static int ext4_ext_split(handle_t *handle, struct inode *inode,
- 		le16_add_cpu(&neh->eh_entries, m);
- 	}
- 
-+	/* zero out unused area in the extent block */
-+	ext_size = sizeof(struct ext4_extent_header) +
-+		sizeof(struct ext4_extent) * le16_to_cpu(neh->eh_entries);
-+	memset(bh->b_data + ext_size, 0, inode->i_sb->s_blocksize - ext_size);
- 	ext4_extent_block_csum_set(inode, neh);
- 	set_buffer_uptodate(bh);
- 	unlock_buffer(bh);
-@@ -1217,6 +1222,11 @@ static int ext4_ext_split(handle_t *handle, struct inode *inode,
- 				sizeof(struct ext4_extent_idx) * m);
- 			le16_add_cpu(&neh->eh_entries, m);
- 		}
-+		/* zero out unused area in the extent block */
-+		ext_size = sizeof(struct ext4_extent_header) +
-+		   (sizeof(struct ext4_extent) * le16_to_cpu(neh->eh_entries));
-+		memset(bh->b_data + ext_size, 0,
-+			inode->i_sb->s_blocksize - ext_size);
- 		ext4_extent_block_csum_set(inode, neh);
- 		set_buffer_uptodate(bh);
- 		unlock_buffer(bh);
-@@ -1282,6 +1292,7 @@ static int ext4_ext_grow_indepth(handle_t *handle, struct inode *inode,
- 	ext4_fsblk_t newblock, goal = 0;
- 	struct ext4_super_block *es = EXT4_SB(inode->i_sb)->s_es;
- 	int err = 0;
-+	size_t ext_size = 0;
- 
- 	/* Try to prepend new index to old one */
- 	if (ext_depth(inode))
-@@ -1307,9 +1318,11 @@ static int ext4_ext_grow_indepth(handle_t *handle, struct inode *inode,
- 		goto out;
- 	}
- 
-+	ext_size = sizeof(EXT4_I(inode)->i_data);
- 	/* move top-level index/leaf into new block */
--	memmove(bh->b_data, EXT4_I(inode)->i_data,
--		sizeof(EXT4_I(inode)->i_data));
-+	memmove(bh->b_data, EXT4_I(inode)->i_data, ext_size);
-+	/* zero out unused area in the extent block */
-+	memset(bh->b_data + ext_size, 0, inode->i_sb->s_blocksize - ext_size);
- 
- 	/* set size of new block */
- 	neh = ext_block_hdr(bh);
--- 
-2.28.0
-
-
-From fa0897757db7e75dd60b63871249d9e34936f885 Mon Sep 17 00:00:00 2001
-From: Lukas Czerner <lczerner@redhat.com>
-Date: Fri, 10 May 2019 21:45:33 -0400
-Subject: [PATCH 42/45] ext4: fix data corruption caused by overlapping
- unaligned and aligned IO
-
-commit 57a0da28ced8707cb9f79f071a016b9d005caf5a upstream.
-
-Unaligned AIO must be serialized because the zeroing of partial blocks
-of unaligned AIO can result in data corruption in case it's overlapping
-another in flight IO.
-
-Currently we wait for all unwritten extents before we submit unaligned
-AIO which protects data in case of unaligned AIO is following overlapping
-IO. However if a unaligned AIO is followed by overlapping aligned AIO we
-can still end up corrupting data.
-
-To fix this, we must make sure that the unaligned AIO is the only IO in
-flight by waiting for unwritten extents conversion not just before the
-IO submission, but right after it as well.
-
-This problem can be reproduced by xfstest generic/538
-
-Signed-off-by: Lukas Czerner <lczerner@redhat.com>
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Cc: stable@kernel.org
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ext4/file.c | 7 +++++++
- 1 file changed, 7 insertions(+)
-
-diff --git a/fs/ext4/file.c b/fs/ext4/file.c
-index fe76d0957a1f..59d3ea7094a0 100644
---- a/fs/ext4/file.c
-+++ b/fs/ext4/file.c
-@@ -163,6 +163,13 @@ ext4_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
- 	}
- 
- 	ret = __generic_file_write_iter(iocb, from);
-+	/*
-+	 * Unaligned direct AIO must be the only IO in flight. Otherwise
-+	 * overlapping aligned IO after unaligned might result in data
-+	 * corruption.
-+	 */
-+	if (ret == -EIOCBQUEUED && unaligned_aio)
-+		ext4_unwritten_wait(inode);
- 	inode_unlock(inode);
- 
- 	if (ret > 0)
--- 
-2.28.0
-
-
-From 51776204959bd7c1db0f76b8d1a3bccf9411abc1 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Micha=C5=82=20Wadowski?= <wadosm@gmail.com>
-Date: Tue, 14 May 2019 16:58:00 +0200
-Subject: [PATCH 43/45] ALSA: hda/realtek - Fix for Lenovo B50-70 inverted
- internal microphone bug
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 56df90b631fc027fe28b70d41352d820797239bb upstream.
-
-Add patch for realtek codec in Lenovo B50-70 that fixes inverted
-internal microphone channel.
-Device IdeaPad Y410P has the same PCI SSID as Lenovo B50-70,
-but first one is about fix the noise and it didn't seem help in a
-later kernel version.
-So I replaced IdeaPad Y410P device description with B50-70 and apply
-inverted microphone fix.
-
-Bugzilla: https://bugs.launchpad.net/ubuntu/+source/alsa-driver/+bug/1524215
-Signed-off-by: Michał Wadowski <wadosm@gmail.com>
-Cc: <stable@vger.kernel.org>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/hda/patch_realtek.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/sound/pci/hda/patch_realtek.c b/sound/pci/hda/patch_realtek.c
-index 1d3fbcdd1699..822650d907fa 100644
---- a/sound/pci/hda/patch_realtek.c
-+++ b/sound/pci/hda/patch_realtek.c
-@@ -5854,7 +5854,7 @@ static const struct snd_pci_quirk alc269_fixup_tbl[] = {
- 	SND_PCI_QUIRK(0x17aa, 0x3112, "ThinkCentre AIO", ALC233_FIXUP_LENOVO_LINE2_MIC_HOTKEY),
- 	SND_PCI_QUIRK(0x17aa, 0x3902, "Lenovo E50-80", ALC269_FIXUP_DMIC_THINKPAD_ACPI),
- 	SND_PCI_QUIRK(0x17aa, 0x3977, "IdeaPad S210", ALC283_FIXUP_INT_MIC),
--	SND_PCI_QUIRK(0x17aa, 0x3978, "IdeaPad Y410P", ALC269_FIXUP_NO_SHUTUP),
-+	SND_PCI_QUIRK(0x17aa, 0x3978, "Lenovo B50-70", ALC269_FIXUP_DMIC_THINKPAD_ACPI),
- 	SND_PCI_QUIRK(0x17aa, 0x5013, "Thinkpad", ALC269_FIXUP_LIMIT_INT_MIC_BOOST),
- 	SND_PCI_QUIRK(0x17aa, 0x501a, "Thinkpad", ALC283_FIXUP_INT_MIC),
- 	SND_PCI_QUIRK(0x17aa, 0x501e, "Thinkpad L440", ALC292_FIXUP_TPT440_DOCK),
--- 
-2.28.0
-
-
-From 0dd8bef58e0bd262962d9a2f4d42f670d64f9e44 Mon Sep 17 00:00:00 2001
-From: Sean Christopherson <sean.j.christopherson@intel.com>
-Date: Tue, 2 Apr 2019 08:19:15 -0700
-Subject: [PATCH 44/45] KVM: x86: Skip EFER vs. guest CPUID checks for
- host-initiated writes
-
-commit 11988499e62b310f3bf6f6d0a807a06d3f9ccc96 upstream.
-
-KVM allows userspace to violate consistency checks related to the
-guest's CPUID model to some degree.  Generally speaking, userspace has
-carte blanche when it comes to guest state so long as jamming invalid
-state won't negatively affect the host.
-
-Currently this is seems to be a non-issue as most of the interesting
-EFER checks are missing, e.g. NX and LME, but those will be added
-shortly.  Proactively exempt userspace from the CPUID checks so as not
-to break userspace.
-
-Note, the efer_reserved_bits check still applies to userspace writes as
-that mask reflects the host's capabilities, e.g. KVM shouldn't allow a
-guest to run with NX=1 if it has been disabled in the host.
-
-Fixes: d80174745ba39 ("KVM: SVM: Only allow setting of EFER_SVME when CPUID SVM is set")
-Cc: stable@vger.kernel.org
-Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/x86/kvm/x86.c | 33 ++++++++++++++++++++++-----------
- 1 file changed, 22 insertions(+), 11 deletions(-)
-
-diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
-index 8285142556b5..1f32c4e32a00 100644
---- a/arch/x86/kvm/x86.c
-+++ b/arch/x86/kvm/x86.c
-@@ -1073,11 +1073,8 @@ static int do_get_msr_feature(struct kvm_vcpu *vcpu, unsigned index, u64 *data)
- 	return 0;
- }
- 
--bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
-+static bool __kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
- {
--	if (efer & efer_reserved_bits)
--		return false;
--
- 	if (efer & EFER_FFXSR) {
- 		struct kvm_cpuid_entry2 *feat;
- 
-@@ -1095,19 +1092,33 @@ bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
- 	}
- 
- 	return true;
-+
-+}
-+bool kvm_valid_efer(struct kvm_vcpu *vcpu, u64 efer)
-+{
-+	if (efer & efer_reserved_bits)
-+		return false;
-+
-+	return __kvm_valid_efer(vcpu, efer);
- }
- EXPORT_SYMBOL_GPL(kvm_valid_efer);
- 
--static int set_efer(struct kvm_vcpu *vcpu, u64 efer)
-+static int set_efer(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
- {
- 	u64 old_efer = vcpu->arch.efer;
-+	u64 efer = msr_info->data;
- 
--	if (!kvm_valid_efer(vcpu, efer))
--		return 1;
-+	if (efer & efer_reserved_bits)
-+		return false;
- 
--	if (is_paging(vcpu)
--	    && (vcpu->arch.efer & EFER_LME) != (efer & EFER_LME))
--		return 1;
-+	if (!msr_info->host_initiated) {
-+		if (!__kvm_valid_efer(vcpu, efer))
-+			return 1;
-+
-+		if (is_paging(vcpu) &&
-+		    (vcpu->arch.efer & EFER_LME) != (efer & EFER_LME))
-+			return 1;
-+	}
- 
- 	efer &= ~EFER_LMA;
- 	efer |= vcpu->arch.efer & EFER_LMA;
-@@ -2203,7 +2214,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
- 		vcpu->arch.arch_capabilities = data;
- 		break;
- 	case MSR_EFER:
--		return set_efer(vcpu, data);
-+		return set_efer(vcpu, msr_info);
- 	case MSR_K7_HWCR:
- 		data &= ~(u64)0x40;	/* ignore flush filter disable */
- 		data &= ~(u64)0x100;	/* ignore ignne emulation enable */
--- 
-2.28.0
-
-
-From a5f56b52c878585b12b8bc37f737dcce4a660c64 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Tue, 21 May 2019 18:49:01 +0200
-Subject: [PATCH 45/45] Linux 4.9.178
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index ceb8f4bf6245..e9fae7a3c621 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 4
- PATCHLEVEL = 9
--SUBLEVEL = 177
-+SUBLEVEL = 178
- EXTRAVERSION =
- NAME = Roaring Lionus
- 
--- 
-2.28.0
-
+-		func = insn->func ? insn->func->pfunc : NULL;
++		if (insn->func)
++			func = insn->func->pfunc;
+ 
+ 		if (func && insn->ignore) {
+ 			WARN_FUNC("BUG: why am I validating an ignored function?",

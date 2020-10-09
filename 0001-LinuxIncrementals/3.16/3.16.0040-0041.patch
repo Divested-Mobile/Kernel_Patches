@@ -1,68 +1,3 @@
-From b71f455440fd7ed03f088580b3a117352fc815dd Mon Sep 17 00:00:00 2001
-From: "Eric W. Biederman" <ebiederm@xmission.com>
-Date: Wed, 28 Sep 2016 00:27:17 -0500
-Subject: [PATCH 01/13] mnt: Add a per mount namespace limit on the number of
- mounts
-
-commit d29216842a85c7970c536108e093963f02714498 upstream.
-
-CAI Qian <caiqian@redhat.com> pointed out that the semantics
-of shared subtrees make it possible to create an exponentially
-increasing number of mounts in a mount namespace.
-
-    mkdir /tmp/1 /tmp/2
-    mount --make-rshared /
-    for i in $(seq 1 20) ; do mount --bind /tmp/1 /tmp/2 ; done
-
-Will create create 2^20 or 1048576 mounts, which is a practical problem
-as some people have managed to hit this by accident.
-
-As such CVE-2016-6213 was assigned.
-
-Ian Kent <raven@themaw.net> described the situation for autofs users
-as follows:
-
-> The number of mounts for direct mount maps is usually not very large because of
-> the way they are implemented, large direct mount maps can have performance
-> problems. There can be anywhere from a few (likely case a few hundred) to less
-> than 10000, plus mounts that have been triggered and not yet expired.
->
-> Indirect mounts have one autofs mount at the root plus the number of mounts that
-> have been triggered and not yet expired.
->
-> The number of autofs indirect map entries can range from a few to the common
-> case of several thousand and in rare cases up to between 30000 and 50000. I've
-> not heard of people with maps larger than 50000 entries.
->
-> The larger the number of map entries the greater the possibility for a large
-> number of active mounts so it's not hard to expect cases of a 1000 or somewhat
-> more active mounts.
-
-So I am setting the default number of mounts allowed per mount
-namespace at 100,000.  This is more than enough for any use case I
-know of, but small enough to quickly stop an exponential increase
-in mounts.  Which should be perfect to catch misconfigurations and
-malfunctioning programs.
-
-For anyone who needs a higher limit this can be changed by writing
-to the new /proc/sys/fs/mount-max sysctl.
-
-Tested-by: CAI Qian <caiqian@redhat.com>
-Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
-[bwh: Backported to 3.16:
- - Use ACCESS_ONCE() instead of READ_ONCE()
- - Adjust context]
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- Documentation/sysctl/fs.txt |  7 ++++++
- fs/mount.h                  |  2 ++
- fs/namespace.c              | 49 ++++++++++++++++++++++++++++++++++++-
- fs/pnode.c                  |  2 +-
- fs/pnode.h                  |  1 +
- include/linux/mount.h       |  2 ++
- kernel/sysctl.c             |  9 +++++++
- 7 files changed, 70 insertions(+), 2 deletions(-)
-
 diff --git a/Documentation/sysctl/fs.txt b/Documentation/sysctl/fs.txt
 index 302b5ed616a6..35e17f748ca7 100644
 --- a/Documentation/sysctl/fs.txt
@@ -81,6 +16,213 @@ index 302b5ed616a6..35e17f748ca7 100644
  
  2. /proc/sys/fs/binfmt_misc
  ----------------------------------------------------------
+diff --git a/Makefile b/Makefile
+index c814b3e2172c..1edbcba47f75 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 16
+-SUBLEVEL = 40
++SUBLEVEL = 41
+ EXTRAVERSION =
+ NAME = Museum of Fishiegoodies
+ 
+diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
+index f0b7bce7e0ba..35f8884817fa 100644
+--- a/arch/x86/kvm/emulate.c
++++ b/arch/x86/kvm/emulate.c
+@@ -744,6 +744,20 @@ static int segmented_read_std(struct x86_emulate_ctxt *ctxt,
+ 	return ctxt->ops->read_std(ctxt, linear, data, size, &ctxt->exception);
+ }
+ 
++static int segmented_write_std(struct x86_emulate_ctxt *ctxt,
++			       struct segmented_address addr,
++			       void *data,
++			       unsigned int size)
++{
++	int rc;
++	ulong linear;
++
++	rc = linearize(ctxt, addr, size, true, &linear);
++	if (rc != X86EMUL_CONTINUE)
++		return rc;
++	return ctxt->ops->write_std(ctxt, linear, data, size, &ctxt->exception);
++}
++
+ /*
+  * Fetch the next byte of the instruction being emulated which is pointed to
+  * by ctxt->_eip, then increment ctxt->_eip.
+@@ -1439,7 +1453,6 @@ static int write_segment_descriptor(struct x86_emulate_ctxt *ctxt,
+ 				    &ctxt->exception);
+ }
+ 
+-/* Does not support long mode */
+ static int __load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
+ 				     u16 selector, int seg, u8 cpl,
+ 				     bool in_task_switch,
+@@ -1475,20 +1488,34 @@ static int __load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
+ 
+ 	rpl = selector & 3;
+ 
+-	/* NULL selector is not valid for TR, CS and SS (except for long mode) */
+-	if ((seg == VCPU_SREG_CS
+-	     || (seg == VCPU_SREG_SS
+-		 && (ctxt->mode != X86EMUL_MODE_PROT64 || rpl != cpl))
+-	     || seg == VCPU_SREG_TR)
+-	    && null_selector)
+-		goto exception;
+-
+ 	/* TR should be in GDT only */
+ 	if (seg == VCPU_SREG_TR && (selector & (1 << 2)))
+ 		goto exception;
+ 
+-	if (null_selector) /* for NULL selector skip all following checks */
++	/* NULL selector is not valid for TR, CS and (except for long mode) SS */
++	if (null_selector) {
++		if (seg == VCPU_SREG_CS || seg == VCPU_SREG_TR)
++			goto exception;
++
++		if (seg == VCPU_SREG_SS) {
++			if (ctxt->mode != X86EMUL_MODE_PROT64 || rpl != cpl)
++				goto exception;
++
++			/*
++			 * ctxt->ops->set_segment expects the CPL to be in
++			 * SS.DPL, so fake an expand-up 32-bit data segment.
++			 */
++			seg_desc.type = 3;
++			seg_desc.p = 1;
++			seg_desc.s = 1;
++			seg_desc.dpl = cpl;
++			seg_desc.d = 1;
++			seg_desc.g = 1;
++		}
++
++		/* Skip all following checks */
+ 		goto load;
++	}
+ 
+ 	ret = read_segment_descriptor(ctxt, selector, &seg_desc, &desc_addr);
+ 	if (ret != X86EMUL_CONTINUE)
+@@ -1584,6 +1611,21 @@ static int load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
+ 				   u16 selector, int seg)
+ {
+ 	u8 cpl = ctxt->ops->cpl(ctxt);
++
++	/*
++	 * None of MOV, POP and LSS can load a NULL selector in CPL=3, but
++	 * they can load it at CPL<3 (Intel's manual says only LSS can,
++	 * but it's wrong).
++	 *
++	 * However, the Intel manual says that putting IST=1/DPL=3 in
++	 * an interrupt gate will result in SS=3 (the AMD manual instead
++	 * says it doesn't), so allow SS=3 in __load_segment_descriptor
++	 * and only forbid it here.
++	 */
++	if (seg == VCPU_SREG_SS && selector == 3 &&
++	    ctxt->mode == X86EMUL_MODE_PROT64)
++		return emulate_exception(ctxt, GP_VECTOR, 0, true);
++
+ 	return __load_segment_descriptor(ctxt, selector, seg, cpl, false, NULL);
+ }
+ 
+@@ -3240,8 +3282,8 @@ static int emulate_store_desc_ptr(struct x86_emulate_ctxt *ctxt,
+ 	}
+ 	/* Disable writeback. */
+ 	ctxt->dst.type = OP_NONE;
+-	return segmented_write(ctxt, ctxt->dst.addr.mem,
+-			       &desc_ptr, 2 + ctxt->op_bytes);
++	return segmented_write_std(ctxt, ctxt->dst.addr.mem,
++				   &desc_ptr, 2 + ctxt->op_bytes);
+ }
+ 
+ static int em_sgdt(struct x86_emulate_ctxt *ctxt)
+diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
+index 413fbb087718..7b16666d6ed4 100644
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@ -1073,10 +1073,10 @@ static inline int nested_cpu_has_ept(struct vmcs12 *vmcs12)
+ 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENABLE_EPT);
+ }
+ 
+-static inline bool is_exception(u32 intr_info)
++static inline bool is_nmi(u32 intr_info)
+ {
+ 	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
+-		== (INTR_TYPE_HARD_EXCEPTION | INTR_INFO_VALID_MASK);
++		== (INTR_TYPE_NMI_INTR | INTR_INFO_VALID_MASK);
+ }
+ 
+ static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
+@@ -4838,7 +4838,7 @@ static int handle_exception(struct kvm_vcpu *vcpu)
+ 	if (is_machine_check(intr_info))
+ 		return handle_machine_check(vcpu);
+ 
+-	if ((intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR)
++	if (is_nmi(intr_info))
+ 		return 1;  /* already handled by vmx_vcpu_run() */
+ 
+ 	if (is_no_device(intr_info)) {
+@@ -6888,7 +6888,7 @@ static bool nested_vmx_exit_handled(struct kvm_vcpu *vcpu)
+ 
+ 	switch (exit_reason) {
+ 	case EXIT_REASON_EXCEPTION_NMI:
+-		if (!is_exception(intr_info))
++		if (is_nmi(intr_info))
+ 			return 0;
+ 		else if (is_page_fault(intr_info))
+ 			return enable_ept;
+@@ -7185,8 +7185,7 @@ static void vmx_complete_atomic_exit(struct vcpu_vmx *vmx)
+ 		kvm_machine_check();
+ 
+ 	/* We need to handle NMIs before interrupts are enabled */
+-	if ((exit_intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR &&
+-	    (exit_intr_info & INTR_INFO_VALID_MASK)) {
++	if (is_nmi(exit_intr_info)) {
+ 		kvm_before_handle_nmi(&vmx->vcpu);
+ 		asm("int $2");
+ 		kvm_after_handle_nmi(&vmx->vcpu);
+diff --git a/drivers/usb/serial/kl5kusb105.c b/drivers/usb/serial/kl5kusb105.c
+index d7440b7557af..ca843033170c 100644
+--- a/drivers/usb/serial/kl5kusb105.c
++++ b/drivers/usb/serial/kl5kusb105.c
+@@ -195,10 +195,11 @@ static int klsi_105_get_line_state(struct usb_serial_port *port,
+ 			     status_buf, KLSI_STATUSBUF_LEN,
+ 			     10000
+ 			     );
+-	if (rc < 0)
+-		dev_err(&port->dev, "Reading line status failed (error = %d)\n",
+-			rc);
+-	else {
++	if (rc != KLSI_STATUSBUF_LEN) {
++		dev_err(&port->dev, "reading line status failed: %d\n", rc);
++		if (rc >= 0)
++			rc = -EIO;
++	} else {
+ 		status = get_unaligned_le16(status_buf);
+ 
+ 		dev_info(&port->serial->dev->dev, "read status %x %x\n",
+diff --git a/fs/ext4/super.c b/fs/ext4/super.c
+index a1fed6689db2..13a33c3047f4 100644
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@ -3905,6 +3905,15 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
+ 			(EXT4_MAX_BLOCK_FILE_PHYS / EXT4_BLOCKS_PER_GROUP(sb)));
+ 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
+ 		   EXT4_DESC_PER_BLOCK(sb);
++	if (EXT4_HAS_INCOMPAT_FEATURE(sb,EXT4_FEATURE_INCOMPAT_META_BG)) {
++		if (le32_to_cpu(es->s_first_meta_bg) >= db_count) {
++			ext4_msg(sb, KERN_WARNING,
++				 "first meta block group too large: %u "
++				 "(group descriptor block count %u)",
++				 le32_to_cpu(es->s_first_meta_bg), db_count);
++			goto failed_mount;
++		}
++	}
+ 	sbi->s_group_desc = ext4_kvmalloc(db_count *
+ 					  sizeof(struct buffer_head *),
+ 					  GFP_KERNEL);
 diff --git a/fs/mount.h b/fs/mount.h
 index d55297f2fa05..662041fe5b39 100644
 --- a/fs/mount.h
@@ -244,6 +386,26 @@ index 16afc3d6d2f2..f5b2dc239ba0 100644
  			 const struct path *root);
 +int count_mounts(struct mnt_namespace *ns, struct mount *mnt);
  #endif /* _LINUX_PNODE_H */
+diff --git a/fs/posix_acl.c b/fs/posix_acl.c
+index a767c594f17a..59dfaeb0ce5f 100644
+--- a/fs/posix_acl.c
++++ b/fs/posix_acl.c
+@@ -904,11 +904,10 @@ int simple_set_acl(struct inode *inode, struct posix_acl *acl, int type)
+ 	int error;
+ 
+ 	if (type == ACL_TYPE_ACCESS) {
+-		error = posix_acl_equiv_mode(acl, &inode->i_mode);
+-		if (error < 0)
+-			return 0;
+-		if (error == 0)
+-			acl = NULL;
++		error = posix_acl_update_mode(inode,
++				&inode->i_mode, &acl);
++		if (error)
++			return error;
+ 	}
+ 
+ 	inode->i_ctime = CURRENT_TIME;
 diff --git a/include/linux/mount.h b/include/linux/mount.h
 index b0c1e6574e7f..000583fa7ca3 100644
 --- a/include/linux/mount.h
@@ -282,527 +444,57 @@ index bd5a8cf2d0f6..f9293694b52a 100644
  	{ }
  };
  
--- 
-2.28.0
-
-
-From 8cebcee992c81aaec741311db337705a4949261c Mon Sep 17 00:00:00 2001
-From: Jim Mattson <jmattson@google.com>
-Date: Mon, 12 Dec 2016 11:01:37 -0800
-Subject: [PATCH 02/13] kvm: nVMX: Allow L1 to intercept software exceptions
- (#BP and #OF)
-
-commit ef85b67385436ddc1998f45f1d6a210f935b3388 upstream.
-
-When L2 exits to L0 due to "exception or NMI", software exceptions
-(#BP and #OF) for which L1 has requested an intercept should be
-handled by L1 rather than L0. Previously, only hardware exceptions
-were forwarded to L1.
-
-Signed-off-by: Jim Mattson <jmattson@google.com>
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-[bwh: Backported to 3.16: adjust context]
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- arch/x86/kvm/vmx.c | 11 +++++------
- 1 file changed, 5 insertions(+), 6 deletions(-)
-
-diff --git a/arch/x86/kvm/vmx.c b/arch/x86/kvm/vmx.c
-index 413fbb087718..7b16666d6ed4 100644
---- a/arch/x86/kvm/vmx.c
-+++ b/arch/x86/kvm/vmx.c
-@@ -1073,10 +1073,10 @@ static inline int nested_cpu_has_ept(struct vmcs12 *vmcs12)
- 	return nested_cpu_has2(vmcs12, SECONDARY_EXEC_ENABLE_EPT);
- }
- 
--static inline bool is_exception(u32 intr_info)
-+static inline bool is_nmi(u32 intr_info)
- {
- 	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VALID_MASK))
--		== (INTR_TYPE_HARD_EXCEPTION | INTR_INFO_VALID_MASK);
-+		== (INTR_TYPE_NMI_INTR | INTR_INFO_VALID_MASK);
- }
- 
- static void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
-@@ -4838,7 +4838,7 @@ static int handle_exception(struct kvm_vcpu *vcpu)
- 	if (is_machine_check(intr_info))
- 		return handle_machine_check(vcpu);
- 
--	if ((intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR)
-+	if (is_nmi(intr_info))
- 		return 1;  /* already handled by vmx_vcpu_run() */
- 
- 	if (is_no_device(intr_info)) {
-@@ -6888,7 +6888,7 @@ static bool nested_vmx_exit_handled(struct kvm_vcpu *vcpu)
- 
- 	switch (exit_reason) {
- 	case EXIT_REASON_EXCEPTION_NMI:
--		if (!is_exception(intr_info))
-+		if (is_nmi(intr_info))
- 			return 0;
- 		else if (is_page_fault(intr_info))
- 			return enable_ept;
-@@ -7185,8 +7185,7 @@ static void vmx_complete_atomic_exit(struct vcpu_vmx *vmx)
- 		kvm_machine_check();
- 
- 	/* We need to handle NMIs before interrupts are enabled */
--	if ((exit_intr_info & INTR_INFO_INTR_TYPE_MASK) == INTR_TYPE_NMI_INTR &&
--	    (exit_intr_info & INTR_INFO_VALID_MASK)) {
-+	if (is_nmi(exit_intr_info)) {
- 		kvm_before_handle_nmi(&vmx->vcpu);
- 		asm("int $2");
- 		kvm_after_handle_nmi(&vmx->vcpu);
--- 
-2.28.0
-
-
-From cde863587b6809fdf61ea3c5391ecf06884b5516 Mon Sep 17 00:00:00 2001
-From: Eryu Guan <guaneryu@gmail.com>
-Date: Thu, 1 Dec 2016 15:08:37 -0500
-Subject: [PATCH 03/13] ext4: validate s_first_meta_bg at mount time
-
-commit 3a4b77cd47bb837b8557595ec7425f281f2ca1fe upstream.
-
-Ralf Spenneberg reported that he hit a kernel crash when mounting a
-modified ext4 image. And it turns out that kernel crashed when
-calculating fs overhead (ext4_calculate_overhead()), this is because
-the image has very large s_first_meta_bg (debug code shows it's
-842150400), and ext4 overruns the memory in count_overhead() when
-setting bitmap buffer, which is PAGE_SIZE.
-
-ext4_calculate_overhead():
-  buf = get_zeroed_page(GFP_NOFS);  <=== PAGE_SIZE buffer
-  blks = count_overhead(sb, i, buf);
-
-count_overhead():
-  for (j = ext4_bg_num_gdb(sb, grp); j > 0; j--) { <=== j = 842150400
-          ext4_set_bit(EXT4_B2C(sbi, s++), buf);   <=== buffer overrun
-          count++;
-  }
-
-This can be reproduced easily for me by this script:
-
-  #!/bin/bash
-  rm -f fs.img
-  mkdir -p /mnt/ext4
-  fallocate -l 16M fs.img
-  mke2fs -t ext4 -O bigalloc,meta_bg,^resize_inode -F fs.img
-  debugfs -w -R "ssv first_meta_bg 842150400" fs.img
-  mount -o loop fs.img /mnt/ext4
-
-Fix it by validating s_first_meta_bg first at mount time, and
-refusing to mount if its value exceeds the largest possible meta_bg
-number.
-
-Reported-by: Ralf Spenneberg <ralf@os-t.de>
-Signed-off-by: Eryu Guan <guaneryu@gmail.com>
-Signed-off-by: Theodore Ts'o <tytso@mit.edu>
-Reviewed-by: Andreas Dilger <adilger@dilger.ca>
-[bwh: Backported to 3.16: use EXT4_HAS_INCOMPAT_FEATURE()]
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- fs/ext4/super.c | 9 +++++++++
- 1 file changed, 9 insertions(+)
-
-diff --git a/fs/ext4/super.c b/fs/ext4/super.c
-index a1fed6689db2..13a33c3047f4 100644
---- a/fs/ext4/super.c
-+++ b/fs/ext4/super.c
-@@ -3905,6 +3905,15 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
- 			(EXT4_MAX_BLOCK_FILE_PHYS / EXT4_BLOCKS_PER_GROUP(sb)));
- 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
- 		   EXT4_DESC_PER_BLOCK(sb);
-+	if (EXT4_HAS_INCOMPAT_FEATURE(sb,EXT4_FEATURE_INCOMPAT_META_BG)) {
-+		if (le32_to_cpu(es->s_first_meta_bg) >= db_count) {
-+			ext4_msg(sb, KERN_WARNING,
-+				 "first meta block group too large: %u "
-+				 "(group descriptor block count %u)",
-+				 le32_to_cpu(es->s_first_meta_bg), db_count);
-+			goto failed_mount;
-+		}
-+	}
- 	sbi->s_group_desc = ext4_kvmalloc(db_count *
- 					  sizeof(struct buffer_head *),
- 					  GFP_KERNEL);
--- 
-2.28.0
-
-
-From 448ec74e72bf4c5952e3d369720a862da99c0895 Mon Sep 17 00:00:00 2001
-From: Paolo Bonzini <pbonzini@redhat.com>
-Date: Thu, 12 Jan 2017 15:02:32 +0100
-Subject: [PATCH 04/13] KVM: x86: fix emulation of "MOV SS, null selector"
-
-commit 33ab91103b3415e12457e3104f0e4517ce12d0f3 upstream.
-
-This is CVE-2017-2583.  On Intel this causes a failed vmentry because
-SS's type is neither 3 nor 7 (even though the manual says this check is
-only done for usable SS, and the dmesg splat says that SS is unusable!).
-On AMD it's worse: svm.c is confused and sets CPL to 0 in the vmcb.
-
-The fix fabricates a data segment descriptor when SS is set to a null
-selector, so that CPL and SS.DPL are set correctly in the VMCS/vmcb.
-Furthermore, only allow setting SS to a NULL selector if SS.RPL < 3;
-this in turn ensures CPL < 3 because RPL must be equal to CPL.
-
-Thanks to Andy Lutomirski and Willy Tarreau for help in analyzing
-the bug and deciphering the manuals.
-
-Reported-by: Xiaohan Zhang <zhangxiaohan1@huawei.com>
-Fixes: 79d5b4c3cd809c770d4bf9812635647016c56011
-Cc: stable@nongnu.org
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-[bwh: Backported to 3.16: adjust context]
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- arch/x86/kvm/emulate.c | 48 +++++++++++++++++++++++++++++++++---------
- 1 file changed, 38 insertions(+), 10 deletions(-)
-
-diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
-index f0b7bce7e0ba..1b8c6faa598a 100644
---- a/arch/x86/kvm/emulate.c
-+++ b/arch/x86/kvm/emulate.c
-@@ -1439,7 +1439,6 @@ static int write_segment_descriptor(struct x86_emulate_ctxt *ctxt,
- 				    &ctxt->exception);
- }
- 
--/* Does not support long mode */
- static int __load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
- 				     u16 selector, int seg, u8 cpl,
- 				     bool in_task_switch,
-@@ -1475,20 +1474,34 @@ static int __load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
- 
- 	rpl = selector & 3;
- 
--	/* NULL selector is not valid for TR, CS and SS (except for long mode) */
--	if ((seg == VCPU_SREG_CS
--	     || (seg == VCPU_SREG_SS
--		 && (ctxt->mode != X86EMUL_MODE_PROT64 || rpl != cpl))
--	     || seg == VCPU_SREG_TR)
--	    && null_selector)
--		goto exception;
--
- 	/* TR should be in GDT only */
- 	if (seg == VCPU_SREG_TR && (selector & (1 << 2)))
- 		goto exception;
- 
--	if (null_selector) /* for NULL selector skip all following checks */
-+	/* NULL selector is not valid for TR, CS and (except for long mode) SS */
-+	if (null_selector) {
-+		if (seg == VCPU_SREG_CS || seg == VCPU_SREG_TR)
-+			goto exception;
-+
-+		if (seg == VCPU_SREG_SS) {
-+			if (ctxt->mode != X86EMUL_MODE_PROT64 || rpl != cpl)
-+				goto exception;
-+
-+			/*
-+			 * ctxt->ops->set_segment expects the CPL to be in
-+			 * SS.DPL, so fake an expand-up 32-bit data segment.
-+			 */
-+			seg_desc.type = 3;
-+			seg_desc.p = 1;
-+			seg_desc.s = 1;
-+			seg_desc.dpl = cpl;
-+			seg_desc.d = 1;
-+			seg_desc.g = 1;
-+		}
-+
-+		/* Skip all following checks */
- 		goto load;
-+	}
- 
- 	ret = read_segment_descriptor(ctxt, selector, &seg_desc, &desc_addr);
- 	if (ret != X86EMUL_CONTINUE)
-@@ -1584,6 +1597,21 @@ static int load_segment_descriptor(struct x86_emulate_ctxt *ctxt,
- 				   u16 selector, int seg)
- {
- 	u8 cpl = ctxt->ops->cpl(ctxt);
-+
-+	/*
-+	 * None of MOV, POP and LSS can load a NULL selector in CPL=3, but
-+	 * they can load it at CPL<3 (Intel's manual says only LSS can,
-+	 * but it's wrong).
-+	 *
-+	 * However, the Intel manual says that putting IST=1/DPL=3 in
-+	 * an interrupt gate will result in SS=3 (the AMD manual instead
-+	 * says it doesn't), so allow SS=3 in __load_segment_descriptor
-+	 * and only forbid it here.
+diff --git a/net/dccp/input.c b/net/dccp/input.c
+index 3c8ec7d4a34e..700440e4fa3b 100644
+--- a/net/dccp/input.c
++++ b/net/dccp/input.c
+@@ -606,7 +606,8 @@ int dccp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
+ 			if (inet_csk(sk)->icsk_af_ops->conn_request(sk,
+ 								    skb) < 0)
+ 				return 1;
+-			goto discard;
++			consume_skb(skb);
++			return 0;
+ 		}
+ 		if (dh->dccph_type == DCCP_PKT_RESET)
+ 			goto discard;
+diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
+index cf377702852d..ecb2b00b6ad3 100644
+--- a/net/ipv4/ip_sockglue.c
++++ b/net/ipv4/ip_sockglue.c
+@@ -1082,7 +1082,14 @@ void ipv4_pktinfo_prepare(const struct sock *sk, struct sk_buff *skb)
+ 		pktinfo->ipi_ifindex = 0;
+ 		pktinfo->ipi_spec_dst.s_addr = 0;
+ 	}
+-	skb_dst_drop(skb);
++	/* We need to keep the dst for __ip_options_echo()
++	 * We could restrict the test to opt.ts_needtime || opt.srr,
++	 * but the following is good enough as IP options are not often used.
 +	 */
-+	if (seg == VCPU_SREG_SS && selector == 3 &&
-+	    ctxt->mode == X86EMUL_MODE_PROT64)
-+		return emulate_exception(ctxt, GP_VECTOR, 0, true);
-+
- 	return __load_segment_descriptor(ctxt, selector, seg, cpl, false, NULL);
++	if (unlikely(IPCB(skb)->opt.optlen))
++		skb_dst_force(skb);
++	else
++		skb_dst_drop(skb);
  }
  
--- 
-2.28.0
-
-
-From 8be074a1f62ff51ffdf5b4634327dee351a5c2c2 Mon Sep 17 00:00:00 2001
-From: Steve Rutherford <srutherford@google.com>
-Date: Wed, 11 Jan 2017 18:28:29 -0800
-Subject: [PATCH 05/13] KVM: x86: Introduce segmented_write_std
-
-commit 129a72a0d3c8e139a04512325384fe5ac119e74d upstream.
-
-Introduces segemented_write_std.
-
-Switches from emulated reads/writes to standard read/writes in fxsave,
-fxrstor, sgdt, and sidt.  This fixes CVE-2017-2584, a longstanding
-kernel memory leak.
-
-Since commit 283c95d0e389 ("KVM: x86: emulate FXSAVE and FXRSTOR",
-2016-11-09), which is luckily not yet in any final release, this would
-also be an exploitable kernel memory *write*!
-
-Reported-by: Dmitry Vyukov <dvyukov@google.com>
-Fixes: 96051572c819194c37a8367624b285be10297eca
-Fixes: 283c95d0e3891b64087706b344a4b545d04a6e62
-Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
-Signed-off-by: Steve Rutherford <srutherford@google.com>
-Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
-[bwh: Backported to 3.16: drop changes to em_fxsave(), em_fxrstor()]
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- arch/x86/kvm/emulate.c | 18 ++++++++++++++++--
- 1 file changed, 16 insertions(+), 2 deletions(-)
-
-diff --git a/arch/x86/kvm/emulate.c b/arch/x86/kvm/emulate.c
-index 1b8c6faa598a..35f8884817fa 100644
---- a/arch/x86/kvm/emulate.c
-+++ b/arch/x86/kvm/emulate.c
-@@ -744,6 +744,20 @@ static int segmented_read_std(struct x86_emulate_ctxt *ctxt,
- 	return ctxt->ops->read_std(ctxt, linear, data, size, &ctxt->exception);
- }
- 
-+static int segmented_write_std(struct x86_emulate_ctxt *ctxt,
-+			       struct segmented_address addr,
-+			       void *data,
-+			       unsigned int size)
-+{
-+	int rc;
-+	ulong linear;
-+
-+	rc = linearize(ctxt, addr, size, true, &linear);
-+	if (rc != X86EMUL_CONTINUE)
-+		return rc;
-+	return ctxt->ops->write_std(ctxt, linear, data, size, &ctxt->exception);
-+}
-+
- /*
-  * Fetch the next byte of the instruction being emulated which is pointed to
-  * by ctxt->_eip, then increment ctxt->_eip.
-@@ -3268,8 +3282,8 @@ static int emulate_store_desc_ptr(struct x86_emulate_ctxt *ctxt,
- 	}
- 	/* Disable writeback. */
- 	ctxt->dst.type = OP_NONE;
--	return segmented_write(ctxt, ctxt->dst.addr.mem,
--			       &desc_ptr, 2 + ctxt->op_bytes);
-+	return segmented_write_std(ctxt, ctxt->dst.addr.mem,
-+				   &desc_ptr, 2 + ctxt->op_bytes);
- }
- 
- static int em_sgdt(struct x86_emulate_ctxt *ctxt)
--- 
-2.28.0
-
-
-From 0646217322101c829aaabf95294ce9b8b02ab807 Mon Sep 17 00:00:00 2001
-From: Stephen Smalley <sds@tycho.nsa.gov>
-Date: Tue, 31 Jan 2017 11:54:04 -0500
-Subject: [PATCH 06/13] selinux: fix off-by-one in setprocattr
-
-commit 0c461cb727d146c9ef2d3e86214f498b78b7d125 upstream.
-
-SELinux tries to support setting/clearing of /proc/pid/attr attributes
-from the shell by ignoring terminating newlines and treating an
-attribute value that begins with a NUL or newline as an attempt to
-clear the attribute.  However, the test for clearing attributes has
-always been wrong; it has an off-by-one error, and this could further
-lead to reading past the end of the allocated buffer since commit
-bb646cdb12e75d82258c2f2e7746d5952d3e321a ("proc_pid_attr_write():
-switch to memdup_user()").  Fix the off-by-one error.
-
-Even with this fix, setting and clearing /proc/pid/attr attributes
-from the shell is not straightforward since the interface does not
-support multiple write() calls (so shells that write the value and
-newline separately will set and then immediately clear the attribute,
-requiring use of echo -n to set the attribute), whereas trying to use
-echo -n "" to clear the attribute causes the shell to skip the
-write() call altogether since POSIX says that a zero-length write
-causes no side effects. Thus, one must use echo -n to set and echo
-without -n to clear, as in the following example:
-$ echo -n unconfined_u:object_r:user_home_t:s0 > /proc/$$/attr/fscreate
-$ cat /proc/$$/attr/fscreate
-unconfined_u:object_r:user_home_t:s0
-$ echo "" > /proc/$$/attr/fscreate
-$ cat /proc/$$/attr/fscreate
-
-Note the use of /proc/$$ rather than /proc/self, as otherwise
-the cat command will read its own attribute value, not that of the shell.
-
-There are no users of this facility to my knowledge; possibly we
-should just get rid of it.
-
-UPDATE: Upon further investigation it appears that a local process
-with the process:setfscreate permission can cause a kernel panic as a
-result of this bug.  This patch fixes CVE-2017-2618.
-
-Signed-off-by: Stephen Smalley <sds@tycho.nsa.gov>
-[PM: added the update about CVE-2017-2618 to the commit description]
-Signed-off-by: Paul Moore <paul@paul-moore.com>
-
-Signed-off-by: James Morris <james.l.morris@oracle.com>
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- security/selinux/hooks.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
-index af2d5124f99c..85a74e299412 100644
---- a/security/selinux/hooks.c
-+++ b/security/selinux/hooks.c
-@@ -5546,7 +5546,7 @@ static int selinux_setprocattr(struct task_struct *p,
- 		return error;
- 
- 	/* Obtain a SID for the context, if one was specified. */
--	if (size && str[1] && str[1] != '\n') {
-+	if (size && str[0] && str[0] != '\n') {
- 		if (str[size-1] == '\n') {
- 			str[size-1] = 0;
- 			size--;
--- 
-2.28.0
-
-
-From 59021c058a0bd2af81d1e8116995d7119be15145 Mon Sep 17 00:00:00 2001
-From: Johan Hovold <johan@kernel.org>
-Date: Tue, 10 Jan 2017 12:05:37 +0100
-Subject: [PATCH 07/13] USB: serial: kl5kusb105: fix line-state error handling
-
-commit 146cc8a17a3b4996f6805ee5c080e7101277c410 upstream.
-
-The current implementation failed to detect short transfers when
-attempting to read the line state, and also, to make things worse,
-logged the content of the uninitialised heap transfer buffer.
-
-Fixes: abf492e7b3ae ("USB: kl5kusb105: fix DMA buffers on stack")
-Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
-Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Signed-off-by: Johan Hovold <johan@kernel.org>
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- drivers/usb/serial/kl5kusb105.c | 9 +++++----
- 1 file changed, 5 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/usb/serial/kl5kusb105.c b/drivers/usb/serial/kl5kusb105.c
-index d7440b7557af..ca843033170c 100644
---- a/drivers/usb/serial/kl5kusb105.c
-+++ b/drivers/usb/serial/kl5kusb105.c
-@@ -195,10 +195,11 @@ static int klsi_105_get_line_state(struct usb_serial_port *port,
- 			     status_buf, KLSI_STATUSBUF_LEN,
- 			     10000
- 			     );
--	if (rc < 0)
--		dev_err(&port->dev, "Reading line status failed (error = %d)\n",
--			rc);
--	else {
-+	if (rc != KLSI_STATUSBUF_LEN) {
-+		dev_err(&port->dev, "reading line status failed: %d\n", rc);
-+		if (rc >= 0)
-+			rc = -EIO;
-+	} else {
- 		status = get_unaligned_le16(status_buf);
- 
- 		dev_info(&port->serial->dev->dev, "read status %x %x\n",
--- 
-2.28.0
-
-
-From b35e1587153b27e12747137ce7a0df0eb921cd85 Mon Sep 17 00:00:00 2001
-From: Gu Zheng <guzheng1@huawei.com>
-Date: Mon, 9 Jan 2017 09:34:48 +0800
-Subject: [PATCH 08/13] tmpfs: clear S_ISGID when setting posix ACLs
-
-commit 497de07d89c1410d76a15bec2bb41f24a2a89f31 upstream.
-
-This change was missed the tmpfs modification in In CVE-2016-7097
-commit 073931017b49 ("posix_acl: Clear SGID bit when setting
-file permissions")
-It can test by xfstest generic/375, which failed to clear
-setgid bit in the following test case on tmpfs:
-
-  touch $testfile
-  chown 100:100 $testfile
-  chmod 2755 $testfile
-  _runas -u 100 -g 101 -- setfacl -m u::rwx,g::rwx,o::rwx $testfile
-
-Signed-off-by: Gu Zheng <guzheng1@huawei.com>
-Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- fs/posix_acl.c | 9 ++++-----
- 1 file changed, 4 insertions(+), 5 deletions(-)
-
-diff --git a/fs/posix_acl.c b/fs/posix_acl.c
-index a767c594f17a..59dfaeb0ce5f 100644
---- a/fs/posix_acl.c
-+++ b/fs/posix_acl.c
-@@ -904,11 +904,10 @@ int simple_set_acl(struct inode *inode, struct posix_acl *acl, int type)
- 	int error;
- 
- 	if (type == ACL_TYPE_ACCESS) {
--		error = posix_acl_equiv_mode(acl, &inode->i_mode);
--		if (error < 0)
--			return 0;
--		if (error == 0)
--			acl = NULL;
-+		error = posix_acl_update_mode(inode,
-+				&inode->i_mode, &acl);
-+		if (error)
-+			return error;
- 	}
- 
- 	inode->i_ctime = CURRENT_TIME;
--- 
-2.28.0
-
-
-From 3a997b28bbc69f7637ccd62c5a37379dec34f36b Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Sat, 4 Feb 2017 23:18:55 -0800
-Subject: [PATCH 09/13] ip6_gre: fix ip6gre_err() invalid reads
-
-commit 7892032cfe67f4bde6fc2ee967e45a8fbaf33756 upstream.
-
-Andrey Konovalov reported out of bound accesses in ip6gre_err()
-
-If GRE flags contains GRE_KEY, the following expression
-*(((__be32 *)p) + (grehlen / 4) - 1)
-
-accesses data ~40 bytes after the expected point, since
-grehlen includes the size of IPv6 headers.
-
-Let's use a "struct gre_base_hdr *greh" pointer to make this
-code more readable.
-
-p[1] becomes greh->protocol.
-grhlen is the GRE header length.
-
-Fixes: c12b395a4664 ("gre: Support GRE over IPv6")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Reported-by: Andrey Konovalov <andreyknvl@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-[bwh: Backported to 3.16:
- - Add #include <net/gre.h>, added earlier upstream
- - Adjust context]
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- net/ipv6/ip6_gre.c | 41 ++++++++++++++++++++++-------------------
- 1 file changed, 22 insertions(+), 19 deletions(-)
-
+ int ip_setsockopt(struct sock *sk, int level,
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 9ee5a4bbb289..068ffa698318 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -765,6 +765,12 @@ ssize_t tcp_splice_read(struct socket *sock, loff_t *ppos,
+ 				ret = -EAGAIN;
+ 				break;
+ 			}
++			/* if __tcp_splice_read() got nothing while we have
++			 * an skb in receive queue, we do not want to loop.
++			 * This might happen with URG data.
++			 */
++			if (!skb_queue_empty(&sk->sk_receive_queue))
++				break;
+ 			sk_wait_data(sk, &timeo);
+ 			if (signal_pending(current)) {
+ 				ret = sock_intr_errno(timeo);
 diff --git a/net/ipv6/ip6_gre.c b/net/ipv6/ip6_gre.c
 index 473bb5031af2..42dd7c0c4283 100644
 --- a/net/ipv6/ip6_gre.c
@@ -872,183 +564,16 @@ index 473bb5031af2..42dd7c0c4283 100644
  	if (t == NULL)
  		return;
  
--- 
-2.28.0
-
-
-From 631f00df1b2fa51492de8ab93a91a3876b697aeb Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Sat, 4 Feb 2017 11:16:52 -0800
-Subject: [PATCH 10/13] ipv4: keep skb->dst around in presence of IP options
-
-commit 34b2cef20f19c87999fff3da4071e66937db9644 upstream.
-
-Andrey Konovalov got crashes in __ip_options_echo() when a NULL skb->dst
-is accessed.
-
-ipv4_pktinfo_prepare() should not drop the dst if (evil) IP options
-are present.
-
-We could refine the test to the presence of ts_needtime or srr,
-but IP options are not often used, so let's be conservative.
-
-Thanks to syzkaller team for finding this bug.
-
-Fixes: d826eb14ecef ("ipv4: PKTINFO doesnt need dst reference")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Reported-by: Andrey Konovalov <andreyknvl@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- net/ipv4/ip_sockglue.c | 9 ++++++++-
- 1 file changed, 8 insertions(+), 1 deletion(-)
-
-diff --git a/net/ipv4/ip_sockglue.c b/net/ipv4/ip_sockglue.c
-index cf377702852d..ecb2b00b6ad3 100644
---- a/net/ipv4/ip_sockglue.c
-+++ b/net/ipv4/ip_sockglue.c
-@@ -1082,7 +1082,14 @@ void ipv4_pktinfo_prepare(const struct sock *sk, struct sk_buff *skb)
- 		pktinfo->ipi_ifindex = 0;
- 		pktinfo->ipi_spec_dst.s_addr = 0;
- 	}
--	skb_dst_drop(skb);
-+	/* We need to keep the dst for __ip_options_echo()
-+	 * We could restrict the test to opt.ts_needtime || opt.srr,
-+	 * but the following is good enough as IP options are not often used.
-+	 */
-+	if (unlikely(IPCB(skb)->opt.optlen))
-+		skb_dst_force(skb);
-+	else
-+		skb_dst_drop(skb);
- }
+diff --git a/security/selinux/hooks.c b/security/selinux/hooks.c
+index af2d5124f99c..85a74e299412 100644
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -5546,7 +5546,7 @@ static int selinux_setprocattr(struct task_struct *p,
+ 		return error;
  
- int ip_setsockopt(struct sock *sk, int level,
--- 
-2.28.0
-
-
-From c21341fd2c2e0e840864062707825d6d0d5e13b2 Mon Sep 17 00:00:00 2001
-From: Andrey Konovalov <andreyknvl@google.com>
-Date: Thu, 16 Feb 2017 17:22:46 +0100
-Subject: [PATCH 11/13] dccp: fix freeing skb too early for IPV6_RECVPKTINFO
-
-commit 5edabca9d4cff7f1f2b68f0bac55ef99d9798ba4 upstream.
-
-In the current DCCP implementation an skb for a DCCP_PKT_REQUEST packet
-is forcibly freed via __kfree_skb in dccp_rcv_state_process if
-dccp_v6_conn_request successfully returns.
-
-However, if IPV6_RECVPKTINFO is set on a socket, the address of the skb
-is saved to ireq->pktopts and the ref count for skb is incremented in
-dccp_v6_conn_request, so skb is still in use. Nevertheless, it gets freed
-in dccp_rcv_state_process.
-
-Fix by calling consume_skb instead of doing goto discard and therefore
-calling __kfree_skb.
-
-Similar fixes for TCP:
-
-fb7e2399ec17f1004c0e0ccfd17439f8759ede01 [TCP]: skb is unexpectedly freed.
-0aea76d35c9651d55bbaf746e7914e5f9ae5a25d tcp: SYN packets are now
-simply consumed
-
-Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
-Acked-by: Eric Dumazet <edumazet@google.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- net/dccp/input.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/net/dccp/input.c b/net/dccp/input.c
-index 3c8ec7d4a34e..700440e4fa3b 100644
---- a/net/dccp/input.c
-+++ b/net/dccp/input.c
-@@ -606,7 +606,8 @@ int dccp_rcv_state_process(struct sock *sk, struct sk_buff *skb,
- 			if (inet_csk(sk)->icsk_af_ops->conn_request(sk,
- 								    skb) < 0)
- 				return 1;
--			goto discard;
-+			consume_skb(skb);
-+			return 0;
- 		}
- 		if (dh->dccph_type == DCCP_PKT_RESET)
- 			goto discard;
--- 
-2.28.0
-
-
-From 5b746247d798a6061d213bf3f64c6e434bb4f23d Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <edumazet@google.com>
-Date: Fri, 3 Feb 2017 14:59:38 -0800
-Subject: [PATCH 12/13] tcp: avoid infinite loop in tcp_splice_read()
-
-commit ccf7abb93af09ad0868ae9033d1ca8108bdaec82 upstream.
-
-Splicing from TCP socket is vulnerable when a packet with URG flag is
-received and stored into receive queue.
-
-__tcp_splice_read() returns 0, and sk_wait_data() immediately
-returns since there is the problematic skb in queue.
-
-This is a nice way to burn cpu (aka infinite loop) and trigger
-soft lockups.
-
-Again, this gem was found by syzkaller tool.
-
-Fixes: 9c55e01c0cc8 ("[TCP]: Splice receive support.")
-Signed-off-by: Eric Dumazet <edumazet@google.com>
-Reported-by: Dmitry Vyukov  <dvyukov@google.com>
-Cc: Willy Tarreau <w@1wt.eu>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-[bwh: Backported to 3.16: adjust context]
-Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
----
- net/ipv4/tcp.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
-index 9ee5a4bbb289..068ffa698318 100644
---- a/net/ipv4/tcp.c
-+++ b/net/ipv4/tcp.c
-@@ -765,6 +765,12 @@ ssize_t tcp_splice_read(struct socket *sock, loff_t *ppos,
- 				ret = -EAGAIN;
- 				break;
- 			}
-+			/* if __tcp_splice_read() got nothing while we have
-+			 * an skb in receive queue, we do not want to loop.
-+			 * This might happen with URG data.
-+			 */
-+			if (!skb_queue_empty(&sk->sk_receive_queue))
-+				break;
- 			sk_wait_data(sk, &timeo);
- 			if (signal_pending(current)) {
- 				ret = sock_intr_errno(timeo);
--- 
-2.28.0
-
-
-From cfd0c7f4abfa175df6dfa40fc7083e22f982891e Mon Sep 17 00:00:00 2001
-From: Ben Hutchings <ben@decadent.org.uk>
-Date: Sun, 26 Feb 2017 20:01:51 +0000
-Subject: [PATCH 13/13] Linux 3.16.41
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index c814b3e2172c..1edbcba47f75 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 16
--SUBLEVEL = 40
-+SUBLEVEL = 41
- EXTRAVERSION =
- NAME = Museum of Fishiegoodies
- 
--- 
-2.28.0
-
+ 	/* Obtain a SID for the context, if one was specified. */
+-	if (size && str[1] && str[1] != '\n') {
++	if (size && str[0] && str[0] != '\n') {
+ 		if (str[size-1] == '\n') {
+ 			str[size-1] = 0;
+ 			size--;

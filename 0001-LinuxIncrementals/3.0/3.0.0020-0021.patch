@@ -1,266 +1,47 @@
-From 99067d691614385f824b42f9a02da9708e66dbb6 Mon Sep 17 00:00:00 2001
-From: Shaohua Li <shaohua.li@intel.com>
-Date: Fri, 3 Feb 2012 15:37:17 -0800
-Subject: [PATCH 01/56] readahead: fix pipeline break caused by block plug
-
-commit 3deaa7190a8da38453c4fabd9dec7f66d17fff67 upstream.
-
-Herbert Poetzl reported a performance regression since 2.6.39.  The test
-is a simple dd read, but with big block size.  The reason is:
-
-T1: ra (A, A+128k), (A+128k, A+256k)
-T2: lock_page for page A, submit the 256k
-T3: hit page A+128K, ra (A+256k, A+384). the range isn't submitted
-because of plug and there isn't any lock_page till we hit page A+256k
-because all pages from A to A+256k is in memory
-T4: hit page A+256k, ra (A+384, A+ 512). Because of plug, the range isn't
-submitted again.
-T5: lock_page A+256k, so (A+256k, A+512k) will be submitted. The task is
-waitting for (A+256k, A+512k) finish.
-
-There is no request to disk in T3 and T4, so readahead pipeline breaks.
-
-We really don't need block plug for generic_file_aio_read() for buffered
-I/O.  The readahead already has plug and has fine grained control when I/O
-should be submitted.  Deleting plug for buffered I/O fixes the regression.
-
-One side effect is plug makes the request size 256k, the size is 128k
-without it.  This is because default ra size is 128k and not a reason we
-need plug here.
-
-Vivek said:
-
-: We submit some readahead IO to device request queue but because of nested
-: plug, queue never gets unplugged.  When read logic reaches a page which is
-: not in page cache, it waits for page to be read from the disk
-: (lock_page_killable()) and that time we flush the plug list.
-:
-: So effectively read ahead logic is kind of broken in parts because of
-: nested plugging.  Removing top level plug (generic_file_aio_read()) for
-: buffered reads, will allow unplugging queue earlier for readahead.
-
-Signed-off-by: Shaohua Li <shaohua.li@intel.com>
-Signed-off-by: Wu Fengguang <fengguang.wu@intel.com>
-Reported-by: Herbert Poetzl <herbert@13thfloor.at>
-Tested-by: Eric Dumazet <eric.dumazet@gmail.com>
-Cc: Christoph Hellwig <hch@infradead.org>
-Cc: Jens Axboe <axboe@kernel.dk>
-Cc: Vivek Goyal <vgoyal@redhat.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/filemap.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/mm/filemap.c b/mm/filemap.c
-index 3c981baadb71..b7d860390f34 100644
---- a/mm/filemap.c
-+++ b/mm/filemap.c
-@@ -1379,15 +1379,12 @@ generic_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
- 	unsigned long seg = 0;
- 	size_t count;
- 	loff_t *ppos = &iocb->ki_pos;
--	struct blk_plug plug;
+diff --git a/Makefile b/Makefile
+index c060c58..d5f0598 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 0
+-SUBLEVEL = 20
++SUBLEVEL = 21
+ EXTRAVERSION =
+ NAME = Sneaky Weasel
  
- 	count = 0;
- 	retval = generic_segment_checks(iov, &nr_segs, &count, VERIFY_WRITE);
- 	if (retval)
- 		return retval;
+diff --git a/arch/arm/kernel/ptrace.c b/arch/arm/kernel/ptrace.c
+index 9726006..172ae01 100644
+--- a/arch/arm/kernel/ptrace.c
++++ b/arch/arm/kernel/ptrace.c
+@@ -719,10 +719,13 @@ static int vfp_set(struct task_struct *target,
+ {
+ 	int ret;
+ 	struct thread_info *thread = task_thread_info(target);
+-	struct vfp_hard_struct new_vfp = thread->vfpstate.hard;
++	struct vfp_hard_struct new_vfp;
+ 	const size_t user_fpregs_offset = offsetof(struct user_vfp, fpregs);
+ 	const size_t user_fpscr_offset = offsetof(struct user_vfp, fpscr);
  
--	blk_start_plug(&plug);
--
- 	/* coalesce the iovecs and go direct-to-BIO for O_DIRECT */
- 	if (filp->f_flags & O_DIRECT) {
- 		loff_t size;
-@@ -1403,8 +1400,12 @@ generic_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
- 			retval = filemap_write_and_wait_range(mapping, pos,
- 					pos + iov_length(iov, nr_segs) - 1);
- 			if (!retval) {
-+				struct blk_plug plug;
++	vfp_sync_hwstate(thread);
++	new_vfp = thread->vfpstate.hard;
 +
-+				blk_start_plug(&plug);
- 				retval = mapping->a_ops->direct_IO(READ, iocb,
- 							iov, pos, nr_segs);
-+				blk_finish_plug(&plug);
- 			}
- 			if (retval > 0) {
- 				*ppos = pos + retval;
-@@ -1460,7 +1461,6 @@ generic_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
- 			break;
- 	}
- out:
--	blk_finish_plug(&plug);
- 	return retval;
+ 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
+ 				  &new_vfp.fpregs,
+ 				  user_fpregs_offset,
+@@ -743,9 +746,8 @@ static int vfp_set(struct task_struct *target,
+ 	if (ret)
+ 		return ret;
+ 
+-	vfp_sync_hwstate(thread);
+-	thread->vfpstate.hard = new_vfp;
+ 	vfp_flush_hwstate(thread);
++	thread->vfpstate.hard = new_vfp;
+ 
+ 	return 0;
  }
- EXPORT_SYMBOL(generic_file_aio_read);
--- 
-2.28.0
-
-
-From 3fe10cf8e23ed6e32c09c05303df7e66abdb7e39 Mon Sep 17 00:00:00 2001
-From: David Henningsson <david.henningsson@canonical.com>
-Date: Wed, 1 Feb 2012 12:05:41 +0100
-Subject: [PATCH 02/56] ALSA: HDA: Fix duplicated output to more than one codec
-
-commit 54c2a89f60fd71b924d0f848ac892442951401a6 upstream.
-
-This typo caused the wrong codec's nid to be checked for wcaps type.
-As a result, sometimes speakers would duplicate the output sent to
-HDMI output.
-
-BugLink: https://bugs.launchpad.net/bugs/924320
-Signed-off-by: David Henningsson <david.henningsson@canonical.com>
-Signed-off-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/pci/hda/hda_codec.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/sound/pci/hda/hda_codec.c b/sound/pci/hda/hda_codec.c
-index 21958518467f..67d341fa7d10 100644
---- a/sound/pci/hda/hda_codec.c
-+++ b/sound/pci/hda/hda_codec.c
-@@ -1328,7 +1328,7 @@ void snd_hda_codec_setup_stream(struct hda_codec *codec, hda_nid_t nid,
- 		for (i = 0; i < c->cvt_setups.used; i++) {
- 			p = snd_array_elem(&c->cvt_setups, i);
- 			if (!p->active && p->stream_tag == stream_tag &&
--			    get_wcaps_type(get_wcaps(codec, p->nid)) == type)
-+			    get_wcaps_type(get_wcaps(c, p->nid)) == type)
- 				p->dirty = 1;
- 		}
- 	}
--- 
-2.28.0
-
-
-From 2cf7d6f29728c367ac742e7e17d89d8d9b6caeba Mon Sep 17 00:00:00 2001
-From: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Date: Fri, 20 Jan 2012 12:19:43 +0000
-Subject: [PATCH 03/56] ASoC: wm_hubs: Enable line out VMID buffer for single
- ended line outputs
-
-commit 77231abe55433aa17eca712718745275853fa66d upstream.
-
-For optimal performance the single ended line outputs require that the
-line output VMID buffer be enabled.
-
-Signed-off-by: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/codecs/wm_hubs.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/sound/soc/codecs/wm_hubs.c b/sound/soc/codecs/wm_hubs.c
-index 9e370d14ad88..1c2a47dcbeab 100644
---- a/sound/soc/codecs/wm_hubs.c
-+++ b/sound/soc/codecs/wm_hubs.c
-@@ -589,6 +589,8 @@ SND_SOC_DAPM_INPUT("IN2RP:VXRP"),
- SND_SOC_DAPM_MICBIAS("MICBIAS2", WM8993_POWER_MANAGEMENT_1, 5, 0),
- SND_SOC_DAPM_MICBIAS("MICBIAS1", WM8993_POWER_MANAGEMENT_1, 4, 0),
- 
-+SND_SOC_DAPM_SUPPLY("LINEOUT_VMID_BUF", WM8993_ANTIPOP1, 7, 0, NULL, 0),
-+
- SND_SOC_DAPM_MIXER("IN1L PGA", WM8993_POWER_MANAGEMENT_2, 6, 0,
- 		   in1l_pga, ARRAY_SIZE(in1l_pga)),
- SND_SOC_DAPM_MIXER("IN1R PGA", WM8993_POWER_MANAGEMENT_2, 4, 0,
-@@ -794,9 +796,11 @@ static const struct snd_soc_dapm_route lineout1_diff_routes[] = {
- };
- 
- static const struct snd_soc_dapm_route lineout1_se_routes[] = {
-+	{ "LINEOUT1N Mixer", NULL, "LINEOUT_VMID_BUF" },
- 	{ "LINEOUT1N Mixer", "Left Output Switch", "Left Output PGA" },
- 	{ "LINEOUT1N Mixer", "Right Output Switch", "Right Output PGA" },
- 
-+	{ "LINEOUT1P Mixer", NULL, "LINEOUT_VMID_BUF" },
- 	{ "LINEOUT1P Mixer", "Left Output Switch", "Left Output PGA" },
- 
- 	{ "LINEOUT1N Driver", NULL, "LINEOUT1N Mixer" },
-@@ -813,9 +817,11 @@ static const struct snd_soc_dapm_route lineout2_diff_routes[] = {
- };
- 
- static const struct snd_soc_dapm_route lineout2_se_routes[] = {
-+	{ "LINEOUT2N Mixer", NULL, "LINEOUT_VMID_BUF" },
- 	{ "LINEOUT2N Mixer", "Left Output Switch", "Left Output PGA" },
- 	{ "LINEOUT2N Mixer", "Right Output Switch", "Right Output PGA" },
- 
-+	{ "LINEOUT2P Mixer", NULL, "LINEOUT_VMID_BUF" },
- 	{ "LINEOUT2P Mixer", "Right Output Switch", "Right Output PGA" },
- 
- 	{ "LINEOUT2N Driver", NULL, "LINEOUT2N Mixer" },
--- 
-2.28.0
-
-
-From a2eeb4b984210336662a9ebdbecb96efd8823ff2 Mon Sep 17 00:00:00 2001
-From: UK KIM <w0806.kim@samsung.com>
-Date: Sat, 28 Jan 2012 01:52:22 +0900
-Subject: [PATCH 04/56] ASoC: wm_hubs: fix wrong bits for LINEOUT2 N/P mixer
-
-commit 114395c61ad2eb5a7a5cd163fcadb2414e48245a upstream.
-
-Signed-off-by: UK KIM <w0806.kim@samsung.com>
-Signed-off-by: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/codecs/wm_hubs.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/sound/soc/codecs/wm_hubs.c b/sound/soc/codecs/wm_hubs.c
-index 1c2a47dcbeab..b85539482ecd 100644
---- a/sound/soc/codecs/wm_hubs.c
-+++ b/sound/soc/codecs/wm_hubs.c
-@@ -568,8 +568,8 @@ SOC_DAPM_SINGLE("Output Switch", WM8993_LINE_MIXER2, 0, 1, 0),
- };
- 
- static const struct snd_kcontrol_new line2n_mix[] = {
--SOC_DAPM_SINGLE("Left Output Switch", WM8993_LINE_MIXER2, 6, 1, 0),
--SOC_DAPM_SINGLE("Right Output Switch", WM8993_LINE_MIXER2, 5, 1, 0),
-+SOC_DAPM_SINGLE("Left Output Switch", WM8993_LINE_MIXER2, 5, 1, 0),
-+SOC_DAPM_SINGLE("Right Output Switch", WM8993_LINE_MIXER2, 6, 1, 0),
- };
- 
- static const struct snd_kcontrol_new line2p_mix[] = {
--- 
-2.28.0
-
-
-From 886d462b0c92357a2f0ca0fc19f5877efbb1f638 Mon Sep 17 00:00:00 2001
-From: Will Deacon <will.deacon@arm.com>
-Date: Mon, 30 Jan 2012 20:21:42 +0100
-Subject: [PATCH 05/56] ARM: 7306/1: vfp: flush thread hwstate before restoring
- context from sigframe
-
-commit 2af276dfb1722e97b190bd2e646b079a2aa674db upstream.
-
-Following execution of a signal handler, we currently restore the VFP
-context from the ucontext in the signal frame. This involves copying
-from the user stack into the current thread's vfp_hard_struct and then
-flushing the new data out to the hardware registers.
-
-This is problematic when using a preemptible kernel because we could be
-context switched whilst updating the vfp_hard_struct. If the current
-thread has made use of VFP since the last context switch, the VFP
-notifier will copy from the hardware registers into the vfp_hard_struct,
-overwriting any data that had been partially copied by the signal code.
-
-Disabling preemption across copy_from_user calls is a terrible idea, so
-instead we move the VFP thread flush *before* we update the
-vfp_hard_struct. Since the flushing is performed lazily, this has the
-effect of disabling VFP and clearing the CPU's VFP state pointer,
-therefore preventing the thread from being updated with stale data on
-the next context switch.
-
-Tested-by: Peter Maydell <peter.maydell@linaro.org>
-Signed-off-by: Will Deacon <will.deacon@arm.com>
-Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/kernel/signal.c | 5 ++---
- 1 file changed, 2 insertions(+), 3 deletions(-)
-
 diff --git a/arch/arm/kernel/signal.c b/arch/arm/kernel/signal.c
-index 0340224cf73c..9e617bd4a146 100644
+index 0340224..9e617bd 100644
 --- a/arch/arm/kernel/signal.c
 +++ b/arch/arm/kernel/signal.c
 @@ -227,6 +227,8 @@ static int restore_vfp_context(struct vfp_sigframe __user *frame)
@@ -282,145 +63,8 @@ index 0340224cf73c..9e617bd4a146 100644
  	return err ? -EFAULT : 0;
  }
  
--- 
-2.28.0
-
-
-From ae3939e12cc597be0ba28d5f3b3d8f158f2d6d70 Mon Sep 17 00:00:00 2001
-From: Dave Martin <dave.martin@linaro.org>
-Date: Mon, 30 Jan 2012 20:22:28 +0100
-Subject: [PATCH 06/56] ARM: 7307/1: vfp: fix ptrace regset modification race
-
-commit 247f4993a5974e6759606c4d380748eecfd273ff upstream.
-
-In a preemptible kernel, vfp_set() can be preempted, causing the
-hardware VFP context to be switched while the thread vfp state is
-being read and modified.  This leads to a race condition which can
-cause the thread vfp state to become corrupted if lazy VFP context
-save occurs due to preemption in between the time thread->vfpstate
-is read and the time the modified state is written back.
-
-This may occur if preemption occurs during the execution of a
-ptrace() call which modifies the VFP register state of a thread.
-Such instances should be very rare in most realistic scenarios --
-none has been reported, so far as I am aware.  Only uniprocessor
-systems should be affected, since VFP context save is not currently
-lazy in SMP kernels.
-
-The problem was introduced by my earlier patch migrating to use
-regsets to implement ptrace.
-
-This patch does a vfp_sync_hwstate() before reading
-thread->vfpstate, to make sure that the thread's VFP state is not
-live in the hardware registers while the registers are modified.
-
-Thanks to Will Deacon for spotting this.
-
-Signed-off-by: Dave Martin <dave.martin@linaro.org>
-Signed-off-by: Will Deacon <will.deacon@arm.com>
-Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/kernel/ptrace.c | 6 ++++--
- 1 file changed, 4 insertions(+), 2 deletions(-)
-
-diff --git a/arch/arm/kernel/ptrace.c b/arch/arm/kernel/ptrace.c
-index 97260060bf26..7f1e1338e4dd 100644
---- a/arch/arm/kernel/ptrace.c
-+++ b/arch/arm/kernel/ptrace.c
-@@ -719,10 +719,13 @@ static int vfp_set(struct task_struct *target,
- {
- 	int ret;
- 	struct thread_info *thread = task_thread_info(target);
--	struct vfp_hard_struct new_vfp = thread->vfpstate.hard;
-+	struct vfp_hard_struct new_vfp;
- 	const size_t user_fpregs_offset = offsetof(struct user_vfp, fpregs);
- 	const size_t user_fpscr_offset = offsetof(struct user_vfp, fpscr);
- 
-+	vfp_sync_hwstate(thread);
-+	new_vfp = thread->vfpstate.hard;
-+
- 	ret = user_regset_copyin(&pos, &count, &kbuf, &ubuf,
- 				  &new_vfp.fpregs,
- 				  user_fpregs_offset,
-@@ -743,7 +746,6 @@ static int vfp_set(struct task_struct *target,
- 	if (ret)
- 		return ret;
- 
--	vfp_sync_hwstate(thread);
- 	thread->vfpstate.hard = new_vfp;
- 	vfp_flush_hwstate(thread);
- 
--- 
-2.28.0
-
-
-From e358073331debaab9e14b3139bc469184288aa48 Mon Sep 17 00:00:00 2001
-From: Will Deacon <will.deacon@arm.com>
-Date: Mon, 30 Jan 2012 20:23:29 +0100
-Subject: [PATCH 07/56] ARM: 7308/1: vfp: flush thread hwstate before copying
- ptrace registers
-
-commit 8130b9d7b9d858aa04ce67805e8951e3cb6e9b2f upstream.
-
-If we are context switched whilst copying into a thread's
-vfp_hard_struct then the partial copy may be corrupted by the VFP
-context switching code (see "ARM: vfp: flush thread hwstate before
-restoring context from sigframe").
-
-This patch updates the ptrace VFP set code so that the thread state is
-flushed before the copy, therefore disabling VFP and preventing
-corruption from occurring.
-
-Signed-off-by: Will Deacon <will.deacon@arm.com>
-Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/kernel/ptrace.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/arch/arm/kernel/ptrace.c b/arch/arm/kernel/ptrace.c
-index 7f1e1338e4dd..172ae01c26e0 100644
---- a/arch/arm/kernel/ptrace.c
-+++ b/arch/arm/kernel/ptrace.c
-@@ -746,8 +746,8 @@ static int vfp_set(struct task_struct *target,
- 	if (ret)
- 		return ret;
- 
--	thread->vfpstate.hard = new_vfp;
- 	vfp_flush_hwstate(thread);
-+	thread->vfpstate.hard = new_vfp;
- 
- 	return 0;
- }
--- 
-2.28.0
-
-
-From 17f272d8e4349543de855ea63e4eea4a67a7abc5 Mon Sep 17 00:00:00 2001
-From: Yegor Yefremov <yegor_sub1@visionsystems.de>
-Date: Mon, 23 Jan 2012 08:32:23 +0100
-Subject: [PATCH 08/56] ARM: OMAP2+: GPMC: fix device size setup
-
-commit 8ef5d844cc3a644ea6f7665932a4307e9fad01fa upstream.
-
-following statement can only change device size from 8-bit(0) to 16-bit(1),
-but not vice versa:
-
-regval |= GPMC_CONFIG1_DEVICESIZE(wval);
-
-so as this field has 1 reserved bit, that could be used in future,
-just clear both bits and then OR with the desired value
-
-Signed-off-by: Yegor Yefremov <yegorslists@googlemail.com>
-Signed-off-by: Tony Lindgren <tony@atomide.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/arm/mach-omap2/gpmc.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
 diff --git a/arch/arm/mach-omap2/gpmc.c b/arch/arm/mach-omap2/gpmc.c
-index 130034bf01d5..dfffbbf4c009 100644
+index 130034b..dfffbbf 100644
 --- a/arch/arm/mach-omap2/gpmc.c
 +++ b/arch/arm/mach-omap2/gpmc.c
 @@ -528,7 +528,13 @@ int gpmc_cs_configure(int cs, int cmd, int wval)
@@ -437,579 +81,88 @@ index 130034bf01d5..dfffbbf4c009 100644
  		gpmc_cs_write_reg(cs, GPMC_CS_CONFIG1, regval);
  		break;
  
--- 
-2.28.0
-
-
-From 344d390bcb4c796b4b7797395cfc07e2c43d935d Mon Sep 17 00:00:00 2001
-From: Samuel Thibault <samuel.thibault@ens-lyon.org>
-Date: Fri, 3 Feb 2012 15:37:15 -0800
-Subject: [PATCH 09/56] drivers/tty/vt/vt_ioctl.c: fix KDFONTOP 32bit
- compatibility layer
-
-commit cbcb8346054073d000ecac324763372d6abd44ac upstream.
-
-KDFONTOP(GET) currently fails with EIO when being run in a 32bit userland
-with a 64bit kernel if the font width is not 8.
-
-This is because of the setting of the KD_FONT_FLAG_OLD flag, which makes
-con_font_get return EIO in such case.
-
-This flag should *not* be set for KDFONTOP, since it's actually the whole
-point of this flag (see comment in con_font_set for instance).
-
-Signed-off-by: Samuel Thibault <samuel.thibault@ens-lyon.org>
-Reviewed-by: Arnd Bergmann <arnd@arndb.de>
-Cc: Arthur Taylor <art@ified.ca>
-Cc: Jiri Slaby <jslaby@suse.cz>
-Cc: Jiri Olsa <jolsa@redhat.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/tty/vt/vt_ioctl.c | 1 -
- 1 file changed, 1 deletion(-)
-
-diff --git a/drivers/tty/vt/vt_ioctl.c b/drivers/tty/vt/vt_ioctl.c
-index 5e096f43bcea..65447c5f91d7 100644
---- a/drivers/tty/vt/vt_ioctl.c
-+++ b/drivers/tty/vt/vt_ioctl.c
-@@ -1463,7 +1463,6 @@ compat_kdfontop_ioctl(struct compat_console_font_op __user *fontop,
- 	if (!perm && op->op != KD_FONT_OP_GET)
- 		return -EPERM;
- 	op->data = compat_ptr(((struct compat_console_font_op *)op)->data);
--	op->flags |= KD_FONT_FLAG_OLD;
- 	i = con_font_op(vc, op);
- 	if (i)
- 		return i;
--- 
-2.28.0
-
-
-From 401f63716ca0bca1728e55ccf2132fb3785cf5da Mon Sep 17 00:00:00 2001
-From: Oleg Nesterov <oleg@redhat.com>
-Date: Tue, 31 Jan 2012 17:14:38 +0100
-Subject: [PATCH 10/56] proc: mem_release() should check mm != NULL
-
-commit 71879d3cb3dd8f2dfdefb252775c1b3ea04a3dd4 upstream.
-
-mem_release() can hit mm == NULL, add the necessary check.
-
-Signed-off-by: Oleg Nesterov <oleg@redhat.com>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/proc/base.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/fs/proc/base.c b/fs/proc/base.c
-index 7b28f27ad80b..b3e298f29421 100644
---- a/fs/proc/base.c
-+++ b/fs/proc/base.c
-@@ -886,8 +886,8 @@ loff_t mem_lseek(struct file *file, loff_t offset, int orig)
- static int mem_release(struct inode *inode, struct file *file)
- {
- 	struct mm_struct *mm = file->private_data;
--
--	mmput(mm);
-+	if (mm)
-+		mmput(mm);
- 	return 0;
+diff --git a/drivers/cpufreq/powernow-k8.c b/drivers/cpufreq/powernow-k8.c
+index bce576d..ad683ec 100644
+--- a/drivers/cpufreq/powernow-k8.c
++++ b/drivers/cpufreq/powernow-k8.c
+@@ -54,6 +54,9 @@ static DEFINE_PER_CPU(struct powernow_k8_data *, powernow_data);
+ 
+ static int cpu_family = CPU_OPTERON;
+ 
++/* array to map SW pstate number to acpi state */
++static u32 ps_to_as[8];
++
+ /* core performance boost */
+ static bool cpb_capable, cpb_enabled;
+ static struct msr __percpu *msrs;
+@@ -80,9 +83,9 @@ static u32 find_khz_freq_from_fid(u32 fid)
  }
  
--- 
-2.28.0
-
-
-From b49767a65a6454f7d546068a785e25dbb0eabbcd Mon Sep 17 00:00:00 2001
-From: Oleg Nesterov <oleg@redhat.com>
-Date: Tue, 31 Jan 2012 17:14:54 +0100
-Subject: [PATCH 11/56] proc: unify mem_read() and mem_write()
-
-commit 572d34b946bae070debd42db1143034d9687e13f upstream.
-
-No functional changes, cleanup and preparation.
-
-mem_read() and mem_write() are very similar. Move this code into the
-new common helper, mem_rw(), which takes the additional "int write"
-argument.
-
-Signed-off-by: Oleg Nesterov <oleg@redhat.com>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/proc/base.c | 90 ++++++++++++++++++--------------------------------
- 1 file changed, 32 insertions(+), 58 deletions(-)
-
-diff --git a/fs/proc/base.c b/fs/proc/base.c
-index b3e298f29421..49b82beec318 100644
---- a/fs/proc/base.c
-+++ b/fs/proc/base.c
-@@ -782,57 +782,13 @@ static int mem_open(struct inode* inode, struct file* file)
- 	return 0;
+ static u32 find_khz_freq_from_pstate(struct cpufreq_frequency_table *data,
+-		u32 pstate)
++				     u32 pstate)
+ {
+-	return data[pstate].frequency;
++	return data[ps_to_as[pstate]].frequency;
  }
  
--static ssize_t mem_read(struct file * file, char __user * buf,
--			size_t count, loff_t *ppos)
-+static ssize_t mem_rw(struct file *file, char __user *buf,
-+			size_t count, loff_t *ppos, int write)
- {
--	int ret;
--	char *page;
--	unsigned long src = *ppos;
- 	struct mm_struct *mm = file->private_data;
--
--	if (!mm)
--		return 0;
--
--	page = (char *)__get_free_page(GFP_TEMPORARY);
--	if (!page)
--		return -ENOMEM;
--
--	ret = 0;
-- 
--	while (count > 0) {
--		int this_len, retval;
--
--		this_len = (count > PAGE_SIZE) ? PAGE_SIZE : count;
--		retval = access_remote_vm(mm, src, page, this_len, 0);
--		if (!retval) {
--			if (!ret)
--				ret = -EIO;
--			break;
--		}
--
--		if (copy_to_user(buf, page, retval)) {
--			ret = -EFAULT;
--			break;
--		}
-- 
--		ret += retval;
--		src += retval;
--		buf += retval;
--		count -= retval;
--	}
--	*ppos = src;
--
--	free_page((unsigned long) page);
--	return ret;
--}
--
--static ssize_t mem_write(struct file * file, const char __user *buf,
--			 size_t count, loff_t *ppos)
--{
--	int copied;
-+	unsigned long addr = *ppos;
-+	ssize_t copied;
- 	char *page;
--	unsigned long dst = *ppos;
--	struct mm_struct *mm = file->private_data;
- 
- 	if (!mm)
- 		return 0;
-@@ -843,30 +799,48 @@ static ssize_t mem_write(struct file * file, const char __user *buf,
- 
- 	copied = 0;
- 	while (count > 0) {
--		int this_len, retval;
-+		int this_len = min_t(int, count, PAGE_SIZE);
- 
--		this_len = (count > PAGE_SIZE) ? PAGE_SIZE : count;
--		if (copy_from_user(page, buf, this_len)) {
-+		if (write && copy_from_user(page, buf, this_len)) {
- 			copied = -EFAULT;
- 			break;
+ /* Return the vco fid for an input fid
+@@ -926,23 +929,27 @@ static int fill_powernow_table_pstate(struct powernow_k8_data *data,
+ 			invalidate_entry(powernow_table, i);
+ 			continue;
  		}
--		retval = access_remote_vm(mm, dst, page, this_len, 1);
--		if (!retval) {
+-		rdmsr(MSR_PSTATE_DEF_BASE + index, lo, hi);
+-		if (!(hi & HW_PSTATE_VALID_MASK)) {
+-			pr_debug("invalid pstate %d, ignoring\n", index);
+-			invalidate_entry(powernow_table, i);
+-			continue;
+-		}
+ 
+-		powernow_table[i].index = index;
++		ps_to_as[index] = i;
+ 
+ 		/* Frequency may be rounded for these */
+ 		if ((boot_cpu_data.x86 == 0x10 && boot_cpu_data.x86_model < 10)
+ 				 || boot_cpu_data.x86 == 0x11) {
 +
-+		this_len = access_remote_vm(mm, addr, page, this_len, write);
-+		if (!this_len) {
- 			if (!copied)
- 				copied = -EIO;
- 			break;
- 		}
--		copied += retval;
--		buf += retval;
--		dst += retval;
--		count -= retval;			
++			rdmsr(MSR_PSTATE_DEF_BASE + index, lo, hi);
++			if (!(hi & HW_PSTATE_VALID_MASK)) {
++				pr_debug("invalid pstate %d, ignoring\n", index);
++				invalidate_entry(powernow_table, i);
++				continue;
++			}
 +
-+		if (!write && copy_to_user(buf, page, this_len)) {
-+			copied = -EFAULT;
-+			break;
-+		}
+ 			powernow_table[i].frequency =
+ 				freq_from_fid_did(lo & 0x3f, (lo >> 6) & 7);
+ 		} else
+ 			powernow_table[i].frequency =
+ 				data->acpi_data.states[i].core_frequency * 1000;
 +
-+		buf += this_len;
-+		addr += this_len;
-+		copied += this_len;
-+		count -= this_len;
++		powernow_table[i].index = index;
  	}
--	*ppos = dst;
-+	*ppos = addr;
- 
- 	free_page((unsigned long) page);
- 	return copied;
- }
- 
-+static ssize_t mem_read(struct file *file, char __user *buf,
-+			size_t count, loff_t *ppos)
-+{
-+	return mem_rw(file, buf, count, ppos, 0);
-+}
-+
-+static ssize_t mem_write(struct file *file, const char __user *buf,
-+			 size_t count, loff_t *ppos)
-+{
-+	return mem_rw(file, (char __user*)buf, count, ppos, 1);
-+}
-+
- loff_t mem_lseek(struct file *file, loff_t offset, int orig)
- {
- 	switch (orig) {
--- 
-2.28.0
-
-
-From 0053779e04bbfabe31287245d89ad10bb66e758a Mon Sep 17 00:00:00 2001
-From: Oleg Nesterov <oleg@redhat.com>
-Date: Tue, 31 Jan 2012 17:15:11 +0100
-Subject: [PATCH 12/56] proc: make sure mem_open() doesn't pin the target's
- memory
-
-commit 6d08f2c7139790c268820a2e590795cb8333181a upstream.
-
-Once /proc/pid/mem is opened, the memory can't be released until
-mem_release() even if its owner exits.
-
-Change mem_open() to do atomic_inc(mm_count) + mmput(), this only
-pins mm_struct. Change mem_rw() to do atomic_inc_not_zero(mm_count)
-before access_remote_vm(), this verifies that this mm is still alive.
-
-I am not sure what should mem_rw() return if atomic_inc_not_zero()
-fails. With this patch it returns zero to match the "mm == NULL" case,
-may be it should return -EINVAL like it did before e268337d.
-
-Perhaps it makes sense to add the additional fatal_signal_pending()
-check into the main loop, to ensure we do not hold this memory if
-the target task was oom-killed.
-
-Signed-off-by: Oleg Nesterov <oleg@redhat.com>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/proc/base.c | 14 +++++++++++++-
- 1 file changed, 13 insertions(+), 1 deletion(-)
-
-diff --git a/fs/proc/base.c b/fs/proc/base.c
-index 49b82beec318..22794e8ab996 100644
---- a/fs/proc/base.c
-+++ b/fs/proc/base.c
-@@ -775,6 +775,13 @@ static int mem_open(struct inode* inode, struct file* file)
- 	if (IS_ERR(mm))
- 		return PTR_ERR(mm);
- 
-+	if (mm) {
-+		/* ensure this mm_struct can't be freed */
-+		atomic_inc(&mm->mm_count);
-+		/* but do not pin its memory */
-+		mmput(mm);
-+	}
-+
- 	/* OK to pass negative loff_t, we can catch out-of-range */
- 	file->f_mode |= FMODE_UNSIGNED_OFFSET;
- 	file->private_data = mm;
-@@ -798,6 +805,9 @@ static ssize_t mem_rw(struct file *file, char __user *buf,
- 		return -ENOMEM;
- 
- 	copied = 0;
-+	if (!atomic_inc_not_zero(&mm->mm_users))
-+		goto free;
-+
- 	while (count > 0) {
- 		int this_len = min_t(int, count, PAGE_SIZE);
- 
-@@ -825,6 +835,8 @@ static ssize_t mem_rw(struct file *file, char __user *buf,
- 	}
- 	*ppos = addr;
- 
-+	mmput(mm);
-+free:
- 	free_page((unsigned long) page);
- 	return copied;
- }
-@@ -861,7 +873,7 @@ static int mem_release(struct inode *inode, struct file *file)
- {
- 	struct mm_struct *mm = file->private_data;
- 	if (mm)
--		mmput(mm);
-+		mmdrop(mm);
  	return 0;
  }
+@@ -1189,7 +1196,8 @@ static int powernowk8_target(struct cpufreq_policy *pol,
+ 	powernow_k8_acpi_pst_values(data, newstate);
  
--- 
-2.28.0
-
-
-From 914dcd6a7120a034c515605ca509cb7e6767f52c Mon Sep 17 00:00:00 2001
-From: Clemens Ladisch <clemens@ladisch.de>
-Date: Thu, 26 Jan 2012 22:05:58 +0100
-Subject: [PATCH 13/56] firewire: ohci: add reset packet quirk for SB Audigy
-
-commit d1bb399ad03c11e792f6dea198d3b1e23061f094 upstream.
-
-The Audigy's SB1394 controller is actually from Texas Instruments
-and has the same bus reset packet generation bug, so it needs the
-same quirk entry.
-
-Signed-off-by: Clemens Ladisch <clemens@ladisch.de>
-Signed-off-by: Stefan Richter <stefanr@s5r6.in-berlin.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/firewire/ohci.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/drivers/firewire/ohci.c b/drivers/firewire/ohci.c
-index ee76c8ec72f6..f2dfd4c49f89 100644
---- a/drivers/firewire/ohci.c
-+++ b/drivers/firewire/ohci.c
-@@ -262,6 +262,7 @@ static inline struct fw_ohci *fw_ohci(struct fw_card *card)
- static char ohci_driver_name[] = KBUILD_MODNAME;
+ 	if (cpu_family == CPU_HW_PSTATE)
+-		ret = transition_frequency_pstate(data, newstate);
++		ret = transition_frequency_pstate(data,
++			data->powernow_table[newstate].index);
+ 	else
+ 		ret = transition_frequency_fidvid(data, newstate);
+ 	if (ret) {
+@@ -1202,7 +1210,7 @@ static int powernowk8_target(struct cpufreq_policy *pol,
  
- #define PCI_DEVICE_ID_AGERE_FW643	0x5901
-+#define PCI_DEVICE_ID_CREATIVE_SB1394	0x4001
- #define PCI_DEVICE_ID_JMICRON_JMB38X_FW	0x2380
- #define PCI_DEVICE_ID_TI_TSB12LV22	0x8009
- #define PCI_VENDOR_ID_PINNACLE_SYSTEMS	0x11bd
-@@ -285,6 +286,9 @@ static const struct {
- 	{PCI_VENDOR_ID_ATT, PCI_DEVICE_ID_AGERE_FW643, 6,
- 		QUIRK_NO_MSI},
- 
-+	{PCI_VENDOR_ID_CREATIVE, PCI_DEVICE_ID_CREATIVE_SB1394, PCI_ANY_ID,
-+		QUIRK_RESET_PACKET},
-+
- 	{PCI_VENDOR_ID_JMICRON, PCI_DEVICE_ID_JMICRON_JMB38X_FW, PCI_ANY_ID,
- 		QUIRK_NO_MSI},
- 
--- 
-2.28.0
-
-
-From c2f8080ae4ebf8d860addf050536b1ec71c53e19 Mon Sep 17 00:00:00 2001
-From: Stefan Richter <stefanr@s5r6.in-berlin.de>
-Date: Sun, 29 Jan 2012 12:41:15 +0100
-Subject: [PATCH 14/56] firewire: ohci: disable MSI on Ricoh controllers
-
-commit 320cfa6ce0b3dc794fedfa4bae54c0f65077234d upstream.
-
-The PCIe device
-
-    FireWire (IEEE 1394) [0c00]: Ricoh Co Ltd FireWire Host Controller
-    [1180:e832] (prog-if 10 [OHCI])
-
-is unable to access attached FireWire devices when MSI is enabled but
-works if MSI is disabled.
-http://www.mail-archive.com/alsa-user@lists.sourceforge.net/msg28251.html
-
-Hence add the "disable MSI" quirks flag for this device, or in fact for
-safety and simplicity for all current (R5U230, R5U231, R5U240) and
-future Ricoh PCIe 1394 controllers.
-
-Reported-by: Stefan Thomas <kontrapunktstefan@googlemail.com>
-Signed-off-by: Stefan Richter <stefanr@s5r6.in-berlin.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/firewire/ohci.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/firewire/ohci.c b/drivers/firewire/ohci.c
-index f2dfd4c49f89..7f97c3097900 100644
---- a/drivers/firewire/ohci.c
-+++ b/drivers/firewire/ohci.c
-@@ -299,7 +299,7 @@ static const struct {
- 		QUIRK_NO_MSI},
- 
- 	{PCI_VENDOR_ID_RICOH, PCI_ANY_ID, PCI_ANY_ID,
--		QUIRK_CYCLE_TIMER},
-+		QUIRK_CYCLE_TIMER | QUIRK_NO_MSI},
- 
- 	{PCI_VENDOR_ID_TI, PCI_DEVICE_ID_TI_TSB12LV22, PCI_ANY_ID,
- 		QUIRK_CYCLE_TIMER | QUIRK_RESET_PACKET | QUIRK_NO_1394A},
--- 
-2.28.0
-
-
-From 55d9f089521b1355cdd6914d1186ae02ddc0f74f Mon Sep 17 00:00:00 2001
-From: Jack Morgenstein <jackm@mellanox.com>
-Date: Thu, 26 Jan 2012 16:41:33 +0200
-Subject: [PATCH 15/56] IB/mlx4: pass SMP vendor-specific attribute MADs to
- firmware
-
-commit a6f7feae6d19e84253918d88b04153af09d3a243 upstream.
-
-In the current code, vendor-specific MADs (e.g with the FDR-10
-attribute) are silently dropped by the driver, resulting in timeouts
-at the sending side and inability to query/configure the relevant
-feature.  However, the ConnectX firmware is able to handle such MADs.
-For unsupported attributes, the firmware returns a GET_RESPONSE MAD
-containing an error status.
-
-For example, for a FDR-10 node with LID 11:
-
-    # ibstat mlx4_0 1
-
-    CA: 'mlx4_0'
-    Port 1:
-    State: Active
-    Physical state: LinkUp
-    Rate: 40 (FDR10)
-    Base lid: 11
-    LMC: 0
-    SM lid: 24
-    Capability mask: 0x02514868
-    Port GUID: 0x0002c903002e65d1
-    Link layer: InfiniBand
-
-Extended Port Query (EPI) vendor mad timeouts before the patch:
-
-    # smpquery MEPI 11 -d
-
-    ibwarn: [4196] smp_query_via: attr 0xff90 mod 0x0 route Lid 11
-    ibwarn: [4196] _do_madrpc: retry 1 (timeout 1000 ms)
-    ibwarn: [4196] _do_madrpc: retry 2 (timeout 1000 ms)
-    ibwarn: [4196] _do_madrpc: timeout after 3 retries, 3000 ms
-    ibwarn: [4196] mad_rpc: _do_madrpc failed; dport (Lid 11)
-    smpquery: iberror: [pid 4196] main: failed: operation EPI: ext port info query failed
-
-EPI query works OK with the patch:
-
-    # smpquery MEPI 11 -d
-
-    ibwarn: [6548] smp_query_via: attr 0xff90 mod 0x0 route Lid 11
-    ibwarn: [6548] mad_rpc: data offs 64 sz 64
-    mad data
-    0000 0000 0000 0001 0000 0001 0000 0001
-    0000 0000 0000 0000 0000 0000 0000 0000
-    0000 0000 0000 0000 0000 0000 0000 0000
-    0000 0000 0000 0000 0000 0000 0000 0000
-    # Ext Port info: Lid 11 port 0
-    StateChangeEnable:...............0x00
-    LinkSpeedSupported:..............0x01
-    LinkSpeedEnabled:................0x01
-    LinkSpeedActive:.................0x01
-
-Signed-off-by: Jack Morgenstein <jackm@mellanox.com>
-Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
-Acked-by: Ira Weiny <weiny2@llnl.gov>
-Signed-off-by: Roland Dreier <roland@purestorage.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/hw/mlx4/mad.c | 7 ++-----
- 1 file changed, 2 insertions(+), 5 deletions(-)
-
-diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
-index 57ffa50f509e..44fc3104e918 100644
---- a/drivers/infiniband/hw/mlx4/mad.c
-+++ b/drivers/infiniband/hw/mlx4/mad.c
-@@ -255,12 +255,9 @@ int mlx4_ib_process_mad(struct ib_device *ibdev, int mad_flags,	u8 port_num,
- 			return IB_MAD_RESULT_SUCCESS;
- 
- 		/*
--		 * Don't process SMInfo queries or vendor-specific
--		 * MADs -- the SMA can't handle them.
-+		 * Don't process SMInfo queries -- the SMA can't handle them.
- 		 */
--		if (in_mad->mad_hdr.attr_id == IB_SMP_ATTR_SM_INFO ||
--		    ((in_mad->mad_hdr.attr_id & IB_SMP_ATTR_VENDOR_MASK) ==
--		     IB_SMP_ATTR_VENDOR_MASK))
-+		if (in_mad->mad_hdr.attr_id == IB_SMP_ATTR_SM_INFO)
- 			return IB_MAD_RESULT_SUCCESS;
- 	} else if (in_mad->mad_hdr.mgmt_class == IB_MGMT_CLASS_PERF_MGMT ||
- 		   in_mad->mad_hdr.mgmt_class == MLX4_IB_VENDOR_CLASS1   ||
--- 
-2.28.0
-
-
-From 603b63484725a6e88e4ae5da58716efd88154b1e Mon Sep 17 00:00:00 2001
-From: Jiang Liu <liuj97@gmail.com>
-Date: Fri, 3 Feb 2012 15:37:16 -0800
-Subject: [PATCH 16/56] kprobes: fix a memory leak in function
- pre_handler_kretprobe()
-
-commit 55ca6140e9bb307efc97a9301a4f501de02a6fd6 upstream.
-
-In function pre_handler_kretprobe(), the allocated kretprobe_instance
-object will get leaked if the entry_handler callback returns non-zero.
-This may cause all the preallocated kretprobe_instance objects exhausted.
-
-This issue can be reproduced by changing
-samples/kprobes/kretprobe_example.c to probe "mutex_unlock".  And the fix
-is straightforward: just put the allocated kretprobe_instance object back
-onto the free_instances list.
-
-[akpm@linux-foundation.org: use raw_spin_lock/unlock]
-Signed-off-by: Jiang Liu <jiang.liu@huawei.com>
-Acked-by: Jim Keniston <jkenisto@us.ibm.com>
-Acked-by: Ananth N Mavinakayanahalli <ananth@in.ibm.com>
-Cc: Masami Hiramatsu <masami.hiramatsu.pt@hitachi.com>
-Cc: Anil S Keshavamurthy <anil.s.keshavamurthy@intel.com>
-Cc: "David S. Miller" <davem@davemloft.net>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/kprobes.c | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
-
-diff --git a/kernel/kprobes.c b/kernel/kprobes.c
-index e0f0bdd92ca2..749340c1e6fc 100644
---- a/kernel/kprobes.c
-+++ b/kernel/kprobes.c
-@@ -1660,8 +1660,12 @@ static int __kprobes pre_handler_kretprobe(struct kprobe *p,
- 		ri->rp = rp;
- 		ri->task = current;
- 
--		if (rp->entry_handler && rp->entry_handler(ri, regs))
-+		if (rp->entry_handler && rp->entry_handler(ri, regs)) {
-+			raw_spin_lock_irqsave(&rp->lock, flags);
-+			hlist_add_head(&ri->hlist, &rp->free_instances);
-+			raw_spin_unlock_irqrestore(&rp->lock, flags);
- 			return 0;
-+		}
- 
- 		arch_prepare_kretprobe(ri, regs);
- 
--- 
-2.28.0
-
-
-From 73632d80356dcadfcacc8e20a319850b112abb9b Mon Sep 17 00:00:00 2001
-From: Nikolaus Voss <n.voss@weinmann.de>
-Date: Tue, 17 Jan 2012 10:28:33 +0100
-Subject: [PATCH 17/56] at_hdmac: bugfix for enabling channel irq
-
-commit bda3a47c886664e86ee14eb79e9072b9e341f575 upstream.
-
-commit 463894705e4089d0ff69e7d877312d496ac70e5b deleted redundant
-chan_id and chancnt initialization in dma drivers as this is done
-in dma_async_device_register().
-
-However, atc_enable_irq() relied on chan_id set before registering
-the device, what left only channel 0 functional for this driver.
-
-This patch introduces atc_enable/disable_chan_irq() as a variant
-of atc_enable/disable_irq() with the channel as explicit argument.
-
-Signed-off-by: Nikolaus Voss <n.voss@weinmann.de>
-Signed-off-by: Nicolas Ferre <nicolas.ferre@atmel.com>
-Signed-off-by: Vinod Koul <vinod.koul@linux.intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/dma/at_hdmac.c      |  4 ++--
- drivers/dma/at_hdmac_regs.h | 17 ++++++++---------
- 2 files changed, 10 insertions(+), 11 deletions(-)
-
+ 	if (cpu_family == CPU_HW_PSTATE)
+ 		pol->cur = find_khz_freq_from_pstate(data->powernow_table,
+-				newstate);
++				data->powernow_table[newstate].index);
+ 	else
+ 		pol->cur = find_khz_freq_from_fid(data->currfid);
+ 	ret = 0;
 diff --git a/drivers/dma/at_hdmac.c b/drivers/dma/at_hdmac.c
-index 36144f88d718..9e9318abc510 100644
+index 36144f8..9e9318a 100644
 --- a/drivers/dma/at_hdmac.c
 +++ b/drivers/dma/at_hdmac.c
 @@ -1279,7 +1279,7 @@ static int __init at_dma_probe(struct platform_device *pdev)
@@ -1031,7 +184,7 @@ index 36144f88d718..9e9318abc510 100644
  
  		tasklet_kill(&atchan->tasklet);
 diff --git a/drivers/dma/at_hdmac_regs.h b/drivers/dma/at_hdmac_regs.h
-index 087dbf1dd39c..19ed47056da8 100644
+index 087dbf1..19ed470 100644
 --- a/drivers/dma/at_hdmac_regs.h
 +++ b/drivers/dma/at_hdmac_regs.h
 @@ -319,28 +319,27 @@ static void atc_dump_lli(struct at_dma_chan *atchan, struct at_lli *lli)
@@ -1071,713 +224,39 @@ index 087dbf1dd39c..19ed47056da8 100644
  }
  
  
--- 
-2.28.0
-
-
-From c713decb179258db83fd048c09ec55d521d864d4 Mon Sep 17 00:00:00 2001
-From: Carsten Otte <carsteno@de.ibm.com>
-Date: Fri, 3 Feb 2012 15:37:14 -0800
-Subject: [PATCH 18/56] mm/filemap_xip.c: fix race condition in
- xip_file_fault()
-
-commit 99f02ef1f18631eb0a4e0ea0a3d56878dbcb4b90 upstream.
-
-Fix a race condition that shows in conjunction with xip_file_fault() when
-two threads of the same user process fault on the same memory page.
-
-In this case, the race winner will install the page table entry and the
-unlucky loser will cause an oops: xip_file_fault calls vm_insert_pfn (via
-vm_insert_mixed) which drops out at this check:
-
-	retval = -EBUSY;
-	if (!pte_none(*pte))
-		goto out_unlock;
-
-The resulting -EBUSY return value will trigger a BUG_ON() in
-xip_file_fault.
-
-This fix simply considers the fault as fixed in this case, because the
-race winner has successfully installed the pte.
-
-[akpm@linux-foundation.org: use conventional (and consistent) comment layout]
-Reported-by: David Sadler <dsadler@us.ibm.com>
-Signed-off-by: Carsten Otte <cotte@de.ibm.com>
-Reported-by: Louis Alex Eisner <leisner@cs.ucsd.edu>
-Cc: Hugh Dickins <hughd@google.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/filemap_xip.c | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
-
-diff --git a/mm/filemap_xip.c b/mm/filemap_xip.c
-index 93356cd12828..dee94297f392 100644
---- a/mm/filemap_xip.c
-+++ b/mm/filemap_xip.c
-@@ -263,7 +263,12 @@ found:
- 							xip_pfn);
- 		if (err == -ENOMEM)
- 			return VM_FAULT_OOM;
--		BUG_ON(err);
-+		/*
-+		 * err == -EBUSY is fine, we've raced against another thread
-+		 * that faulted-in the same page
-+		 */
-+		if (err != -EBUSY)
-+			BUG_ON(err);
- 		return VM_FAULT_NOPAGE;
- 	} else {
- 		int err, ret = VM_FAULT_OOM;
--- 
-2.28.0
-
-
-From 77650df5a701fb3a7acadfb347ebfb0e95cffe09 Mon Sep 17 00:00:00 2001
-From: Mel Gorman <mgorman@suse.de>
-Date: Fri, 3 Feb 2012 15:37:18 -0800
-Subject: [PATCH 19/56] mm: compaction: check pfn_valid when entering a new
- MAX_ORDER_NR_PAGES block during isolation for migration
-
-commit 0bf380bc70ecba68cb4d74dc656cc2fa8c4d801a upstream.
-
-When isolating for migration, migration starts at the start of a zone
-which is not necessarily pageblock aligned.  Further, it stops isolating
-when COMPACT_CLUSTER_MAX pages are isolated so migrate_pfn is generally
-not aligned.  This allows isolate_migratepages() to call pfn_to_page() on
-an invalid PFN which can result in a crash.  This was originally reported
-against a 3.0-based kernel with the following trace in a crash dump.
-
-PID: 9902   TASK: d47aecd0  CPU: 0   COMMAND: "memcg_process_s"
- #0 [d72d3ad0] crash_kexec at c028cfdb
- #1 [d72d3b24] oops_end at c05c5322
- #2 [d72d3b38] __bad_area_nosemaphore at c0227e60
- #3 [d72d3bec] bad_area at c0227fb6
- #4 [d72d3c00] do_page_fault at c05c72ec
- #5 [d72d3c80] error_code (via page_fault) at c05c47a4
-    EAX: 00000000  EBX: 000c0000  ECX: 00000001  EDX: 00000807  EBP: 000c0000
-    DS:  007b      ESI: 00000001  ES:  007b      EDI: f3000a80  GS:  6f50
-    CS:  0060      EIP: c030b15a  ERR: ffffffff  EFLAGS: 00010002
- #6 [d72d3cb4] isolate_migratepages at c030b15a
- #7 [d72d3d14] zone_watermark_ok at c02d26cb
- #8 [d72d3d2c] compact_zone at c030b8de
- #9 [d72d3d68] compact_zone_order at c030bba1
-#10 [d72d3db4] try_to_compact_pages at c030bc84
-#11 [d72d3ddc] __alloc_pages_direct_compact at c02d61e7
-#12 [d72d3e08] __alloc_pages_slowpath at c02d66c7
-#13 [d72d3e78] __alloc_pages_nodemask at c02d6a97
-#14 [d72d3eb8] alloc_pages_vma at c030a845
-#15 [d72d3ed4] do_huge_pmd_anonymous_page at c03178eb
-#16 [d72d3f00] handle_mm_fault at c02f36c6
-#17 [d72d3f30] do_page_fault at c05c70ed
-#18 [d72d3fb0] error_code (via page_fault) at c05c47a4
-    EAX: b71ff000  EBX: 00000001  ECX: 00001600  EDX: 00000431
-    DS:  007b      ESI: 08048950  ES:  007b      EDI: bfaa3788
-    SS:  007b      ESP: bfaa36e0  EBP: bfaa3828  GS:  6f50
-    CS:  0073      EIP: 080487c8  ERR: ffffffff  EFLAGS: 00010202
-
-It was also reported by Herbert van den Bergh against 3.1-based kernel
-with the following snippet from the console log.
-
-BUG: unable to handle kernel paging request at 01c00008
-IP: [<c0522399>] isolate_migratepages+0x119/0x390
-*pdpt = 000000002f7ce001 *pde = 0000000000000000
-
-It is expected that it also affects 3.2.x and current mainline.
-
-The problem is that pfn_valid is only called on the first PFN being
-checked and that PFN is not necessarily aligned.  Lets say we have a case
-like this
-
-H = MAX_ORDER_NR_PAGES boundary
-| = pageblock boundary
-m = cc->migrate_pfn
-f = cc->free_pfn
-o = memory hole
-
-H------|------H------|----m-Hoooooo|ooooooH-f----|------H
-
-The migrate_pfn is just below a memory hole and the free scanner is beyond
-the hole.  When isolate_migratepages started, it scans from migrate_pfn to
-migrate_pfn+pageblock_nr_pages which is now in a memory hole.  It checks
-pfn_valid() on the first PFN but then scans into the hole where there are
-not necessarily valid struct pages.
-
-This patch ensures that isolate_migratepages calls pfn_valid when
-necessary.
-
-Reported-by: Herbert van den Bergh <herbert.van.den.bergh@oracle.com>
-Tested-by: Herbert van den Bergh <herbert.van.den.bergh@oracle.com>
-Signed-off-by: Mel Gorman <mgorman@suse.de>
-Acked-by: Michal Nazarewicz <mina86@mina86.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/compaction.c | 13 +++++++++++++
- 1 file changed, 13 insertions(+)
-
-diff --git a/mm/compaction.c b/mm/compaction.c
-index 6cc604bd5649..7ca6842c665d 100644
---- a/mm/compaction.c
-+++ b/mm/compaction.c
-@@ -320,6 +320,19 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
- 		} else if (!locked)
- 			spin_lock_irq(&zone->lru_lock);
+diff --git a/drivers/firewire/ohci.c b/drivers/firewire/ohci.c
+index ee76c8e..7f97c30 100644
+--- a/drivers/firewire/ohci.c
++++ b/drivers/firewire/ohci.c
+@@ -262,6 +262,7 @@ static inline struct fw_ohci *fw_ohci(struct fw_card *card)
+ static char ohci_driver_name[] = KBUILD_MODNAME;
  
-+		/*
-+		 * migrate_pfn does not necessarily start aligned to a
-+		 * pageblock. Ensure that pfn_valid is called when moving
-+		 * into a new MAX_ORDER_NR_PAGES range in case of large
-+		 * memory holes within the zone
-+		 */
-+		if ((low_pfn & (MAX_ORDER_NR_PAGES - 1)) == 0) {
-+			if (!pfn_valid(low_pfn)) {
-+				low_pfn += MAX_ORDER_NR_PAGES - 1;
-+				continue;
-+			}
-+		}
+ #define PCI_DEVICE_ID_AGERE_FW643	0x5901
++#define PCI_DEVICE_ID_CREATIVE_SB1394	0x4001
+ #define PCI_DEVICE_ID_JMICRON_JMB38X_FW	0x2380
+ #define PCI_DEVICE_ID_TI_TSB12LV22	0x8009
+ #define PCI_VENDOR_ID_PINNACLE_SYSTEMS	0x11bd
+@@ -285,6 +286,9 @@ static const struct {
+ 	{PCI_VENDOR_ID_ATT, PCI_DEVICE_ID_AGERE_FW643, 6,
+ 		QUIRK_NO_MSI},
+ 
++	{PCI_VENDOR_ID_CREATIVE, PCI_DEVICE_ID_CREATIVE_SB1394, PCI_ANY_ID,
++		QUIRK_RESET_PACKET},
 +
- 		if (!pfn_valid_within(low_pfn))
- 			continue;
- 		nr_scanned++;
--- 
-2.28.0
-
-
-From f5e9a83833c2effd51bb138b598636f4ed661498 Mon Sep 17 00:00:00 2001
-From: =?UTF-8?q?Michel=20D=C3=A4nzer?= <michel.daenzer@amd.com>
-Date: Wed, 1 Feb 2012 12:09:55 +0100
-Subject: [PATCH 20/56] drm/radeon: Set DESKTOP_HEIGHT register to the
- framebuffer (not mode) height.
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit 1b61925061660009f5b8047f93c5297e04541273 upstream.
-
-The value of this register is transferred to the V_COUNTER register at the
-beginning of vertical blank. V_COUNTER is the reference for VLINE waits and
-goes from VIEWPORT_Y_START to VIEWPORT_Y_START+VIEWPORT_HEIGHT during scanout,
-so if VIEWPORT_Y_START is not 0, V_COUNTER actually went backwards at the
-beginning of vertical blank, and VLINE waits excluding the whole scanout area
-could never finish (possibly only if VIEWPORT_Y_START is larger than the length
-of vertical blank in scanlines). Setting DESKTOP_HEIGHT to the framebuffer
-height should prevent this for any kind of VLINE wait.
-
-Fixes https://bugs.freedesktop.org/show_bug.cgi?id=45329 .
-
-Signed-off-by: Michel Dänzer <michel.daenzer@amd.com>
-Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Dave Airlie <airlied@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/radeon/atombios_crtc.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/gpu/drm/radeon/atombios_crtc.c b/drivers/gpu/drm/radeon/atombios_crtc.c
-index 9541995e4b21..071ded119eb9 100644
---- a/drivers/gpu/drm/radeon/atombios_crtc.c
-+++ b/drivers/gpu/drm/radeon/atombios_crtc.c
-@@ -1173,7 +1173,7 @@ static int dce4_crtc_do_set_base(struct drm_crtc *crtc,
- 	WREG32(EVERGREEN_GRPH_ENABLE + radeon_crtc->crtc_offset, 1);
+ 	{PCI_VENDOR_ID_JMICRON, PCI_DEVICE_ID_JMICRON_JMB38X_FW, PCI_ANY_ID,
+ 		QUIRK_NO_MSI},
  
- 	WREG32(EVERGREEN_DESKTOP_HEIGHT + radeon_crtc->crtc_offset,
--	       crtc->mode.vdisplay);
-+	       target_fb->height);
- 	x &= ~3;
- 	y &= ~1;
- 	WREG32(EVERGREEN_VIEWPORT_START + radeon_crtc->crtc_offset,
-@@ -1342,7 +1342,7 @@ static int avivo_crtc_do_set_base(struct drm_crtc *crtc,
- 	WREG32(AVIVO_D1GRPH_ENABLE + radeon_crtc->crtc_offset, 1);
+@@ -295,7 +299,7 @@ static const struct {
+ 		QUIRK_NO_MSI},
  
- 	WREG32(AVIVO_D1MODE_DESKTOP_HEIGHT + radeon_crtc->crtc_offset,
--	       crtc->mode.vdisplay);
-+	       target_fb->height);
- 	x &= ~3;
- 	y &= ~1;
- 	WREG32(AVIVO_D1MODE_VIEWPORT_START + radeon_crtc->crtc_offset,
--- 
-2.28.0
-
-
-From e1cf4ad959d7b2644f2be70ff38030d6cd3cbede Mon Sep 17 00:00:00 2001
-From: Ben Skeggs <bskeggs@redhat.com>
-Date: Tue, 10 Jan 2012 10:18:28 +1000
-Subject: [PATCH 21/56] drm/nouveau/gem: fix fence_sync race / oops
-
-commit 525895ba388c949aa906f26e3ec5cb1ab041f56b upstream.
-
-Due to a race it was possible for a fence to be destroyed while another
-thread was trying to synchronise with it.  If this happened in the fallback
-non-semaphore path, it lead to the following oops due to fence->channel
-being NULL.
-
-BUG: unable to handle kernel NULL pointer dereference at   (null)
-IP: [<fa9632ce>] nouveau_fence_update+0xe/0xe0 [nouveau]
-*pde = a649c067
-SMP
-Modules linked in: fuse nouveau(O) ttm(O) drm_kms_helper(O) drm(O) mxm_wmi video wmi netconsole configfs lockd bnep bluetooth rfkill ip6t_REJECT nf_conntrack_ipv6 nf_defrag_ipv6 nf_conntrack_ipv4 nf_defrag_ipv4 xt_state nf_conntrack ip6table_filter ip6_tables snd_hda_codec_realtek snd_hda_intel snd_hda_cobinfmt_misc uinput ata_generic pata_acpi pata_aet2c_algo_bit i2c_core [last unloaded: wmi]
-
-Pid: 2255, comm: gnome-shell Tainted: G           O 3.2.0-0.rc5.git0.1.fc17.i686 #1 System manufacturer System Product Name/M2A-VM
-EIP: 0060:[<fa9632ce>] EFLAGS: 00010296 CPU: 1
-EIP is at nouveau_fence_update+0xe/0xe0 [nouveau]
-EAX: 00000000 EBX: ddfc6dd0 ECX: dd111580 EDX: 00000000
-ESI: 00003e80 EDI: dd111580 EBP: dd121d00 ESP: dd121ce8
- DS: 007b ES: 007b FS: 00d8 GS: 00e0 SS: 0068
-Process gnome-shell (pid: 2255, ti=dd120000 task=dd111580 task.ti=dd120000)
-Stack:
- 7dc86c76 00000000 00003e80 ddfc6dd0 00003e80 dd111580 dd121d0c fa96371f
- 00000000 dd121d3c fa963773 dd111580 01000246 000ec53d 00000000 ddfc6dd0
- 00001f40 00000000 ddfc6dd0 00000010 dc7df840 dd121d6c fa9639a0 00000000
-Call Trace:
- [<fa96371f>] __nouveau_fence_signalled+0x1f/0x30 [nouveau]
- [<fa963773>] __nouveau_fence_wait+0x43/0xd0 [nouveau]
- [<fa9639a0>] nouveau_fence_sync+0x1a0/0x1c0 [nouveau]
- [<fa964046>] validate_list+0x176/0x300 [nouveau]
- [<f7d9c9c0>] ? ttm_bo_mem_put+0x30/0x30 [ttm]
- [<fa964b8a>] nouveau_gem_ioctl_pushbuf+0x48a/0xfd0 [nouveau]
- [<c0406481>] ? die+0x31/0x80
- [<f7c93d98>] drm_ioctl+0x388/0x490 [drm]
- [<c0406481>] ? die+0x31/0x80
- [<fa964700>] ? nouveau_gem_ioctl_new+0x150/0x150 [nouveau]
- [<c0635c7b>] ? file_has_perm+0xcb/0xe0
- [<f7c93a10>] ? drm_copy_field+0x80/0x80 [drm]
- [<c0564f56>] do_vfs_ioctl+0x86/0x5b0
- [<c0406481>] ? die+0x31/0x80
- [<c0635f22>] ? selinux_file_ioctl+0x62/0x130
- [<c0554f30>] ? fget_light+0x30/0x340
- [<c05654ef>] sys_ioctl+0x6f/0x80
- [<c099e3a4>] syscall_call+0x7/0xb
- [<c0406481>] ? die+0x31/0x80
- [<c0406481>] ? die+0x31/0x80
-
-Signed-off-by: Ben Skeggs <bskeggs@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/nouveau/nouveau_gem.c | 23 +++++++++++++++++++++--
- 1 file changed, 21 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/gpu/drm/nouveau/nouveau_gem.c b/drivers/gpu/drm/nouveau/nouveau_gem.c
-index b52e46018245..cee78b26f60f 100644
---- a/drivers/gpu/drm/nouveau/nouveau_gem.c
-+++ b/drivers/gpu/drm/nouveau/nouveau_gem.c
-@@ -314,6 +314,25 @@ retry:
- 	return 0;
- }
+ 	{PCI_VENDOR_ID_RICOH, PCI_ANY_ID, PCI_ANY_ID,
+-		QUIRK_CYCLE_TIMER},
++		QUIRK_CYCLE_TIMER | QUIRK_NO_MSI},
  
-+static int
-+validate_sync(struct nouveau_channel *chan, struct nouveau_bo *nvbo)
-+{
-+	struct nouveau_fence *fence = NULL;
-+	int ret = 0;
-+
-+	spin_lock(&nvbo->bo.bdev->fence_lock);
-+	if (nvbo->bo.sync_obj)
-+		fence = nouveau_fence_ref(nvbo->bo.sync_obj);
-+	spin_unlock(&nvbo->bo.bdev->fence_lock);
-+
-+	if (fence) {
-+		ret = nouveau_fence_sync(fence, chan);
-+		nouveau_fence_unref(&fence);
-+	}
-+
-+	return ret;
-+}
-+
- static int
- validate_list(struct nouveau_channel *chan, struct list_head *list,
- 	      struct drm_nouveau_gem_pushbuf_bo *pbbo, uint64_t user_pbbo_ptr)
-@@ -327,7 +346,7 @@ validate_list(struct nouveau_channel *chan, struct list_head *list,
- 	list_for_each_entry(nvbo, list, entry) {
- 		struct drm_nouveau_gem_pushbuf_bo *b = &pbbo[nvbo->pbbo_index];
- 
--		ret = nouveau_fence_sync(nvbo->bo.sync_obj, chan);
-+		ret = validate_sync(chan, nvbo);
- 		if (unlikely(ret)) {
- 			NV_ERROR(dev, "fail pre-validate sync\n");
- 			return ret;
-@@ -350,7 +369,7 @@ validate_list(struct nouveau_channel *chan, struct list_head *list,
- 			return ret;
- 		}
- 
--		ret = nouveau_fence_sync(nvbo->bo.sync_obj, chan);
-+		ret = validate_sync(chan, nvbo);
- 		if (unlikely(ret)) {
- 			NV_ERROR(dev, "fail post-validate sync\n");
- 			return ret;
--- 
-2.28.0
-
-
-From 32c4490a6ffbe3de604581f5fdce361eb049acff Mon Sep 17 00:00:00 2001
-From: Seth Forshee <seth.forshee@canonical.com>
-Date: Tue, 31 Jan 2012 19:06:25 -0600
-Subject: [PATCH 22/56] drm/radeon/kms: disable output polling when suspended
-
-commit 86698c20f71d488b32c49ed4687fb3cf8a88a5ca upstream.
-
-Polling the outputs when the device is suspended can result in erroneous
-status updates. Disable output polling during suspend to prevent this
-from happening.
-
-Signed-off-by: Seth Forshee <seth.forshee@canonical.com>
-Reviewed-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Dave Airlie <airlied@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/radeon/radeon_device.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
-index 5d0c1236dd4c..e87893c2c88a 100644
---- a/drivers/gpu/drm/radeon/radeon_device.c
-+++ b/drivers/gpu/drm/radeon/radeon_device.c
-@@ -857,6 +857,8 @@ int radeon_suspend_kms(struct drm_device *dev, pm_message_t state)
- 	if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
- 		return 0;
- 
-+	drm_kms_helper_poll_disable(dev);
-+
- 	/* turn off display hw */
- 	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
- 		drm_helper_connector_dpms(connector, DRM_MODE_DPMS_OFF);
-@@ -943,6 +945,8 @@ int radeon_resume_kms(struct drm_device *dev)
- 	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
- 		drm_helper_connector_dpms(connector, DRM_MODE_DPMS_ON);
- 	}
-+
-+	drm_kms_helper_poll_enable(dev);
- 	return 0;
- }
- 
--- 
-2.28.0
-
-
-From c27711dc7f2cff89cee6a47026d936672cb29350 Mon Sep 17 00:00:00 2001
-From: Chanho Min <chanho0207@gmail.com>
-Date: Thu, 5 Jan 2012 20:00:19 +0900
-Subject: [PATCH 23/56] sched/rt: Fix task stack corruption under
- __ARCH_WANT_INTERRUPTS_ON_CTXSW
-
-commit cb297a3e433dbdcf7ad81e0564e7b804c941ff0d upstream.
-
-This issue happens under the following conditions:
-
- 1. preemption is off
- 2. __ARCH_WANT_INTERRUPTS_ON_CTXSW is defined
- 3. RT scheduling class
- 4. SMP system
-
-Sequence is as follows:
-
- 1.suppose current task is A. start schedule()
- 2.task A is enqueued pushable task at the entry of schedule()
-   __schedule
-    prev = rq->curr;
-    ...
-    put_prev_task
-     put_prev_task_rt
-      enqueue_pushable_task
- 4.pick the task B as next task.
-   next = pick_next_task(rq);
- 3.rq->curr set to task B and context_switch is started.
-   rq->curr = next;
- 4.At the entry of context_swtich, release this cpu's rq->lock.
-   context_switch
-    prepare_task_switch
-     prepare_lock_switch
-      raw_spin_unlock_irq(&rq->lock);
- 5.Shortly after rq->lock is released, interrupt is occurred and start IRQ context
- 6.try_to_wake_up() which called by ISR acquires rq->lock
-    try_to_wake_up
-     ttwu_remote
-      rq = __task_rq_lock(p)
-      ttwu_do_wakeup(rq, p, wake_flags);
-        task_woken_rt
- 7.push_rt_task picks the task A which is enqueued before.
-   task_woken_rt
-    push_rt_tasks(rq)
-     next_task = pick_next_pushable_task(rq)
- 8.At find_lock_lowest_rq(), If double_lock_balance() returns 0,
-   lowest_rq can be the remote rq.
-  (But,If preemption is on, double_lock_balance always return 1 and it
-   does't happen.)
-   push_rt_task
-    find_lock_lowest_rq
-     if (double_lock_balance(rq, lowest_rq))..
- 9.find_lock_lowest_rq return the available rq. task A is migrated to
-   the remote cpu/rq.
-   push_rt_task
-    ...
-    deactivate_task(rq, next_task, 0);
-    set_task_cpu(next_task, lowest_rq->cpu);
-    activate_task(lowest_rq, next_task, 0);
- 10. But, task A is on irq context at this cpu.
-     So, task A is scheduled by two cpus at the same time until restore from IRQ.
-     Task A's stack is corrupted.
-
-To fix it, don't migrate an RT task if it's still running.
-
-Signed-off-by: Chanho Min <chanho.min@lge.com>
-Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
-Acked-by: Steven Rostedt <rostedt@goodmis.org>
-Link: http://lkml.kernel.org/r/CAOAMb1BHA=5fm7KTewYyke6u-8DP0iUuJMpgQw54vNeXFsGpoQ@mail.gmail.com
-Signed-off-by: Ingo Molnar <mingo@elte.hu>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/sched_rt.c | 5 +++++
- 1 file changed, 5 insertions(+)
-
-diff --git a/kernel/sched_rt.c b/kernel/sched_rt.c
-index 17f2319d5e4f..ac79f9e34fd2 100644
---- a/kernel/sched_rt.c
-+++ b/kernel/sched_rt.c
-@@ -1390,6 +1390,11 @@ static int push_rt_task(struct rq *rq)
- 	if (!next_task)
- 		return 0;
- 
-+#ifdef __ARCH_WANT_INTERRUPTS_ON_CTXSW
-+       if (unlikely(task_running(rq, next_task)))
-+               return 0;
-+#endif
-+
- retry:
- 	if (unlikely(next_task == rq->curr)) {
- 		WARN_ON(1);
--- 
-2.28.0
-
-
-From 10f672f1a199240bc2a77d6f81e1d37f33ba743e Mon Sep 17 00:00:00 2001
-From: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Date: Tue, 20 Sep 2011 11:41:54 +0100
-Subject: [PATCH 24/56] ASoC: Ensure we generate a driver name
-
-commit f0e8ed858edb327802ee65fd695cc1538286226f upstream.
-
-Commit 873bd4c (ASoC: Don't set invalid name string to snd_card->driver
-field) broke generation of a driver name for all ASoC cards relying on the
-automatic generation of one. Fix this by using the old default with spaces
-replaced by underscores.
-
-Signed-off-by: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Acked-by: Takashi Iwai <tiwai@suse.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/soc-core.c | 18 +++++++++++++++---
- 1 file changed, 15 insertions(+), 3 deletions(-)
-
-diff --git a/sound/soc/soc-core.c b/sound/soc/soc-core.c
-index 493ae7c4c041..e2bfe1d69e74 100644
---- a/sound/soc/soc-core.c
-+++ b/sound/soc/soc-core.c
-@@ -30,6 +30,7 @@
- #include <linux/bitops.h>
- #include <linux/debugfs.h>
- #include <linux/platform_device.h>
-+#include <linux/ctype.h>
- #include <linux/slab.h>
- #include <sound/ac97_codec.h>
- #include <sound/core.h>
-@@ -1931,9 +1932,20 @@ static void snd_soc_instantiate_card(struct snd_soc_card *card)
- 		 "%s", card->name);
- 	snprintf(card->snd_card->longname, sizeof(card->snd_card->longname),
- 		 "%s", card->long_name ? card->long_name : card->name);
--	if (card->driver_name)
--		strlcpy(card->snd_card->driver, card->driver_name,
--			sizeof(card->snd_card->driver));
-+	snprintf(card->snd_card->driver, sizeof(card->snd_card->driver),
-+		 "%s", card->driver_name ? card->driver_name : card->name);
-+	for (i = 0; i < ARRAY_SIZE(card->snd_card->driver); i++) {
-+		switch (card->snd_card->driver[i]) {
-+		case '_':
-+		case '-':
-+		case '\0':
-+			break;
-+		default:
-+			if (!isalnum(card->snd_card->driver[i]))
-+				card->snd_card->driver[i] = '_';
-+			break;
-+		}
-+	}
- 
- 	if (card->late_probe) {
- 		ret = card->late_probe(card);
--- 
-2.28.0
-
-
-From 1357ed0b4b9db30846377febb40a847d6103c991 Mon Sep 17 00:00:00 2001
-From: Jan Kara <jack@suse.cz>
-Date: Fri, 23 Dec 2011 11:53:07 +0100
-Subject: [PATCH 25/56] udf: Mark LVID buffer as uptodate before marking it
- dirty
-
-commit 853a0c25baf96b028de1654bea1e0c8857eadf3d upstream.
-
-When we hit EIO while writing LVID, the buffer uptodate bit is cleared.
-This then results in an anoying warning from mark_buffer_dirty() when we
-write the buffer again. So just set uptodate flag unconditionally.
-
-Reviewed-by: Namjae Jeon <linkinjeon@gmail.com>
-Signed-off-by: Jan Kara <jack@suse.cz>
-Cc: Dave Jones <davej@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/udf/super.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/fs/udf/super.c b/fs/udf/super.c
-index 7b27b063ff6d..7f0e18aa25d4 100644
---- a/fs/udf/super.c
-+++ b/fs/udf/super.c
-@@ -1830,6 +1830,12 @@ static void udf_close_lvid(struct super_block *sb)
- 				le16_to_cpu(lvid->descTag.descCRCLength)));
- 
- 	lvid->descTag.tagChecksum = udf_tag_checksum(&lvid->descTag);
-+	/*
-+	 * We set buffer uptodate unconditionally here to avoid spurious
-+	 * warnings from mark_buffer_dirty() when previous EIO has marked
-+	 * the buffer as !uptodate
-+	 */
-+	set_buffer_uptodate(bh);
- 	mark_buffer_dirty(bh);
- 	sbi->s_lvid_dirty = 0;
- 	mutex_unlock(&sbi->s_alloc_mutex);
--- 
-2.28.0
-
-
-From 032aa01c0b53e12b3ac46db8e7202a3230a83a89 Mon Sep 17 00:00:00 2001
-From: Wu Fengguang <fengguang.wu@intel.com>
-Date: Fri, 9 Dec 2011 20:42:20 +0800
-Subject: [PATCH 26/56] drm/i915: HDMI hot remove notification to audio driver
-
-commit 2deed761188d7480eb5f7efbfe7aa77f09322ed8 upstream.
-
-On HDMI monitor hot remove, clear SDVO_AUDIO_ENABLE accordingly, so that
-the audio driver will receive hot plug events and take action to refresh
-its device state and ELD contents.
-
-The cleared SDVO_AUDIO_ENABLE bit needs to be restored to prevent losing
-HDMI audio after DPMS on.
-
-CC: Wang Zhenyu <zhenyu.z.wang@intel.com>
-Signed-off-by: Wu Fengguang <fengguang.wu@intel.com>
-Signed-off-by: Keith Packard <keithp@keithp.com>
-Signed-off-by: Eugeni Dodonov <eugeni.dodonov@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/i915/intel_hdmi.c | 8 ++++++--
- 1 file changed, 6 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
-index aa0a8e83142e..236bbe09abd5 100644
---- a/drivers/gpu/drm/i915/intel_hdmi.c
-+++ b/drivers/gpu/drm/i915/intel_hdmi.c
-@@ -158,6 +158,10 @@ static void intel_hdmi_dpms(struct drm_encoder *encoder, int mode)
- 	struct drm_i915_private *dev_priv = dev->dev_private;
- 	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(encoder);
- 	u32 temp;
-+	u32 enable_bits = SDVO_ENABLE;
-+
-+	if (intel_hdmi->has_audio)
-+		enable_bits |= SDVO_AUDIO_ENABLE;
- 
- 	temp = I915_READ(intel_hdmi->sdvox_reg);
- 
-@@ -170,9 +174,9 @@ static void intel_hdmi_dpms(struct drm_encoder *encoder, int mode)
- 	}
- 
- 	if (mode != DRM_MODE_DPMS_ON) {
--		temp &= ~SDVO_ENABLE;
-+		temp &= ~enable_bits;
- 	} else {
--		temp |= SDVO_ENABLE;
-+		temp |= enable_bits;
- 	}
- 
- 	I915_WRITE(intel_hdmi->sdvox_reg, temp);
--- 
-2.28.0
-
-
-From 1f8991ccf771442ae2423971798a6ca9d6db6343 Mon Sep 17 00:00:00 2001
-From: Wu Fengguang <fengguang.wu@intel.com>
-Date: Fri, 9 Dec 2011 20:42:21 +0800
-Subject: [PATCH 27/56] drm/i915: DisplayPort hot remove notification to audio
- driver
-
-commit 832afda6a7d7235ef0e09f4ec46736861540da6d upstream.
-
-On DP monitor hot remove, clear DP_AUDIO_OUTPUT_ENABLE accordingly,
-so that the audio driver will receive hot plug events and take action
-to refresh its device state and ELD contents.
-
-Note that the DP_AUDIO_OUTPUT_ENABLE bit may be enabled or disabled
-only when the link training is complete and set to "Normal".
-
-Tested OK for both hot plug/remove and DPMS on/off.
-
-Signed-off-by: Wu Fengguang <fengguang.wu@intel.com>
-Signed-off-by: Keith Packard <keithp@keithp.com>
-Signed-off-by: Eugeni Dodonov <eugeni.dodonov@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/i915/intel_dp.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
-index 14264a8c03eb..bf9fea941617 100644
---- a/drivers/gpu/drm/i915/intel_dp.c
-+++ b/drivers/gpu/drm/i915/intel_dp.c
-@@ -1554,6 +1554,7 @@ intel_dp_link_down(struct intel_dp *intel_dp)
- 			intel_wait_for_vblank(dev, to_intel_crtc(crtc)->pipe);
- 	}
- 
-+	DP &= ~DP_AUDIO_OUTPUT_ENABLE;
- 	I915_WRITE(intel_dp->output_reg, DP & ~DP_PORT_EN);
- 	POSTING_READ(intel_dp->output_reg);
- }
--- 
-2.28.0
-
-
-From 5b19005c6230e6a65d3fe3de8f514feac7d2eebb Mon Sep 17 00:00:00 2001
-From: Daniel Vetter <daniel.vetter@ffwll.ch>
-Date: Sun, 27 Nov 2011 18:58:17 +0100
-Subject: [PATCH 28/56] drm/i915: check ACTHD of all rings
-
-commit 097354eb14fa94d31a09c64d640643f58e4a5a9a upstream.
-
-Otherwise hangcheck spuriously fires when running blitter/bsd-only
-workloads.
-
-Contrary to a similar patch by Ben Widawsky this does not check
-INSTDONE of the other rings. Chris Wilson implied that in a failure to
-detect a hang, most likely because INSTDONE was fluctuating. Thus only
-check ACTHD, which as far as I know is rather reliable. Also, blitter
-and bsd rings can't launch complex tasks from a single instruction
-(like 3D_PRIM on the render with complex or even infinite shaders).
-
-This fixes spurious gpu hang detection when running
-tests/gem_hangcheck_forcewake on snb/ivb.
-
-Signed-Off-by: Daniel Vetter <daniel.vetter@ffwll.ch>
-Reviewed-by: Chris Wilson <chris@chris-wilson.co.uk>
-Signed-off-by: Keith Packard <keithp@keithp.com>
-Signed-off-by: Eugeni Dodonov <eugeni.dodonov@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/i915/i915_drv.h |  2 ++
- drivers/gpu/drm/i915/i915_irq.c | 13 ++++++++++---
- 2 files changed, 12 insertions(+), 3 deletions(-)
-
+ 	{PCI_VENDOR_ID_TI, PCI_DEVICE_ID_TI_TSB12LV22, PCI_ANY_ID,
+ 		QUIRK_CYCLE_TIMER | QUIRK_RESET_PACKET | QUIRK_NO_1394A},
 diff --git a/drivers/gpu/drm/i915/i915_drv.h b/drivers/gpu/drm/i915/i915_drv.h
-index 335564e35c3c..b570415c3fd9 100644
+index 335564e..b570415 100644
 --- a/drivers/gpu/drm/i915/i915_drv.h
 +++ b/drivers/gpu/drm/i915/i915_drv.h
 @@ -325,6 +325,8 @@ typedef struct drm_i915_private {
@@ -1790,7 +269,7 @@ index 335564e35c3c..b570415c3fd9 100644
  	uint32_t last_instdone1;
  
 diff --git a/drivers/gpu/drm/i915/i915_irq.c b/drivers/gpu/drm/i915/i915_irq.c
-index 363564704b1b..997db7fab21a 100644
+index 3635647..997db7f 100644
 --- a/drivers/gpu/drm/i915/i915_irq.c
 +++ b/drivers/gpu/drm/i915/i915_irq.c
 @@ -1665,7 +1665,7 @@ void i915_hangcheck_elapsed(unsigned long data)
@@ -1835,31 +314,62 @@ index 363564704b1b..997db7fab21a 100644
  		dev_priv->last_instdone = instdone;
  		dev_priv->last_instdone1 = instdone1;
  	}
--- 
-2.28.0
-
-
-From bd26f229584ab3c0470410550d3c69bf3c9d29ee Mon Sep 17 00:00:00 2001
-From: Rodrigo Vivi <rodrigo.vivi@gmail.com>
-Date: Wed, 14 Dec 2011 21:10:06 -0200
-Subject: [PATCH 29/56] drm/i915: Fix TV Out refresh rate.
-
-commit 23bd15ec662344dc10e9918fdd0dbc58bc71526d upstream.
-
-TV Out refresh rate was half of the specification for almost all modes.
-Due to this reason pixel clock was so low for some modes causing flickering screen.
-
-Signed-off-by: Rodrigo Vivi <rodrigo.vivi@gmail.com>
-Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org>
-Signed-off-by: Keith Packard <keithp@keithp.com>
-Signed-off-by: Eugeni Dodonov <eugeni.dodonov@intel.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/i915/intel_tv.c | 16 ++++++++--------
- 1 file changed, 8 insertions(+), 8 deletions(-)
-
+diff --git a/drivers/gpu/drm/i915/i915_suspend.c b/drivers/gpu/drm/i915/i915_suspend.c
+index cf15533..bc7dcaa 100644
+--- a/drivers/gpu/drm/i915/i915_suspend.c
++++ b/drivers/gpu/drm/i915/i915_suspend.c
+@@ -34,6 +34,10 @@ static bool i915_pipe_enabled(struct drm_device *dev, enum pipe pipe)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	u32	dpll_reg;
+ 
++	/* On IVB, 3rd pipe shares PLL with another one */
++	if (pipe > 1)
++		return false;
++
+ 	if (HAS_PCH_SPLIT(dev))
+ 		dpll_reg = (pipe == PIPE_A) ? _PCH_DPLL_A : _PCH_DPLL_B;
+ 	else
+diff --git a/drivers/gpu/drm/i915/intel_dp.c b/drivers/gpu/drm/i915/intel_dp.c
+index 14264a8..bf9fea9 100644
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@ -1554,6 +1554,7 @@ intel_dp_link_down(struct intel_dp *intel_dp)
+ 			intel_wait_for_vblank(dev, to_intel_crtc(crtc)->pipe);
+ 	}
+ 
++	DP &= ~DP_AUDIO_OUTPUT_ENABLE;
+ 	I915_WRITE(intel_dp->output_reg, DP & ~DP_PORT_EN);
+ 	POSTING_READ(intel_dp->output_reg);
+ }
+diff --git a/drivers/gpu/drm/i915/intel_hdmi.c b/drivers/gpu/drm/i915/intel_hdmi.c
+index aa0a8e8..236bbe0 100644
+--- a/drivers/gpu/drm/i915/intel_hdmi.c
++++ b/drivers/gpu/drm/i915/intel_hdmi.c
+@@ -158,6 +158,10 @@ static void intel_hdmi_dpms(struct drm_encoder *encoder, int mode)
+ 	struct drm_i915_private *dev_priv = dev->dev_private;
+ 	struct intel_hdmi *intel_hdmi = enc_to_intel_hdmi(encoder);
+ 	u32 temp;
++	u32 enable_bits = SDVO_ENABLE;
++
++	if (intel_hdmi->has_audio)
++		enable_bits |= SDVO_AUDIO_ENABLE;
+ 
+ 	temp = I915_READ(intel_hdmi->sdvox_reg);
+ 
+@@ -170,9 +174,9 @@ static void intel_hdmi_dpms(struct drm_encoder *encoder, int mode)
+ 	}
+ 
+ 	if (mode != DRM_MODE_DPMS_ON) {
+-		temp &= ~SDVO_ENABLE;
++		temp &= ~enable_bits;
+ 	} else {
+-		temp |= SDVO_ENABLE;
++		temp |= enable_bits;
+ 	}
+ 
+ 	I915_WRITE(intel_hdmi->sdvox_reg, temp);
 diff --git a/drivers/gpu/drm/i915/intel_tv.c b/drivers/gpu/drm/i915/intel_tv.c
-index 113e4e7264cd..f57b08bd8c6c 100644
+index 113e4e7..f57b08b 100644
 --- a/drivers/gpu/drm/i915/intel_tv.c
 +++ b/drivers/gpu/drm/i915/intel_tv.c
 @@ -417,7 +417,7 @@ static const struct tv_mode tv_modes[] = {
@@ -1934,262 +444,100 @@ index 113e4e7264cd..f57b08bd8c6c 100644
  		.oversample     = TV_OVERSAMPLE_2X,
  		.component_only = 1,
  
--- 
-2.28.0
-
-
-From dade9ad146b19c22141032d84190d2220623d2ca Mon Sep 17 00:00:00 2001
-From: Eugeni Dodonov <eugeni.dodonov@intel.com>
-Date: Sat, 7 Jan 2012 23:40:35 -0200
-Subject: [PATCH 30/56] drm/i915: handle 3rd pipe
-
-commit 07c1e8c1462fa7324de4c36ae9e55da2abd79cee upstream.
-
-We don't need to check 3rd pipe specifically, as it shares PLL with some
-other one.
-
-Bugzilla: https://bugs.freedesktop.org/show_bug.cgi?id=41977
-Signed-off-by: Eugeni Dodonov <eugeni.dodonov@intel.com>
-Reviewed-by: Jesse Barnes <jbarnes@virtuousgeek.org>
-Signed-off-by: Keith Packard <keithp@keithp.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/i915/i915_suspend.c | 4 ++++
- 1 file changed, 4 insertions(+)
-
-diff --git a/drivers/gpu/drm/i915/i915_suspend.c b/drivers/gpu/drm/i915/i915_suspend.c
-index cf15533aabf6..bc7dcaa1c689 100644
---- a/drivers/gpu/drm/i915/i915_suspend.c
-+++ b/drivers/gpu/drm/i915/i915_suspend.c
-@@ -34,6 +34,10 @@ static bool i915_pipe_enabled(struct drm_device *dev, enum pipe pipe)
- 	struct drm_i915_private *dev_priv = dev->dev_private;
- 	u32	dpll_reg;
- 
-+	/* On IVB, 3rd pipe shares PLL with another one */
-+	if (pipe > 1)
-+		return false;
-+
- 	if (HAS_PCH_SPLIT(dev))
- 		dpll_reg = (pipe == PIPE_A) ? _PCH_DPLL_A : _PCH_DPLL_B;
- 	else
--- 
-2.28.0
-
-
-From 1a11d5d7fb7988a92e798dfbed7cdd350c0701cc Mon Sep 17 00:00:00 2001
-From: Li Wang <liwang@nudt.edu.cn>
-Date: Thu, 19 Jan 2012 09:44:36 +0800
-Subject: [PATCH 31/56] eCryptfs: Infinite loop due to overflow in
- ecryptfs_write()
-
-commit 684a3ff7e69acc7c678d1a1394fe9e757993fd34 upstream.
-
-ecryptfs_write() can enter an infinite loop when truncating a file to a
-size larger than 4G. This only happens on architectures where size_t is
-represented by 32 bits.
-
-This was caused by a size_t overflow due to it incorrectly being used to
-store the result of a calculation which uses potentially large values of
-type loff_t.
-
-[tyhicks@canonical.com: rewrite subject and commit message]
-Signed-off-by: Li Wang <liwang@nudt.edu.cn>
-Signed-off-by: Yunchuan Wen <wenyunchuan@kylinos.com.cn>
-Reviewed-by: Cong Wang <xiyou.wangcong@gmail.com>
-Signed-off-by: Tyler Hicks <tyhicks@canonical.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/ecryptfs/read_write.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/fs/ecryptfs/read_write.c b/fs/ecryptfs/read_write.c
-index 54eb14caad7b..608c1c3fde1b 100644
---- a/fs/ecryptfs/read_write.c
-+++ b/fs/ecryptfs/read_write.c
-@@ -130,7 +130,7 @@ int ecryptfs_write(struct inode *ecryptfs_inode, char *data, loff_t offset,
- 		pgoff_t ecryptfs_page_idx = (pos >> PAGE_CACHE_SHIFT);
- 		size_t start_offset_in_page = (pos & ~PAGE_CACHE_MASK);
- 		size_t num_bytes = (PAGE_CACHE_SIZE - start_offset_in_page);
--		size_t total_remaining_bytes = ((offset + size) - pos);
-+		loff_t total_remaining_bytes = ((offset + size) - pos);
- 
- 		if (fatal_signal_pending(current)) {
- 			rc = -EINTR;
-@@ -141,7 +141,7 @@ int ecryptfs_write(struct inode *ecryptfs_inode, char *data, loff_t offset,
- 			num_bytes = total_remaining_bytes;
- 		if (pos < offset) {
- 			/* remaining zeros to write, up to destination offset */
--			size_t total_remaining_zeros = (offset - pos);
-+			loff_t total_remaining_zeros = (offset - pos);
- 
- 			if (num_bytes > total_remaining_zeros)
- 				num_bytes = total_remaining_zeros;
--- 
-2.28.0
-
-
-From 7a415a8da853b0724413680a769d89affc8b5be5 Mon Sep 17 00:00:00 2001
-From: Shirish Pargaonkar <shirishpargaonkar@gmail.com>
-Date: Thu, 2 Feb 2012 15:28:28 -0600
-Subject: [PATCH 32/56] cifs: Fix oops in session setup code for null user
- mounts
-
-commit de47a4176c532ef5961b8a46a2d541a3517412d3 upstream.
-
-For null user mounts, do not invoke string length function
-during session setup.
-
-Reported-and-Tested-by: Chris Clayton <chris2553@googlemail.com>
-Acked-by: Jeff Layton <jlayton@redhat.com>
-Signed-off-by: Shirish Pargaonkar <shirishpargaonkar@gmail.com>
-Signed-off-by: Steve French <smfrench@gmail.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/cifs/sess.c | 7 +++----
- 1 file changed, 3 insertions(+), 4 deletions(-)
-
-diff --git a/fs/cifs/sess.c b/fs/cifs/sess.c
-index d3e619692ee0..0cfae19129bd 100644
---- a/fs/cifs/sess.c
-+++ b/fs/cifs/sess.c
-@@ -244,16 +244,15 @@ static void ascii_ssetup_strings(char **pbcc_area, struct cifs_ses *ses,
- 	/* copy user */
- 	/* BB what about null user mounts - check that we do this BB */
- 	/* copy user */
--	if (ses->user_name != NULL)
-+	if (ses->user_name != NULL) {
- 		strncpy(bcc_ptr, ses->user_name, MAX_USERNAME_SIZE);
-+		bcc_ptr += strnlen(ses->user_name, MAX_USERNAME_SIZE);
-+	}
- 	/* else null user mount */
--
--	bcc_ptr += strnlen(ses->user_name, MAX_USERNAME_SIZE);
- 	*bcc_ptr = 0;
- 	bcc_ptr++; /* account for null termination */
- 
- 	/* copy domain */
--
- 	if (ses->domainName != NULL) {
- 		strncpy(bcc_ptr, ses->domainName, 256);
- 		bcc_ptr += strnlen(ses->domainName, 256);
--- 
-2.28.0
-
-
-From e02c339f506e10fadf8a5f00f1c932035596ed8e Mon Sep 17 00:00:00 2001
-From: Hubert Feurstein <h.feurstein@gmail.com>
-Date: Mon, 9 Jan 2012 17:23:57 +0100
-Subject: [PATCH 33/56] atmel_lcdfb: fix usage of CONTRAST_CTR in
- suspend/resume
-
-commit 9f1065032ceb7e86c7c9f16bb86518857e88a172 upstream.
-
-An error was existing in the saving of CONTRAST_CTR register
-across suspend/resume.
-
-Signed-off-by: Hubert Feurstein <h.feurstein@gmail.com>
-Signed-off-by: Nicolas Ferre <nicolas.ferre@atmel.com>
-Acked-by: Jean-Christophe PLAGNIOL-VILLARD <plagnioj@jcrosoft.com>
-Signed-off-by: Florian Tobias Schandinat <FlorianSchandinat@gmx.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/video/atmel_lcdfb.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/video/atmel_lcdfb.c b/drivers/video/atmel_lcdfb.c
-index 4484c721f0f9..c2ceae4bb6ca 100644
---- a/drivers/video/atmel_lcdfb.c
-+++ b/drivers/video/atmel_lcdfb.c
-@@ -1085,7 +1085,7 @@ static int atmel_lcdfb_suspend(struct platform_device *pdev, pm_message_t mesg)
- 	 */
- 	lcdc_writel(sinfo, ATMEL_LCDC_IDR, ~0UL);
- 
--	sinfo->saved_lcdcon = lcdc_readl(sinfo, ATMEL_LCDC_CONTRAST_VAL);
-+	sinfo->saved_lcdcon = lcdc_readl(sinfo, ATMEL_LCDC_CONTRAST_CTR);
- 	lcdc_writel(sinfo, ATMEL_LCDC_CONTRAST_CTR, 0);
- 	if (sinfo->atmel_lcdfb_power_control)
- 		sinfo->atmel_lcdfb_power_control(0);
--- 
-2.28.0
-
-
-From d378b2d044139f88384d278bd5830669c44c789b Mon Sep 17 00:00:00 2001
-From: Peter Zijlstra <a.p.zijlstra@chello.nl>
-Date: Mon, 14 Nov 2011 13:13:49 +0100
-Subject: [PATCH 34/56] lockdep, bug: Exclude TAINT_FIRMWARE_WORKAROUND from
- disabling lockdep
-
-commit df754e6af2f237a6c020c0daff55a1a609338e31 upstream.
-
-It's unlikely that TAINT_FIRMWARE_WORKAROUND causes false
-lockdep messages, so do not disable lockdep in that case.
-We still want to keep lockdep disabled in the
-TAINT_OOT_MODULE case:
-
-  - bin-only modules can cause various instabilities in
-    their and in unrelated kernel code
-
-  - they are impossible to debug for kernel developers
-
-  - they also typically do not have the copyright license
-    permission to link to the GPL-ed lockdep code.
-
-Suggested-by: Ben Hutchings <ben@decadent.org.uk>
-Signed-off-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
-Link: http://lkml.kernel.org/n/tip-xopopjjens57r0i13qnyh2yo@git.kernel.org
-Signed-off-by: Ingo Molnar <mingo@elte.hu>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/panic.c | 12 ++++++++++--
- 1 file changed, 10 insertions(+), 2 deletions(-)
-
-diff --git a/kernel/panic.c b/kernel/panic.c
-index 69231670eb95..8e48cf6ab56d 100644
---- a/kernel/panic.c
-+++ b/kernel/panic.c
-@@ -236,8 +236,16 @@ void add_taint(unsigned flag)
- 	 * Also we want to keep up lockdep for staging development and
- 	 * post-warning case.
- 	 */
--	if (flag != TAINT_CRAP && flag != TAINT_WARN && __debug_locks_off())
--		printk(KERN_WARNING "Disabling lock debugging due to kernel taint\n");
-+	switch (flag) {
-+	case TAINT_CRAP:
-+	case TAINT_WARN:
-+	case TAINT_FIRMWARE_WORKAROUND:
-+		break;
-+
-+	default:
-+		if (__debug_locks_off())
-+			printk(KERN_WARNING "Disabling lock debugging due to kernel taint\n");
-+	}
- 
- 	set_bit(flag, &tainted_mask);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_gem.c b/drivers/gpu/drm/nouveau/nouveau_gem.c
+index b52e460..cee78b2 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_gem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_gem.c
+@@ -315,6 +315,25 @@ retry:
  }
--- 
-2.28.0
-
-
-From eb521fbb338f21b2de12fe8f7e4fa5b7e4f9fb2a Mon Sep 17 00:00:00 2001
-From: Guenter Roeck <linux@roeck-us.net>
-Date: Fri, 27 Jan 2012 05:43:59 -0800
-Subject: [PATCH 35/56] hwmon: (w83627ehf) Fix number of fans for NCT6776F
-
-commit 585c0fd8216e0c9f98e2434092af7ec0f999522d upstream.
-
-NCT6776F can select fan input pins for fans 3 to 5 with a secondary set of
-chip register bits. Check that second set of bits in addition to the first set
-to detect if fans 3..5 are monitored.
-
-Signed-off-by: Guenter Roeck <linux@roeck-us.net>
-Acked-by: Jean Delvare <khali@linux-fr.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/hwmon/w83627ehf.c | 26 +++++++++++++++++++++++---
- 1 file changed, 23 insertions(+), 3 deletions(-)
-
+ 
+ static int
++validate_sync(struct nouveau_channel *chan, struct nouveau_bo *nvbo)
++{
++	struct nouveau_fence *fence = NULL;
++	int ret = 0;
++
++	spin_lock(&nvbo->bo.bdev->fence_lock);
++	if (nvbo->bo.sync_obj)
++		fence = nouveau_fence_ref(nvbo->bo.sync_obj);
++	spin_unlock(&nvbo->bo.bdev->fence_lock);
++
++	if (fence) {
++		ret = nouveau_fence_sync(fence, chan);
++		nouveau_fence_unref(&fence);
++	}
++
++	return ret;
++}
++
++static int
+ validate_list(struct nouveau_channel *chan, struct list_head *list,
+ 	      struct drm_nouveau_gem_pushbuf_bo *pbbo, uint64_t user_pbbo_ptr)
+ {
+@@ -327,7 +346,7 @@ validate_list(struct nouveau_channel *chan, struct list_head *list,
+ 	list_for_each_entry(nvbo, list, entry) {
+ 		struct drm_nouveau_gem_pushbuf_bo *b = &pbbo[nvbo->pbbo_index];
+ 
+-		ret = nouveau_fence_sync(nvbo->bo.sync_obj, chan);
++		ret = validate_sync(chan, nvbo);
+ 		if (unlikely(ret)) {
+ 			NV_ERROR(dev, "fail pre-validate sync\n");
+ 			return ret;
+@@ -350,7 +369,7 @@ validate_list(struct nouveau_channel *chan, struct list_head *list,
+ 			return ret;
+ 		}
+ 
+-		ret = nouveau_fence_sync(nvbo->bo.sync_obj, chan);
++		ret = validate_sync(chan, nvbo);
+ 		if (unlikely(ret)) {
+ 			NV_ERROR(dev, "fail post-validate sync\n");
+ 			return ret;
+diff --git a/drivers/gpu/drm/radeon/atombios_crtc.c b/drivers/gpu/drm/radeon/atombios_crtc.c
+index 9541995..071ded1 100644
+--- a/drivers/gpu/drm/radeon/atombios_crtc.c
++++ b/drivers/gpu/drm/radeon/atombios_crtc.c
+@@ -1173,7 +1173,7 @@ static int dce4_crtc_do_set_base(struct drm_crtc *crtc,
+ 	WREG32(EVERGREEN_GRPH_ENABLE + radeon_crtc->crtc_offset, 1);
+ 
+ 	WREG32(EVERGREEN_DESKTOP_HEIGHT + radeon_crtc->crtc_offset,
+-	       crtc->mode.vdisplay);
++	       target_fb->height);
+ 	x &= ~3;
+ 	y &= ~1;
+ 	WREG32(EVERGREEN_VIEWPORT_START + radeon_crtc->crtc_offset,
+@@ -1342,7 +1342,7 @@ static int avivo_crtc_do_set_base(struct drm_crtc *crtc,
+ 	WREG32(AVIVO_D1GRPH_ENABLE + radeon_crtc->crtc_offset, 1);
+ 
+ 	WREG32(AVIVO_D1MODE_DESKTOP_HEIGHT + radeon_crtc->crtc_offset,
+-	       crtc->mode.vdisplay);
++	       target_fb->height);
+ 	x &= ~3;
+ 	y &= ~1;
+ 	WREG32(AVIVO_D1MODE_VIEWPORT_START + radeon_crtc->crtc_offset,
+diff --git a/drivers/gpu/drm/radeon/radeon_device.c b/drivers/gpu/drm/radeon/radeon_device.c
+index 5d0c123..e87893c 100644
+--- a/drivers/gpu/drm/radeon/radeon_device.c
++++ b/drivers/gpu/drm/radeon/radeon_device.c
+@@ -857,6 +857,8 @@ int radeon_suspend_kms(struct drm_device *dev, pm_message_t state)
+ 	if (dev->switch_power_state == DRM_SWITCH_POWER_OFF)
+ 		return 0;
+ 
++	drm_kms_helper_poll_disable(dev);
++
+ 	/* turn off display hw */
+ 	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
+ 		drm_helper_connector_dpms(connector, DRM_MODE_DPMS_OFF);
+@@ -943,6 +945,8 @@ int radeon_resume_kms(struct drm_device *dev)
+ 	list_for_each_entry(connector, &dev->mode_config.connector_list, head) {
+ 		drm_helper_connector_dpms(connector, DRM_MODE_DPMS_ON);
+ 	}
++
++	drm_kms_helper_poll_enable(dev);
+ 	return 0;
+ }
+ 
 diff --git a/drivers/hwmon/w83627ehf.c b/drivers/hwmon/w83627ehf.c
-index 628451572455..359bb1e23ac5 100644
+index 6284515..359bb1e 100644
 --- a/drivers/hwmon/w83627ehf.c
 +++ b/drivers/hwmon/w83627ehf.c
 @@ -2104,9 +2104,29 @@ static int __devinit w83627ehf_probe(struct platform_device *pdev)
@@ -2225,1372 +573,8 @@ index 628451572455..359bb1e23ac5 100644
  		fan4min = fan4pin;
  	} else if (sio_data->kind == w83667hg || sio_data->kind == w83667hg_b) {
  		fan3pin = 1;
--- 
-2.28.0
-
-
-From 30b4b3a54fc6ca34c6f8a18b56c83680ad0a7fa9 Mon Sep 17 00:00:00 2001
-From: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Date: Tue, 31 Jan 2012 11:55:32 +0000
-Subject: [PATCH 36/56] ASoC: wm_hubs: Fix routing of input PGAs to line output
- mixer
-
-commit ee76744c51ec342df9822b4a85dbbfc3887b6d60 upstream.
-
-IN1L/R is routed to both line output mixers, we don't route IN1 to LINEOUT1
-and IN2 to LINEOUT2.
-
-Signed-off-by: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/codecs/wm_hubs.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/sound/soc/codecs/wm_hubs.c b/sound/soc/codecs/wm_hubs.c
-index b85539482ecd..f2e07b50b90d 100644
---- a/sound/soc/codecs/wm_hubs.c
-+++ b/sound/soc/codecs/wm_hubs.c
-@@ -562,8 +562,8 @@ SOC_DAPM_SINGLE("Left Output Switch", WM8993_LINE_MIXER1, 0, 1, 0),
- };
- 
- static const struct snd_kcontrol_new line2_mix[] = {
--SOC_DAPM_SINGLE("IN2R Switch", WM8993_LINE_MIXER2, 2, 1, 0),
--SOC_DAPM_SINGLE("IN2L Switch", WM8993_LINE_MIXER2, 1, 1, 0),
-+SOC_DAPM_SINGLE("IN1R Switch", WM8993_LINE_MIXER2, 2, 1, 0),
-+SOC_DAPM_SINGLE("IN1L Switch", WM8993_LINE_MIXER2, 1, 1, 0),
- SOC_DAPM_SINGLE("Output Switch", WM8993_LINE_MIXER2, 0, 1, 0),
- };
- 
-@@ -808,8 +808,8 @@ static const struct snd_soc_dapm_route lineout1_se_routes[] = {
- };
- 
- static const struct snd_soc_dapm_route lineout2_diff_routes[] = {
--	{ "LINEOUT2 Mixer", "IN2L Switch", "IN2L PGA" },
--	{ "LINEOUT2 Mixer", "IN2R Switch", "IN2R PGA" },
-+	{ "LINEOUT2 Mixer", "IN1L Switch", "IN1L PGA" },
-+	{ "LINEOUT2 Mixer", "IN1R Switch", "IN1R PGA" },
- 	{ "LINEOUT2 Mixer", "Output Switch", "Right Output PGA" },
- 
- 	{ "LINEOUT2N Driver", NULL, "LINEOUT2 Mixer" },
--- 
-2.28.0
-
-
-From b855f76b5f217bd6d03c7dfa38a64b51143338ac Mon Sep 17 00:00:00 2001
-From: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Date: Wed, 1 Feb 2012 23:46:58 +0000
-Subject: [PATCH 37/56] ASoC: wm_hubs: Correct line input to line output 2
- paths
-
-commit 43b6cec27e1e50a1de3eff47e66e502f3fe7e66e upstream.
-
-The second line output mixer has the controls for the line input bypasses
-in the opposite order.
-
-Signed-off-by: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/codecs/wm_hubs.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/sound/soc/codecs/wm_hubs.c b/sound/soc/codecs/wm_hubs.c
-index f2e07b50b90d..8712a9f6d6ec 100644
---- a/sound/soc/codecs/wm_hubs.c
-+++ b/sound/soc/codecs/wm_hubs.c
-@@ -562,8 +562,8 @@ SOC_DAPM_SINGLE("Left Output Switch", WM8993_LINE_MIXER1, 0, 1, 0),
- };
- 
- static const struct snd_kcontrol_new line2_mix[] = {
--SOC_DAPM_SINGLE("IN1R Switch", WM8993_LINE_MIXER2, 2, 1, 0),
--SOC_DAPM_SINGLE("IN1L Switch", WM8993_LINE_MIXER2, 1, 1, 0),
-+SOC_DAPM_SINGLE("IN1L Switch", WM8993_LINE_MIXER2, 2, 1, 0),
-+SOC_DAPM_SINGLE("IN1R Switch", WM8993_LINE_MIXER2, 1, 1, 0),
- SOC_DAPM_SINGLE("Output Switch", WM8993_LINE_MIXER2, 0, 1, 0),
- };
- 
--- 
-2.28.0
-
-
-From 2b42237845c6c1f94479320b012664bbf07bb989 Mon Sep 17 00:00:00 2001
-From: Susan Gao <sgao@opensource.wolfsonmicro.com>
-Date: Mon, 30 Jan 2012 13:57:04 -0800
-Subject: [PATCH 38/56] ASoC: wm8962: Fix word length configuration
-
-commit 2b6712b19531e22455e7fa18371c5ba9eec76699 upstream.
-
-Signed-off-by: Susan Gao <sgao@opensource.wolfsonmicro.com>
-Signed-off-by: Mark Brown <broonie@opensource.wolfsonmicro.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- sound/soc/codecs/wm8962.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/sound/soc/codecs/wm8962.c b/sound/soc/codecs/wm8962.c
-index 4a0f666a90bd..6d0cae4681bd 100644
---- a/sound/soc/codecs/wm8962.c
-+++ b/sound/soc/codecs/wm8962.c
-@@ -2975,13 +2975,13 @@ static int wm8962_hw_params(struct snd_pcm_substream *substream,
- 	case SNDRV_PCM_FORMAT_S16_LE:
- 		break;
- 	case SNDRV_PCM_FORMAT_S20_3LE:
--		aif0 |= 0x40;
-+		aif0 |= 0x4;
- 		break;
- 	case SNDRV_PCM_FORMAT_S24_LE:
--		aif0 |= 0x80;
-+		aif0 |= 0x8;
- 		break;
- 	case SNDRV_PCM_FORMAT_S32_LE:
--		aif0 |= 0xc0;
-+		aif0 |= 0xc;
- 		break;
- 	default:
- 		return -EINVAL;
--- 
-2.28.0
-
-
-From a5e2ba3e021e7a3135a7dbb8e188d21971a59f49 Mon Sep 17 00:00:00 2001
-From: Russell King <rmk+kernel@arm.linux.org.uk>
-Date: Wed, 8 Feb 2012 17:13:41 -0800
-Subject: [PATCH 39/56] pcmcia: fix socket refcount decrementing on each resume
-
-commit 025e4ab3db07fcbf62c01e4f30d1012234beb980 upstream.
-
-This fixes a memory-corrupting bug: not only does it cause the warning,
-but as a result of dropping the refcount to zero, it causes the
-pcmcia_socket0 device structure to be freed while it still has
-references, causing slab caches corruption.  A fatal oops quickly
-follows this warning - often even just a 'dmesg' following the warning
-causes the kernel to oops.
-
-While testing suspend/resume on an ARM device with PCMCIA support, and a
-CF card inserted, I found that after five suspend and resumes, the
-kernel would complain, and shortly die after with slab corruption.
-
-  WARNING: at include/linux/kref.h:41 kobject_get+0x28/0x50()
-
-As the message doesn't give a clue about which kobject, and the built-in
-debugging in drivers/base/power/main.c happens too late, this was added
-right before each get_device():
-
-  printk("%s: %p [%s] %u\n", __func__, dev, kobject_name(&dev->kobj), atomic_read(&dev->kobj.kref.refcount));
-
-and on the 3rd s2ram cycle, the following behaviour observed:
-
-On the 3rd suspend/resume cycle:
-
-  dpm_prepare: c1a0d998 [pcmcia_socket0] 3
-  dpm_suspend: c1a0d998 [pcmcia_socket0] 3
-  dpm_suspend_noirq: c1a0d998 [pcmcia_socket0] 3
-  dpm_resume_noirq: c1a0d998 [pcmcia_socket0] 3
-  dpm_resume: c1a0d998 [pcmcia_socket0] 3
-  dpm_complete: c1a0d998 [pcmcia_socket0] 2
-
-4th:
-
-  dpm_prepare: c1a0d998 [pcmcia_socket0] 2
-  dpm_suspend: c1a0d998 [pcmcia_socket0] 2
-  dpm_suspend_noirq: c1a0d998 [pcmcia_socket0] 2
-  dpm_resume_noirq: c1a0d998 [pcmcia_socket0] 2
-  dpm_resume: c1a0d998 [pcmcia_socket0] 2
-  dpm_complete: c1a0d998 [pcmcia_socket0] 1
-
-5th:
-
-  dpm_prepare: c1a0d998 [pcmcia_socket0] 1
-  dpm_suspend: c1a0d998 [pcmcia_socket0] 1
-  dpm_suspend_noirq: c1a0d998 [pcmcia_socket0] 1
-  dpm_resume_noirq: c1a0d998 [pcmcia_socket0] 1
-  dpm_resume: c1a0d998 [pcmcia_socket0] 1
-  dpm_complete: c1a0d998 [pcmcia_socket0] 0
-  ------------[ cut here ]------------
-  WARNING: at include/linux/kref.h:41 kobject_get+0x28/0x50()
-  Modules linked in: ucb1x00_core
-  Backtrace:
-  [<c0212090>] (dump_backtrace+0x0/0x110) from [<c04799dc>] (dump_stack+0x18/0x1c)
-  [<c04799c4>] (dump_stack+0x0/0x1c) from [<c021cba0>] (warn_slowpath_common+0x50/0x68)
-  [<c021cb50>] (warn_slowpath_common+0x0/0x68) from [<c021cbdc>] (warn_slowpath_null+0x24/0x28)
-  [<c021cbb8>] (warn_slowpath_null+0x0/0x28) from [<c0335374>] (kobject_get+0x28/0x50)
-  [<c033534c>] (kobject_get+0x0/0x50) from [<c03804f4>] (get_device+0x1c/0x24)
-  [<c0388c90>] (dpm_complete+0x0/0x1a0) from [<c0389cc0>] (dpm_resume_end+0x1c/0x20)
-  ...
-
-Looking at commit 7b24e7988263 ("pcmcia: split up central event handler"),
-the following change was made to cs.c:
-
-                return 0;
-        }
- #endif
--
--       send_event(skt, CS_EVENT_PM_RESUME, CS_EVENT_PRI_LOW);
-+       if (!(skt->state & SOCKET_CARDBUS) && (skt->callback))
-+               skt->callback->early_resume(skt);
-        return 0;
- }
-
-And the corresponding change in ds.c is from:
-
--static int ds_event(struct pcmcia_socket *skt, event_t event, int priority)
--{
--       struct pcmcia_socket *s = pcmcia_get_socket(skt);
-...
--       switch (event) {
-...
--       case CS_EVENT_PM_RESUME:
--               if (verify_cis_cache(skt) != 0) {
--                       dev_dbg(&skt->dev, "cis mismatch - different card\n");
--                       /* first, remove the card */
--                       ds_event(skt, CS_EVENT_CARD_REMOVAL, CS_EVENT_PRI_HIGH);
--                       mutex_lock(&s->ops_mutex);
--                       destroy_cis_cache(skt);
--                       kfree(skt->fake_cis);
--                       skt->fake_cis = NULL;
--                       s->functions = 0;
--                       mutex_unlock(&s->ops_mutex);
--                       /* now, add the new card */
--                       ds_event(skt, CS_EVENT_CARD_INSERTION,
--                                CS_EVENT_PRI_LOW);
--               }
--               break;
-...
--    }
-
--    pcmcia_put_socket(s);
-
--    return 0;
--} /* ds_event */
-
-to:
-
-+static int pcmcia_bus_early_resume(struct pcmcia_socket *skt)
-+{
-+       if (!verify_cis_cache(skt)) {
-+               pcmcia_put_socket(skt);
-+               return 0;
-+       }
-
-+       dev_dbg(&skt->dev, "cis mismatch - different card\n");
-
-+       /* first, remove the card */
-+       pcmcia_bus_remove(skt);
-+       mutex_lock(&skt->ops_mutex);
-+       destroy_cis_cache(skt);
-+       kfree(skt->fake_cis);
-+       skt->fake_cis = NULL;
-+       skt->functions = 0;
-+       mutex_unlock(&skt->ops_mutex);
-
-+       /* now, add the new card */
-+       pcmcia_bus_add(skt);
-+       return 0;
-+}
-
-As can be seen, the original function called pcmcia_get_socket() and
-pcmcia_put_socket() around the guts, whereas the replacement code
-calls pcmcia_put_socket() only in one path.  This creates an imbalance
-in the refcounting.
-
-Testing with pcmcia_put_socket() put removed shows that the bug is gone:
-
-  dpm_suspend: c1a10998 [pcmcia_socket0] 5
-  dpm_suspend_noirq: c1a10998 [pcmcia_socket0] 5
-  dpm_resume_noirq: c1a10998 [pcmcia_socket0] 5
-  dpm_resume: c1a10998 [pcmcia_socket0] 5
-  dpm_complete: c1a10998 [pcmcia_socket0] 5
-
-Tested-by: Russell King <rmk+kernel@arm.linux.org.uk>
-Signed-off-by: Russell King <rmk+kernel@arm.linux.org.uk>
-Cc: Dominik Brodowski <linux@dominikbrodowski.net>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/pcmcia/ds.c | 4 +---
- 1 file changed, 1 insertion(+), 3 deletions(-)
-
-diff --git a/drivers/pcmcia/ds.c b/drivers/pcmcia/ds.c
-index 749c2a16012c..1932029de48d 100644
---- a/drivers/pcmcia/ds.c
-+++ b/drivers/pcmcia/ds.c
-@@ -1269,10 +1269,8 @@ static int pcmcia_bus_add(struct pcmcia_socket *skt)
- 
- static int pcmcia_bus_early_resume(struct pcmcia_socket *skt)
- {
--	if (!verify_cis_cache(skt)) {
--		pcmcia_put_socket(skt);
-+	if (!verify_cis_cache(skt))
- 		return 0;
--	}
- 
- 	dev_dbg(&skt->dev, "cis mismatch - different card\n");
- 
--- 
-2.28.0
-
-
-From b9134812300fd0e3c242c50af5c563065d2f1b1e Mon Sep 17 00:00:00 2001
-From: Mel Gorman <mgorman@suse.de>
-Date: Wed, 8 Feb 2012 17:13:38 -0800
-Subject: [PATCH 40/56] mm: compaction: check for overlapping nodes during
- isolation for migration
-
-commit dc9086004b3d5db75997a645b3fe08d9138b7ad0 upstream.
-
-When isolating pages for migration, migration starts at the start of a
-zone while the free scanner starts at the end of the zone.  Migration
-avoids entering a new zone by never going beyond the free scanned.
-
-Unfortunately, in very rare cases nodes can overlap.  When this happens,
-migration isolates pages without the LRU lock held, corrupting lists
-which will trigger errors in reclaim or during page free such as in the
-following oops
-
-  BUG: unable to handle kernel NULL pointer dereference at 0000000000000008
-  IP: [<ffffffff810f795c>] free_pcppages_bulk+0xcc/0x450
-  PGD 1dda554067 PUD 1e1cb58067 PMD 0
-  Oops: 0000 [#1] SMP
-  CPU 37
-  Pid: 17088, comm: memcg_process_s Tainted: G            X
-  RIP: free_pcppages_bulk+0xcc/0x450
-  Process memcg_process_s (pid: 17088, threadinfo ffff881c2926e000, task ffff881c2926c0c0)
-  Call Trace:
-    free_hot_cold_page+0x17e/0x1f0
-    __pagevec_free+0x90/0xb0
-    release_pages+0x22a/0x260
-    pagevec_lru_move_fn+0xf3/0x110
-    putback_lru_page+0x66/0xe0
-    unmap_and_move+0x156/0x180
-    migrate_pages+0x9e/0x1b0
-    compact_zone+0x1f3/0x2f0
-    compact_zone_order+0xa2/0xe0
-    try_to_compact_pages+0xdf/0x110
-    __alloc_pages_direct_compact+0xee/0x1c0
-    __alloc_pages_slowpath+0x370/0x830
-    __alloc_pages_nodemask+0x1b1/0x1c0
-    alloc_pages_vma+0x9b/0x160
-    do_huge_pmd_anonymous_page+0x160/0x270
-    do_page_fault+0x207/0x4c0
-    page_fault+0x25/0x30
-
-The "X" in the taint flag means that external modules were loaded but but
-is unrelated to the bug triggering.  The real problem was because the PFN
-layout looks like this
-
-  Zone PFN ranges:
-    DMA      0x00000010 -> 0x00001000
-    DMA32    0x00001000 -> 0x00100000
-    Normal   0x00100000 -> 0x01e80000
-  Movable zone start PFN for each node
-  early_node_map[14] active PFN ranges
-      0: 0x00000010 -> 0x0000009b
-      0: 0x00000100 -> 0x0007a1ec
-      0: 0x0007a354 -> 0x0007a379
-      0: 0x0007f7ff -> 0x0007f800
-      0: 0x00100000 -> 0x00680000
-      1: 0x00680000 -> 0x00e80000
-      0: 0x00e80000 -> 0x01080000
-      1: 0x01080000 -> 0x01280000
-      0: 0x01280000 -> 0x01480000
-      1: 0x01480000 -> 0x01680000
-      0: 0x01680000 -> 0x01880000
-      1: 0x01880000 -> 0x01a80000
-      0: 0x01a80000 -> 0x01c80000
-      1: 0x01c80000 -> 0x01e80000
-
-The fix is straight-forward.  isolate_migratepages() has to make a
-similar check to isolate_freepage to ensure that it never isolates pages
-from a zone it does not hold the LRU lock for.
-
-This was discovered in a 3.0-based kernel but it affects 3.1.x, 3.2.x
-and current mainline.
-
-Signed-off-by: Mel Gorman <mgorman@suse.de>
-Acked-by: Michal Nazarewicz <mina86@mina86.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/compaction.c | 11 ++++++++++-
- 1 file changed, 10 insertions(+), 1 deletion(-)
-
-diff --git a/mm/compaction.c b/mm/compaction.c
-index 7ca6842c665d..c4bc5acf865d 100644
---- a/mm/compaction.c
-+++ b/mm/compaction.c
-@@ -337,8 +337,17 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
- 			continue;
- 		nr_scanned++;
- 
--		/* Get the page and skip if free */
-+		/*
-+		 * Get the page and ensure the page is within the same zone.
-+		 * See the comment in isolate_freepages about overlapping
-+		 * nodes. It is deliberate that the new zone lock is not taken
-+		 * as memory compaction should not move pages between nodes.
-+		 */
- 		page = pfn_to_page(low_pfn);
-+		if (page_zone(page) != zone)
-+			continue;
-+
-+		/* Skip if free */
- 		if (PageBuddy(page))
- 			continue;
- 
--- 
-2.28.0
-
-
-From 91b08ca08c8f5fbad289950086d6fb7ab0642d63 Mon Sep 17 00:00:00 2001
-From: Hugh Dickins <hughd@google.com>
-Date: Wed, 8 Feb 2012 17:13:40 -0800
-Subject: [PATCH 41/56] mm: fix UP THP spin_is_locked BUGs
-
-commit b9980cdcf2524c5fe15d8cbae9c97b3ed6385563 upstream.
-
-Fix CONFIG_TRANSPARENT_HUGEPAGE=y CONFIG_SMP=n CONFIG_DEBUG_VM=y
-CONFIG_DEBUG_SPINLOCK=n kernel: spin_is_locked() is then always false,
-and so triggers some BUGs in Transparent HugePage codepaths.
-
-asm-generic/bug.h mentions this problem, and provides a WARN_ON_SMP(x);
-but being too lazy to add VM_BUG_ON_SMP, BUG_ON_SMP, WARN_ON_SMP_ONCE,
-VM_WARN_ON_SMP_ONCE, just test NR_CPUS != 1 in the existing VM_BUG_ONs.
-
-Signed-off-by: Hugh Dickins <hughd@google.com>
-Cc: Andrea Arcangeli <aarcange@redhat.com>
-Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
-Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- mm/huge_memory.c | 4 ++--
- mm/swap.c        | 2 +-
- 2 files changed, 3 insertions(+), 3 deletions(-)
-
-diff --git a/mm/huge_memory.c b/mm/huge_memory.c
-index cc5acf9998b0..78a83e716996 100644
---- a/mm/huge_memory.c
-+++ b/mm/huge_memory.c
-@@ -2020,7 +2020,7 @@ static void collect_mm_slot(struct mm_slot *mm_slot)
- {
- 	struct mm_struct *mm = mm_slot->mm;
- 
--	VM_BUG_ON(!spin_is_locked(&khugepaged_mm_lock));
-+	VM_BUG_ON(NR_CPUS != 1 && !spin_is_locked(&khugepaged_mm_lock));
- 
- 	if (khugepaged_test_exit(mm)) {
- 		/* free mm_slot */
-@@ -2048,7 +2048,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
- 	int progress = 0;
- 
- 	VM_BUG_ON(!pages);
--	VM_BUG_ON(!spin_is_locked(&khugepaged_mm_lock));
-+	VM_BUG_ON(NR_CPUS != 1 && !spin_is_locked(&khugepaged_mm_lock));
- 
- 	if (khugepaged_scan.mm_slot)
- 		mm_slot = khugepaged_scan.mm_slot;
-diff --git a/mm/swap.c b/mm/swap.c
-index 87627f181c3f..4a1fc6db89e8 100644
---- a/mm/swap.c
-+++ b/mm/swap.c
-@@ -667,7 +667,7 @@ void lru_add_page_tail(struct zone* zone,
- 	VM_BUG_ON(!PageHead(page));
- 	VM_BUG_ON(PageCompound(page_tail));
- 	VM_BUG_ON(PageLRU(page_tail));
--	VM_BUG_ON(!spin_is_locked(&zone->lru_lock));
-+	VM_BUG_ON(NR_CPUS != 1 && !spin_is_locked(&zone->lru_lock));
- 
- 	SetPageLRU(page_tail);
- 
--- 
-2.28.0
-
-
-From b96473a25fa375b08c9bf0c1c0dbf47ca826eaec Mon Sep 17 00:00:00 2001
-From: Marco Sanvido <marco@purestorage.com>
-Date: Tue, 3 Jan 2012 17:12:57 -0800
-Subject: [PATCH 42/56] target: Use correct preempted registration sense code
-
-commit 9e08e34e3735ae057eb3834da3570995811b7eb9 upstream.
-
-The comments quote the right parts of the spec:
-
-   * d) Establish a unit attention condition for the
-   *    initiator port associated with every I_T nexus
-   *    that lost its registration other than the I_T
-   *    nexus on which the PERSISTENT RESERVE OUT command
-   *    was received, with the additional sense code set
-   *    to REGISTRATIONS PREEMPTED.
-
-and
-
-   * e) Establish a unit attention condition for the initiator
-   *    port associated with every I_T nexus that lost its
-   *    persistent reservation and/or registration, with the
-   *    additional sense code set to REGISTRATIONS PREEMPTED;
-
-but the actual code accidentally uses ASCQ_2AH_RESERVATIONS_PREEMPTED
-instead of ASCQ_2AH_REGISTRATIONS_PREEMPTED.  Fix this.
-
-Signed-off-by: Marco Sanvido <marco@purestorage.com>
-Signed-off-by: Roland Dreier <roland@purestorage.com>
-Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/target/target_core_pr.c | 4 ++--
- 1 file changed, 2 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/target/target_core_pr.c b/drivers/target/target_core_pr.c
-index b662db3a320b..025d5c7e56ef 100644
---- a/drivers/target/target_core_pr.c
-+++ b/drivers/target/target_core_pr.c
-@@ -3079,7 +3079,7 @@ static int core_scsi3_pro_preempt(
- 			if (!(calling_it_nexus))
- 				core_scsi3_ua_allocate(pr_reg_nacl,
- 					pr_res_mapped_lun, 0x2A,
--					ASCQ_2AH_RESERVATIONS_PREEMPTED);
-+					ASCQ_2AH_REGISTRATIONS_PREEMPTED);
- 		}
- 		spin_unlock(&pr_tmpl->registration_lock);
- 		/*
-@@ -3191,7 +3191,7 @@ static int core_scsi3_pro_preempt(
- 		 *    additional sense code set to REGISTRATIONS PREEMPTED;
- 		 */
- 		core_scsi3_ua_allocate(pr_reg_nacl, pr_res_mapped_lun, 0x2A,
--				ASCQ_2AH_RESERVATIONS_PREEMPTED);
-+				ASCQ_2AH_REGISTRATIONS_PREEMPTED);
- 	}
- 	spin_unlock(&pr_tmpl->registration_lock);
- 	/*
--- 
-2.28.0
-
-
-From b8a8c4aa9e22c2de7af17ea48b7cc868f5bc79ad Mon Sep 17 00:00:00 2001
-From: Marco Sanvido <marco@purestorage.com>
-Date: Tue, 3 Jan 2012 17:12:58 -0800
-Subject: [PATCH 43/56] target: Allow PERSISTENT RESERVE IN for non-reservation
- holder
-
-commit 6816966a8418b980481b4dced7eddd1796b145e8 upstream.
-
-Initiators that aren't the active reservation holder should be able to
-do a PERSISTENT RESERVE IN command in all cases, so add it to the list
-of allowed CDBs in core_scsi3_pr_seq_non_holder().
-
-Signed-off-by: Marco Sanvido <marco@purestorage.com>
-Signed-off-by: Roland Dreier <roland@purestorage.com>
-Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/target/target_core_pr.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/target/target_core_pr.c b/drivers/target/target_core_pr.c
-index 025d5c7e56ef..98e12d31c9c2 100644
---- a/drivers/target/target_core_pr.c
-+++ b/drivers/target/target_core_pr.c
-@@ -471,6 +471,7 @@ static int core_scsi3_pr_seq_non_holder(
- 	case READ_MEDIA_SERIAL_NUMBER:
- 	case REPORT_LUNS:
- 	case REQUEST_SENSE:
-+	case PERSISTENT_RESERVE_IN:
- 		ret = 0; /*/ Allowed CDBs */
- 		break;
- 	default:
--- 
-2.28.0
-
-
-From 967a6f42d195569b596f9af39cd878803a0d1f8b Mon Sep 17 00:00:00 2001
-From: Roland Dreier <roland@purestorage.com>
-Date: Mon, 9 Jan 2012 17:54:00 -0800
-Subject: [PATCH 44/56] target: Correct sense key for INVALID FIELD IN
- {PARAMETER LIST,CDB}
-
-commit 9fbc8909876a2160044e71d376848973b9bfdc3f upstream.
-
-According to SPC-4, the sense key for commands that are failed with
-INVALID FIELD IN PARAMETER LIST and INVALID FIELD IN CDB should be
-ILLEGAL REQUEST (5h) rather than ABORTED COMMAND (Bh).  Without this
-patch, a tcm_loop LUN incorrectly gives:
-
-    # sg_raw -r 1 -v /dev/sda 3 1 0 0 ff 0
-    Sense Information:
-     Fixed format, current;  Sense key: Aborted Command
-     Additional sense: Invalid field in cdb
-     Raw sense data (in hex):
-            70 00 0b 00 00 00 00 0a  00 00 00 00 24 00 00 00
-            00 00
-
-While a real SCSI disk gives:
-
-    Sense Information:
-     Fixed format, current;  Sense key: Illegal Request
-     Additional sense: Invalid field in cdb
-     Raw sense data (in hex):
-            70 00 05 00 00 00 00 18  00 00 00 00 24 00 00 00
-            00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
-
-with the main point being that the real disk gives a sense key of
-ILLEGAL REQUEST (5h).
-
-Signed-off-by: Roland Dreier <roland@purestorage.com>
-Signed-off-by: Nicholas Bellinger <nab@linux-iscsi.org>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/target/target_core_transport.c | 8 ++++----
- 1 file changed, 4 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
-index bb86655dd407..d3a7342317ea 100644
---- a/drivers/target/target_core_transport.c
-+++ b/drivers/target/target_core_transport.c
-@@ -5709,8 +5709,8 @@ int transport_send_check_condition_and_sense(
- 		/* CURRENT ERROR */
- 		buffer[offset] = 0x70;
- 		buffer[offset+SPC_ADD_SENSE_LEN_OFFSET] = 10;
--		/* ABORTED COMMAND */
--		buffer[offset+SPC_SENSE_KEY_OFFSET] = ABORTED_COMMAND;
-+		/* ILLEGAL REQUEST */
-+		buffer[offset+SPC_SENSE_KEY_OFFSET] = ILLEGAL_REQUEST;
- 		/* INVALID FIELD IN CDB */
- 		buffer[offset+SPC_ASC_KEY_OFFSET] = 0x24;
- 		break;
-@@ -5718,8 +5718,8 @@ int transport_send_check_condition_and_sense(
- 		/* CURRENT ERROR */
- 		buffer[offset] = 0x70;
- 		buffer[offset+SPC_ADD_SENSE_LEN_OFFSET] = 10;
--		/* ABORTED COMMAND */
--		buffer[offset+SPC_SENSE_KEY_OFFSET] = ABORTED_COMMAND;
-+		/* ILLEGAL REQUEST */
-+		buffer[offset+SPC_SENSE_KEY_OFFSET] = ILLEGAL_REQUEST;
- 		/* INVALID FIELD IN PARAMETER LIST */
- 		buffer[offset+SPC_ASC_KEY_OFFSET] = 0x26;
- 		break;
--- 
-2.28.0
-
-
-From 3f64466ca0f04dc2b138a3c1e348a7e15b91ebba Mon Sep 17 00:00:00 2001
-From: Pekka Paalanen <pq@iki.fi>
-Date: Sun, 22 Jan 2012 16:33:46 +0200
-Subject: [PATCH 45/56] Staging: asus_oled: fix image processing
-
-commit 635032cb397b396241372fa0ff36ae758e658b23 upstream.
-
-Programming an image was broken, because odev->buf_offs was not advanced
-for val == 0 in append_values(). This regression was introduced in:
-
- commit 1ff12a4aa354bed093a0240d5e6347b1e27601bc
- Author: Kevin A. Granade <kevin.granade@gmail.com>
- Date:   Sat Sep 5 01:03:39 2009 -0500
-
-     Staging: asus_oled: Cleaned up checkpatch issues.
-
-Fix the image processing by special-casing val == 0.
-
-I have tested this change on an Asus G50V laptop only.
-
-Cc: Jakub Schmidtke <sjakub@gmail.com>
-Cc: Kevin A. Granade <kevin.granade@gmail.com>
-Signed-off-by: Pekka Paalanen <pq@iki.fi>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/staging/asus_oled/asus_oled.c | 10 ++++++++--
- 1 file changed, 8 insertions(+), 2 deletions(-)
-
-diff --git a/drivers/staging/asus_oled/asus_oled.c b/drivers/staging/asus_oled/asus_oled.c
-index 7bb7da7959a2..8894bd5f7d82 100644
---- a/drivers/staging/asus_oled/asus_oled.c
-+++ b/drivers/staging/asus_oled/asus_oled.c
-@@ -355,7 +355,14 @@ static void send_data(struct asus_oled_dev *odev)
- 
- static int append_values(struct asus_oled_dev *odev, uint8_t val, size_t count)
- {
--	while (count-- > 0 && val) {
-+	odev->last_val = val;
-+
-+	if (val == 0) {
-+		odev->buf_offs += count;
-+		return 0;
-+	}
-+
-+	while (count-- > 0) {
- 		size_t x = odev->buf_offs % odev->width;
- 		size_t y = odev->buf_offs / odev->width;
- 		size_t i;
-@@ -406,7 +413,6 @@ static int append_values(struct asus_oled_dev *odev, uint8_t val, size_t count)
- 			;
- 		}
- 
--		odev->last_val = val;
- 		odev->buf_offs++;
- 	}
- 
--- 
-2.28.0
-
-
-From 946972e6ab9c59142f5cb51f31ea36a090f2ce16 Mon Sep 17 00:00:00 2001
-From: Pekka Paalanen <pq@iki.fi>
-Date: Sun, 22 Jan 2012 16:33:47 +0200
-Subject: [PATCH 46/56] Staging: asus_oled: fix NULL-ptr crash on unloading
-
-commit 3589e74595a4332ebf77b5ed006f3c6686071ecd upstream.
-
-Asus_oled triggers the following bug on module unloading:
-
- usbcore: deregistering interface driver asus-oled
- BUG: unable to handle kernel NULL pointer dereference at 0000000000000038
- IP: [<ffffffff8111292b>] sysfs_delete_link+0x30/0x66
-
- Call Trace:
-  [<ffffffff81225373>] device_remove_class_symlinks+0x6b/0x70
-  [<ffffffff812256a8>] device_del+0x9f/0x1ab
-  [<ffffffff812257c5>] device_unregister+0x11/0x1e
-  [<ffffffffa000cb82>] asus_oled_disconnect+0x4f/0x9e [asus_oled]
-  [<ffffffff81277430>] usb_unbind_interface+0x54/0x103
-  [<ffffffff812276c4>] __device_release_driver+0xa2/0xeb
-  [<ffffffff81227794>] driver_detach+0x87/0xad
-  [<ffffffff812269e9>] bus_remove_driver+0x91/0xc1
-  [<ffffffff81227fb4>] driver_unregister+0x66/0x6e
-  [<ffffffff812771ed>] usb_deregister+0xbb/0xc4
-  [<ffffffffa000ce87>] asus_oled_exit+0x2f/0x31 [asus_oled]
-  [<ffffffff81068365>] sys_delete_module+0x1b8/0x21b
-  [<ffffffff810ae3de>] ? do_munmap+0x2ef/0x313
-  [<ffffffff813699bb>] system_call_fastpath+0x16/0x1b
-
-This is due to an incorrect destruction sequence in asus_oled_exit().
-
-Fix the order, fixes the bug. Tested on an Asus G50V laptop only.
-
-Cc: Jakub Schmidtke <sjakub@gmail.com>
-Signed-off-by: Pekka Paalanen <pq@iki.fi>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/staging/asus_oled/asus_oled.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
-diff --git a/drivers/staging/asus_oled/asus_oled.c b/drivers/staging/asus_oled/asus_oled.c
-index 8894bd5f7d82..63bafbb0980f 100644
---- a/drivers/staging/asus_oled/asus_oled.c
-+++ b/drivers/staging/asus_oled/asus_oled.c
-@@ -811,10 +811,9 @@ error:
- 
- static void __exit asus_oled_exit(void)
- {
-+	usb_deregister(&oled_driver);
- 	class_remove_file(oled_class, &class_attr_version.attr);
- 	class_destroy(oled_class);
--
--	usb_deregister(&oled_driver);
- }
- 
- module_init(asus_oled_init);
--- 
-2.28.0
-
-
-From fc2286972bd426b03fe64d79d39d9ff9ac1c4cc3 Mon Sep 17 00:00:00 2001
-From: Larry Finger <Larry.Finger@lwfinger.net>
-Date: Sat, 7 Jan 2012 10:07:03 -0600
-Subject: [PATCH 47/56] staging: r8712u: Add new Sitecom UsB ID
-
-commit 1793bf1deddc8ce25dc41925d5dbe64536c841b6 upstream.
-
-Add USB ID for SITECOM WLA-1000 V1 001 WLAN
-
-Reported-and-tested-by: Roland Gruber <post@rolandgruber.de>
-Reported-and-tested-by: Dario Lucia <dario.lucia@gmail.com>
-Signed-off-by: Larry Finger <Larry.Finger@lwfinger.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/staging/rtl8712/usb_intf.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/staging/rtl8712/usb_intf.c b/drivers/staging/rtl8712/usb_intf.c
-index 6cb7e28c99a6..6d88d1a45f17 100644
---- a/drivers/staging/rtl8712/usb_intf.c
-+++ b/drivers/staging/rtl8712/usb_intf.c
-@@ -86,6 +86,7 @@ static struct usb_device_id rtl871x_usb_id_tbl[] = {
- 	{USB_DEVICE(0x0DF6, 0x0045)},
- 	{USB_DEVICE(0x0DF6, 0x0059)}, /* 11n mode disable */
- 	{USB_DEVICE(0x0DF6, 0x004B)},
-+	{USB_DEVICE(0x0DF6, 0x005B)},
- 	{USB_DEVICE(0x0DF6, 0x005D)},
- 	{USB_DEVICE(0x0DF6, 0x0063)},
- 	/* Sweex */
--- 
-2.28.0
-
-
-From d6adb709398ee159ab2ef26d51760041ca5e8262 Mon Sep 17 00:00:00 2001
-From: Timo Juhani Lindfors <timo.lindfors@iki.fi>
-Date: Sun, 29 Jan 2012 16:12:13 +0200
-Subject: [PATCH 48/56] usb: gadget: zero: fix bug in loopback autoresume
- handling
-
-commit 683da59d7b8ae04891636d4b59893cd4e9b0b7e5 upstream.
-
-ab943a2e125b (USB: gadget: gadget zero uses new suspend/resume hooks)
-introduced a copy-paste error where f_loopback.c writes to a variable
-declared in f_sourcesink.c. This prevents one from creating gadgets
-that only have a loopback function.
-
-Signed-off-by: Timo Juhani Lindfors <timo.lindfors@iki.fi>
-Signed-off-by: Felipe Balbi <balbi@ti.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/gadget/f_loopback.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/usb/gadget/f_loopback.c b/drivers/usb/gadget/f_loopback.c
-index b37960f9e753..0e64a47cd6b2 100644
---- a/drivers/usb/gadget/f_loopback.c
-+++ b/drivers/usb/gadget/f_loopback.c
-@@ -373,7 +373,7 @@ int __init loopback_add(struct usb_composite_dev *cdev, bool autoresume)
- 
- 	/* support autoresume for remote wakeup testing */
- 	if (autoresume)
--		sourcesink_driver.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
-+		loopback_driver.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
- 
- 	/* support OTG systems */
- 	if (gadget_is_otg(cdev->gadget)) {
--- 
-2.28.0
-
-
-From 20ef4883ff2c65f96da1617446ebc58c0a707970 Mon Sep 17 00:00:00 2001
-From: Jayachandran C <jayachandranc@netlogicmicro.com>
-Date: Fri, 27 Jan 2012 20:27:32 +0530
-Subject: [PATCH 49/56] usb: Skip PCI USB quirk handling for Netlogic XLP
-
-commit e4436a7c17ac2b5e138f93f83a541cba9b311685 upstream.
-
-The Netlogic XLP SoC's on-chip USB controller appears as a PCI
-USB device, but does not need the EHCI/OHCI handoff done in
-usb/host/pci-quirks.c.
-
-The pci-quirks.c is enabled for all vendors and devices, and is
-enabled if USB and PCI are configured.
-
-If we do not skip the qurik handling on XLP, the readb() call in
-ehci_bios_handoff() will cause a crash since byte access is not
-supported for EHCI registers in XLP.
-
-Signed-off-by: Jayachandran C <jayachandranc@netlogicmicro.com>
-Acked-by: Alan Stern <stern@rowland.harvard.edu>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/host/pci-quirks.c | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/drivers/usb/host/pci-quirks.c b/drivers/usb/host/pci-quirks.c
-index 23e04fb038ba..20f2f2163470 100644
---- a/drivers/usb/host/pci-quirks.c
-+++ b/drivers/usb/host/pci-quirks.c
-@@ -866,6 +866,12 @@ hc_init:
- 
- static void __devinit quirk_usb_early_handoff(struct pci_dev *pdev)
- {
-+	/* Skip Netlogic mips SoC's internal PCI USB controller.
-+	 * This device does not need/support EHCI/OHCI handoff
-+	 */
-+	if (pdev->vendor == 0x184e)	/* vendor Netlogic */
-+		return;
-+
- 	if (pdev->class == PCI_CLASS_SERIAL_USB_UHCI)
- 		quirk_usb_handoff_uhci(pdev);
- 	else if (pdev->class == PCI_CLASS_SERIAL_USB_OHCI)
--- 
-2.28.0
-
-
-From 71f1a6a81350c7bf75141e183c1d5e310f264622 Mon Sep 17 00:00:00 2001
-From: Milan Kocian <milon@wq.cz>
-Date: Fri, 3 Feb 2012 14:28:00 +0100
-Subject: [PATCH 50/56] USB: usbserial: add new PID number (0xa951) to the ftdi
- driver
-
-commit 90451e6973a5da155c6f315a409ca0a8d3ce6b76 upstream.
-
-Signed-off-by: Milan Kocian <milon@wq.cz>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/serial/ftdi_sio.c     | 1 +
- drivers/usb/serial/ftdi_sio_ids.h | 7 +++++++
- 2 files changed, 8 insertions(+)
-
-diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
-index a872cc2c93ad..78c7d420bdd0 100644
---- a/drivers/usb/serial/ftdi_sio.c
-+++ b/drivers/usb/serial/ftdi_sio.c
-@@ -838,6 +838,7 @@ static struct usb_device_id id_table_combined [] = {
- 	{ USB_DEVICE(FTDI_VID, FTDI_SCIENCESCOPE_LOGBOOKML_PID) },
- 	{ USB_DEVICE(FTDI_VID, FTDI_SCIENCESCOPE_LS_LOGBOOK_PID) },
- 	{ USB_DEVICE(FTDI_VID, FTDI_SCIENCESCOPE_HS_LOGBOOK_PID) },
-+	{ USB_DEVICE(FTDI_VID, FTDI_CINTERION_MC55I_PID) },
- 	{ USB_DEVICE(FTDI_VID, FTDI_DOTEC_PID) },
- 	{ USB_DEVICE(QIHARDWARE_VID, MILKYMISTONE_JTAGSERIAL_PID),
- 		.driver_info = (kernel_ulong_t)&ftdi_jtag_quirk },
-diff --git a/drivers/usb/serial/ftdi_sio_ids.h b/drivers/usb/serial/ftdi_sio_ids.h
-index 76d4f31b38c5..4eb77150f035 100644
---- a/drivers/usb/serial/ftdi_sio_ids.h
-+++ b/drivers/usb/serial/ftdi_sio_ids.h
-@@ -1187,3 +1187,10 @@
-  */
- /* ZigBee controller */
- #define FTDI_RF_R106		0x8A28
-+
-+/*
-+ * Product: HCP HIT GPRS modem
-+ * Manufacturer: HCP d.o.o.
-+ * ATI command output: Cinterion MC55i
-+ */
-+#define FTDI_CINTERION_MC55I_PID	0xA951
--- 
-2.28.0
-
-
-From 27939dafb1bd1053fda96d69d4b693f29f2389b6 Mon Sep 17 00:00:00 2001
-From: Rui li <li.rui27@zte.com.cn>
-Date: Tue, 31 Jan 2012 15:27:33 +0800
-Subject: [PATCH 51/56] USB: add new zte 3g-dongle's pid to option.c
-
-commit 1608ea5f4b5d6262cd6e808839491cfb2a67405a upstream.
-
-As ZTE have and will use more pid for new products this year,
-so we need to add some new zte 3g-dongle's pid on option.c ,
-and delete one pid 0x0154 because it use for mass-storage port.
-
-Signed-off-by: Rui li <li.rui27@zte.com.cn>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/usb/serial/option.c | 129 +++++++++++++++++++++++++++++++++++-
- 1 file changed, 128 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
-index 2a9ed6ec8cb7..338d082525b7 100644
---- a/drivers/usb/serial/option.c
-+++ b/drivers/usb/serial/option.c
-@@ -855,6 +855,18 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0083, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0086, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0087, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0088, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0089, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0090, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0091, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0092, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0093, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0094, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0095, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0096, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0097, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0098, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0099, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0104, 0xff, 0xff, 0xff),
- 		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0105, 0xff, 0xff, 0xff) },
-@@ -883,7 +895,6 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0151, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0152, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0153, 0xff, 0xff, 0xff) },
--	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0154, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0155, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0156, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0157, 0xff, 0xff, 0xff) },
-@@ -892,6 +903,12 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0160, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0161, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0162, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0164, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0165, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0168, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0170, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0176, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0178, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1008, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1010, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1012, 0xff, 0xff, 0xff) },
-@@ -1066,6 +1083,116 @@ static const struct usb_device_id option_ids[] = {
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1298, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1299, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1300, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1401, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1402, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1403, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1404, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1405, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1406, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1407, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1408, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1409, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1410, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1411, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1412, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1413, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1414, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1415, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1416, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1417, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1418, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1419, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1420, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1421, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1422, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1423, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1424, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1425, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1426, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1427, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1428, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1429, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1430, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1431, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1432, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1433, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1434, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1435, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1436, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1437, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1438, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1439, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1440, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1441, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1442, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1443, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1444, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1445, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1446, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1447, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1448, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1449, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1450, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1451, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1452, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1453, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1454, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1455, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1456, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1457, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1458, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1459, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1460, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1461, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1462, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1463, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1464, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1465, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1466, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1467, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1468, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1469, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1470, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1471, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1472, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1473, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1474, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1475, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1476, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1477, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1478, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1479, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1480, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1481, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1482, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1483, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1484, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1485, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1486, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1487, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1488, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1489, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1490, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1491, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1492, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1493, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1494, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1495, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1496, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1497, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1498, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1499, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1500, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1501, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1502, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1503, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1504, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1505, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1506, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1507, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1508, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1509, 0xff, 0xff, 0xff) },
-+	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1510, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0014, 0xff, 0xff, 0xff) }, /* ZTE CDMA products */
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0027, 0xff, 0xff, 0xff) },
- 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0059, 0xff, 0xff, 0xff) },
--- 
-2.28.0
-
-
-From ebc5010892742064d7436a1c1ff91b3189c4b8c7 Mon Sep 17 00:00:00 2001
-From: Axel Lin <axel.lin@gmail.com>
-Date: Wed, 1 Feb 2012 12:31:47 +0800
-Subject: [PATCH 52/56] mmc: cb710 core: Add missing spin_lock_init for
- irq_lock of struct cb710_chip
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-commit b5266ea675c5a041e2852c7ccec4cf2d4f5e0cf4 upstream.
-
-Signed-off-by: Axel Lin <axel.lin@gmail.com>
-Acked-by: Michał Mirosław <mirq-linux@rere.qmqm.pl>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/misc/cb710/core.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/misc/cb710/core.c b/drivers/misc/cb710/core.c
-index efec4139c3f6..b1f16d6084ae 100644
---- a/drivers/misc/cb710/core.c
-+++ b/drivers/misc/cb710/core.c
-@@ -244,6 +244,7 @@ static int __devinit cb710_probe(struct pci_dev *pdev,
- 	if (err)
- 		return err;
- 
-+	spin_lock_init(&chip->irq_lock);
- 	chip->pdev = pdev;
- 	chip->iobase = pcim_iomap_table(pdev)[0];
- 
--- 
-2.28.0
-
-
-From 2d8a3a209b35f8301c86e7962f636a372a0d7cad Mon Sep 17 00:00:00 2001
-From: Andreas Herrmann <andreas.herrmann3@amd.com>
-Date: Fri, 6 Jan 2012 15:56:31 +0100
-Subject: [PATCH 53/56] powernow-k8: Avoid Pstate MSR accesses on systems
- supporting CPB
-
-commit 201bf0f129e1715a33568d1563d9a75b840ab4d3 upstream.
-
-Due to CPB we can't directly map SW Pstates to Pstate MSRs. Get rid of
-the paranoia check. (assuming that the ACPI Pstate information is
-correct.)
-
-Signed-off-by: Andreas Herrmann <andreas.herrmann3@amd.com>
-Signed-off-by: Dave Jones <davej@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/cpufreq/powernow-k8.c | 19 ++++++++++---------
- 1 file changed, 10 insertions(+), 9 deletions(-)
-
-diff --git a/drivers/cpufreq/powernow-k8.c b/drivers/cpufreq/powernow-k8.c
-index bce576d7478e..e0329f9fa40e 100644
---- a/drivers/cpufreq/powernow-k8.c
-+++ b/drivers/cpufreq/powernow-k8.c
-@@ -926,23 +926,24 @@ static int fill_powernow_table_pstate(struct powernow_k8_data *data,
- 			invalidate_entry(powernow_table, i);
- 			continue;
- 		}
--		rdmsr(MSR_PSTATE_DEF_BASE + index, lo, hi);
--		if (!(hi & HW_PSTATE_VALID_MASK)) {
--			pr_debug("invalid pstate %d, ignoring\n", index);
--			invalidate_entry(powernow_table, i);
--			continue;
--		}
--
--		powernow_table[i].index = index;
--
- 		/* Frequency may be rounded for these */
- 		if ((boot_cpu_data.x86 == 0x10 && boot_cpu_data.x86_model < 10)
- 				 || boot_cpu_data.x86 == 0x11) {
-+
-+			rdmsr(MSR_PSTATE_DEF_BASE + index, lo, hi);
-+			if (!(hi & HW_PSTATE_VALID_MASK)) {
-+				pr_debug("invalid pstate %d, ignoring\n", index);
-+				invalidate_entry(powernow_table, i);
-+				continue;
-+			}
-+
- 			powernow_table[i].frequency =
- 				freq_from_fid_did(lo & 0x3f, (lo >> 6) & 7);
- 		} else
- 			powernow_table[i].frequency =
- 				data->acpi_data.states[i].core_frequency * 1000;
-+
-+		powernow_table[i].index = index;
- 	}
- 	return 0;
- }
--- 
-2.28.0
-
-
-From 323a479328cbc2fb5cf647790f7414ca570a577b Mon Sep 17 00:00:00 2001
-From: Andreas Herrmann <andreas.herrmann3@amd.com>
-Date: Fri, 6 Jan 2012 15:57:55 +0100
-Subject: [PATCH 54/56] powernow-k8: Fix indexing issue
-
-commit a8eb28480e9b637cc78b9aa5e08612ba97e1317a upstream.
-
-The driver uses the pstate number from the status register as index in
-its table of ACPI pstates (powernow_table). This is wrong as this is
-not a 1-to-1 mapping.
-
-For example we can have _PSS information to just utilize Pstate 0 and
-Pstate 4, ie.
-
-  powernow-k8: Core Performance Boosting: on.
-  powernow-k8:    0 : pstate 0 (2200 MHz)
-  powernow-k8:    1 : pstate 4 (1400 MHz)
-
-In this example the driver's powernow_table has just 2 entries. Using
-the pstate number (4) as index into this table is just plain wrong.
-
-Signed-off-by: Andreas Herrmann <andreas.herrmann3@amd.com>
-Signed-off-by: Dave Jones <davej@redhat.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/cpufreq/powernow-k8.c | 15 +++++++++++----
- 1 file changed, 11 insertions(+), 4 deletions(-)
-
-diff --git a/drivers/cpufreq/powernow-k8.c b/drivers/cpufreq/powernow-k8.c
-index e0329f9fa40e..ad683ec2c57e 100644
---- a/drivers/cpufreq/powernow-k8.c
-+++ b/drivers/cpufreq/powernow-k8.c
-@@ -54,6 +54,9 @@ static DEFINE_PER_CPU(struct powernow_k8_data *, powernow_data);
- 
- static int cpu_family = CPU_OPTERON;
- 
-+/* array to map SW pstate number to acpi state */
-+static u32 ps_to_as[8];
-+
- /* core performance boost */
- static bool cpb_capable, cpb_enabled;
- static struct msr __percpu *msrs;
-@@ -80,9 +83,9 @@ static u32 find_khz_freq_from_fid(u32 fid)
- }
- 
- static u32 find_khz_freq_from_pstate(struct cpufreq_frequency_table *data,
--		u32 pstate)
-+				     u32 pstate)
- {
--	return data[pstate].frequency;
-+	return data[ps_to_as[pstate]].frequency;
- }
- 
- /* Return the vco fid for an input fid
-@@ -926,6 +929,9 @@ static int fill_powernow_table_pstate(struct powernow_k8_data *data,
- 			invalidate_entry(powernow_table, i);
- 			continue;
- 		}
-+
-+		ps_to_as[index] = i;
-+
- 		/* Frequency may be rounded for these */
- 		if ((boot_cpu_data.x86 == 0x10 && boot_cpu_data.x86_model < 10)
- 				 || boot_cpu_data.x86 == 0x11) {
-@@ -1190,7 +1196,8 @@ static int powernowk8_target(struct cpufreq_policy *pol,
- 	powernow_k8_acpi_pst_values(data, newstate);
- 
- 	if (cpu_family == CPU_HW_PSTATE)
--		ret = transition_frequency_pstate(data, newstate);
-+		ret = transition_frequency_pstate(data,
-+			data->powernow_table[newstate].index);
- 	else
- 		ret = transition_frequency_fidvid(data, newstate);
- 	if (ret) {
-@@ -1203,7 +1210,7 @@ static int powernowk8_target(struct cpufreq_policy *pol,
- 
- 	if (cpu_family == CPU_HW_PSTATE)
- 		pol->cur = find_khz_freq_from_pstate(data->powernow_table,
--				newstate);
-+				data->powernow_table[newstate].index);
- 	else
- 		pol->cur = find_khz_freq_from_fid(data->currfid);
- 	ret = 0;
--- 
-2.28.0
-
-
-From 8a533666d1591cf4ea596c6bd710e2fe682cb56a Mon Sep 17 00:00:00 2001
-From: Eric Dumazet <eric.dumazet@gmail.com>
-Date: Thu, 9 Feb 2012 16:13:19 -0500
-Subject: [PATCH 55/56] net: fix NULL dereferences in check_peer_redir()
-
-[ Upstream commit d3aaeb38c40e5a6c08dd31a1b64da65c4352be36, along
-  with dependent backports of commits:
-     69cce1d1404968f78b177a0314f5822d5afdbbfb
-     9de79c127cccecb11ae6a21ab1499e87aa222880
-     218fa90f072e4aeff9003d57e390857f4f35513e
-     580da35a31f91a594f3090b7a2c39b85cb051a12
-     f7e57044eeb1841847c24aa06766c8290c202583
-     e049f28883126c689cf95859480d9ee4ab23b7fa ]
-
-Gergely Kalman reported crashes in check_peer_redir().
-
-It appears commit f39925dbde778 (ipv4: Cache learned redirect
-information in inetpeer.) added a race, leading to possible NULL ptr
-dereference.
-
-Since we can now change dst neighbour, we should make sure a reader can
-safely use a neighbour.
-
-Add RCU protection to dst neighbour, and make sure check_peer_redir()
-can be called safely by different cpus in parallel.
-
-As neighbours are already freed after one RCU grace period, this patch
-should not add typical RCU penalty (cache cold effects)
-
-Many thanks to Gergely for providing a pretty report pointing to the
-bug.
-
-Reported-by: Gergely Kalman <synapse@hippy.csoma.elte.hu>
-Signed-off-by: Eric Dumazet <eric.dumazet@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/infiniband/core/addr.c                | 16 +++--
- drivers/infiniband/hw/cxgb3/iwch_cm.c         | 16 +++--
- drivers/infiniband/hw/cxgb4/cm.c              | 46 ++++++++-------
- drivers/infiniband/hw/mlx4/qp.c               |  2 +-
- drivers/infiniband/hw/nes/nes_cm.c            |  8 ++-
- drivers/infiniband/ulp/ipoib/ipoib_main.c     | 59 ++++++++++++-------
- .../infiniband/ulp/ipoib/ipoib_multicast.c    | 24 +++++---
- drivers/net/cxgb3/cxgb3_offload.c             |  8 +--
- drivers/s390/net/qeth_l3_main.c               | 25 +++++---
- drivers/scsi/cxgbi/cxgb3i/cxgb3i.c            |  2 +-
- drivers/scsi/cxgbi/cxgb4i/cxgb4i.c            |  2 +-
- drivers/scsi/cxgbi/libcxgbi.c                 |  4 +-
- include/net/arp.h                             |  1 +
- include/net/dst.h                             | 27 ++++++++-
- net/atm/clip.c                                | 16 +++--
- net/bridge/br_netfilter.c                     |  6 +-
- net/core/dst.c                                | 15 +++--
- net/core/neighbour.c                          | 19 +++---
- net/decnet/dn_neigh.c                         |  8 +--
- net/decnet/dn_route.c                         | 18 +++---
- net/ipv4/arp.c                                | 28 +++++----
- net/ipv4/ip_gre.c                             |  2 +-
- net/ipv4/ip_output.c                          | 22 +++++--
- net/ipv4/route.c                              | 31 ++++++----
- net/ipv6/addrconf.c                           |  2 +-
- net/ipv6/ip6_fib.c                            |  2 +-
- net/ipv6/ip6_output.c                         | 40 ++++++++++---
- net/ipv6/ndisc.c                              |  4 +-
- net/ipv6/route.c                              | 59 ++++++++++++-------
- net/ipv6/sit.c                                |  4 +-
- net/sched/sch_teql.c                          | 31 ++++++----
- net/xfrm/xfrm_policy.c                        |  2 +-
- 32 files changed, 359 insertions(+), 190 deletions(-)
-
 diff --git a/drivers/infiniband/core/addr.c b/drivers/infiniband/core/addr.c
-index 8e21d457b899..f2a84c6f8543 100644
+index 8e21d45..f2a84c6 100644
 --- a/drivers/infiniband/core/addr.c
 +++ b/drivers/infiniband/core/addr.c
 @@ -215,7 +215,9 @@ static int addr4_resolve(struct sockaddr_in *src_in,
@@ -3627,7 +611,7 @@ index 8e21d457b899..f2a84c6f8543 100644
  	dst_release(dst);
  	return ret;
 diff --git a/drivers/infiniband/hw/cxgb3/iwch_cm.c b/drivers/infiniband/hw/cxgb3/iwch_cm.c
-index 2332dc22aa04..e55ce7a428be 100644
+index 2332dc2..e55ce7a 100644
 --- a/drivers/infiniband/hw/cxgb3/iwch_cm.c
 +++ b/drivers/infiniband/hw/cxgb3/iwch_cm.c
 @@ -1328,6 +1328,7 @@ static int pass_accept_req(struct t3cdev *tdev, struct sk_buff *skb, void *ctx)
@@ -3679,7 +663,7 @@ index 2332dc22aa04..e55ce7a428be 100644
  		printk(KERN_ERR MOD "%s - cannot alloc l2e.\n", __func__);
  		err = -ENOMEM;
 diff --git a/drivers/infiniband/hw/cxgb4/cm.c b/drivers/infiniband/hw/cxgb4/cm.c
-index 31fb44085c9b..daa93e942e16 100644
+index 31fb440..daa93e9 100644
 --- a/drivers/infiniband/hw/cxgb4/cm.c
 +++ b/drivers/infiniband/hw/cxgb4/cm.c
 @@ -1325,6 +1325,7 @@ static int pass_accept_req(struct c4iw_dev *dev, struct sk_buff *skb)
@@ -3789,8 +773,27 @@ index 31fb44085c9b..daa93e942e16 100644
  	if (!ep->l2t) {
  		printk(KERN_ERR MOD "%s - cannot alloc l2e.\n", __func__);
  		err = -ENOMEM;
+diff --git a/drivers/infiniband/hw/mlx4/mad.c b/drivers/infiniband/hw/mlx4/mad.c
+index 57ffa50..44fc310 100644
+--- a/drivers/infiniband/hw/mlx4/mad.c
++++ b/drivers/infiniband/hw/mlx4/mad.c
+@@ -255,12 +255,9 @@ int mlx4_ib_process_mad(struct ib_device *ibdev, int mad_flags,	u8 port_num,
+ 			return IB_MAD_RESULT_SUCCESS;
+ 
+ 		/*
+-		 * Don't process SMInfo queries or vendor-specific
+-		 * MADs -- the SMA can't handle them.
++		 * Don't process SMInfo queries -- the SMA can't handle them.
+ 		 */
+-		if (in_mad->mad_hdr.attr_id == IB_SMP_ATTR_SM_INFO ||
+-		    ((in_mad->mad_hdr.attr_id & IB_SMP_ATTR_VENDOR_MASK) ==
+-		     IB_SMP_ATTR_VENDOR_MASK))
++		if (in_mad->mad_hdr.attr_id == IB_SMP_ATTR_SM_INFO)
+ 			return IB_MAD_RESULT_SUCCESS;
+ 	} else if (in_mad->mad_hdr.mgmt_class == IB_MGMT_CLASS_PERF_MGMT ||
+ 		   in_mad->mad_hdr.mgmt_class == MLX4_IB_VENDOR_CLASS1   ||
 diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
-index 2001f20a4361..23c04ff6519b 100644
+index 2001f20..23c04ff 100644
 --- a/drivers/infiniband/hw/mlx4/qp.c
 +++ b/drivers/infiniband/hw/mlx4/qp.c
 @@ -1301,7 +1301,7 @@ static int build_mlx_header(struct mlx4_ib_sqp *sqp, struct ib_send_wr *wr,
@@ -3803,7 +806,7 @@ index 2001f20a4361..23c04ff6519b 100644
  	send_size = 0;
  	for (i = 0; i < wr->num_sge; ++i)
 diff --git a/drivers/infiniband/hw/nes/nes_cm.c b/drivers/infiniband/hw/nes/nes_cm.c
-index e74cdf9ef471..a1f74f6381ba 100644
+index e74cdf9..a1f74f6 100644
 --- a/drivers/infiniband/hw/nes/nes_cm.c
 +++ b/drivers/infiniband/hw/nes/nes_cm.c
 @@ -1150,9 +1150,11 @@ static int nes_addr_resolve_neigh(struct nes_vnic *nesvnic, u32 dst_ip, int arpi
@@ -3822,7 +825,7 @@ index e74cdf9ef471..a1f74f6381ba 100644
  	return rc;
  }
 diff --git a/drivers/infiniband/ulp/ipoib/ipoib_main.c b/drivers/infiniband/ulp/ipoib/ipoib_main.c
-index 86addca9ddf6..a98c414978ec 100644
+index 86addca..a98c414 100644
 --- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
 +++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
 @@ -555,14 +555,17 @@ static int path_rec_start(struct net_device *dev,
@@ -3985,7 +988,7 @@ index 86addca9ddf6..a98c414978ec 100644
  			(struct ipoib_pseudoheader *) skb_push(skb, sizeof *phdr);
  		memcpy(phdr->hwaddr, daddr, INFINIBAND_ALEN);
 diff --git a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
-index 3871ac663554..a8d2a891b840 100644
+index 3871ac6..a8d2a89 100644
 --- a/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
 +++ b/drivers/infiniband/ulp/ipoib/ipoib_multicast.c
 @@ -258,11 +258,15 @@ static int ipoib_mcast_join_finish(struct ipoib_mcast *mcast,
@@ -4036,8 +1039,20 @@ index 3871ac663554..a8d2a891b840 100644
  		spin_unlock_irqrestore(&priv->lock, flags);
  		ipoib_send(dev, skb, mcast->ah, IB_MULTICAST_QPN);
  		return;
+diff --git a/drivers/misc/cb710/core.c b/drivers/misc/cb710/core.c
+index efec413..b1f16d6 100644
+--- a/drivers/misc/cb710/core.c
++++ b/drivers/misc/cb710/core.c
+@@ -244,6 +244,7 @@ static int __devinit cb710_probe(struct pci_dev *pdev,
+ 	if (err)
+ 		return err;
+ 
++	spin_lock_init(&chip->irq_lock);
+ 	chip->pdev = pdev;
+ 	chip->iobase = pcim_iomap_table(pdev)[0];
+ 
 diff --git a/drivers/net/cxgb3/cxgb3_offload.c b/drivers/net/cxgb3/cxgb3_offload.c
-index 3f2e12c3ac1b..015b5152b0de 100644
+index 3f2e12c..015b515 100644
 --- a/drivers/net/cxgb3/cxgb3_offload.c
 +++ b/drivers/net/cxgb3/cxgb3_offload.c
 @@ -971,7 +971,7 @@ static int nb_callback(struct notifier_block *self, unsigned long event,
@@ -4069,8 +1084,24 @@ index 3f2e12c3ac1b..015b5152b0de 100644
  	if (!e) {
  		printk(KERN_ERR "%s: couldn't allocate new l2t entry!\n",
  		       __func__);
+diff --git a/drivers/pcmcia/ds.c b/drivers/pcmcia/ds.c
+index 749c2a1..1932029 100644
+--- a/drivers/pcmcia/ds.c
++++ b/drivers/pcmcia/ds.c
+@@ -1269,10 +1269,8 @@ static int pcmcia_bus_add(struct pcmcia_socket *skt)
+ 
+ static int pcmcia_bus_early_resume(struct pcmcia_socket *skt)
+ {
+-	if (!verify_cis_cache(skt)) {
+-		pcmcia_put_socket(skt);
++	if (!verify_cis_cache(skt))
+ 		return 0;
+-	}
+ 
+ 	dev_dbg(&skt->dev, "cis mismatch - different card\n");
+ 
 diff --git a/drivers/s390/net/qeth_l3_main.c b/drivers/s390/net/qeth_l3_main.c
-index fd69da3fa6b4..e2c9ac5fcb36 100644
+index fd69da3..e2c9ac5 100644
 --- a/drivers/s390/net/qeth_l3_main.c
 +++ b/drivers/s390/net/qeth_l3_main.c
 @@ -2742,9 +2742,14 @@ static int qeth_l3_do_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
@@ -4133,7 +1164,7 @@ index fd69da3fa6b4..e2c9ac5fcb36 100644
  			/* fill in destination address used in ip header */
  			memcpy(hdr->hdr.l3.dest_addr,
 diff --git a/drivers/scsi/cxgbi/cxgb3i/cxgb3i.c b/drivers/scsi/cxgbi/cxgb3i/cxgb3i.c
-index b2d661147a43..143f2682bdab 100644
+index b2d6611..143f268 100644
 --- a/drivers/scsi/cxgbi/cxgb3i/cxgb3i.c
 +++ b/drivers/scsi/cxgbi/cxgb3i/cxgb3i.c
 @@ -985,7 +985,7 @@ static int init_act_open(struct cxgbi_sock *csk)
@@ -4146,7 +1177,7 @@ index b2d661147a43..143f2682bdab 100644
  		pr_err("NO l2t available.\n");
  		return -EINVAL;
 diff --git a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
-index f3a4cd7cf782..ae13c4993aa3 100644
+index f3a4cd7..ae13c49 100644
 --- a/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
 +++ b/drivers/scsi/cxgbi/cxgb4i/cxgb4i.c
 @@ -1160,7 +1160,7 @@ static int init_act_open(struct cxgbi_sock *csk)
@@ -4159,7 +1190,7 @@ index f3a4cd7cf782..ae13c4993aa3 100644
  		pr_err("%s, cannot alloc l2t.\n", ndev->name);
  		goto rel_resource;
 diff --git a/drivers/scsi/cxgbi/libcxgbi.c b/drivers/scsi/cxgbi/libcxgbi.c
-index a2a9c7c6c643..77ac217ad5ce 100644
+index a2a9c7c..77ac217 100644
 --- a/drivers/scsi/cxgbi/libcxgbi.c
 +++ b/drivers/scsi/cxgbi/libcxgbi.c
 @@ -492,7 +492,7 @@ static struct cxgbi_sock *cxgbi_check_route(struct sockaddr *dst_addr)
@@ -4180,8 +1211,578 @@ index a2a9c7c6c643..77ac217ad5ce 100644
  	}
  
  	cdev = cxgbi_device_find_by_netdev(ndev, &port);
+diff --git a/drivers/staging/asus_oled/asus_oled.c b/drivers/staging/asus_oled/asus_oled.c
+index 7bb7da7..63bafbb 100644
+--- a/drivers/staging/asus_oled/asus_oled.c
++++ b/drivers/staging/asus_oled/asus_oled.c
+@@ -355,7 +355,14 @@ static void send_data(struct asus_oled_dev *odev)
+ 
+ static int append_values(struct asus_oled_dev *odev, uint8_t val, size_t count)
+ {
+-	while (count-- > 0 && val) {
++	odev->last_val = val;
++
++	if (val == 0) {
++		odev->buf_offs += count;
++		return 0;
++	}
++
++	while (count-- > 0) {
+ 		size_t x = odev->buf_offs % odev->width;
+ 		size_t y = odev->buf_offs / odev->width;
+ 		size_t i;
+@@ -406,7 +413,6 @@ static int append_values(struct asus_oled_dev *odev, uint8_t val, size_t count)
+ 			;
+ 		}
+ 
+-		odev->last_val = val;
+ 		odev->buf_offs++;
+ 	}
+ 
+@@ -805,10 +811,9 @@ error:
+ 
+ static void __exit asus_oled_exit(void)
+ {
++	usb_deregister(&oled_driver);
+ 	class_remove_file(oled_class, &class_attr_version.attr);
+ 	class_destroy(oled_class);
+-
+-	usb_deregister(&oled_driver);
+ }
+ 
+ module_init(asus_oled_init);
+diff --git a/drivers/staging/rtl8712/usb_intf.c b/drivers/staging/rtl8712/usb_intf.c
+index 6cb7e28..6d88d1a 100644
+--- a/drivers/staging/rtl8712/usb_intf.c
++++ b/drivers/staging/rtl8712/usb_intf.c
+@@ -86,6 +86,7 @@ static struct usb_device_id rtl871x_usb_id_tbl[] = {
+ 	{USB_DEVICE(0x0DF6, 0x0045)},
+ 	{USB_DEVICE(0x0DF6, 0x0059)}, /* 11n mode disable */
+ 	{USB_DEVICE(0x0DF6, 0x004B)},
++	{USB_DEVICE(0x0DF6, 0x005B)},
+ 	{USB_DEVICE(0x0DF6, 0x005D)},
+ 	{USB_DEVICE(0x0DF6, 0x0063)},
+ 	/* Sweex */
+diff --git a/drivers/target/target_core_pr.c b/drivers/target/target_core_pr.c
+index b662db3..98e12d3 100644
+--- a/drivers/target/target_core_pr.c
++++ b/drivers/target/target_core_pr.c
+@@ -471,6 +471,7 @@ static int core_scsi3_pr_seq_non_holder(
+ 	case READ_MEDIA_SERIAL_NUMBER:
+ 	case REPORT_LUNS:
+ 	case REQUEST_SENSE:
++	case PERSISTENT_RESERVE_IN:
+ 		ret = 0; /*/ Allowed CDBs */
+ 		break;
+ 	default:
+@@ -3079,7 +3080,7 @@ static int core_scsi3_pro_preempt(
+ 			if (!(calling_it_nexus))
+ 				core_scsi3_ua_allocate(pr_reg_nacl,
+ 					pr_res_mapped_lun, 0x2A,
+-					ASCQ_2AH_RESERVATIONS_PREEMPTED);
++					ASCQ_2AH_REGISTRATIONS_PREEMPTED);
+ 		}
+ 		spin_unlock(&pr_tmpl->registration_lock);
+ 		/*
+@@ -3191,7 +3192,7 @@ static int core_scsi3_pro_preempt(
+ 		 *    additional sense code set to REGISTRATIONS PREEMPTED;
+ 		 */
+ 		core_scsi3_ua_allocate(pr_reg_nacl, pr_res_mapped_lun, 0x2A,
+-				ASCQ_2AH_RESERVATIONS_PREEMPTED);
++				ASCQ_2AH_REGISTRATIONS_PREEMPTED);
+ 	}
+ 	spin_unlock(&pr_tmpl->registration_lock);
+ 	/*
+diff --git a/drivers/target/target_core_transport.c b/drivers/target/target_core_transport.c
+index bb86655..d3a7342 100644
+--- a/drivers/target/target_core_transport.c
++++ b/drivers/target/target_core_transport.c
+@@ -5709,8 +5709,8 @@ int transport_send_check_condition_and_sense(
+ 		/* CURRENT ERROR */
+ 		buffer[offset] = 0x70;
+ 		buffer[offset+SPC_ADD_SENSE_LEN_OFFSET] = 10;
+-		/* ABORTED COMMAND */
+-		buffer[offset+SPC_SENSE_KEY_OFFSET] = ABORTED_COMMAND;
++		/* ILLEGAL REQUEST */
++		buffer[offset+SPC_SENSE_KEY_OFFSET] = ILLEGAL_REQUEST;
+ 		/* INVALID FIELD IN CDB */
+ 		buffer[offset+SPC_ASC_KEY_OFFSET] = 0x24;
+ 		break;
+@@ -5718,8 +5718,8 @@ int transport_send_check_condition_and_sense(
+ 		/* CURRENT ERROR */
+ 		buffer[offset] = 0x70;
+ 		buffer[offset+SPC_ADD_SENSE_LEN_OFFSET] = 10;
+-		/* ABORTED COMMAND */
+-		buffer[offset+SPC_SENSE_KEY_OFFSET] = ABORTED_COMMAND;
++		/* ILLEGAL REQUEST */
++		buffer[offset+SPC_SENSE_KEY_OFFSET] = ILLEGAL_REQUEST;
+ 		/* INVALID FIELD IN PARAMETER LIST */
+ 		buffer[offset+SPC_ASC_KEY_OFFSET] = 0x26;
+ 		break;
+diff --git a/drivers/tty/vt/vt_ioctl.c b/drivers/tty/vt/vt_ioctl.c
+index 5e096f4..65447c5 100644
+--- a/drivers/tty/vt/vt_ioctl.c
++++ b/drivers/tty/vt/vt_ioctl.c
+@@ -1463,7 +1463,6 @@ compat_kdfontop_ioctl(struct compat_console_font_op __user *fontop,
+ 	if (!perm && op->op != KD_FONT_OP_GET)
+ 		return -EPERM;
+ 	op->data = compat_ptr(((struct compat_console_font_op *)op)->data);
+-	op->flags |= KD_FONT_FLAG_OLD;
+ 	i = con_font_op(vc, op);
+ 	if (i)
+ 		return i;
+diff --git a/drivers/usb/gadget/f_loopback.c b/drivers/usb/gadget/f_loopback.c
+index b37960f..0e64a47 100644
+--- a/drivers/usb/gadget/f_loopback.c
++++ b/drivers/usb/gadget/f_loopback.c
+@@ -373,7 +373,7 @@ int __init loopback_add(struct usb_composite_dev *cdev, bool autoresume)
+ 
+ 	/* support autoresume for remote wakeup testing */
+ 	if (autoresume)
+-		sourcesink_driver.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
++		loopback_driver.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
+ 
+ 	/* support OTG systems */
+ 	if (gadget_is_otg(cdev->gadget)) {
+diff --git a/drivers/usb/host/pci-quirks.c b/drivers/usb/host/pci-quirks.c
+index 23e04fb..20f2f21 100644
+--- a/drivers/usb/host/pci-quirks.c
++++ b/drivers/usb/host/pci-quirks.c
+@@ -866,6 +866,12 @@ hc_init:
+ 
+ static void __devinit quirk_usb_early_handoff(struct pci_dev *pdev)
+ {
++	/* Skip Netlogic mips SoC's internal PCI USB controller.
++	 * This device does not need/support EHCI/OHCI handoff
++	 */
++	if (pdev->vendor == 0x184e)	/* vendor Netlogic */
++		return;
++
+ 	if (pdev->class == PCI_CLASS_SERIAL_USB_UHCI)
+ 		quirk_usb_handoff_uhci(pdev);
+ 	else if (pdev->class == PCI_CLASS_SERIAL_USB_OHCI)
+diff --git a/drivers/usb/serial/ftdi_sio.c b/drivers/usb/serial/ftdi_sio.c
+index a872cc2..78c7d42 100644
+--- a/drivers/usb/serial/ftdi_sio.c
++++ b/drivers/usb/serial/ftdi_sio.c
+@@ -838,6 +838,7 @@ static struct usb_device_id id_table_combined [] = {
+ 	{ USB_DEVICE(FTDI_VID, FTDI_SCIENCESCOPE_LOGBOOKML_PID) },
+ 	{ USB_DEVICE(FTDI_VID, FTDI_SCIENCESCOPE_LS_LOGBOOK_PID) },
+ 	{ USB_DEVICE(FTDI_VID, FTDI_SCIENCESCOPE_HS_LOGBOOK_PID) },
++	{ USB_DEVICE(FTDI_VID, FTDI_CINTERION_MC55I_PID) },
+ 	{ USB_DEVICE(FTDI_VID, FTDI_DOTEC_PID) },
+ 	{ USB_DEVICE(QIHARDWARE_VID, MILKYMISTONE_JTAGSERIAL_PID),
+ 		.driver_info = (kernel_ulong_t)&ftdi_jtag_quirk },
+diff --git a/drivers/usb/serial/ftdi_sio_ids.h b/drivers/usb/serial/ftdi_sio_ids.h
+index 76d4f31..4eb7715 100644
+--- a/drivers/usb/serial/ftdi_sio_ids.h
++++ b/drivers/usb/serial/ftdi_sio_ids.h
+@@ -1187,3 +1187,10 @@
+  */
+ /* ZigBee controller */
+ #define FTDI_RF_R106		0x8A28
++
++/*
++ * Product: HCP HIT GPRS modem
++ * Manufacturer: HCP d.o.o.
++ * ATI command output: Cinterion MC55i
++ */
++#define FTDI_CINTERION_MC55I_PID	0xA951
+diff --git a/drivers/usb/serial/option.c b/drivers/usb/serial/option.c
+index 2a9ed6e..338d082 100644
+--- a/drivers/usb/serial/option.c
++++ b/drivers/usb/serial/option.c
+@@ -855,6 +855,18 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0083, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0086, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0087, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0088, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0089, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0090, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0091, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0092, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0093, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0094, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0095, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0096, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0097, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0098, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0099, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0104, 0xff, 0xff, 0xff),
+ 		.driver_info = (kernel_ulong_t)&net_intf4_blacklist },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0105, 0xff, 0xff, 0xff) },
+@@ -883,7 +895,6 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0151, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0152, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0153, 0xff, 0xff, 0xff) },
+-	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0154, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0155, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0156, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0157, 0xff, 0xff, 0xff) },
+@@ -892,6 +903,12 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0160, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0161, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0162, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0164, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0165, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0168, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0170, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0176, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0178, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1008, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1010, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1012, 0xff, 0xff, 0xff) },
+@@ -1066,6 +1083,116 @@ static const struct usb_device_id option_ids[] = {
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1298, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1299, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1300, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1401, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1402, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1403, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1404, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1405, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1406, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1407, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1408, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1409, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1410, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1411, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1412, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1413, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1414, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1415, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1416, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1417, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1418, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1419, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1420, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1421, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1422, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1423, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1424, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1425, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1426, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1427, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1428, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1429, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1430, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1431, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1432, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1433, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1434, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1435, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1436, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1437, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1438, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1439, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1440, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1441, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1442, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1443, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1444, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1445, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1446, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1447, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1448, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1449, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1450, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1451, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1452, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1453, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1454, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1455, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1456, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1457, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1458, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1459, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1460, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1461, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1462, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1463, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1464, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1465, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1466, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1467, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1468, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1469, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1470, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1471, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1472, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1473, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1474, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1475, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1476, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1477, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1478, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1479, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1480, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1481, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1482, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1483, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1484, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1485, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1486, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1487, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1488, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1489, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1490, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1491, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1492, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1493, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1494, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1495, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1496, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1497, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1498, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1499, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1500, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1501, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1502, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1503, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1504, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1505, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1506, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1507, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1508, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1509, 0xff, 0xff, 0xff) },
++	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x1510, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0014, 0xff, 0xff, 0xff) }, /* ZTE CDMA products */
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0027, 0xff, 0xff, 0xff) },
+ 	{ USB_DEVICE_AND_INTERFACE_INFO(ZTE_VENDOR_ID, 0x0059, 0xff, 0xff, 0xff) },
+diff --git a/drivers/video/atmel_lcdfb.c b/drivers/video/atmel_lcdfb.c
+index 4484c72..c2ceae4 100644
+--- a/drivers/video/atmel_lcdfb.c
++++ b/drivers/video/atmel_lcdfb.c
+@@ -1085,7 +1085,7 @@ static int atmel_lcdfb_suspend(struct platform_device *pdev, pm_message_t mesg)
+ 	 */
+ 	lcdc_writel(sinfo, ATMEL_LCDC_IDR, ~0UL);
+ 
+-	sinfo->saved_lcdcon = lcdc_readl(sinfo, ATMEL_LCDC_CONTRAST_VAL);
++	sinfo->saved_lcdcon = lcdc_readl(sinfo, ATMEL_LCDC_CONTRAST_CTR);
+ 	lcdc_writel(sinfo, ATMEL_LCDC_CONTRAST_CTR, 0);
+ 	if (sinfo->atmel_lcdfb_power_control)
+ 		sinfo->atmel_lcdfb_power_control(0);
+diff --git a/fs/cifs/sess.c b/fs/cifs/sess.c
+index d3e6196..0cfae19 100644
+--- a/fs/cifs/sess.c
++++ b/fs/cifs/sess.c
+@@ -244,16 +244,15 @@ static void ascii_ssetup_strings(char **pbcc_area, struct cifs_ses *ses,
+ 	/* copy user */
+ 	/* BB what about null user mounts - check that we do this BB */
+ 	/* copy user */
+-	if (ses->user_name != NULL)
++	if (ses->user_name != NULL) {
+ 		strncpy(bcc_ptr, ses->user_name, MAX_USERNAME_SIZE);
++		bcc_ptr += strnlen(ses->user_name, MAX_USERNAME_SIZE);
++	}
+ 	/* else null user mount */
+-
+-	bcc_ptr += strnlen(ses->user_name, MAX_USERNAME_SIZE);
+ 	*bcc_ptr = 0;
+ 	bcc_ptr++; /* account for null termination */
+ 
+ 	/* copy domain */
+-
+ 	if (ses->domainName != NULL) {
+ 		strncpy(bcc_ptr, ses->domainName, 256);
+ 		bcc_ptr += strnlen(ses->domainName, 256);
+diff --git a/fs/ecryptfs/read_write.c b/fs/ecryptfs/read_write.c
+index 54eb14c..608c1c3 100644
+--- a/fs/ecryptfs/read_write.c
++++ b/fs/ecryptfs/read_write.c
+@@ -130,7 +130,7 @@ int ecryptfs_write(struct inode *ecryptfs_inode, char *data, loff_t offset,
+ 		pgoff_t ecryptfs_page_idx = (pos >> PAGE_CACHE_SHIFT);
+ 		size_t start_offset_in_page = (pos & ~PAGE_CACHE_MASK);
+ 		size_t num_bytes = (PAGE_CACHE_SIZE - start_offset_in_page);
+-		size_t total_remaining_bytes = ((offset + size) - pos);
++		loff_t total_remaining_bytes = ((offset + size) - pos);
+ 
+ 		if (fatal_signal_pending(current)) {
+ 			rc = -EINTR;
+@@ -141,7 +141,7 @@ int ecryptfs_write(struct inode *ecryptfs_inode, char *data, loff_t offset,
+ 			num_bytes = total_remaining_bytes;
+ 		if (pos < offset) {
+ 			/* remaining zeros to write, up to destination offset */
+-			size_t total_remaining_zeros = (offset - pos);
++			loff_t total_remaining_zeros = (offset - pos);
+ 
+ 			if (num_bytes > total_remaining_zeros)
+ 				num_bytes = total_remaining_zeros;
+diff --git a/fs/proc/base.c b/fs/proc/base.c
+index 7b28f27..22794e8 100644
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@ -775,6 +775,13 @@ static int mem_open(struct inode* inode, struct file* file)
+ 	if (IS_ERR(mm))
+ 		return PTR_ERR(mm);
+ 
++	if (mm) {
++		/* ensure this mm_struct can't be freed */
++		atomic_inc(&mm->mm_count);
++		/* but do not pin its memory */
++		mmput(mm);
++	}
++
+ 	/* OK to pass negative loff_t, we can catch out-of-range */
+ 	file->f_mode |= FMODE_UNSIGNED_OFFSET;
+ 	file->private_data = mm;
+@@ -782,57 +789,13 @@ static int mem_open(struct inode* inode, struct file* file)
+ 	return 0;
+ }
+ 
+-static ssize_t mem_read(struct file * file, char __user * buf,
+-			size_t count, loff_t *ppos)
++static ssize_t mem_rw(struct file *file, char __user *buf,
++			size_t count, loff_t *ppos, int write)
+ {
+-	int ret;
+-	char *page;
+-	unsigned long src = *ppos;
+ 	struct mm_struct *mm = file->private_data;
+-
+-	if (!mm)
+-		return 0;
+-
+-	page = (char *)__get_free_page(GFP_TEMPORARY);
+-	if (!page)
+-		return -ENOMEM;
+-
+-	ret = 0;
+- 
+-	while (count > 0) {
+-		int this_len, retval;
+-
+-		this_len = (count > PAGE_SIZE) ? PAGE_SIZE : count;
+-		retval = access_remote_vm(mm, src, page, this_len, 0);
+-		if (!retval) {
+-			if (!ret)
+-				ret = -EIO;
+-			break;
+-		}
+-
+-		if (copy_to_user(buf, page, retval)) {
+-			ret = -EFAULT;
+-			break;
+-		}
+- 
+-		ret += retval;
+-		src += retval;
+-		buf += retval;
+-		count -= retval;
+-	}
+-	*ppos = src;
+-
+-	free_page((unsigned long) page);
+-	return ret;
+-}
+-
+-static ssize_t mem_write(struct file * file, const char __user *buf,
+-			 size_t count, loff_t *ppos)
+-{
+-	int copied;
++	unsigned long addr = *ppos;
++	ssize_t copied;
+ 	char *page;
+-	unsigned long dst = *ppos;
+-	struct mm_struct *mm = file->private_data;
+ 
+ 	if (!mm)
+ 		return 0;
+@@ -842,31 +805,54 @@ static ssize_t mem_write(struct file * file, const char __user *buf,
+ 		return -ENOMEM;
+ 
+ 	copied = 0;
++	if (!atomic_inc_not_zero(&mm->mm_users))
++		goto free;
++
+ 	while (count > 0) {
+-		int this_len, retval;
++		int this_len = min_t(int, count, PAGE_SIZE);
+ 
+-		this_len = (count > PAGE_SIZE) ? PAGE_SIZE : count;
+-		if (copy_from_user(page, buf, this_len)) {
++		if (write && copy_from_user(page, buf, this_len)) {
+ 			copied = -EFAULT;
+ 			break;
+ 		}
+-		retval = access_remote_vm(mm, dst, page, this_len, 1);
+-		if (!retval) {
++
++		this_len = access_remote_vm(mm, addr, page, this_len, write);
++		if (!this_len) {
+ 			if (!copied)
+ 				copied = -EIO;
+ 			break;
+ 		}
+-		copied += retval;
+-		buf += retval;
+-		dst += retval;
+-		count -= retval;			
++
++		if (!write && copy_to_user(buf, page, this_len)) {
++			copied = -EFAULT;
++			break;
++		}
++
++		buf += this_len;
++		addr += this_len;
++		copied += this_len;
++		count -= this_len;
+ 	}
+-	*ppos = dst;
++	*ppos = addr;
+ 
++	mmput(mm);
++free:
+ 	free_page((unsigned long) page);
+ 	return copied;
+ }
+ 
++static ssize_t mem_read(struct file *file, char __user *buf,
++			size_t count, loff_t *ppos)
++{
++	return mem_rw(file, buf, count, ppos, 0);
++}
++
++static ssize_t mem_write(struct file *file, const char __user *buf,
++			 size_t count, loff_t *ppos)
++{
++	return mem_rw(file, (char __user*)buf, count, ppos, 1);
++}
++
+ loff_t mem_lseek(struct file *file, loff_t offset, int orig)
+ {
+ 	switch (orig) {
+@@ -886,8 +872,8 @@ loff_t mem_lseek(struct file *file, loff_t offset, int orig)
+ static int mem_release(struct inode *inode, struct file *file)
+ {
+ 	struct mm_struct *mm = file->private_data;
+-
+-	mmput(mm);
++	if (mm)
++		mmdrop(mm);
+ 	return 0;
+ }
+ 
+diff --git a/fs/udf/super.c b/fs/udf/super.c
+index 7b27b06..7f0e18a 100644
+--- a/fs/udf/super.c
++++ b/fs/udf/super.c
+@@ -1830,6 +1830,12 @@ static void udf_close_lvid(struct super_block *sb)
+ 				le16_to_cpu(lvid->descTag.descCRCLength)));
+ 
+ 	lvid->descTag.tagChecksum = udf_tag_checksum(&lvid->descTag);
++	/*
++	 * We set buffer uptodate unconditionally here to avoid spurious
++	 * warnings from mark_buffer_dirty() when previous EIO has marked
++	 * the buffer as !uptodate
++	 */
++	set_buffer_uptodate(bh);
+ 	mark_buffer_dirty(bh);
+ 	sbi->s_lvid_dirty = 0;
+ 	mutex_unlock(&sbi->s_alloc_mutex);
 diff --git a/include/net/arp.h b/include/net/arp.h
-index 91f0568a04ef..fb0eb9048b19 100644
+index 91f0568..fb0eb90 100644
 --- a/include/net/arp.h
 +++ b/include/net/arp.h
 @@ -16,6 +16,7 @@ extern void     arp_send(int type, int ptype, __be32 dest_ip,
@@ -4193,7 +1794,7 @@ index 91f0568a04ef..fb0eb9048b19 100644
  extern void	arp_ifdown(struct net_device *dev);
  
 diff --git a/include/net/dst.h b/include/net/dst.h
-index e12ddfb9eb16..d0201340bee2 100644
+index e12ddfb..d020134 100644
 --- a/include/net/dst.h
 +++ b/include/net/dst.h
 @@ -37,7 +37,7 @@ struct dst_entry {
@@ -4244,8 +1845,199 @@ index e12ddfb9eb16..d0201340bee2 100644
  }
  
  static inline void dst_link_failure(struct sk_buff *skb)
+diff --git a/kernel/kprobes.c b/kernel/kprobes.c
+index e0f0bdd..749340c 100644
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@ -1660,8 +1660,12 @@ static int __kprobes pre_handler_kretprobe(struct kprobe *p,
+ 		ri->rp = rp;
+ 		ri->task = current;
+ 
+-		if (rp->entry_handler && rp->entry_handler(ri, regs))
++		if (rp->entry_handler && rp->entry_handler(ri, regs)) {
++			raw_spin_lock_irqsave(&rp->lock, flags);
++			hlist_add_head(&ri->hlist, &rp->free_instances);
++			raw_spin_unlock_irqrestore(&rp->lock, flags);
+ 			return 0;
++		}
+ 
+ 		arch_prepare_kretprobe(ri, regs);
+ 
+diff --git a/kernel/panic.c b/kernel/panic.c
+index 6923167..8e48cf6 100644
+--- a/kernel/panic.c
++++ b/kernel/panic.c
+@@ -236,8 +236,16 @@ void add_taint(unsigned flag)
+ 	 * Also we want to keep up lockdep for staging development and
+ 	 * post-warning case.
+ 	 */
+-	if (flag != TAINT_CRAP && flag != TAINT_WARN && __debug_locks_off())
+-		printk(KERN_WARNING "Disabling lock debugging due to kernel taint\n");
++	switch (flag) {
++	case TAINT_CRAP:
++	case TAINT_WARN:
++	case TAINT_FIRMWARE_WORKAROUND:
++		break;
++
++	default:
++		if (__debug_locks_off())
++			printk(KERN_WARNING "Disabling lock debugging due to kernel taint\n");
++	}
+ 
+ 	set_bit(flag, &tainted_mask);
+ }
+diff --git a/kernel/sched_rt.c b/kernel/sched_rt.c
+index 17f2319..ac79f9e3 100644
+--- a/kernel/sched_rt.c
++++ b/kernel/sched_rt.c
+@@ -1390,6 +1390,11 @@ static int push_rt_task(struct rq *rq)
+ 	if (!next_task)
+ 		return 0;
+ 
++#ifdef __ARCH_WANT_INTERRUPTS_ON_CTXSW
++       if (unlikely(task_running(rq, next_task)))
++               return 0;
++#endif
++
+ retry:
+ 	if (unlikely(next_task == rq->curr)) {
+ 		WARN_ON(1);
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 6cc604b..c4bc5ac 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -320,12 +320,34 @@ static isolate_migrate_t isolate_migratepages(struct zone *zone,
+ 		} else if (!locked)
+ 			spin_lock_irq(&zone->lru_lock);
+ 
++		/*
++		 * migrate_pfn does not necessarily start aligned to a
++		 * pageblock. Ensure that pfn_valid is called when moving
++		 * into a new MAX_ORDER_NR_PAGES range in case of large
++		 * memory holes within the zone
++		 */
++		if ((low_pfn & (MAX_ORDER_NR_PAGES - 1)) == 0) {
++			if (!pfn_valid(low_pfn)) {
++				low_pfn += MAX_ORDER_NR_PAGES - 1;
++				continue;
++			}
++		}
++
+ 		if (!pfn_valid_within(low_pfn))
+ 			continue;
+ 		nr_scanned++;
+ 
+-		/* Get the page and skip if free */
++		/*
++		 * Get the page and ensure the page is within the same zone.
++		 * See the comment in isolate_freepages about overlapping
++		 * nodes. It is deliberate that the new zone lock is not taken
++		 * as memory compaction should not move pages between nodes.
++		 */
+ 		page = pfn_to_page(low_pfn);
++		if (page_zone(page) != zone)
++			continue;
++
++		/* Skip if free */
+ 		if (PageBuddy(page))
+ 			continue;
+ 
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 3c981ba..b7d8603 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -1379,15 +1379,12 @@ generic_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
+ 	unsigned long seg = 0;
+ 	size_t count;
+ 	loff_t *ppos = &iocb->ki_pos;
+-	struct blk_plug plug;
+ 
+ 	count = 0;
+ 	retval = generic_segment_checks(iov, &nr_segs, &count, VERIFY_WRITE);
+ 	if (retval)
+ 		return retval;
+ 
+-	blk_start_plug(&plug);
+-
+ 	/* coalesce the iovecs and go direct-to-BIO for O_DIRECT */
+ 	if (filp->f_flags & O_DIRECT) {
+ 		loff_t size;
+@@ -1403,8 +1400,12 @@ generic_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
+ 			retval = filemap_write_and_wait_range(mapping, pos,
+ 					pos + iov_length(iov, nr_segs) - 1);
+ 			if (!retval) {
++				struct blk_plug plug;
++
++				blk_start_plug(&plug);
+ 				retval = mapping->a_ops->direct_IO(READ, iocb,
+ 							iov, pos, nr_segs);
++				blk_finish_plug(&plug);
+ 			}
+ 			if (retval > 0) {
+ 				*ppos = pos + retval;
+@@ -1460,7 +1461,6 @@ generic_file_aio_read(struct kiocb *iocb, const struct iovec *iov,
+ 			break;
+ 	}
+ out:
+-	blk_finish_plug(&plug);
+ 	return retval;
+ }
+ EXPORT_SYMBOL(generic_file_aio_read);
+diff --git a/mm/filemap_xip.c b/mm/filemap_xip.c
+index 93356cd..dee9429 100644
+--- a/mm/filemap_xip.c
++++ b/mm/filemap_xip.c
+@@ -263,7 +263,12 @@ found:
+ 							xip_pfn);
+ 		if (err == -ENOMEM)
+ 			return VM_FAULT_OOM;
+-		BUG_ON(err);
++		/*
++		 * err == -EBUSY is fine, we've raced against another thread
++		 * that faulted-in the same page
++		 */
++		if (err != -EBUSY)
++			BUG_ON(err);
+ 		return VM_FAULT_NOPAGE;
+ 	} else {
+ 		int err, ret = VM_FAULT_OOM;
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index cc5acf9..78a83e7 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2020,7 +2020,7 @@ static void collect_mm_slot(struct mm_slot *mm_slot)
+ {
+ 	struct mm_struct *mm = mm_slot->mm;
+ 
+-	VM_BUG_ON(!spin_is_locked(&khugepaged_mm_lock));
++	VM_BUG_ON(NR_CPUS != 1 && !spin_is_locked(&khugepaged_mm_lock));
+ 
+ 	if (khugepaged_test_exit(mm)) {
+ 		/* free mm_slot */
+@@ -2048,7 +2048,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
+ 	int progress = 0;
+ 
+ 	VM_BUG_ON(!pages);
+-	VM_BUG_ON(!spin_is_locked(&khugepaged_mm_lock));
++	VM_BUG_ON(NR_CPUS != 1 && !spin_is_locked(&khugepaged_mm_lock));
+ 
+ 	if (khugepaged_scan.mm_slot)
+ 		mm_slot = khugepaged_scan.mm_slot;
+diff --git a/mm/swap.c b/mm/swap.c
+index 87627f1..4a1fc6d 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -667,7 +667,7 @@ void lru_add_page_tail(struct zone* zone,
+ 	VM_BUG_ON(!PageHead(page));
+ 	VM_BUG_ON(PageCompound(page_tail));
+ 	VM_BUG_ON(PageLRU(page_tail));
+-	VM_BUG_ON(!spin_is_locked(&zone->lru_lock));
++	VM_BUG_ON(NR_CPUS != 1 && !spin_is_locked(&zone->lru_lock));
+ 
+ 	SetPageLRU(page_tail);
+ 
 diff --git a/net/atm/clip.c b/net/atm/clip.c
-index 1d4be60e1390..5889074e9718 100644
+index 1d4be60..5889074 100644
 --- a/net/atm/clip.c
 +++ b/net/atm/clip.c
 @@ -364,33 +364,37 @@ static netdev_tx_t clip_start_xmit(struct sk_buff *skb,
@@ -4301,7 +2093,7 @@ index 1d4be60e1390..5889074e9718 100644
  		void *here;
  
 diff --git a/net/bridge/br_netfilter.c b/net/bridge/br_netfilter.c
-index 56149ec36d7f..3dc7f5446a9d 100644
+index 56149ec..3dc7f54 100644
 --- a/net/bridge/br_netfilter.c
 +++ b/net/bridge/br_netfilter.c
 @@ -343,24 +343,26 @@ static int br_nf_pre_routing_finish_ipv6(struct sk_buff *skb)
@@ -4334,7 +2126,7 @@ index 56149ec36d7f..3dc7f5446a9d 100644
  free_skb:
  	kfree_skb(skb);
 diff --git a/net/core/dst.c b/net/core/dst.c
-index 6135f3671692..8246d47a2184 100644
+index 6135f36..8246d47 100644
 --- a/net/core/dst.c
 +++ b/net/core/dst.c
 @@ -171,7 +171,7 @@ void *dst_alloc(struct dst_ops *ops, struct net_device *dev,
@@ -4387,7 +2179,7 @@ index 6135f3671692..8246d47a2184 100644
  }
  
 diff --git a/net/core/neighbour.c b/net/core/neighbour.c
-index 16db88707804..8c54aff0b0c1 100644
+index 16db887..8c54aff 100644
 --- a/net/core/neighbour.c
 +++ b/net/core/neighbour.c
 @@ -1173,12 +1173,17 @@ int neigh_update(struct neighbour *neigh, const u8 *lladdr, u8 new,
@@ -4443,7 +2235,7 @@ index 16db88707804..8c54aff0b0c1 100644
  	unsigned int seq;
  
 diff --git a/net/decnet/dn_neigh.c b/net/decnet/dn_neigh.c
-index 602dade7e9a3..9810610d26c6 100644
+index 602dade..9810610 100644
 --- a/net/decnet/dn_neigh.c
 +++ b/net/decnet/dn_neigh.c
 @@ -208,7 +208,7 @@ static int dn_neigh_output_packet(struct sk_buff *skb)
@@ -4483,7 +2275,7 @@ index 602dade7e9a3..9810610d26c6 100644
  	int headroom = dev->hard_header_len + sizeof(struct dn_short_packet) + 2;
  	struct dn_short_packet *sp;
 diff --git a/net/decnet/dn_route.c b/net/decnet/dn_route.c
-index 74544bc6fdec..b91b60363c39 100644
+index 74544bc..b91b603 100644
 --- a/net/decnet/dn_route.c
 +++ b/net/decnet/dn_route.c
 @@ -241,9 +241,11 @@ static int dn_dst_gc(struct dst_ops *ops)
@@ -4551,7 +2343,7 @@ index 74544bc6fdec..b91b60363c39 100644
  	rt->dst.output = dn_rt_bug;
  	switch(res.type) {
 diff --git a/net/ipv4/arp.c b/net/ipv4/arp.c
-index 1b74d3b64371..1d5675efcfbc 100644
+index 1b74d3b..1d5675e 100644
 --- a/net/ipv4/arp.c
 +++ b/net/ipv4/arp.c
 @@ -518,26 +518,32 @@ EXPORT_SYMBOL(arp_find);
@@ -4599,7 +2391,7 @@ index 1b74d3b64371..1d5675efcfbc 100644
  	return 0;
  }
 diff --git a/net/ipv4/ip_gre.c b/net/ipv4/ip_gre.c
-index 8871067560db..d7bb94c48345 100644
+index 8871067..d7bb94c 100644
 --- a/net/ipv4/ip_gre.c
 +++ b/net/ipv4/ip_gre.c
 @@ -731,9 +731,9 @@ static netdev_tx_t ipgre_tunnel_xmit(struct sk_buff *skb, struct net_device *dev
@@ -4614,7 +2406,7 @@ index 8871067560db..d7bb94c48345 100644
  			if (neigh == NULL)
  				goto tx_error;
 diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
-index 0c99db4c80b1..51a3eec2c706 100644
+index 0c99db4..51a3eec 100644
 --- a/net/ipv4/ip_output.c
 +++ b/net/ipv4/ip_output.c
 @@ -182,6 +182,8 @@ static inline int ip_finish_output2(struct sk_buff *skb)
@@ -4654,7 +2446,7 @@ index 0c99db4c80b1..51a3eec2c706 100644
  	if (net_ratelimit())
  		printk(KERN_DEBUG "ip_finish_output2: No header cache and no neighbour!\n");
 diff --git a/net/ipv4/route.c b/net/ipv4/route.c
-index 4845bfe02d24..65ff2e52a142 100644
+index 4845bfe..65ff2e5 100644
 --- a/net/ipv4/route.c
 +++ b/net/ipv4/route.c
 @@ -416,7 +416,13 @@ static int rt_cache_seq_show(struct seq_file *seq, void *v)
@@ -4718,7 +2510,7 @@ index 4845bfe02d24..65ff2e52a142 100644
  	return 0;
  }
 diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
-index 498b927f68be..0f335c67eb8a 100644
+index 498b927..0f335c6 100644
 --- a/net/ipv6/addrconf.c
 +++ b/net/ipv6/addrconf.c
 @@ -656,7 +656,7 @@ ipv6_add_addr(struct inet6_dev *idev, const struct in6_addr *addr, int pfxlen,
@@ -4731,7 +2523,7 @@ index 498b927f68be..0f335c67eb8a 100644
  
  	ifa->idev = idev;
 diff --git a/net/ipv6/ip6_fib.c b/net/ipv6/ip6_fib.c
-index 4076a0b14b20..0f9b37a1c1d4 100644
+index 4076a0b..0f9b37a 100644
 --- a/net/ipv6/ip6_fib.c
 +++ b/net/ipv6/ip6_fib.c
 @@ -1455,7 +1455,7 @@ static int fib6_age(struct rt6_info *rt, void *arg)
@@ -4744,7 +2536,7 @@ index 4076a0b14b20..0f9b37a1c1d4 100644
  				  rt);
  			return -1;
 diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index e17596b8407a..9cbf17686a1b 100644
+index e17596b..9cbf176 100644
 --- a/net/ipv6/ip6_output.c
 +++ b/net/ipv6/ip6_output.c
 @@ -100,6 +100,8 @@ static int ip6_finish_output2(struct sk_buff *skb)
@@ -4844,7 +2636,7 @@ index e17596b8407a..9cbf17686a1b 100644
  #endif
  
 diff --git a/net/ipv6/ndisc.c b/net/ipv6/ndisc.c
-index 7596f071d308..10a8d411707e 100644
+index 7596f07..10a8d41 100644
 --- a/net/ipv6/ndisc.c
 +++ b/net/ipv6/ndisc.c
 @@ -1244,7 +1244,7 @@ static void ndisc_router_discovery(struct sk_buff *skb)
@@ -4866,7 +2658,7 @@ index 7596f071d308..10a8d411707e 100644
  			ND_PRINTK0(KERN_ERR
  				   "ICMPv6 RA: %s() got default router without neighbour.\n",
 diff --git a/net/ipv6/route.c b/net/ipv6/route.c
-index 0ef1f086feb8..e70e902a5d06 100644
+index 0ef1f08..e70e902 100644
 --- a/net/ipv6/route.c
 +++ b/net/ipv6/route.c
 @@ -356,7 +356,7 @@ out:
@@ -5063,7 +2855,7 @@ index 0ef1f086feb8..e70e902a5d06 100644
  		   rt->rt6i_metric, atomic_read(&rt->dst.__refcnt),
  		   rt->dst.__use, rt->rt6i_flags,
 diff --git a/net/ipv6/sit.c b/net/ipv6/sit.c
-index 38490d5c7e13..f56acd096598 100644
+index 38490d5..f56acd0 100644
 --- a/net/ipv6/sit.c
 +++ b/net/ipv6/sit.c
 @@ -679,7 +679,7 @@ static netdev_tx_t ipip6_tunnel_xmit(struct sk_buff *skb,
@@ -5085,7 +2877,7 @@ index 38490d5c7e13..f56acd096598 100644
  		if (neigh == NULL) {
  			if (net_ratelimit())
 diff --git a/net/sched/sch_teql.c b/net/sched/sch_teql.c
-index 45cd30098e34..4f4c52c0eeb3 100644
+index 45cd300..4f4c52c 100644
 --- a/net/sched/sch_teql.c
 +++ b/net/sched/sch_teql.c
 @@ -225,11 +225,11 @@ static int teql_qdisc_init(struct Qdisc *sch, struct nlattr *opt)
@@ -5147,7 +2939,7 @@ index 45cd30098e34..4f4c52c0eeb3 100644
  			if (__netif_tx_trylock(slave_txq)) {
  				unsigned int length = qdisc_pkt_len(skb);
 diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
-index 5ce74a385525..7803eb6af414 100644
+index 5ce74a3..7803eb6 100644
 --- a/net/xfrm/xfrm_policy.c
 +++ b/net/xfrm/xfrm_policy.c
 @@ -1497,7 +1497,7 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
@@ -5159,31 +2951,140 @@ index 5ce74a385525..7803eb6af414 100644
  
  	xfrm_init_path((struct xfrm_dst *)dst0, dst, nfheader_len);
  	xfrm_init_pmtu(dst_prev);
--- 
-2.28.0
-
-
-From 1d05f993784973189395051cc711fdd6dd5eb389 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Mon, 13 Feb 2012 11:15:52 -0800
-Subject: [PATCH 56/56] Linux 3.0.21
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index c060c58ad0d5..d5f0598c253b 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 0
--SUBLEVEL = 20
-+SUBLEVEL = 21
- EXTRAVERSION =
- NAME = Sneaky Weasel
+diff --git a/sound/pci/hda/hda_codec.c b/sound/pci/hda/hda_codec.c
+index 2195851..67d341f 100644
+--- a/sound/pci/hda/hda_codec.c
++++ b/sound/pci/hda/hda_codec.c
+@@ -1328,7 +1328,7 @@ void snd_hda_codec_setup_stream(struct hda_codec *codec, hda_nid_t nid,
+ 		for (i = 0; i < c->cvt_setups.used; i++) {
+ 			p = snd_array_elem(&c->cvt_setups, i);
+ 			if (!p->active && p->stream_tag == stream_tag &&
+-			    get_wcaps_type(get_wcaps(codec, p->nid)) == type)
++			    get_wcaps_type(get_wcaps(c, p->nid)) == type)
+ 				p->dirty = 1;
+ 		}
+ 	}
+diff --git a/sound/soc/codecs/wm8962.c b/sound/soc/codecs/wm8962.c
+index 4a0f666..6d0cae4 100644
+--- a/sound/soc/codecs/wm8962.c
++++ b/sound/soc/codecs/wm8962.c
+@@ -2975,13 +2975,13 @@ static int wm8962_hw_params(struct snd_pcm_substream *substream,
+ 	case SNDRV_PCM_FORMAT_S16_LE:
+ 		break;
+ 	case SNDRV_PCM_FORMAT_S20_3LE:
+-		aif0 |= 0x40;
++		aif0 |= 0x4;
+ 		break;
+ 	case SNDRV_PCM_FORMAT_S24_LE:
+-		aif0 |= 0x80;
++		aif0 |= 0x8;
+ 		break;
+ 	case SNDRV_PCM_FORMAT_S32_LE:
+-		aif0 |= 0xc0;
++		aif0 |= 0xc;
+ 		break;
+ 	default:
+ 		return -EINVAL;
+diff --git a/sound/soc/codecs/wm_hubs.c b/sound/soc/codecs/wm_hubs.c
+index 9e370d1..8712a9f 100644
+--- a/sound/soc/codecs/wm_hubs.c
++++ b/sound/soc/codecs/wm_hubs.c
+@@ -562,14 +562,14 @@ SOC_DAPM_SINGLE("Left Output Switch", WM8993_LINE_MIXER1, 0, 1, 0),
+ };
  
--- 
-2.28.0
-
+ static const struct snd_kcontrol_new line2_mix[] = {
+-SOC_DAPM_SINGLE("IN2R Switch", WM8993_LINE_MIXER2, 2, 1, 0),
+-SOC_DAPM_SINGLE("IN2L Switch", WM8993_LINE_MIXER2, 1, 1, 0),
++SOC_DAPM_SINGLE("IN1L Switch", WM8993_LINE_MIXER2, 2, 1, 0),
++SOC_DAPM_SINGLE("IN1R Switch", WM8993_LINE_MIXER2, 1, 1, 0),
+ SOC_DAPM_SINGLE("Output Switch", WM8993_LINE_MIXER2, 0, 1, 0),
+ };
+ 
+ static const struct snd_kcontrol_new line2n_mix[] = {
+-SOC_DAPM_SINGLE("Left Output Switch", WM8993_LINE_MIXER2, 6, 1, 0),
+-SOC_DAPM_SINGLE("Right Output Switch", WM8993_LINE_MIXER2, 5, 1, 0),
++SOC_DAPM_SINGLE("Left Output Switch", WM8993_LINE_MIXER2, 5, 1, 0),
++SOC_DAPM_SINGLE("Right Output Switch", WM8993_LINE_MIXER2, 6, 1, 0),
+ };
+ 
+ static const struct snd_kcontrol_new line2p_mix[] = {
+@@ -589,6 +589,8 @@ SND_SOC_DAPM_INPUT("IN2RP:VXRP"),
+ SND_SOC_DAPM_MICBIAS("MICBIAS2", WM8993_POWER_MANAGEMENT_1, 5, 0),
+ SND_SOC_DAPM_MICBIAS("MICBIAS1", WM8993_POWER_MANAGEMENT_1, 4, 0),
+ 
++SND_SOC_DAPM_SUPPLY("LINEOUT_VMID_BUF", WM8993_ANTIPOP1, 7, 0, NULL, 0),
++
+ SND_SOC_DAPM_MIXER("IN1L PGA", WM8993_POWER_MANAGEMENT_2, 6, 0,
+ 		   in1l_pga, ARRAY_SIZE(in1l_pga)),
+ SND_SOC_DAPM_MIXER("IN1R PGA", WM8993_POWER_MANAGEMENT_2, 4, 0,
+@@ -794,9 +796,11 @@ static const struct snd_soc_dapm_route lineout1_diff_routes[] = {
+ };
+ 
+ static const struct snd_soc_dapm_route lineout1_se_routes[] = {
++	{ "LINEOUT1N Mixer", NULL, "LINEOUT_VMID_BUF" },
+ 	{ "LINEOUT1N Mixer", "Left Output Switch", "Left Output PGA" },
+ 	{ "LINEOUT1N Mixer", "Right Output Switch", "Right Output PGA" },
+ 
++	{ "LINEOUT1P Mixer", NULL, "LINEOUT_VMID_BUF" },
+ 	{ "LINEOUT1P Mixer", "Left Output Switch", "Left Output PGA" },
+ 
+ 	{ "LINEOUT1N Driver", NULL, "LINEOUT1N Mixer" },
+@@ -804,8 +808,8 @@ static const struct snd_soc_dapm_route lineout1_se_routes[] = {
+ };
+ 
+ static const struct snd_soc_dapm_route lineout2_diff_routes[] = {
+-	{ "LINEOUT2 Mixer", "IN2L Switch", "IN2L PGA" },
+-	{ "LINEOUT2 Mixer", "IN2R Switch", "IN2R PGA" },
++	{ "LINEOUT2 Mixer", "IN1L Switch", "IN1L PGA" },
++	{ "LINEOUT2 Mixer", "IN1R Switch", "IN1R PGA" },
+ 	{ "LINEOUT2 Mixer", "Output Switch", "Right Output PGA" },
+ 
+ 	{ "LINEOUT2N Driver", NULL, "LINEOUT2 Mixer" },
+@@ -813,9 +817,11 @@ static const struct snd_soc_dapm_route lineout2_diff_routes[] = {
+ };
+ 
+ static const struct snd_soc_dapm_route lineout2_se_routes[] = {
++	{ "LINEOUT2N Mixer", NULL, "LINEOUT_VMID_BUF" },
+ 	{ "LINEOUT2N Mixer", "Left Output Switch", "Left Output PGA" },
+ 	{ "LINEOUT2N Mixer", "Right Output Switch", "Right Output PGA" },
+ 
++	{ "LINEOUT2P Mixer", NULL, "LINEOUT_VMID_BUF" },
+ 	{ "LINEOUT2P Mixer", "Right Output Switch", "Right Output PGA" },
+ 
+ 	{ "LINEOUT2N Driver", NULL, "LINEOUT2N Mixer" },
+diff --git a/sound/soc/soc-core.c b/sound/soc/soc-core.c
+index 493ae7c..e2bfe1d 100644
+--- a/sound/soc/soc-core.c
++++ b/sound/soc/soc-core.c
+@@ -30,6 +30,7 @@
+ #include <linux/bitops.h>
+ #include <linux/debugfs.h>
+ #include <linux/platform_device.h>
++#include <linux/ctype.h>
+ #include <linux/slab.h>
+ #include <sound/ac97_codec.h>
+ #include <sound/core.h>
+@@ -1931,9 +1932,20 @@ static void snd_soc_instantiate_card(struct snd_soc_card *card)
+ 		 "%s", card->name);
+ 	snprintf(card->snd_card->longname, sizeof(card->snd_card->longname),
+ 		 "%s", card->long_name ? card->long_name : card->name);
+-	if (card->driver_name)
+-		strlcpy(card->snd_card->driver, card->driver_name,
+-			sizeof(card->snd_card->driver));
++	snprintf(card->snd_card->driver, sizeof(card->snd_card->driver),
++		 "%s", card->driver_name ? card->driver_name : card->name);
++	for (i = 0; i < ARRAY_SIZE(card->snd_card->driver); i++) {
++		switch (card->snd_card->driver[i]) {
++		case '_':
++		case '-':
++		case '\0':
++			break;
++		default:
++			if (!isalnum(card->snd_card->driver[i]))
++				card->snd_card->driver[i] = '_';
++			break;
++		}
++	}
+ 
+ 	if (card->late_probe) {
+ 		ret = card->late_probe(card);

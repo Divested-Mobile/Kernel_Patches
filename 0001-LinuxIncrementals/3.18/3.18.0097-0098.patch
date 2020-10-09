@@ -1,209 +1,83 @@
-From 5900ecf33c2ff2329dc34167fca8405250743c71 Mon Sep 17 00:00:00 2001
-From: Jakub Sitnicki <jkbs@redhat.com>
-Date: Wed, 8 Jun 2016 15:13:34 +0200
-Subject: [PATCH 01/25] ipv6: Skip XFRM lookup if dst_entry in socket cache is
- valid
-
-commit 00bc0ef5880dc7b82f9c320dead4afaad48e47be upstream.
-
-At present we perform an xfrm_lookup() for each UDPv6 message we
-send. The lookup involves querying the flow cache (flow_cache_lookup)
-and, in case of a cache miss, creating an XFRM bundle.
-
-If we miss the flow cache, we can end up creating a new bundle and
-deriving the path MTU (xfrm_init_pmtu) from on an already transformed
-dst_entry, which we pass from the socket cache (sk->sk_dst_cache) down
-to xfrm_lookup(). This can happen only if we're caching the dst_entry
-in the socket, that is when we're using a connected UDP socket.
-
-To put it another way, the path MTU shrinks each time we miss the flow
-cache, which later on leads to incorrectly fragmented payload. It can
-be observed with ESPv6 in transport mode:
-
-  1) Set up a transformation and lower the MTU to trigger fragmentation
-    # ip xfrm policy add dir out src ::1 dst ::1 \
-      tmpl src ::1 dst ::1 proto esp spi 1
-    # ip xfrm state add src ::1 dst ::1 \
-      proto esp spi 1 enc 'aes' 0x0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b
-    # ip link set dev lo mtu 1500
-
-  2) Monitor the packet flow and set up an UDP sink
-    # tcpdump -ni lo -ttt &
-    # socat udp6-listen:12345,fork /dev/null &
-
-  3) Send a datagram that needs fragmentation with a connected socket
-    # perl -e 'print "@" x 1470 | socat - udp6:[::1]:12345
-    2016/06/07 18:52:52 socat[724] E read(3, 0x555bb3d5ba00, 8192): Protocol error
-    00:00:00.000000 IP6 ::1 > ::1: frag (0|1448) ESP(spi=0x00000001,seq=0x2), length 1448
-    00:00:00.000014 IP6 ::1 > ::1: frag (1448|32)
-    00:00:00.000050 IP6 ::1 > ::1: ESP(spi=0x00000001,seq=0x3), length 1272
-    (^ ICMPv6 Parameter Problem)
-    00:00:00.000022 IP6 ::1 > ::1: ESP(spi=0x00000001,seq=0x5), length 136
-
-  4) Compare it to a non-connected socket
-    # perl -e 'print "@" x 1500' | socat - udp6-sendto:[::1]:12345
-    00:00:40.535488 IP6 ::1 > ::1: frag (0|1448) ESP(spi=0x00000001,seq=0x6), length 1448
-    00:00:00.000010 IP6 ::1 > ::1: frag (1448|64)
-
-What happens in step (3) is:
-
-  1) when connecting the socket in __ip6_datagram_connect(), we
-     perform an XFRM lookup, miss the flow cache, create an XFRM
-     bundle, and cache the destination,
-
-  2) afterwards, when sending the datagram, we perform an XFRM lookup,
-     again, miss the flow cache (due to mismatch of flowi6_iif and
-     flowi6_oif, which is an issue of its own), and recreate an XFRM
-     bundle based on the cached (and already transformed) destination.
-
-To prevent the recreation of an XFRM bundle, avoid an XFRM lookup
-altogether whenever we already have a destination entry cached in the
-socket. This prevents the path MTU shrinkage and brings us on par with
-UDPv4.
-
-The fix also benefits connected PINGv6 sockets, another user of
-ip6_sk_dst_lookup_flow(), who also suffer messages being transformed
-twice.
-
-Joint work with Hannes Frederic Sowa.
-
-Reported-by: Jan Tluka <jtluka@redhat.com>
-Signed-off-by: Jakub Sitnicki <jkbs@redhat.com>
-Acked-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Benedict Wong <benedictwong@google.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/ip6_output.c | 11 +++--------
- 1 file changed, 3 insertions(+), 8 deletions(-)
-
-diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
-index 8aeedb1fed89..1b6637fb99cb 100644
---- a/net/ipv6/ip6_output.c
-+++ b/net/ipv6/ip6_output.c
-@@ -1038,17 +1038,12 @@ struct dst_entry *ip6_sk_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
- 					 const struct in6_addr *final_dst)
+diff --git a/Makefile b/Makefile
+index 7781ca4f1ca2..1e7d18b5025c 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 3
+ PATCHLEVEL = 18
+-SUBLEVEL = 97
++SUBLEVEL = 98
+ EXTRAVERSION =
+ NAME = Diseased Newt
+ 
+diff --git a/arch/sh/boards/mach-se/770x/setup.c b/arch/sh/boards/mach-se/770x/setup.c
+index 658326f44df8..5e0267624d8d 100644
+--- a/arch/sh/boards/mach-se/770x/setup.c
++++ b/arch/sh/boards/mach-se/770x/setup.c
+@@ -8,6 +8,7 @@
+  */
+ #include <linux/init.h>
+ #include <linux/platform_device.h>
++#include <linux/sh_eth.h>
+ #include <mach-se/mach/se.h>
+ #include <mach-se/mach/mrshpc.h>
+ #include <asm/machvec.h>
+@@ -114,6 +115,11 @@ static struct platform_device heartbeat_device = {
+ #if defined(CONFIG_CPU_SUBTYPE_SH7710) ||\
+ 	defined(CONFIG_CPU_SUBTYPE_SH7712)
+ /* SH771X Ethernet driver */
++static struct sh_eth_plat_data sh_eth_plat = {
++	.phy = PHY_ID,
++	.phy_interface = PHY_INTERFACE_MODE_MII,
++};
++
+ static struct resource sh_eth0_resources[] = {
+ 	[0] = {
+ 		.start = SH_ETH0_BASE,
+@@ -131,7 +137,7 @@ static struct platform_device sh_eth0_device = {
+ 	.name = "sh771x-ether",
+ 	.id = 0,
+ 	.dev = {
+-		.platform_data = PHY_ID,
++		.platform_data = &sh_eth_plat,
+ 	},
+ 	.num_resources = ARRAY_SIZE(sh_eth0_resources),
+ 	.resource = sh_eth0_resources,
+@@ -154,7 +160,7 @@ static struct platform_device sh_eth1_device = {
+ 	.name = "sh771x-ether",
+ 	.id = 1,
+ 	.dev = {
+-		.platform_data = PHY_ID,
++		.platform_data = &sh_eth_plat,
+ 	},
+ 	.num_resources = ARRAY_SIZE(sh_eth1_resources),
+ 	.resource = sh_eth1_resources,
+diff --git a/drivers/gpu/drm/ttm/ttm_page_alloc.c b/drivers/gpu/drm/ttm/ttm_page_alloc.c
+index 5d8dfe027b30..75d51ec98e06 100644
+--- a/drivers/gpu/drm/ttm/ttm_page_alloc.c
++++ b/drivers/gpu/drm/ttm/ttm_page_alloc.c
+@@ -818,6 +818,8 @@ int ttm_page_alloc_init(struct ttm_mem_global *glob, unsigned max_pages)
+ 	pr_info("Initializing pool allocator\n");
+ 
+ 	_manager = kzalloc(sizeof(*_manager), GFP_KERNEL);
++	if (!_manager)
++		return -ENOMEM;
+ 
+ 	ttm_page_pool_init_locked(&_manager->wc_pool, GFP_HIGHUSER, "wc");
+ 
+diff --git a/drivers/leds/led-core.c b/drivers/leds/led-core.c
+index aaa8eba9099f..0633cf033645 100644
+--- a/drivers/leds/led-core.c
++++ b/drivers/leds/led-core.c
+@@ -76,7 +76,7 @@ void led_blink_set(struct led_classdev *led_cdev,
+ 		   unsigned long *delay_on,
+ 		   unsigned long *delay_off)
  {
- 	struct dst_entry *dst = sk_dst_check(sk, inet6_sk(sk)->dst_cookie);
--	int err;
+-	del_timer_sync(&led_cdev->blink_timer);
++	led_stop_software_blink(led_cdev);
  
- 	dst = ip6_sk_dst_check(sk, dst, fl6);
-+	if (!dst)
-+		dst = ip6_dst_lookup_flow(sk, fl6, final_dst);
- 
--	err = ip6_dst_lookup_tail(sk, &dst, fl6);
--	if (err)
--		return ERR_PTR(err);
--	if (final_dst)
--		fl6->daddr = *final_dst;
--
--	return xfrm_lookup_route(sock_net(sk), dst, flowi6_to_flowi(fl6), sk, 0);
-+	return dst;
- }
- EXPORT_SYMBOL_GPL(ip6_sk_dst_lookup_flow);
- 
--- 
-2.28.0
-
-
-From 5ae0e9de0ac6728f8a29612ff216240945a25dc8 Mon Sep 17 00:00:00 2001
-From: Anna-Maria Gleixner <anna-maria@linutronix.de>
-Date: Thu, 21 Dec 2017 11:41:35 +0100
-Subject: [PATCH 02/25] hrtimer: Ensure POSIX compliance (relative
- CLOCK_REALTIME hrtimers)
-
-commit 48d0c9becc7f3c66874c100c126459a9da0fdced upstream.
-
-The POSIX specification defines that relative CLOCK_REALTIME timers are not
-affected by clock modifications. Those timers have to use CLOCK_MONOTONIC
-to ensure POSIX compliance.
-
-The introduction of the additional HRTIMER_MODE_PINNED mode broke this
-requirement for pinned timers.
-
-There is no user space visible impact because user space timers are not
-using pinned mode, but for consistency reasons this needs to be fixed.
-
-Check whether the mode has the HRTIMER_MODE_REL bit set instead of
-comparing with HRTIMER_MODE_ABS.
-
-Signed-off-by: Anna-Maria Gleixner <anna-maria@linutronix.de>
-Cc: Christoph Hellwig <hch@lst.de>
-Cc: John Stultz <john.stultz@linaro.org>
-Cc: Linus Torvalds <torvalds@linux-foundation.org>
-Cc: Peter Zijlstra <peterz@infradead.org>
-Cc: Thomas Gleixner <tglx@linutronix.de>
-Cc: keescook@chromium.org
-Fixes: 597d0275736d ("timers: Framework for identifying pinned timers")
-Link: http://lkml.kernel.org/r/20171221104205.7269-7-anna-maria@linutronix.de
-Signed-off-by: Ingo Molnar <mingo@kernel.org>
-Cc: Mike Galbraith <efault@gmx.de>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- kernel/time/hrtimer.c | 7 ++++++-
- 1 file changed, 6 insertions(+), 1 deletion(-)
-
-diff --git a/kernel/time/hrtimer.c b/kernel/time/hrtimer.c
-index e4c722437708..d822fb88a605 100644
---- a/kernel/time/hrtimer.c
-+++ b/kernel/time/hrtimer.c
-@@ -1149,7 +1149,12 @@ static void __hrtimer_init(struct hrtimer *timer, clockid_t clock_id,
- 
- 	cpu_base = raw_cpu_ptr(&hrtimer_bases);
- 
--	if (clock_id == CLOCK_REALTIME && mode != HRTIMER_MODE_ABS)
-+	/*
-+	 * POSIX magic: Relative CLOCK_REALTIME timers are not affected by
-+	 * clock modifications, so they needs to become CLOCK_MONOTONIC to
-+	 * ensure POSIX compliance.
-+	 */
-+	if (clock_id == CLOCK_REALTIME && mode & HRTIMER_MODE_REL)
- 		clock_id = CLOCK_MONOTONIC;
- 
- 	base = hrtimer_clockid_to_base(clock_id);
--- 
-2.28.0
-
-
-From 9d293792bfdd25f1c1a7aecc0152e2b2bc596e45 Mon Sep 17 00:00:00 2001
-From: Sascha Hauer <s.hauer@pengutronix.de>
-Date: Tue, 5 Dec 2017 11:51:40 +0100
-Subject: [PATCH 03/25] mtd: nand: gpmi: Fix failure when a erased page has a
- bitflip at BBM
-
-[ Upstream commit fdf2e821052958a114618a95ab18a300d0b080cb ]
-
-When erased subpages are read then the BCH decoder returns STATUS_ERASED
-if they are all empty, or STATUS_UNCORRECTABLE if there are bitflips.
-When there are bitflips, we have to set these bits again to show the
-upper layers a completely erased page. When a bitflip happens in the
-exact byte where the bad block marker is, then this byte is swapped
-with another byte in block_mark_swapping(). The correction code then
-detects a bitflip in another subpage and no longer corrects the bitflip
-where it really happens.
-
-Correct this behaviour by calling block_mark_swapping() after the
-bitflips have been corrected.
-
-In our case UBIFS failed with this bug because it expects erased
-pages to be really empty:
-
-UBIFS error (pid 187): ubifs_scan: corrupt empty space at LEB 36:118735
-UBIFS error (pid 187): ubifs_scanned_corruption: corruption at LEB 36:118735
-UBIFS error (pid 187): ubifs_scanned_corruption: first 8192 bytes from LEB 36:118735
-UBIFS error (pid 187): ubifs_scan: LEB 36 scanning failed
-UBIFS error (pid 187): do_commit: commit failed, error -117
-
-Signed-off-by: Sascha Hauer <s.hauer@pengutronix.de>
-Reviewed-by: Richard Weinberger <richard@nod.at>
-Acked-by: Boris Brezillon <boris.brezillon@free-electrons.com>
-Signed-off-by: Richard Weinberger <richard@nod.at>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/mtd/nand/gpmi-nand/gpmi-nand.c | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
-
+ 	led_cdev->flags &= ~LED_BLINK_ONESHOT;
+ 	led_cdev->flags &= ~LED_BLINK_ONESHOT_STOP;
 diff --git a/drivers/mtd/nand/gpmi-nand/gpmi-nand.c b/drivers/mtd/nand/gpmi-nand/gpmi-nand.c
 index 959cb9b70310..0b27e338dae9 100644
 --- a/drivers/mtd/nand/gpmi-nand/gpmi-nand.c
@@ -228,165 +102,6 @@ index 959cb9b70310..0b27e338dae9 100644
  	if (oob_required) {
  		/*
  		 * It's time to deliver the OOB bytes. See gpmi_ecc_read_oob()
--- 
-2.28.0
-
-
-From a97c0dc1a45fbe574eeb713f063b2e3dac73e152 Mon Sep 17 00:00:00 2001
-From: Brendan McGrath <redmcg@redmandi.dyndns.org>
-Date: Wed, 13 Dec 2017 22:14:57 +1100
-Subject: [PATCH 04/25] ipv6: icmp6: Allow icmp messages to be looped back
-
-[ Upstream commit 588753f1eb18978512b1c9b85fddb457d46f9033 ]
-
-One example of when an ICMPv6 packet is required to be looped back is
-when a host acts as both a Multicast Listener and a Multicast Router.
-
-A Multicast Router will listen on address ff02::16 for MLDv2 messages.
-
-Currently, MLDv2 messages originating from a Multicast Listener running
-on the same host as the Multicast Router are not being delivered to the
-Multicast Router. This is due to dst.input being assigned the default
-value of dst_discard.
-
-This results in the packet being looped back but discarded before being
-delivered to the Multicast Router.
-
-This patch sets dst.input to ip6_input to ensure a looped back packet
-is delivered to the Multicast Router.
-
-Signed-off-by: Brendan McGrath <redmcg@redmandi.dyndns.org>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/ipv6/route.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/net/ipv6/route.c b/net/ipv6/route.c
-index 31ecdb35fd7f..168e40d98cce 100644
---- a/net/ipv6/route.c
-+++ b/net/ipv6/route.c
-@@ -1367,6 +1367,7 @@ struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
- 	}
- 
- 	rt->dst.flags |= DST_HOST;
-+	rt->dst.input = ip6_input;
- 	rt->dst.output  = ip6_output;
- 	atomic_set(&rt->dst.__refcnt, 1);
- 	rt->rt6i_gateway  = fl6->daddr;
--- 
-2.28.0
-
-
-From 7c7e39f79bad5cb368714ab746c0d578de79e493 Mon Sep 17 00:00:00 2001
-From: Al Viro <viro@zeniv.linux.org.uk>
-Date: Mon, 18 Dec 2017 15:05:07 -0500
-Subject: [PATCH 05/25] sget(): handle failures of register_shrinker()
-
-[ Upstream commit 9ee332d99e4d5a97548943b81c54668450ce641b ]
-
-Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/super.c | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
-
-diff --git a/fs/super.c b/fs/super.c
-index 19fafe86071a..d4731c401278 100644
---- a/fs/super.c
-+++ b/fs/super.c
-@@ -476,7 +476,11 @@ retry:
- 	hlist_add_head(&s->s_instances, &type->fs_supers);
- 	spin_unlock(&sb_lock);
- 	get_filesystem(type);
--	register_shrinker(&s->s_shrink);
-+	err = register_shrinker(&s->s_shrink);
-+	if (err) {
-+		deactivate_locked_super(s);
-+		s = ERR_PTR(err);
-+	}
- 	return s;
- }
- 
--- 
-2.28.0
-
-
-From bfde9f19290e7dce114d447b8ab23340e8bd049d Mon Sep 17 00:00:00 2001
-From: Radu Pirea <radu.pirea@microchip.com>
-Date: Fri, 15 Dec 2017 17:40:17 +0200
-Subject: [PATCH 06/25] spi: atmel: fixed spin_lock usage inside
- atmel_spi_remove
-
-[ Upstream commit 66e900a3d225575c8b48b59ae1fe74bb6e5a65cc ]
-
-The only part of atmel_spi_remove which needs to be atomic is hardware
-reset.
-
-atmel_spi_stop_dma calls dma_terminate_all and this needs interrupts
-enabled.
-atmel_spi_release_dma calls dma_release_channel and dma_release_channel
-locks a mutex inside of spin_lock.
-
-So the call of these functions can't be inside a spin_lock.
-
-Reported-by: Jia-Ju Bai <baijiaju1990@gmail.com>
-Signed-off-by: Radu Pirea <radu.pirea@microchip.com>
-Signed-off-by: Mark Brown <broonie@kernel.org>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/spi/spi-atmel.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/spi/spi-atmel.c b/drivers/spi/spi-atmel.c
-index 4bf337aa4fd5..fab124d3b8a6 100644
---- a/drivers/spi/spi-atmel.c
-+++ b/drivers/spi/spi-atmel.c
-@@ -1416,12 +1416,12 @@ static int atmel_spi_remove(struct platform_device *pdev)
- 	struct atmel_spi	*as = spi_master_get_devdata(master);
- 
- 	/* reset the hardware and block queue progress */
--	spin_lock_irq(&as->lock);
- 	if (as->use_dma) {
- 		atmel_spi_stop_dma(as);
- 		atmel_spi_release_dma(as);
- 	}
- 
-+	spin_lock_irq(&as->lock);
- 	spi_writel(as, CR, SPI_BIT(SWRST));
- 	spi_writel(as, CR, SPI_BIT(SWRST)); /* AT91SAM9263 Rev B workaround */
- 	spi_readl(as, SR);
--- 
-2.28.0
-
-
-From 69712e5d5b312ad926191bf54bb69e945ffcad30 Mon Sep 17 00:00:00 2001
-From: Alexander Kochetkov <al.kochet@gmail.com>
-Date: Fri, 15 Dec 2017 20:20:06 +0300
-Subject: [PATCH 07/25] net: arc_emac: fix arc_emac_rx() error paths
-
-[ Upstream commit e688822d035b494071ecbadcccbd6f3325fb0f59 ]
-
-arc_emac_rx() has some issues found by code review.
-
-In case netdev_alloc_skb_ip_align() or dma_map_single() failure
-rx fifo entry will not be returned to EMAC.
-
-In case dma_map_single() failure previously allocated skb became
-lost to driver. At the same time address of newly allocated skb
-will not be provided to EMAC.
-
-Signed-off-by: Alexander Kochetkov <al.kochet@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/arc/emac_main.c | 53 ++++++++++++++++------------
- 1 file changed, 31 insertions(+), 22 deletions(-)
-
 diff --git a/drivers/net/ethernet/arc/emac_main.c b/drivers/net/ethernet/arc/emac_main.c
 index abe1eabc0171..9cc5daed13ed 100644
 --- a/drivers/net/ethernet/arc/emac_main.c
@@ -462,204 +177,6 @@ index abe1eabc0171..9cc5daed13ed 100644
  		dma_unmap_addr_set(rx_buff, addr, addr);
  		dma_unmap_len_set(rx_buff, len, EMAC_BUFFER_SIZE);
  
--- 
-2.28.0
-
-
-From 05caa7ec533d19058d7978df5ce6d01507205d03 Mon Sep 17 00:00:00 2001
-From: Cathy Avery <cavery@redhat.com>
-Date: Tue, 19 Dec 2017 13:32:48 -0500
-Subject: [PATCH 08/25] scsi: storvsc: Fix scsi_cmd error assignments in
- storvsc_handle_error
-
-[ Upstream commit d1b8b2391c24751e44f618fcf86fb55d9a9247fd ]
-
-When an I/O is returned with an srb_status of SRB_STATUS_INVALID_LUN
-which has zero good_bytes it must be assigned an error. Otherwise the
-I/O will be continuously requeued and will cause a deadlock in the case
-where disks are being hot added and removed. sd_probe_async will wait
-forever for its I/O to complete while holding scsi_sd_probe_domain.
-
-Also returning the default error of DID_TARGET_FAILURE causes multipath
-to not retry the I/O resulting in applications receiving I/O errors
-before a failover can occur.
-
-Signed-off-by: Cathy Avery <cavery@redhat.com>
-Signed-off-by: Long Li <longli@microsoft.com>
-Reviewed-by: Stephen Hemminger <stephen@networkplumber.org>
-Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/scsi/storvsc_drv.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/scsi/storvsc_drv.c b/drivers/scsi/storvsc_drv.c
-index e511e3406cfa..96c6e75bbfe6 100644
---- a/drivers/scsi/storvsc_drv.c
-+++ b/drivers/scsi/storvsc_drv.c
-@@ -1029,10 +1029,11 @@ static void storvsc_handle_error(struct vmscsi_request *vm_srb,
- 		case TEST_UNIT_READY:
- 			break;
- 		default:
--			set_host_byte(scmnd, DID_TARGET_FAILURE);
-+			set_host_byte(scmnd, DID_ERROR);
- 		}
- 		break;
- 	case SRB_STATUS_INVALID_LUN:
-+		set_host_byte(scmnd, DID_NO_CONNECT);
- 		do_work = true;
- 		process_err_fn = storvsc_remove_lun;
- 		break;
--- 
-2.28.0
-
-
-From 7862b4d6f8acde0386d17ee162e0ddb26faea751 Mon Sep 17 00:00:00 2001
-From: Siva Reddy Kallam <siva.kallam@broadcom.com>
-Date: Fri, 22 Dec 2017 16:05:28 +0530
-Subject: [PATCH 09/25] tg3: Add workaround to restrict 5762 MRRS to 2048
-
-[ Upstream commit 4419bb1cedcda0272e1dc410345c5a1d1da0e367 ]
-
-One of AMD based server with 5762 hangs with jumbo frame traffic.
-This AMD platform has southbridge limitation which is restricting MRRS
-to 4000. As a work around, driver to restricts the MRRS to 2048 for
-this particular 5762 NX1 card.
-
-Signed-off-by: Siva Reddy Kallam <siva.kallam@broadcom.com>
-Signed-off-by: Michael Chan <michael.chan@broadcom.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/broadcom/tg3.c | 10 ++++++++++
- drivers/net/ethernet/broadcom/tg3.h |  4 ++++
- 2 files changed, 14 insertions(+)
-
-diff --git a/drivers/net/ethernet/broadcom/tg3.c b/drivers/net/ethernet/broadcom/tg3.c
-index 05a2f3b304c3..e0b446525f53 100644
---- a/drivers/net/ethernet/broadcom/tg3.c
-+++ b/drivers/net/ethernet/broadcom/tg3.c
-@@ -10028,6 +10028,16 @@ static int tg3_reset_hw(struct tg3 *tp, bool reset_phy)
- 
- 	tw32(GRC_MODE, tp->grc_mode | val);
- 
-+	/* On one of the AMD platform, MRRS is restricted to 4000 because of
-+	 * south bridge limitation. As a workaround, Driver is setting MRRS
-+	 * to 2048 instead of default 4096.
-+	 */
-+	if (tp->pdev->subsystem_vendor == PCI_VENDOR_ID_DELL &&
-+	    tp->pdev->subsystem_device == TG3PCI_SUBDEVICE_ID_DELL_5762) {
-+		val = tr32(TG3PCI_DEV_STATUS_CTRL) & ~MAX_READ_REQ_MASK;
-+		tw32(TG3PCI_DEV_STATUS_CTRL, val | MAX_READ_REQ_SIZE_2048);
-+	}
-+
- 	/* Setup the timer prescalar register.  Clock is always 66Mhz. */
- 	val = tr32(GRC_MISC_CFG);
- 	val &= ~0xff;
-diff --git a/drivers/net/ethernet/broadcom/tg3.h b/drivers/net/ethernet/broadcom/tg3.h
-index 31c9f8295953..19532961e173 100644
---- a/drivers/net/ethernet/broadcom/tg3.h
-+++ b/drivers/net/ethernet/broadcom/tg3.h
-@@ -95,6 +95,7 @@
- #define TG3PCI_SUBDEVICE_ID_DELL_JAGUAR		0x0106
- #define TG3PCI_SUBDEVICE_ID_DELL_MERLOT		0x0109
- #define TG3PCI_SUBDEVICE_ID_DELL_SLIM_MERLOT	0x010a
-+#define TG3PCI_SUBDEVICE_ID_DELL_5762		0x07f0
- #define TG3PCI_SUBVENDOR_ID_COMPAQ		PCI_VENDOR_ID_COMPAQ
- #define TG3PCI_SUBDEVICE_ID_COMPAQ_BANSHEE	0x007c
- #define TG3PCI_SUBDEVICE_ID_COMPAQ_BANSHEE_2	0x009a
-@@ -280,6 +281,9 @@
- #define TG3PCI_STD_RING_PROD_IDX	0x00000098 /* 64-bit */
- #define TG3PCI_RCV_RET_RING_CON_IDX	0x000000a0 /* 64-bit */
- /* 0xa8 --> 0xb8 unused */
-+#define TG3PCI_DEV_STATUS_CTRL		0x000000b4
-+#define  MAX_READ_REQ_SIZE_2048		 0x00004000
-+#define  MAX_READ_REQ_MASK		 0x00007000
- #define TG3PCI_DUAL_MAC_CTRL		0x000000b8
- #define  DUAL_MAC_CTRL_CH_MASK		 0x00000003
- #define  DUAL_MAC_CTRL_ID		 0x00000004
--- 
-2.28.0
-
-
-From e93041fc495ba9b76b842b4edff57655e54e4fd0 Mon Sep 17 00:00:00 2001
-From: Siva Reddy Kallam <siva.kallam@broadcom.com>
-Date: Fri, 22 Dec 2017 16:05:29 +0530
-Subject: [PATCH 10/25] tg3: Enable PHY reset in MTU change path for 5720
-
-[ Upstream commit e60ee41aaf898584205a6af5c996860d0fe6a836 ]
-
-A customer noticed RX path hang when MTU is changed on the fly while
-running heavy traffic with NCSI enabled for 5717 and 5719. Since 5720
-belongs to same ASIC family, we observed same issue and same fix
-could solve this problem for 5720.
-
-Signed-off-by: Siva Reddy Kallam <siva.kallam@broadcom.com>
-Signed-off-by: Michael Chan <michael.chan@broadcom.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/broadcom/tg3.c | 3 ++-
- 1 file changed, 2 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/net/ethernet/broadcom/tg3.c b/drivers/net/ethernet/broadcom/tg3.c
-index e0b446525f53..397bc868559b 100644
---- a/drivers/net/ethernet/broadcom/tg3.c
-+++ b/drivers/net/ethernet/broadcom/tg3.c
-@@ -14214,7 +14214,8 @@ static int tg3_change_mtu(struct net_device *dev, int new_mtu)
- 	 */
- 	if (tg3_asic_rev(tp) == ASIC_REV_57766 ||
- 	    tg3_asic_rev(tp) == ASIC_REV_5717 ||
--	    tg3_asic_rev(tp) == ASIC_REV_5719)
-+	    tg3_asic_rev(tp) == ASIC_REV_5719 ||
-+	    tg3_asic_rev(tp) == ASIC_REV_5720)
- 		reset_phy = true;
- 
- 	err = tg3_restart_hw(tp, reset_phy);
--- 
-2.28.0
-
-
-From c85a6e7bdea9a9532c1e68c1c472082bf88bc210 Mon Sep 17 00:00:00 2001
-From: "Guilherme G. Piccoli" <gpiccoli@linux.vnet.ibm.com>
-Date: Fri, 22 Dec 2017 13:01:39 -0200
-Subject: [PATCH 11/25] bnx2x: Improve reliability in case of nested PCI errors
-
-[ Upstream commit f7084059a9cb9e56a186e1677b1dcffd76c2cd24 ]
-
-While in recovery process of PCI error (called EEH on PowerPC arch),
-another PCI transaction could be corrupted causing a situation of
-nested PCI errors. Also, this scenario could be reproduced with
-error injection mechanisms (for debug purposes).
-
-We observe that in case of nested PCI errors, bnx2x might attempt to
-initialize its shmem and cause a kernel crash due to bad addresses
-read from MCP. Multiple different stack traces were observed depending
-on the point the second PCI error happens.
-
-This patch avoids the crashes by:
-
- * failing PCI recovery in case of nested errors (since multiple
- PCI errors in a row are not expected to lead to a functional
- adapter anyway), and by,
-
- * preventing access to adapter FW when MCP is failed (we mark it as
- failed when shmem cannot get initialized properly).
-
-Reported-by: Abdul Haleem <abdhalee@linux.vnet.ibm.com>
-Signed-off-by: Guilherme G. Piccoli <gpiccoli@linux.vnet.ibm.com>
-Acked-by: Shahed Shaikh <Shahed.Shaikh@cavium.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c  |  4 ++--
- drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c | 14 +++++++++++++-
- 2 files changed, 15 insertions(+), 3 deletions(-)
-
 diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
 index c4ad4b390239..d2ebc9d5e183 100644
 --- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_cmn.c
@@ -714,312 +231,76 @@ index 1217eafb61a4..f8e8206d7620 100644
  
  		if (IS_PF(bp) && SHMEM2_HAS(bp, drv_capabilities_flag)) {
  			u32 v;
--- 
-2.28.0
-
-
-From 20f6d9c2af33da892a0e03ffd6249c7ab81edfb7 Mon Sep 17 00:00:00 2001
-From: Matthieu CASTET <matthieu.castet@parrot.com>
-Date: Tue, 12 Dec 2017 11:10:44 +0100
-Subject: [PATCH 12/25] led: core: Fix brightness setting when setting
- delay_off=0
-
-[ Upstream commit 2b83ff96f51d0b039c4561b9f95c824d7bddb85c ]
-
-With the current code, the following sequence won't work :
-echo timer > trigger
-
-echo 0 >  delay_off
-* at this point we call
-** led_delay_off_store
-** led_blink_set
----
- drivers/leds/led-core.c | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/drivers/leds/led-core.c b/drivers/leds/led-core.c
-index aaa8eba9099f..0633cf033645 100644
---- a/drivers/leds/led-core.c
-+++ b/drivers/leds/led-core.c
-@@ -76,7 +76,7 @@ void led_blink_set(struct led_classdev *led_cdev,
- 		   unsigned long *delay_on,
- 		   unsigned long *delay_off)
- {
--	del_timer_sync(&led_cdev->blink_timer);
-+	led_stop_software_blink(led_cdev);
+diff --git a/drivers/net/ethernet/broadcom/tg3.c b/drivers/net/ethernet/broadcom/tg3.c
+index 05a2f3b304c3..397bc868559b 100644
+--- a/drivers/net/ethernet/broadcom/tg3.c
++++ b/drivers/net/ethernet/broadcom/tg3.c
+@@ -10028,6 +10028,16 @@ static int tg3_reset_hw(struct tg3 *tp, bool reset_phy)
  
- 	led_cdev->flags &= ~LED_BLINK_ONESHOT;
- 	led_cdev->flags &= ~LED_BLINK_ONESHOT_STOP;
--- 
-2.28.0
-
-
-From 96dd200101791418675e7250b88828d71a46e80f Mon Sep 17 00:00:00 2001
-From: Stefan Haberland <sth@linux.vnet.ibm.com>
-Date: Wed, 6 Dec 2017 10:30:39 +0100
-Subject: [PATCH 13/25] s390/dasd: fix wrongly assigned configuration data
-
-[ Upstream commit 8a9bd4f8ebc6800bfc0596e28631ff6809a2f615 ]
-
-We store per path and per device configuration data to identify the
-path or device correctly. The per path configuration data might get
-mixed up if the original request gets into error recovery and is
-started with a random path mask.
-
-This would lead to a wrong identification of a path in case of a CUIR
-event for example.
-
-Fix by copying the path mask from the original request to the error
-recovery request in case it is a path verification request.
-
-Signed-off-by: Stefan Haberland <sth@linux.vnet.ibm.com>
-Reviewed-by: Jan Hoeppner <hoeppner@linux.vnet.ibm.com>
-Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/s390/block/dasd_3990_erp.c | 10 ++++++++++
- 1 file changed, 10 insertions(+)
-
-diff --git a/drivers/s390/block/dasd_3990_erp.c b/drivers/s390/block/dasd_3990_erp.c
-index d26134713682..d05c553eb552 100644
---- a/drivers/s390/block/dasd_3990_erp.c
-+++ b/drivers/s390/block/dasd_3990_erp.c
-@@ -2743,6 +2743,16 @@ dasd_3990_erp_action(struct dasd_ccw_req * cqr)
- 		erp = dasd_3990_erp_handle_match_erp(cqr, erp);
- 	}
+ 	tw32(GRC_MODE, tp->grc_mode | val);
  
-+
-+	/*
-+	 * For path verification work we need to stick with the path that was
-+	 * originally chosen so that the per path configuration data is
-+	 * assigned correctly.
++	/* On one of the AMD platform, MRRS is restricted to 4000 because of
++	 * south bridge limitation. As a workaround, Driver is setting MRRS
++	 * to 2048 instead of default 4096.
 +	 */
-+	if (test_bit(DASD_CQR_VERIFY_PATH, &erp->flags) && cqr->lpm) {
-+		erp->lpm = cqr->lpm;
++	if (tp->pdev->subsystem_vendor == PCI_VENDOR_ID_DELL &&
++	    tp->pdev->subsystem_device == TG3PCI_SUBDEVICE_ID_DELL_5762) {
++		val = tr32(TG3PCI_DEV_STATUS_CTRL) & ~MAX_READ_REQ_MASK;
++		tw32(TG3PCI_DEV_STATUS_CTRL, val | MAX_READ_REQ_SIZE_2048);
 +	}
 +
- 	if (device->features & DASD_FEATURE_ERPLOG) {
- 		/* print current erp_chain */
- 		dev_err(&device->cdev->dev,
--- 
-2.28.0
-
-
-From ac086d5fe75a5c56a78f2500bd6dcbf9137fa2f4 Mon Sep 17 00:00:00 2001
-From: Aliaksei Karaliou <akaraliou.dev@gmail.com>
-Date: Thu, 21 Dec 2017 13:18:26 -0800
-Subject: [PATCH 14/25] xfs: quota: fix missed destroy of qi_tree_lock
-
-[ Upstream commit 2196881566225f3c3428d1a5f847a992944daa5b ]
-
-xfs_qm_destroy_quotainfo() does not destroy quotainfo->qi_tree_lock
-while destroys quotainfo->qi_quotaofflock.
-
-Signed-off-by: Aliaksei Karaliou <akaraliou.dev@gmail.com>
-Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
-Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/xfs/xfs_qm.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
-index 2eb71027d236..30eea71405ce 100644
---- a/fs/xfs/xfs_qm.c
-+++ b/fs/xfs/xfs_qm.c
-@@ -703,6 +703,7 @@ xfs_qm_destroy_quotainfo(
- 		IRELE(qi->qi_pquotaip);
- 		qi->qi_pquotaip = NULL;
- 	}
-+	mutex_destroy(&qi->qi_tree_lock);
- 	mutex_destroy(&qi->qi_quotaofflock);
- 	kmem_free(qi);
- 	mp->m_quotainfo = NULL;
--- 
-2.28.0
-
-
-From 9d3948996ee2b774435967809b7c2e37d2b536ff Mon Sep 17 00:00:00 2001
-From: Aliaksei Karaliou <akaraliou.dev@gmail.com>
-Date: Thu, 21 Dec 2017 13:18:26 -0800
-Subject: [PATCH 15/25] xfs: quota: check result of register_shrinker()
-
-[ Upstream commit 3a3882ff26fbdbaf5f7e13f6a0bccfbf7121041d ]
-
-xfs_qm_init_quotainfo() does not check result of register_shrinker()
-which was tagged as __must_check recently, reported by sparse.
-
-Signed-off-by: Aliaksei Karaliou <akaraliou.dev@gmail.com>
-[darrick: move xfs_qm_destroy_quotainos nearer xfs_qm_init_quotainos]
-Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
-Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
-
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- fs/xfs/xfs_qm.c | 45 +++++++++++++++++++++++++++++----------------
- 1 file changed, 29 insertions(+), 16 deletions(-)
-
-diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
-index 30eea71405ce..b11a9c93e780 100644
---- a/fs/xfs/xfs_qm.c
-+++ b/fs/xfs/xfs_qm.c
-@@ -49,7 +49,7 @@
- STATIC int	xfs_qm_init_quotainos(xfs_mount_t *);
- STATIC int	xfs_qm_init_quotainfo(xfs_mount_t *);
+ 	/* Setup the timer prescalar register.  Clock is always 66Mhz. */
+ 	val = tr32(GRC_MISC_CFG);
+ 	val &= ~0xff;
+@@ -14204,7 +14214,8 @@ static int tg3_change_mtu(struct net_device *dev, int new_mtu)
+ 	 */
+ 	if (tg3_asic_rev(tp) == ASIC_REV_57766 ||
+ 	    tg3_asic_rev(tp) == ASIC_REV_5717 ||
+-	    tg3_asic_rev(tp) == ASIC_REV_5719)
++	    tg3_asic_rev(tp) == ASIC_REV_5719 ||
++	    tg3_asic_rev(tp) == ASIC_REV_5720)
+ 		reset_phy = true;
  
+ 	err = tg3_restart_hw(tp, reset_phy);
+diff --git a/drivers/net/ethernet/broadcom/tg3.h b/drivers/net/ethernet/broadcom/tg3.h
+index 31c9f8295953..19532961e173 100644
+--- a/drivers/net/ethernet/broadcom/tg3.h
++++ b/drivers/net/ethernet/broadcom/tg3.h
+@@ -95,6 +95,7 @@
+ #define TG3PCI_SUBDEVICE_ID_DELL_JAGUAR		0x0106
+ #define TG3PCI_SUBDEVICE_ID_DELL_MERLOT		0x0109
+ #define TG3PCI_SUBDEVICE_ID_DELL_SLIM_MERLOT	0x010a
++#define TG3PCI_SUBDEVICE_ID_DELL_5762		0x07f0
+ #define TG3PCI_SUBVENDOR_ID_COMPAQ		PCI_VENDOR_ID_COMPAQ
+ #define TG3PCI_SUBDEVICE_ID_COMPAQ_BANSHEE	0x007c
+ #define TG3PCI_SUBDEVICE_ID_COMPAQ_BANSHEE_2	0x009a
+@@ -280,6 +281,9 @@
+ #define TG3PCI_STD_RING_PROD_IDX	0x00000098 /* 64-bit */
+ #define TG3PCI_RCV_RET_RING_CON_IDX	0x000000a0 /* 64-bit */
+ /* 0xa8 --> 0xb8 unused */
++#define TG3PCI_DEV_STATUS_CTRL		0x000000b4
++#define  MAX_READ_REQ_SIZE_2048		 0x00004000
++#define  MAX_READ_REQ_MASK		 0x00007000
+ #define TG3PCI_DUAL_MAC_CTRL		0x000000b8
+ #define  DUAL_MAC_CTRL_CH_MASK		 0x00000003
+ #define  DUAL_MAC_CTRL_ID		 0x00000004
+diff --git a/drivers/net/ethernet/freescale/gianfar_ptp.c b/drivers/net/ethernet/freescale/gianfar_ptp.c
+index bb568006f37d..503991823551 100644
+--- a/drivers/net/ethernet/freescale/gianfar_ptp.c
++++ b/drivers/net/ethernet/freescale/gianfar_ptp.c
+@@ -314,11 +314,10 @@ static int ptp_gianfar_adjtime(struct ptp_clock_info *ptp, s64 delta)
+ 	now = tmr_cnt_read(etsects);
+ 	now += delta;
+ 	tmr_cnt_write(etsects, now);
++	set_fipers(etsects);
+ 
+ 	spin_unlock_irqrestore(&etsects->lock, flags);
+ 
+-	set_fipers(etsects);
 -
-+STATIC void	xfs_qm_destroy_quotainos(xfs_quotainfo_t *qi);
- STATIC void	xfs_qm_dqfree_one(struct xfs_dquot *dqp);
- /*
-  * We use the batch lookup interface to iterate over the dquots as it
-@@ -662,9 +662,17 @@ xfs_qm_init_quotainfo(
- 	qinf->qi_shrinker.scan_objects = xfs_qm_shrink_scan;
- 	qinf->qi_shrinker.seeks = DEFAULT_SEEKS;
- 	qinf->qi_shrinker.flags = SHRINKER_NUMA_AWARE;
--	register_shrinker(&qinf->qi_shrinker);
-+
-+	error = register_shrinker(&qinf->qi_shrinker);
-+	if (error)
-+		goto out_free_inos;
-+
  	return 0;
- 
-+out_free_inos:
-+	mutex_destroy(&qinf->qi_quotaofflock);
-+	mutex_destroy(&qinf->qi_tree_lock);
-+	xfs_qm_destroy_quotainos(qinf);
- out_free_lru:
- 	list_lru_destroy(&qinf->qi_lru);
- out_free_qinf:
-@@ -673,7 +681,6 @@ out_free_qinf:
- 	return error;
  }
  
--
- /*
-  * Gets called when unmounting a filesystem or when all quotas get
-  * turned off.
-@@ -690,19 +697,7 @@ xfs_qm_destroy_quotainfo(
- 
- 	unregister_shrinker(&qi->qi_shrinker);
- 	list_lru_destroy(&qi->qi_lru);
--
--	if (qi->qi_uquotaip) {
--		IRELE(qi->qi_uquotaip);
--		qi->qi_uquotaip = NULL; /* paranoia */
--	}
--	if (qi->qi_gquotaip) {
--		IRELE(qi->qi_gquotaip);
--		qi->qi_gquotaip = NULL;
--	}
--	if (qi->qi_pquotaip) {
--		IRELE(qi->qi_pquotaip);
--		qi->qi_pquotaip = NULL;
--	}
-+	xfs_qm_destroy_quotainos(qi);
- 	mutex_destroy(&qi->qi_tree_lock);
- 	mutex_destroy(&qi->qi_quotaofflock);
- 	kmem_free(qi);
-@@ -1573,6 +1568,24 @@ error_rele:
- 	return error;
- }
- 
-+STATIC void
-+xfs_qm_destroy_quotainos(
-+	xfs_quotainfo_t	*qi)
-+{
-+	if (qi->qi_uquotaip) {
-+		IRELE(qi->qi_uquotaip);
-+		qi->qi_uquotaip = NULL; /* paranoia */
-+	}
-+	if (qi->qi_gquotaip) {
-+		IRELE(qi->qi_gquotaip);
-+		qi->qi_gquotaip = NULL;
-+	}
-+	if (qi->qi_pquotaip) {
-+		IRELE(qi->qi_pquotaip);
-+		qi->qi_pquotaip = NULL;
-+	}
-+}
-+
- STATIC void
- xfs_qm_dqfree_one(
- 	struct xfs_dquot	*dqp)
--- 
-2.28.0
-
-
-From 154770b1dc1eeaf3d4db433b35621c2a4844e80d Mon Sep 17 00:00:00 2001
-From: Tushar Dave <tushar.n.dave@oracle.com>
-Date: Wed, 6 Dec 2017 02:26:29 +0530
-Subject: [PATCH 16/25] e1000: fix disabling already-disabled warning
-
-[ Upstream commit 0b76aae741abb9d16d2c0e67f8b1e766576f897d ]
-
-This patch adds check so that driver does not disable already
-disabled device.
-
-[   44.637743] advantechwdt: Unexpected close, not stopping watchdog!
-[   44.997548] input: ImExPS/2 Generic Explorer Mouse as /devices/platform/i8042/serio1/input/input6
-[   45.013419] e1000 0000:00:03.0: disabling already-disabled device
-[   45.013447] ------------[ cut here ]------------
-[   45.014868] WARNING: CPU: 1 PID: 71 at drivers/pci/pci.c:1641 pci_disable_device+0xa1/0x105:
-						pci_disable_device at drivers/pci/pci.c:1640
-[   45.016171] CPU: 1 PID: 71 Comm: rcu_perf_shutdo Not tainted 4.14.0-01330-g3c07399 #1
-[   45.017197] task: ffff88011bee9e40 task.stack: ffffc90000860000
-[   45.017987] RIP: 0010:pci_disable_device+0xa1/0x105:
-						pci_disable_device at drivers/pci/pci.c:1640
-[   45.018603] RSP: 0000:ffffc90000863e30 EFLAGS: 00010286
-[   45.019282] RAX: 0000000000000035 RBX: ffff88013a230008 RCX: 0000000000000000
-[   45.020182] RDX: 0000000000000000 RSI: 0000000000000000 RDI: 0000000000000203
-[   45.021084] RBP: ffff88013a3f31e8 R08: 0000000000000001 R09: 0000000000000000
-[   45.021986] R10: ffffffff827ec29c R11: 0000000000000002 R12: 0000000000000001
-[   45.022946] R13: ffff88013a230008 R14: ffff880117802b20 R15: ffffc90000863e8f
-[   45.023842] FS:  0000000000000000(0000) GS:ffff88013fd00000(0000) knlGS:0000000000000000
-[   45.024863] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
-[   45.025583] CR2: ffffc900006d4000 CR3: 000000000220f000 CR4: 00000000000006a0
-[   45.026478] Call Trace:
-[   45.026811]  __e1000_shutdown+0x1d4/0x1e2:
-						__e1000_shutdown at drivers/net/ethernet/intel/e1000/e1000_main.c:5162
-[   45.027344]  ? rcu_perf_cleanup+0x2a1/0x2a1:
-						rcu_perf_shutdown at kernel/rcu/rcuperf.c:627
-[   45.027883]  e1000_shutdown+0x14/0x3a:
-						e1000_shutdown at drivers/net/ethernet/intel/e1000/e1000_main.c:5235
-[   45.028351]  device_shutdown+0x110/0x1aa:
-						device_shutdown at drivers/base/core.c:2807
-[   45.028858]  kernel_power_off+0x31/0x64:
-						kernel_power_off at kernel/reboot.c:260
-[   45.029343]  rcu_perf_shutdown+0x9b/0xa7:
-						rcu_perf_shutdown at kernel/rcu/rcuperf.c:637
-[   45.029852]  ? __wake_up_common_lock+0xa2/0xa2:
-						autoremove_wake_function at kernel/sched/wait.c:376
-[   45.030414]  kthread+0x126/0x12e:
-						kthread at kernel/kthread.c:233
-[   45.030834]  ? __kthread_bind_mask+0x8e/0x8e:
-						kthread at kernel/kthread.c:190
-[   45.031399]  ? ret_from_fork+0x1f/0x30:
-						ret_from_fork at arch/x86/entry/entry_64.S:443
-[   45.031883]  ? kernel_init+0xa/0xf5:
-						kernel_init at init/main.c:997
-[   45.032325]  ret_from_fork+0x1f/0x30:
-						ret_from_fork at arch/x86/entry/entry_64.S:443
-[   45.032777] Code: 00 48 85 ed 75 07 48 8b ab a8 00 00 00 48 8d bb 98 00 00 00 e8 aa d1 11 00 48 89 ea 48 89 c6 48 c7 c7 d8 e4 0b 82 e8 55 7d da ff <0f> ff b9 01 00 00 00 31 d2 be 01 00 00 00 48 c7 c7 f0 b1 61 82
-[   45.035222] ---[ end trace c257137b1b1976ef ]---
-[   45.037838] ACPI: Preparing to enter system sleep state S5
-
-Signed-off-by: Tushar Dave <tushar.n.dave@oracle.com>
-Tested-by: Fengguang Wu <fengguang.wu@intel.com>
-Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/intel/e1000/e1000.h      |  3 ++-
- drivers/net/ethernet/intel/e1000/e1000_main.c | 27 +++++++++++++++----
- 2 files changed, 24 insertions(+), 6 deletions(-)
-
 diff --git a/drivers/net/ethernet/intel/e1000/e1000.h b/drivers/net/ethernet/intel/e1000/e1000.h
 index 69707108d23c..4cd6dac110f0 100644
 --- a/drivers/net/ethernet/intel/e1000/e1000.h
@@ -1134,118 +415,6 @@ index 3a06cae4ff68..883d971c6cca 100644
  	pci_set_master(pdev);
  
  	pci_enable_wake(pdev, PCI_D3hot, 0);
--- 
-2.28.0
-
-
-From 4108c7767f28ed381d7c70a5a89884b97d0c34cc Mon Sep 17 00:00:00 2001
-From: Xiongwei Song <sxwjean@gmail.com>
-Date: Tue, 2 Jan 2018 21:24:55 +0800
-Subject: [PATCH 17/25] drm/ttm: check the return value of kzalloc
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-[ Upstream commit 19d859a7205bc59ffc38303eb25ae394f61d21dc ]
-
-In the function ttm_page_alloc_init, kzalloc call is made for variable
-_manager, we need to check its return value, it may return NULL.
-
-Signed-off-by: Xiongwei Song <sxwjean@gmail.com>
-Reviewed-by: Christian König <christian.koenig@amd.com>
-Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/gpu/drm/ttm/ttm_page_alloc.c | 2 ++
- 1 file changed, 2 insertions(+)
-
-diff --git a/drivers/gpu/drm/ttm/ttm_page_alloc.c b/drivers/gpu/drm/ttm/ttm_page_alloc.c
-index 5d8dfe027b30..75d51ec98e06 100644
---- a/drivers/gpu/drm/ttm/ttm_page_alloc.c
-+++ b/drivers/gpu/drm/ttm/ttm_page_alloc.c
-@@ -818,6 +818,8 @@ int ttm_page_alloc_init(struct ttm_mem_global *glob, unsigned max_pages)
- 	pr_info("Initializing pool allocator\n");
- 
- 	_manager = kzalloc(sizeof(*_manager), GFP_KERNEL);
-+	if (!_manager)
-+		return -ENOMEM;
- 
- 	ttm_page_pool_init_locked(&_manager->wc_pool, GFP_HIGHUSER, "wc");
- 
--- 
-2.28.0
-
-
-From 8094b1a3fa737e7f3515ae8b5286c65964d1a51f Mon Sep 17 00:00:00 2001
-From: Eduardo Otubo <otubo@redhat.com>
-Date: Fri, 5 Jan 2018 09:42:16 +0100
-Subject: [PATCH 18/25] xen-netfront: enable device after manual module load
-
-[ Upstream commit b707fda2df4070785d0fa8a278aa13944c5f51f8 ]
-
-When loading the module after unloading it, the network interface would
-not be enabled and thus wouldn't have a backend counterpart and unable
-to be used by the guest.
-
-The guest would face errors like:
-
-  [root@guest ~]# ethtool -i eth0
-  Cannot get driver information: No such device
-
-  [root@guest ~]# ifconfig eth0
-  eth0: error fetching interface information: Device not found
-
-This patch initializes the state of the netfront device whenever it is
-loaded manually, this state would communicate the netback to create its
-device and establish the connection between them.
-
-Signed-off-by: Eduardo Otubo <otubo@redhat.com>
-Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/xen-netfront.c | 1 +
- 1 file changed, 1 insertion(+)
-
-diff --git a/drivers/net/xen-netfront.c b/drivers/net/xen-netfront.c
-index e76f46edee08..824ae807ea80 100644
---- a/drivers/net/xen-netfront.c
-+++ b/drivers/net/xen-netfront.c
-@@ -1358,6 +1358,7 @@ static struct net_device *xennet_create_dev(struct xenbus_device *dev)
- 
- 	netif_carrier_off(netdev);
- 
-+	xenbus_switch_state(dev, XenbusStateInitialising);
- 	return netdev;
- 
-  exit:
--- 
-2.28.0
-
-
-From eb8936ae670aef8d6efa447a82e4acc48f6a304b Mon Sep 17 00:00:00 2001
-From: Christophe JAILLET <christophe.jaillet@wanadoo.fr>
-Date: Sat, 6 Jan 2018 09:00:09 +0100
-Subject: [PATCH 19/25] mdio-sun4i: Fix a memory leak
-
-[ Upstream commit 56c0290202ab94a2f2780c449395d4ae8495fab4 ]
-
-If the probing of the regulator is deferred, the memory allocated by
-'mdiobus_alloc_size()' will be leaking.
-It should be freed before the next call to 'sun4i_mdio_probe()' which will
-reallocate it.
-
-Fixes: 4bdcb1dd9feb ("net: Add MDIO bus driver for the Allwinner EMAC")
-Signed-off-by: Christophe JAILLET <christophe.jaillet@wanadoo.fr>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/phy/mdio-sun4i.c | 6 ++++--
- 1 file changed, 4 insertions(+), 2 deletions(-)
-
 diff --git a/drivers/net/phy/mdio-sun4i.c b/drivers/net/phy/mdio-sun4i.c
 index 15bc7f9ea224..afd76e07088b 100644
 --- a/drivers/net/phy/mdio-sun4i.c
@@ -1263,100 +432,76 @@ index 15bc7f9ea224..afd76e07088b 100644
  
  		dev_info(&pdev->dev, "no regulator found\n");
  	} else {
--- 
-2.28.0
-
-
-From 56cf3902c1795e0180d8ce221562784fb5c1b85b Mon Sep 17 00:00:00 2001
-From: Sergei Shtylyov <sergei.shtylyov@cogentembedded.com>
-Date: Sat, 6 Jan 2018 21:53:26 +0300
-Subject: [PATCH 20/25] SolutionEngine771x: fix Ether platform data
-
-[ Upstream commit 195e2addbce09e5afbc766efc1e6567c9ce840d3 ]
-
-The 'sh_eth' driver's probe() method would fail  on the SolutionEngine7710
-board and crash on SolutionEngine7712 board  as the platform code is
-hopelessly behind the driver's platform data --  it passes the PHY address
-instead of 'struct sh_eth_plat_data *'; pass the latter to the driver in
-order to fix the bug...
-
-Fixes: 71557a37adb5 ("[netdrvr] sh_eth: Add SH7619 support")
-Signed-off-by: Sergei Shtylyov <sergei.shtylyov@cogentembedded.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- arch/sh/boards/mach-se/770x/setup.c | 10 ++++++++--
- 1 file changed, 8 insertions(+), 2 deletions(-)
-
-diff --git a/arch/sh/boards/mach-se/770x/setup.c b/arch/sh/boards/mach-se/770x/setup.c
-index 658326f44df8..5e0267624d8d 100644
---- a/arch/sh/boards/mach-se/770x/setup.c
-+++ b/arch/sh/boards/mach-se/770x/setup.c
-@@ -8,6 +8,7 @@
-  */
- #include <linux/init.h>
- #include <linux/platform_device.h>
-+#include <linux/sh_eth.h>
- #include <mach-se/mach/se.h>
- #include <mach-se/mach/mrshpc.h>
- #include <asm/machvec.h>
-@@ -114,6 +115,11 @@ static struct platform_device heartbeat_device = {
- #if defined(CONFIG_CPU_SUBTYPE_SH7710) ||\
- 	defined(CONFIG_CPU_SUBTYPE_SH7712)
- /* SH771X Ethernet driver */
-+static struct sh_eth_plat_data sh_eth_plat = {
-+	.phy = PHY_ID,
-+	.phy_interface = PHY_INTERFACE_MODE_MII,
-+};
+diff --git a/drivers/net/xen-netfront.c b/drivers/net/xen-netfront.c
+index e76f46edee08..824ae807ea80 100644
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@ -1358,6 +1358,7 @@ static struct net_device *xennet_create_dev(struct xenbus_device *dev)
+ 
+ 	netif_carrier_off(netdev);
+ 
++	xenbus_switch_state(dev, XenbusStateInitialising);
+ 	return netdev;
+ 
+  exit:
+diff --git a/drivers/s390/block/dasd_3990_erp.c b/drivers/s390/block/dasd_3990_erp.c
+index d26134713682..d05c553eb552 100644
+--- a/drivers/s390/block/dasd_3990_erp.c
++++ b/drivers/s390/block/dasd_3990_erp.c
+@@ -2743,6 +2743,16 @@ dasd_3990_erp_action(struct dasd_ccw_req * cqr)
+ 		erp = dasd_3990_erp_handle_match_erp(cqr, erp);
+ 	}
+ 
 +
- static struct resource sh_eth0_resources[] = {
- 	[0] = {
- 		.start = SH_ETH0_BASE,
-@@ -131,7 +137,7 @@ static struct platform_device sh_eth0_device = {
- 	.name = "sh771x-ether",
- 	.id = 0,
- 	.dev = {
--		.platform_data = PHY_ID,
-+		.platform_data = &sh_eth_plat,
- 	},
- 	.num_resources = ARRAY_SIZE(sh_eth0_resources),
- 	.resource = sh_eth0_resources,
-@@ -154,7 +160,7 @@ static struct platform_device sh_eth1_device = {
- 	.name = "sh771x-ether",
- 	.id = 1,
- 	.dev = {
--		.platform_data = PHY_ID,
-+		.platform_data = &sh_eth_plat,
- 	},
- 	.num_resources = ARRAY_SIZE(sh_eth1_resources),
- 	.resource = sh_eth1_resources,
--- 
-2.28.0
-
-
-From 8e43167ca9876f2e1ef65ac40b533440c9ab2e27 Mon Sep 17 00:00:00 2001
-From: Ross Lagerwall <ross.lagerwall@citrix.com>
-Date: Tue, 9 Jan 2018 12:10:21 +0000
-Subject: [PATCH 21/25] xen/gntdev: Fix off-by-one error when unmapping with
- holes
-
-[ Upstream commit 951a010233625b77cde3430b4b8785a9a22968d1 ]
-
-If the requested range has a hole, the calculation of the number of
-pages to unmap is off by one. Fix it.
-
-Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
-Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
-Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/xen/gntdev.c | 4 +---
- 1 file changed, 1 insertion(+), 3 deletions(-)
-
++	/*
++	 * For path verification work we need to stick with the path that was
++	 * originally chosen so that the per path configuration data is
++	 * assigned correctly.
++	 */
++	if (test_bit(DASD_CQR_VERIFY_PATH, &erp->flags) && cqr->lpm) {
++		erp->lpm = cqr->lpm;
++	}
++
+ 	if (device->features & DASD_FEATURE_ERPLOG) {
+ 		/* print current erp_chain */
+ 		dev_err(&device->cdev->dev,
+diff --git a/drivers/scsi/storvsc_drv.c b/drivers/scsi/storvsc_drv.c
+index e511e3406cfa..96c6e75bbfe6 100644
+--- a/drivers/scsi/storvsc_drv.c
++++ b/drivers/scsi/storvsc_drv.c
+@@ -1029,10 +1029,11 @@ static void storvsc_handle_error(struct vmscsi_request *vm_srb,
+ 		case TEST_UNIT_READY:
+ 			break;
+ 		default:
+-			set_host_byte(scmnd, DID_TARGET_FAILURE);
++			set_host_byte(scmnd, DID_ERROR);
+ 		}
+ 		break;
+ 	case SRB_STATUS_INVALID_LUN:
++		set_host_byte(scmnd, DID_NO_CONNECT);
+ 		do_work = true;
+ 		process_err_fn = storvsc_remove_lun;
+ 		break;
+diff --git a/drivers/spi/spi-atmel.c b/drivers/spi/spi-atmel.c
+index 4bf337aa4fd5..fab124d3b8a6 100644
+--- a/drivers/spi/spi-atmel.c
++++ b/drivers/spi/spi-atmel.c
+@@ -1416,12 +1416,12 @@ static int atmel_spi_remove(struct platform_device *pdev)
+ 	struct atmel_spi	*as = spi_master_get_devdata(master);
+ 
+ 	/* reset the hardware and block queue progress */
+-	spin_lock_irq(&as->lock);
+ 	if (as->use_dma) {
+ 		atmel_spi_stop_dma(as);
+ 		atmel_spi_release_dma(as);
+ 	}
+ 
++	spin_lock_irq(&as->lock);
+ 	spi_writel(as, CR, SPI_BIT(SWRST));
+ 	spi_writel(as, CR, SPI_BIT(SWRST)); /* AT91SAM9263 Rev B workaround */
+ 	spi_readl(as, SR);
 diff --git a/drivers/xen/gntdev.c b/drivers/xen/gntdev.c
-index 91cc44611062..1c03e30f66b4 100644
+index 91cc44611062..5ad2534480ff 100644
 --- a/drivers/xen/gntdev.c
 +++ b/drivers/xen/gntdev.c
 @@ -348,10 +348,8 @@ static int unmap_grant_pages(struct grant_map *map, int offset, int pages)
@@ -1371,40 +516,7 @@ index 91cc44611062..1c03e30f66b4 100644
  			range++;
  		}
  		err = __unmap_grant_pages(map, offset, range);
--- 
-2.28.0
-
-
-From 99a318ec9d85150ca6f4834c1ec40bf816cec2fb Mon Sep 17 00:00:00 2001
-From: Ross Lagerwall <ross.lagerwall@citrix.com>
-Date: Tue, 9 Jan 2018 12:10:22 +0000
-Subject: [PATCH 22/25] xen/gntdev: Fix partial gntdev_mmap() cleanup
-
-[ Upstream commit cf2acf66ad43abb39735568f55e1f85f9844e990 ]
-
-When cleaning up after a partially successful gntdev_mmap(), unmap the
-successfully mapped grant pages otherwise Xen will kill the domain if
-in debug mode (Attempt to implicitly unmap a granted PTE) or Linux will
-kill the process and emit "BUG: Bad page map in process" if Xen is in
-release mode.
-
-This is only needed when use_ptemod is true because gntdev_put_map()
-will unmap grant pages itself when use_ptemod is false.
-
-Signed-off-by: Ross Lagerwall <ross.lagerwall@citrix.com>
-Reviewed-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
-Signed-off-by: Boris Ostrovsky <boris.ostrovsky@oracle.com>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/xen/gntdev.c | 4 +++-
- 1 file changed, 3 insertions(+), 1 deletion(-)
-
-diff --git a/drivers/xen/gntdev.c b/drivers/xen/gntdev.c
-index 1c03e30f66b4..5ad2534480ff 100644
---- a/drivers/xen/gntdev.c
-+++ b/drivers/xen/gntdev.c
-@@ -817,8 +817,10 @@ unlock_out:
+@@ -819,8 +817,10 @@ unlock_out:
  out_unlock_put:
  	mutex_unlock(&priv->lock);
  out_put_map:
@@ -1416,34 +528,165 @@ index 1c03e30f66b4..5ad2534480ff 100644
  	gntdev_put_map(priv, map);
  	return err;
  }
--- 
-2.28.0
-
-
-From f895445fad01fb69df79aae897cb31ff7967a5d8 Mon Sep 17 00:00:00 2001
-From: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
-Date: Mon, 8 Jan 2018 19:02:29 -0200
-Subject: [PATCH 23/25] sctp: make use of pre-calculated len
-
-[ Upstream commit c76f97c99ae6d26d14c7f0e50e074382bfbc9f98 ]
-
-Some sockopt handling functions were calculating the length of the
-buffer to be written to userspace and then calculating it again when
-actually writing the buffer, which could lead to some write not using
-an up-to-date length.
-
-This patch updates such places to just make use of the len variable.
-
-Also, replace some sizeof(type) to sizeof(var).
-
-Signed-off-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- net/sctp/socket.c | 16 ++++++++++------
- 1 file changed, 10 insertions(+), 6 deletions(-)
-
+diff --git a/fs/super.c b/fs/super.c
+index 19fafe86071a..d4731c401278 100644
+--- a/fs/super.c
++++ b/fs/super.c
+@@ -476,7 +476,11 @@ retry:
+ 	hlist_add_head(&s->s_instances, &type->fs_supers);
+ 	spin_unlock(&sb_lock);
+ 	get_filesystem(type);
+-	register_shrinker(&s->s_shrink);
++	err = register_shrinker(&s->s_shrink);
++	if (err) {
++		deactivate_locked_super(s);
++		s = ERR_PTR(err);
++	}
+ 	return s;
+ }
+ 
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index 2eb71027d236..b11a9c93e780 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -49,7 +49,7 @@
+ STATIC int	xfs_qm_init_quotainos(xfs_mount_t *);
+ STATIC int	xfs_qm_init_quotainfo(xfs_mount_t *);
+ 
+-
++STATIC void	xfs_qm_destroy_quotainos(xfs_quotainfo_t *qi);
+ STATIC void	xfs_qm_dqfree_one(struct xfs_dquot *dqp);
+ /*
+  * We use the batch lookup interface to iterate over the dquots as it
+@@ -662,9 +662,17 @@ xfs_qm_init_quotainfo(
+ 	qinf->qi_shrinker.scan_objects = xfs_qm_shrink_scan;
+ 	qinf->qi_shrinker.seeks = DEFAULT_SEEKS;
+ 	qinf->qi_shrinker.flags = SHRINKER_NUMA_AWARE;
+-	register_shrinker(&qinf->qi_shrinker);
++
++	error = register_shrinker(&qinf->qi_shrinker);
++	if (error)
++		goto out_free_inos;
++
+ 	return 0;
+ 
++out_free_inos:
++	mutex_destroy(&qinf->qi_quotaofflock);
++	mutex_destroy(&qinf->qi_tree_lock);
++	xfs_qm_destroy_quotainos(qinf);
+ out_free_lru:
+ 	list_lru_destroy(&qinf->qi_lru);
+ out_free_qinf:
+@@ -673,7 +681,6 @@ out_free_qinf:
+ 	return error;
+ }
+ 
+-
+ /*
+  * Gets called when unmounting a filesystem or when all quotas get
+  * turned off.
+@@ -690,19 +697,8 @@ xfs_qm_destroy_quotainfo(
+ 
+ 	unregister_shrinker(&qi->qi_shrinker);
+ 	list_lru_destroy(&qi->qi_lru);
+-
+-	if (qi->qi_uquotaip) {
+-		IRELE(qi->qi_uquotaip);
+-		qi->qi_uquotaip = NULL; /* paranoia */
+-	}
+-	if (qi->qi_gquotaip) {
+-		IRELE(qi->qi_gquotaip);
+-		qi->qi_gquotaip = NULL;
+-	}
+-	if (qi->qi_pquotaip) {
+-		IRELE(qi->qi_pquotaip);
+-		qi->qi_pquotaip = NULL;
+-	}
++	xfs_qm_destroy_quotainos(qi);
++	mutex_destroy(&qi->qi_tree_lock);
+ 	mutex_destroy(&qi->qi_quotaofflock);
+ 	kmem_free(qi);
+ 	mp->m_quotainfo = NULL;
+@@ -1572,6 +1568,24 @@ error_rele:
+ 	return error;
+ }
+ 
++STATIC void
++xfs_qm_destroy_quotainos(
++	xfs_quotainfo_t	*qi)
++{
++	if (qi->qi_uquotaip) {
++		IRELE(qi->qi_uquotaip);
++		qi->qi_uquotaip = NULL; /* paranoia */
++	}
++	if (qi->qi_gquotaip) {
++		IRELE(qi->qi_gquotaip);
++		qi->qi_gquotaip = NULL;
++	}
++	if (qi->qi_pquotaip) {
++		IRELE(qi->qi_pquotaip);
++		qi->qi_pquotaip = NULL;
++	}
++}
++
+ STATIC void
+ xfs_qm_dqfree_one(
+ 	struct xfs_dquot	*dqp)
+diff --git a/kernel/time/hrtimer.c b/kernel/time/hrtimer.c
+index e4c722437708..d822fb88a605 100644
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -1149,7 +1149,12 @@ static void __hrtimer_init(struct hrtimer *timer, clockid_t clock_id,
+ 
+ 	cpu_base = raw_cpu_ptr(&hrtimer_bases);
+ 
+-	if (clock_id == CLOCK_REALTIME && mode != HRTIMER_MODE_ABS)
++	/*
++	 * POSIX magic: Relative CLOCK_REALTIME timers are not affected by
++	 * clock modifications, so they needs to become CLOCK_MONOTONIC to
++	 * ensure POSIX compliance.
++	 */
++	if (clock_id == CLOCK_REALTIME && mode & HRTIMER_MODE_REL)
+ 		clock_id = CLOCK_MONOTONIC;
+ 
+ 	base = hrtimer_clockid_to_base(clock_id);
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index 8aeedb1fed89..1b6637fb99cb 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -1038,17 +1038,12 @@ struct dst_entry *ip6_sk_dst_lookup_flow(struct sock *sk, struct flowi6 *fl6,
+ 					 const struct in6_addr *final_dst)
+ {
+ 	struct dst_entry *dst = sk_dst_check(sk, inet6_sk(sk)->dst_cookie);
+-	int err;
+ 
+ 	dst = ip6_sk_dst_check(sk, dst, fl6);
++	if (!dst)
++		dst = ip6_dst_lookup_flow(sk, fl6, final_dst);
+ 
+-	err = ip6_dst_lookup_tail(sk, &dst, fl6);
+-	if (err)
+-		return ERR_PTR(err);
+-	if (final_dst)
+-		fl6->daddr = *final_dst;
+-
+-	return xfrm_lookup_route(sock_net(sk), dst, flowi6_to_flowi(fl6), sk, 0);
++	return dst;
+ }
+ EXPORT_SYMBOL_GPL(ip6_sk_dst_lookup_flow);
+ 
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index 31ecdb35fd7f..168e40d98cce 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -1367,6 +1367,7 @@ struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
+ 	}
+ 
+ 	rt->dst.flags |= DST_HOST;
++	rt->dst.input = ip6_input;
+ 	rt->dst.output  = ip6_output;
+ 	atomic_set(&rt->dst.__refcnt, 1);
+ 	rt->rt6i_gateway  = fl6->daddr;
 diff --git a/net/sctp/socket.c b/net/sctp/socket.c
 index 06d9626a1678..225019397bc6 100644
 --- a/net/sctp/socket.c
@@ -1513,75 +756,3 @@ index 06d9626a1678..225019397bc6 100644
  		return -EFAULT;
  
  	to = p->gauth_chunks;
--- 
-2.28.0
-
-
-From 62a101cde990623dbe9b9f8370ac5294f1da3229 Mon Sep 17 00:00:00 2001
-From: Yangbo Lu <yangbo.lu@nxp.com>
-Date: Tue, 9 Jan 2018 11:02:33 +0800
-Subject: [PATCH 24/25] net: gianfar_ptp: move set_fipers() to spinlock
- protecting area
-
-[ Upstream commit 11d827a993a969c3c6ec56758ff63a44ba19b466 ]
-
-set_fipers() calling should be protected by spinlock in
-case that any interrupt breaks related registers setting
-and the function we expect. This patch is to move set_fipers()
-to spinlock protecting area in ptp_gianfar_adjtime().
-
-Signed-off-by: Yangbo Lu <yangbo.lu@nxp.com>
-Acked-by: Richard Cochran <richardcochran@gmail.com>
-Reviewed-by: Fabio Estevam <fabio.estevam@nxp.com>
-Signed-off-by: David S. Miller <davem@davemloft.net>
-Signed-off-by: Sasha Levin <alexander.levin@microsoft.com>
-Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
----
- drivers/net/ethernet/freescale/gianfar_ptp.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
-
-diff --git a/drivers/net/ethernet/freescale/gianfar_ptp.c b/drivers/net/ethernet/freescale/gianfar_ptp.c
-index bb568006f37d..503991823551 100644
---- a/drivers/net/ethernet/freescale/gianfar_ptp.c
-+++ b/drivers/net/ethernet/freescale/gianfar_ptp.c
-@@ -314,11 +314,10 @@ static int ptp_gianfar_adjtime(struct ptp_clock_info *ptp, s64 delta)
- 	now = tmr_cnt_read(etsects);
- 	now += delta;
- 	tmr_cnt_write(etsects, now);
-+	set_fipers(etsects);
- 
- 	spin_unlock_irqrestore(&etsects->lock, flags);
- 
--	set_fipers(etsects);
--
- 	return 0;
- }
- 
--- 
-2.28.0
-
-
-From 7c017f897e601aced95b71521bb0eb58af9002d5 Mon Sep 17 00:00:00 2001
-From: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
-Date: Sat, 3 Mar 2018 10:17:11 +0100
-Subject: [PATCH 25/25] Linux 3.18.98
-
----
- Makefile | 2 +-
- 1 file changed, 1 insertion(+), 1 deletion(-)
-
-diff --git a/Makefile b/Makefile
-index 7781ca4f1ca2..1e7d18b5025c 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,6 +1,6 @@
- VERSION = 3
- PATCHLEVEL = 18
--SUBLEVEL = 97
-+SUBLEVEL = 98
- EXTRAVERSION =
- NAME = Diseased Newt
- 
--- 
-2.28.0
-
