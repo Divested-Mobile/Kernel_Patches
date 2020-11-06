@@ -1,0 +1,157 @@
+From 2b8f74c8f0a4aab0a20b9e77fdc3d17e8f2405dd Mon Sep 17 00:00:00 2001
+From: Linus Torvalds <torvalds@linux-foundation.org>
+Date: Wed, 12 Sep 2018 23:57:48 -1000
+Subject: mm: get rid of vmacache_flush_all() entirely
+
+commit 7a9cdebdcc17e426fb5287e4a82db1dfe86339b2 upstream.
+
+Jann Horn points out that the vmacache_flush_all() function is not only
+potentially expensive, it's buggy too.  It also happens to be entirely
+unnecessary, because the sequence number overflow case can be avoided by
+simply making the sequence number be 64-bit.  That doesn't even grow the
+data structures in question, because the other adjacent fields are
+already 64-bit.
+
+So simplify the whole thing by just making the sequence number overflow
+case go away entirely, which gets rid of all the complications and makes
+the code faster too.  Win-win.
+
+[ Oleg Nesterov points out that the VMACACHE_FULL_FLUSHES statistics
+  also just goes away entirely with this ]
+
+Reported-by: Jann Horn <jannh@google.com>
+Suggested-by: Will Deacon <will.deacon@arm.com>
+Acked-by: Davidlohr Bueso <dave@stgolabs.net>
+Cc: Oleg Nesterov <oleg@redhat.com>
+Cc: stable@kernel.org
+Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ include/linux/mm_types.h |  2 +-
+ include/linux/sched.h    |  2 +-
+ include/linux/vmacache.h |  5 -----
+ mm/debug.c               |  4 ++--
+ mm/vmacache.c            | 36 ------------------------------------
+ 5 files changed, 4 insertions(+), 45 deletions(-)
+
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index 6e0b286649f1f..3ffdb0fcb4dcc 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -345,7 +345,7 @@ struct kioctx_table;
+ struct mm_struct {
+ 	struct vm_area_struct *mmap;		/* list of VMAs */
+ 	struct rb_root mm_rb;
+-	u32 vmacache_seqnum;                   /* per-thread vmacache */
++	u64 vmacache_seqnum;                   /* per-thread vmacache */
+ #ifdef CONFIG_MMU
+ 	unsigned long (*get_unmapped_area) (struct file *filp,
+ 				unsigned long addr, unsigned long len,
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index ab10455e5b024..4e41e629afb1e 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1315,7 +1315,7 @@ struct task_struct {
+ 	unsigned brk_randomized:1;
+ #endif
+ 	/* per-thread vma caching */
+-	u32 vmacache_seqnum;
++	u64 vmacache_seqnum;
+ 	struct vm_area_struct *vmacache[VMACACHE_SIZE];
+ #if defined(SPLIT_RSS_COUNTING)
+ 	struct task_rss_stat	rss_stat;
+diff --git a/include/linux/vmacache.h b/include/linux/vmacache.h
+index c3fa0fd439499..4f58ff2dacd69 100644
+--- a/include/linux/vmacache.h
++++ b/include/linux/vmacache.h
+@@ -15,7 +15,6 @@ static inline void vmacache_flush(struct task_struct *tsk)
+ 	memset(tsk->vmacache, 0, sizeof(tsk->vmacache));
+ }
+ 
+-extern void vmacache_flush_all(struct mm_struct *mm);
+ extern void vmacache_update(unsigned long addr, struct vm_area_struct *newvma);
+ extern struct vm_area_struct *vmacache_find(struct mm_struct *mm,
+ 						    unsigned long addr);
+@@ -29,10 +28,6 @@ extern struct vm_area_struct *vmacache_find_exact(struct mm_struct *mm,
+ static inline void vmacache_invalidate(struct mm_struct *mm)
+ {
+ 	mm->vmacache_seqnum++;
+-
+-	/* deal with overflows */
+-	if (unlikely(mm->vmacache_seqnum == 0))
+-		vmacache_flush_all(mm);
+ }
+ 
+ #endif /* __LINUX_VMACACHE_H */
+diff --git a/mm/debug.c b/mm/debug.c
+index 5ce45c9a29b52..fbf16575c5123 100644
+--- a/mm/debug.c
++++ b/mm/debug.c
+@@ -166,7 +166,7 @@ EXPORT_SYMBOL(dump_vma);
+ 
+ void dump_mm(const struct mm_struct *mm)
+ {
+-	pr_emerg("mm %p mmap %p seqnum %d task_size %lu\n"
++	pr_emerg("mm %p mmap %p seqnum %llu task_size %lu\n"
+ #ifdef CONFIG_MMU
+ 		"get_unmapped_area %p\n"
+ #endif
+@@ -196,7 +196,7 @@ void dump_mm(const struct mm_struct *mm)
+ #endif
+ 		"%s",	/* This is here to hold the comma */
+ 
+-		mm, mm->mmap, mm->vmacache_seqnum, mm->task_size,
++		mm, mm->mmap, (long long) mm->vmacache_seqnum, mm->task_size,
+ #ifdef CONFIG_MMU
+ 		mm->get_unmapped_area,
+ #endif
+diff --git a/mm/vmacache.c b/mm/vmacache.c
+index 9f25af825dec6..e6e6e92d0d722 100644
+--- a/mm/vmacache.c
++++ b/mm/vmacache.c
+@@ -5,42 +5,6 @@
+ #include <linux/mm.h>
+ #include <linux/vmacache.h>
+ 
+-/*
+- * Flush vma caches for threads that share a given mm.
+- *
+- * The operation is safe because the caller holds the mmap_sem
+- * exclusively and other threads accessing the vma cache will
+- * have mmap_sem held at least for read, so no extra locking
+- * is required to maintain the vma cache.
+- */
+-void vmacache_flush_all(struct mm_struct *mm)
+-{
+-	struct task_struct *g, *p;
+-
+-	/*
+-	 * Single threaded tasks need not iterate the entire
+-	 * list of process. We can avoid the flushing as well
+-	 * since the mm's seqnum was increased and don't have
+-	 * to worry about other threads' seqnum. Current's
+-	 * flush will occur upon the next lookup.
+-	 */
+-	if (atomic_read(&mm->mm_users) == 1)
+-		return;
+-
+-	rcu_read_lock();
+-	for_each_process_thread(g, p) {
+-		/*
+-		 * Only flush the vmacache pointers as the
+-		 * mm seqnum is already set and curr's will
+-		 * be set upon invalidation when the next
+-		 * lookup is done.
+-		 */
+-		if (mm == p->mm)
+-			vmacache_flush(p);
+-	}
+-	rcu_read_unlock();
+-}
+-
+ /*
+  * This task may be accessing a foreign mm via (for example)
+  * get_user_pages()->find_vma().  The vmacache is task-local and this
+-- 
+cgit 1.2.3-1.el7
+
