@@ -1,12 +1,12 @@
-#!/bin/bash
-function rmVersion() {
-	if [ ! -z $1 ]; then
+#!/bin/sh
+rmVersion() {
+	if [ -n "$1" ]; then
 		awk -i inplace '!/Link - '$1' - https/' Kernel_CVE_Patch_List.txt;
 		rm -rfv CVE*/$1;
 	fi;
 }
 
-function rmVersions() {
+rmVersions() {
 	#5.10 LTS
 	rmVersion 5\.9;
 	rmVersion 5\.8;
