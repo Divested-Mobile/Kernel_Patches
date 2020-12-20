@@ -2,7 +2,7 @@
 rmVersion() {
 	if [ -n "$1" ]; then
 		awk -i inplace '!/Link - '$1' - https/' Kernel_CVE_Patch_List.txt;
-		#awk -i inplace '!/Link - '$1' - https/' CIP.txt
+		awk -i inplace '!/Link - '$1' - https/' CIP.txt
 		rm -rfv CVE*/$1;
 	fi;
 }
