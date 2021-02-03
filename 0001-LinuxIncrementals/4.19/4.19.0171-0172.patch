@@ -1,0 +1,1606 @@
+diff --git a/Documentation/device-mapper/dm-integrity.txt b/Documentation/device-mapper/dm-integrity.txt
+index 297251b0d2d57..bf6af2ade0a67 100644
+--- a/Documentation/device-mapper/dm-integrity.txt
++++ b/Documentation/device-mapper/dm-integrity.txt
+@@ -146,6 +146,13 @@ block_size:number
+ 	Supported values are 512, 1024, 2048 and 4096 bytes.  If not
+ 	specified the default block size is 512 bytes.
+ 
++legacy_recalculate
++	Allow recalculating of volumes with HMAC keys. This is disabled by
++	default for security reasons - an attacker could modify the volume,
++	set recalc_sector to zero, and the kernel would not detect the
++	modification.
++
++
+ The journal mode (D/J), buffer_sectors, journal_watermark, commit_time can
+ be changed when reloading the target (load an inactive table and swap the
+ tables with suspend and resume). The other arguments should not be changed
+diff --git a/Makefile b/Makefile
+index 335b015c5c9ba..7da0ddd650521 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 19
+-SUBLEVEL = 171
++SUBLEVEL = 172
+ EXTRAVERSION =
+ NAME = "People's Front"
+ 
+diff --git a/drivers/gpio/gpio-mvebu.c b/drivers/gpio/gpio-mvebu.c
+index 3b78dcda47364..874caed723905 100644
+--- a/drivers/gpio/gpio-mvebu.c
++++ b/drivers/gpio/gpio-mvebu.c
+@@ -650,9 +650,8 @@ static void mvebu_pwm_get_state(struct pwm_chip *chip,
+ 
+ 	spin_lock_irqsave(&mvpwm->lock, flags);
+ 
+-	val = (unsigned long long)
+-		readl_relaxed(mvebu_pwmreg_blink_on_duration(mvpwm));
+-	val *= NSEC_PER_SEC;
++	u = readl_relaxed(mvebu_pwmreg_blink_on_duration(mvpwm));
++	val = (unsigned long long) u * NSEC_PER_SEC;
+ 	do_div(val, mvpwm->clk_rate);
+ 	if (val > UINT_MAX)
+ 		state->duty_cycle = UINT_MAX;
+@@ -661,21 +660,17 @@ static void mvebu_pwm_get_state(struct pwm_chip *chip,
+ 	else
+ 		state->duty_cycle = 1;
+ 
+-	val = (unsigned long long)
+-		readl_relaxed(mvebu_pwmreg_blink_off_duration(mvpwm));
++	val = (unsigned long long) u; /* on duration */
++	/* period = on + off duration */
++	val += readl_relaxed(mvebu_pwmreg_blink_off_duration(mvpwm));
+ 	val *= NSEC_PER_SEC;
+ 	do_div(val, mvpwm->clk_rate);
+-	if (val < state->duty_cycle) {
++	if (val > UINT_MAX)
++		state->period = UINT_MAX;
++	else if (val)
++		state->period = val;
++	else
+ 		state->period = 1;
+-	} else {
+-		val -= state->duty_cycle;
+-		if (val > UINT_MAX)
+-			state->period = UINT_MAX;
+-		else if (val)
+-			state->period = val;
+-		else
+-			state->period = 1;
+-	}
+ 
+ 	regmap_read(mvchip->regs, GPIO_BLINK_EN_OFF + mvchip->offset, &u);
+ 	if (u)
+diff --git a/drivers/hid/wacom_sys.c b/drivers/hid/wacom_sys.c
+index 523014f2c0eb2..8006732b8f424 100644
+--- a/drivers/hid/wacom_sys.c
++++ b/drivers/hid/wacom_sys.c
+@@ -150,9 +150,9 @@ static int wacom_wac_pen_serial_enforce(struct hid_device *hdev,
+ 	}
+ 
+ 	if (flush)
+-		wacom_wac_queue_flush(hdev, &wacom_wac->pen_fifo);
++		wacom_wac_queue_flush(hdev, wacom_wac->pen_fifo);
+ 	else if (insert)
+-		wacom_wac_queue_insert(hdev, &wacom_wac->pen_fifo,
++		wacom_wac_queue_insert(hdev, wacom_wac->pen_fifo,
+ 				       raw_data, report_size);
+ 
+ 	return insert && !flush;
+@@ -1251,7 +1251,7 @@ static void wacom_devm_kfifo_release(struct device *dev, void *res)
+ static int wacom_devm_kfifo_alloc(struct wacom *wacom)
+ {
+ 	struct wacom_wac *wacom_wac = &wacom->wacom_wac;
+-	struct kfifo_rec_ptr_2 *pen_fifo = &wacom_wac->pen_fifo;
++	struct kfifo_rec_ptr_2 *pen_fifo;
+ 	int error;
+ 
+ 	pen_fifo = devres_alloc(wacom_devm_kfifo_release,
+@@ -1268,6 +1268,7 @@ static int wacom_devm_kfifo_alloc(struct wacom *wacom)
+ 	}
+ 
+ 	devres_add(&wacom->hdev->dev, pen_fifo);
++	wacom_wac->pen_fifo = pen_fifo;
+ 
+ 	return 0;
+ }
+diff --git a/drivers/hid/wacom_wac.h b/drivers/hid/wacom_wac.h
+index f67d871841c0c..46da97162ef43 100644
+--- a/drivers/hid/wacom_wac.h
++++ b/drivers/hid/wacom_wac.h
+@@ -344,7 +344,7 @@ struct wacom_wac {
+ 	struct input_dev *pen_input;
+ 	struct input_dev *touch_input;
+ 	struct input_dev *pad_input;
+-	struct kfifo_rec_ptr_2 pen_fifo;
++	struct kfifo_rec_ptr_2 *pen_fifo;
+ 	int pid;
+ 	int num_contacts_left;
+ 	u8 bt_features;
+diff --git a/drivers/md/dm-integrity.c b/drivers/md/dm-integrity.c
+index 1917051b512f5..cffd423172726 100644
+--- a/drivers/md/dm-integrity.c
++++ b/drivers/md/dm-integrity.c
+@@ -240,6 +240,7 @@ struct dm_integrity_c {
+ 
+ 	bool journal_uptodate;
+ 	bool just_formatted;
++	bool legacy_recalculate;
+ 
+ 	struct alg_spec internal_hash_alg;
+ 	struct alg_spec journal_crypt_alg;
+@@ -345,6 +346,14 @@ static int dm_integrity_failed(struct dm_integrity_c *ic)
+ 	return READ_ONCE(ic->failed);
+ }
+ 
++static bool dm_integrity_disable_recalculate(struct dm_integrity_c *ic)
++{
++	if ((ic->internal_hash_alg.key || ic->journal_mac_alg.key) &&
++	    !ic->legacy_recalculate)
++		return true;
++	return false;
++}
++
+ static commit_id_t dm_integrity_commit_id(struct dm_integrity_c *ic, unsigned i,
+ 					  unsigned j, unsigned char seq)
+ {
+@@ -2503,6 +2512,7 @@ static void dm_integrity_status(struct dm_target *ti, status_type_t type,
+ 		arg_count += !!ic->internal_hash_alg.alg_string;
+ 		arg_count += !!ic->journal_crypt_alg.alg_string;
+ 		arg_count += !!ic->journal_mac_alg.alg_string;
++		arg_count += ic->legacy_recalculate;
+ 		DMEMIT("%s %llu %u %c %u", ic->dev->name, (unsigned long long)ic->start,
+ 		       ic->tag_size, ic->mode, arg_count);
+ 		if (ic->meta_dev)
+@@ -2516,6 +2526,8 @@ static void dm_integrity_status(struct dm_target *ti, status_type_t type,
+ 		DMEMIT(" buffer_sectors:%u", 1U << ic->log2_buffer_sectors);
+ 		DMEMIT(" journal_watermark:%u", (unsigned)watermark_percentage);
+ 		DMEMIT(" commit_time:%u", ic->autocommit_msec);
++		if (ic->legacy_recalculate)
++			DMEMIT(" legacy_recalculate");
+ 
+ #define EMIT_ALG(a, n)							\
+ 		do {							\
+@@ -3118,7 +3130,7 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
+ 	unsigned extra_args;
+ 	struct dm_arg_set as;
+ 	static const struct dm_arg _args[] = {
+-		{0, 15, "Invalid number of feature args"},
++		{0, 12, "Invalid number of feature args"},
+ 	};
+ 	unsigned journal_sectors, interleave_sectors, buffer_sectors, journal_watermark, sync_msec;
+ 	bool recalculate;
+@@ -3248,6 +3260,8 @@ static int dm_integrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
+ 				goto bad;
+ 		} else if (!strcmp(opt_string, "recalculate")) {
+ 			recalculate = true;
++		} else if (!strcmp(opt_string, "legacy_recalculate")) {
++			ic->legacy_recalculate = true;
+ 		} else {
+ 			r = -EINVAL;
+ 			ti->error = "Invalid argument";
+@@ -3523,6 +3537,14 @@ try_smaller_buffer:
+ 		}
+ 	}
+ 
++	if (ic->sb->flags & cpu_to_le32(SB_FLAG_RECALCULATING) &&
++	    le64_to_cpu(ic->sb->recalc_sector) < ic->provided_data_sectors &&
++	    dm_integrity_disable_recalculate(ic)) {
++		ti->error = "Recalculating with HMAC is disabled for security reasons - if you really need it, use the argument \"legacy_recalculate\"";
++		r = -EOPNOTSUPP;
++		goto bad;
++	}
++
+ 	ic->bufio = dm_bufio_client_create(ic->meta_dev ? ic->meta_dev->bdev : ic->dev->bdev,
+ 			1U << (SECTOR_SHIFT + ic->log2_buffer_sectors), 1, 0, NULL, NULL);
+ 	if (IS_ERR(ic->bufio)) {
+diff --git a/fs/exec.c b/fs/exec.c
+index 52788644c4af2..6eea921a7e72f 100644
+--- a/fs/exec.c
++++ b/fs/exec.c
+@@ -1011,7 +1011,7 @@ static int exec_mmap(struct mm_struct *mm)
+ 	/* Notify parent that we're no longer interested in the old VM */
+ 	tsk = current;
+ 	old_mm = current->mm;
+-	mm_release(tsk, old_mm);
++	exec_mm_release(tsk, old_mm);
+ 
+ 	if (old_mm) {
+ 		sync_mm_rss(old_mm);
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index b2a9c746f8ce4..edeb837081c80 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -5209,7 +5209,7 @@ static int other_inode_match(struct inode * inode, unsigned long ino,
+ 	    (inode->i_state & I_DIRTY_TIME)) {
+ 		struct ext4_inode_info	*ei = EXT4_I(inode);
+ 
+-		inode->i_state &= ~(I_DIRTY_TIME | I_DIRTY_TIME_EXPIRED);
++		inode->i_state &= ~I_DIRTY_TIME;
+ 		spin_unlock(&inode->i_lock);
+ 
+ 		spin_lock(&ei->i_raw_lock);
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 15216b440880a..f2d0c4acb3cbb 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -1157,7 +1157,7 @@ static bool inode_dirtied_after(struct inode *inode, unsigned long t)
+  */
+ static int move_expired_inodes(struct list_head *delaying_queue,
+ 			       struct list_head *dispatch_queue,
+-			       int flags, unsigned long dirtied_before)
++			       unsigned long dirtied_before)
+ {
+ 	LIST_HEAD(tmp);
+ 	struct list_head *pos, *node;
+@@ -1173,8 +1173,6 @@ static int move_expired_inodes(struct list_head *delaying_queue,
+ 		list_move(&inode->i_io_list, &tmp);
+ 		moved++;
+ 		spin_lock(&inode->i_lock);
+-		if (flags & EXPIRE_DIRTY_ATIME)
+-			inode->i_state |= I_DIRTY_TIME_EXPIRED;
+ 		inode->i_state |= I_SYNC_QUEUED;
+ 		spin_unlock(&inode->i_lock);
+ 		if (sb_is_blkdev_sb(inode->i_sb))
+@@ -1222,11 +1220,11 @@ static void queue_io(struct bdi_writeback *wb, struct wb_writeback_work *work,
+ 
+ 	assert_spin_locked(&wb->list_lock);
+ 	list_splice_init(&wb->b_more_io, &wb->b_io);
+-	moved = move_expired_inodes(&wb->b_dirty, &wb->b_io, 0, dirtied_before);
++	moved = move_expired_inodes(&wb->b_dirty, &wb->b_io, dirtied_before);
+ 	if (!work->for_sync)
+ 		time_expire_jif = jiffies - dirtytime_expire_interval * HZ;
+ 	moved += move_expired_inodes(&wb->b_dirty_time, &wb->b_io,
+-				     EXPIRE_DIRTY_ATIME, time_expire_jif);
++				     time_expire_jif);
+ 	if (moved)
+ 		wb_io_lists_populated(wb);
+ 	trace_writeback_queue_io(wb, work, dirtied_before, moved);
+@@ -1394,26 +1392,26 @@ __writeback_single_inode(struct inode *inode, struct writeback_control *wbc)
+ 			ret = err;
+ 	}
+ 
++	/*
++	 * If the inode has dirty timestamps and we need to write them, call
++	 * mark_inode_dirty_sync() to notify the filesystem about it and to
++	 * change I_DIRTY_TIME into I_DIRTY_SYNC.
++	 */
++	if ((inode->i_state & I_DIRTY_TIME) &&
++	    (wbc->sync_mode == WB_SYNC_ALL || wbc->for_sync ||
++	     time_after(jiffies, inode->dirtied_time_when +
++			dirtytime_expire_interval * HZ))) {
++		trace_writeback_lazytime(inode);
++		mark_inode_dirty_sync(inode);
++	}
++
+ 	/*
+ 	 * Some filesystems may redirty the inode during the writeback
+ 	 * due to delalloc, clear dirty metadata flags right before
+ 	 * write_inode()
+ 	 */
+ 	spin_lock(&inode->i_lock);
+-
+ 	dirty = inode->i_state & I_DIRTY;
+-	if (inode->i_state & I_DIRTY_TIME) {
+-		if ((dirty & I_DIRTY_INODE) ||
+-		    wbc->sync_mode == WB_SYNC_ALL ||
+-		    unlikely(inode->i_state & I_DIRTY_TIME_EXPIRED) ||
+-		    unlikely(time_after(jiffies,
+-					(inode->dirtied_time_when +
+-					 dirtytime_expire_interval * HZ)))) {
+-			dirty |= I_DIRTY_TIME | I_DIRTY_TIME_EXPIRED;
+-			trace_writeback_lazytime(inode);
+-		}
+-	} else
+-		inode->i_state &= ~I_DIRTY_TIME_EXPIRED;
+ 	inode->i_state &= ~dirty;
+ 
+ 	/*
+@@ -1434,8 +1432,6 @@ __writeback_single_inode(struct inode *inode, struct writeback_control *wbc)
+ 
+ 	spin_unlock(&inode->i_lock);
+ 
+-	if (dirty & I_DIRTY_TIME)
+-		mark_inode_dirty_sync(inode);
+ 	/* Don't write the inode if only I_DIRTY_PAGES was set */
+ 	if (dirty & ~I_DIRTY_PAGES) {
+ 		int err = write_inode(inode, wbc);
+diff --git a/fs/xfs/xfs_trans_inode.c b/fs/xfs/xfs_trans_inode.c
+index ae453dd236a69..6fcdf7e449fe7 100644
+--- a/fs/xfs/xfs_trans_inode.c
++++ b/fs/xfs/xfs_trans_inode.c
+@@ -99,9 +99,9 @@ xfs_trans_log_inode(
+ 	 * to log the timestamps, or will clear already cleared fields in the
+ 	 * worst case.
+ 	 */
+-	if (inode->i_state & (I_DIRTY_TIME | I_DIRTY_TIME_EXPIRED)) {
++	if (inode->i_state & I_DIRTY_TIME) {
+ 		spin_lock(&inode->i_lock);
+-		inode->i_state &= ~(I_DIRTY_TIME | I_DIRTY_TIME_EXPIRED);
++		inode->i_state &= ~I_DIRTY_TIME;
+ 		spin_unlock(&inode->i_lock);
+ 	}
+ 
+diff --git a/include/linux/compat.h b/include/linux/compat.h
+index de0c13bdcd2c7..189d0e111d57d 100644
+--- a/include/linux/compat.h
++++ b/include/linux/compat.h
+@@ -445,8 +445,6 @@ struct compat_kexec_segment;
+ struct compat_mq_attr;
+ struct compat_msgbuf;
+ 
+-extern void compat_exit_robust_list(struct task_struct *curr);
+-
+ #define BITS_PER_COMPAT_LONG    (8*sizeof(compat_long_t))
+ 
+ #define BITS_TO_COMPAT_LONGS(bits) DIV_ROUND_UP(bits, BITS_PER_COMPAT_LONG)
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 876bfb6df06a9..b6a955ba6173a 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -2071,7 +2071,6 @@ static inline void init_sync_kiocb(struct kiocb *kiocb, struct file *filp)
+ #define I_DIO_WAKEUP		(1 << __I_DIO_WAKEUP)
+ #define I_LINKABLE		(1 << 10)
+ #define I_DIRTY_TIME		(1 << 11)
+-#define I_DIRTY_TIME_EXPIRED	(1 << 12)
+ #define I_WB_SWITCH		(1 << 13)
+ #define I_OVL_INUSE		(1 << 14)
+ #define I_CREATING		(1 << 15)
+diff --git a/include/linux/futex.h b/include/linux/futex.h
+index a61bf436dcf36..b70df27d7e85c 100644
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@ -2,7 +2,9 @@
+ #ifndef _LINUX_FUTEX_H
+ #define _LINUX_FUTEX_H
+ 
++#include <linux/sched.h>
+ #include <linux/ktime.h>
++
+ #include <uapi/linux/futex.h>
+ 
+ struct inode;
+@@ -51,15 +53,35 @@ union futex_key {
+ #define FUTEX_KEY_INIT (union futex_key) { .both = { .ptr = 0ULL } }
+ 
+ #ifdef CONFIG_FUTEX
+-extern void exit_robust_list(struct task_struct *curr);
++enum {
++	FUTEX_STATE_OK,
++	FUTEX_STATE_EXITING,
++	FUTEX_STATE_DEAD,
++};
+ 
+-long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+-	      u32 __user *uaddr2, u32 val2, u32 val3);
+-#else
+-static inline void exit_robust_list(struct task_struct *curr)
++static inline void futex_init_task(struct task_struct *tsk)
+ {
++	tsk->robust_list = NULL;
++#ifdef CONFIG_COMPAT
++	tsk->compat_robust_list = NULL;
++#endif
++	INIT_LIST_HEAD(&tsk->pi_state_list);
++	tsk->pi_state_cache = NULL;
++	tsk->futex_state = FUTEX_STATE_OK;
++	mutex_init(&tsk->futex_exit_mutex);
+ }
+ 
++void futex_exit_recursive(struct task_struct *tsk);
++void futex_exit_release(struct task_struct *tsk);
++void futex_exec_release(struct task_struct *tsk);
++
++long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
++	      u32 __user *uaddr2, u32 val2, u32 val3);
++#else
++static inline void futex_init_task(struct task_struct *tsk) { }
++static inline void futex_exit_recursive(struct task_struct *tsk) { }
++static inline void futex_exit_release(struct task_struct *tsk) { }
++static inline void futex_exec_release(struct task_struct *tsk) { }
+ static inline long do_futex(u32 __user *uaddr, int op, u32 val,
+ 			    ktime_t *timeout, u32 __user *uaddr2,
+ 			    u32 val2, u32 val3)
+@@ -68,12 +90,4 @@ static inline long do_futex(u32 __user *uaddr, int op, u32 val,
+ }
+ #endif
+ 
+-#ifdef CONFIG_FUTEX_PI
+-extern void exit_pi_state_list(struct task_struct *curr);
+-#else
+-static inline void exit_pi_state_list(struct task_struct *curr)
+-{
+-}
+-#endif
+-
+ #endif
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index c69f308f3a53c..5524cd5c6abe6 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -996,6 +996,8 @@ struct task_struct {
+ #endif
+ 	struct list_head		pi_state_list;
+ 	struct futex_pi_state		*pi_state_cache;
++	struct mutex			futex_exit_mutex;
++	unsigned int			futex_state;
+ #endif
+ #ifdef CONFIG_PERF_EVENTS
+ 	struct perf_event_context	*perf_event_ctxp[perf_nr_task_contexts];
+@@ -1377,7 +1379,6 @@ extern struct pid *cad_pid;
+  */
+ #define PF_IDLE			0x00000002	/* I am an IDLE thread */
+ #define PF_EXITING		0x00000004	/* Getting shut down */
+-#define PF_EXITPIDONE		0x00000008	/* PI exit done on shut down */
+ #define PF_VCPU			0x00000010	/* I'm a virtual CPU */
+ #define PF_WQ_WORKER		0x00000020	/* I'm a workqueue worker */
+ #define PF_FORKNOEXEC		0x00000040	/* Forked but didn't exec */
+diff --git a/include/linux/sched/mm.h b/include/linux/sched/mm.h
+index 766bbe8138615..8d3b7e731b742 100644
+--- a/include/linux/sched/mm.h
++++ b/include/linux/sched/mm.h
+@@ -119,8 +119,10 @@ extern struct mm_struct *get_task_mm(struct task_struct *task);
+  * succeeds.
+  */
+ extern struct mm_struct *mm_access(struct task_struct *task, unsigned int mode);
+-/* Remove the current tasks stale references to the old mm_struct */
+-extern void mm_release(struct task_struct *, struct mm_struct *);
++/* Remove the current tasks stale references to the old mm_struct on exit() */
++extern void exit_mm_release(struct task_struct *, struct mm_struct *);
++/* Remove the current tasks stale references to the old mm_struct on exec() */
++extern void exec_mm_release(struct task_struct *, struct mm_struct *);
+ 
+ #ifdef CONFIG_MEMCG
+ extern void mm_update_next_owner(struct mm_struct *mm);
+diff --git a/include/trace/events/writeback.h b/include/trace/events/writeback.h
+index 29d09755e5cfc..146e7b3faa856 100644
+--- a/include/trace/events/writeback.h
++++ b/include/trace/events/writeback.h
+@@ -20,7 +20,6 @@
+ 		{I_CLEAR,		"I_CLEAR"},		\
+ 		{I_SYNC,		"I_SYNC"},		\
+ 		{I_DIRTY_TIME,		"I_DIRTY_TIME"},	\
+-		{I_DIRTY_TIME_EXPIRED,	"I_DIRTY_TIME_EXPIRED"}, \
+ 		{I_REFERENCED,		"I_REFERENCED"}		\
+ 	)
+ 
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 65133ebddfada..908e7a33e1fcb 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -498,7 +498,7 @@ static void exit_mm(void)
+ 	struct mm_struct *mm = current->mm;
+ 	struct core_state *core_state;
+ 
+-	mm_release(current, mm);
++	exit_mm_release(current, mm);
+ 	if (!mm)
+ 		return;
+ 	sync_mm_rss(mm);
+@@ -818,32 +818,12 @@ void __noreturn do_exit(long code)
+ 	 */
+ 	if (unlikely(tsk->flags & PF_EXITING)) {
+ 		pr_alert("Fixing recursive fault but reboot is needed!\n");
+-		/*
+-		 * We can do this unlocked here. The futex code uses
+-		 * this flag just to verify whether the pi state
+-		 * cleanup has been done or not. In the worst case it
+-		 * loops once more. We pretend that the cleanup was
+-		 * done as there is no way to return. Either the
+-		 * OWNER_DIED bit is set by now or we push the blocked
+-		 * task into the wait for ever nirwana as well.
+-		 */
+-		tsk->flags |= PF_EXITPIDONE;
++		futex_exit_recursive(tsk);
+ 		set_current_state(TASK_UNINTERRUPTIBLE);
+ 		schedule();
+ 	}
+ 
+ 	exit_signals(tsk);  /* sets PF_EXITING */
+-	/*
+-	 * Ensure that all new tsk->pi_lock acquisitions must observe
+-	 * PF_EXITING. Serializes against futex.c:attach_to_pi_owner().
+-	 */
+-	smp_mb();
+-	/*
+-	 * Ensure that we must observe the pi_state in exit_mm() ->
+-	 * mm_release() -> exit_pi_state_list().
+-	 */
+-	raw_spin_lock_irq(&tsk->pi_lock);
+-	raw_spin_unlock_irq(&tsk->pi_lock);
+ 
+ 	/* sync mm's RSS info before statistics gathering */
+ 	if (tsk->mm)
+@@ -918,12 +898,6 @@ void __noreturn do_exit(long code)
+ 	 * Make sure we are holding no locks:
+ 	 */
+ 	debug_check_no_locks_held();
+-	/*
+-	 * We can do this unlocked here. The futex code uses this flag
+-	 * just to verify whether the pi state cleanup has been done
+-	 * or not. In the worst case it loops once more.
+-	 */
+-	tsk->flags |= PF_EXITPIDONE;
+ 
+ 	if (tsk->io_context)
+ 		exit_io_context(tsk);
+diff --git a/kernel/fork.c b/kernel/fork.c
+index f2c92c1001949..cf535b9d5db75 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1217,24 +1217,8 @@ static int wait_for_vfork_done(struct task_struct *child,
+  * restoring the old one. . .
+  * Eric Biederman 10 January 1998
+  */
+-void mm_release(struct task_struct *tsk, struct mm_struct *mm)
++static void mm_release(struct task_struct *tsk, struct mm_struct *mm)
+ {
+-	/* Get rid of any futexes when releasing the mm */
+-#ifdef CONFIG_FUTEX
+-	if (unlikely(tsk->robust_list)) {
+-		exit_robust_list(tsk);
+-		tsk->robust_list = NULL;
+-	}
+-#ifdef CONFIG_COMPAT
+-	if (unlikely(tsk->compat_robust_list)) {
+-		compat_exit_robust_list(tsk);
+-		tsk->compat_robust_list = NULL;
+-	}
+-#endif
+-	if (unlikely(!list_empty(&tsk->pi_state_list)))
+-		exit_pi_state_list(tsk);
+-#endif
+-
+ 	uprobe_free_utask(tsk);
+ 
+ 	/* Get rid of any cached register state */
+@@ -1267,6 +1251,18 @@ void mm_release(struct task_struct *tsk, struct mm_struct *mm)
+ 		complete_vfork_done(tsk);
+ }
+ 
++void exit_mm_release(struct task_struct *tsk, struct mm_struct *mm)
++{
++	futex_exit_release(tsk);
++	mm_release(tsk, mm);
++}
++
++void exec_mm_release(struct task_struct *tsk, struct mm_struct *mm)
++{
++	futex_exec_release(tsk);
++	mm_release(tsk, mm);
++}
++
+ /*
+  * Allocate a new mm structure and copy contents from the
+  * mm structure of the passed in task structure.
+@@ -1937,14 +1933,8 @@ static __latent_entropy struct task_struct *copy_process(
+ #ifdef CONFIG_BLOCK
+ 	p->plug = NULL;
+ #endif
+-#ifdef CONFIG_FUTEX
+-	p->robust_list = NULL;
+-#ifdef CONFIG_COMPAT
+-	p->compat_robust_list = NULL;
+-#endif
+-	INIT_LIST_HEAD(&p->pi_state_list);
+-	p->pi_state_cache = NULL;
+-#endif
++	futex_init_task(p);
++
+ 	/*
+ 	 * sigaltstack should be cleared when sharing the same VM
+ 	 */
+diff --git a/kernel/futex.c b/kernel/futex.c
+index 334dc4cae780e..224adcdac6c19 100644
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@ -341,6 +341,12 @@ static inline bool should_fail_futex(bool fshared)
+ }
+ #endif /* CONFIG_FAIL_FUTEX */
+ 
++#ifdef CONFIG_COMPAT
++static void compat_exit_robust_list(struct task_struct *curr);
++#else
++static inline void compat_exit_robust_list(struct task_struct *curr) { }
++#endif
++
+ static inline void futex_get_mm(union futex_key *key)
+ {
+ 	mmgrab(key->private.mm);
+@@ -833,6 +839,29 @@ static struct futex_pi_state *alloc_pi_state(void)
+ 	return pi_state;
+ }
+ 
++static void pi_state_update_owner(struct futex_pi_state *pi_state,
++				  struct task_struct *new_owner)
++{
++	struct task_struct *old_owner = pi_state->owner;
++
++	lockdep_assert_held(&pi_state->pi_mutex.wait_lock);
++
++	if (old_owner) {
++		raw_spin_lock(&old_owner->pi_lock);
++		WARN_ON(list_empty(&pi_state->list));
++		list_del_init(&pi_state->list);
++		raw_spin_unlock(&old_owner->pi_lock);
++	}
++
++	if (new_owner) {
++		raw_spin_lock(&new_owner->pi_lock);
++		WARN_ON(!list_empty(&pi_state->list));
++		list_add(&pi_state->list, &new_owner->pi_state_list);
++		pi_state->owner = new_owner;
++		raw_spin_unlock(&new_owner->pi_lock);
++	}
++}
++
+ static void get_pi_state(struct futex_pi_state *pi_state)
+ {
+ 	WARN_ON_ONCE(!atomic_inc_not_zero(&pi_state->refcount));
+@@ -855,17 +884,11 @@ static void put_pi_state(struct futex_pi_state *pi_state)
+ 	 * and has cleaned up the pi_state already
+ 	 */
+ 	if (pi_state->owner) {
+-		struct task_struct *owner;
+ 		unsigned long flags;
+ 
+ 		raw_spin_lock_irqsave(&pi_state->pi_mutex.wait_lock, flags);
+-		owner = pi_state->owner;
+-		if (owner) {
+-			raw_spin_lock(&owner->pi_lock);
+-			list_del_init(&pi_state->list);
+-			raw_spin_unlock(&owner->pi_lock);
+-		}
+-		rt_mutex_proxy_unlock(&pi_state->pi_mutex, owner);
++		pi_state_update_owner(pi_state, NULL);
++		rt_mutex_proxy_unlock(&pi_state->pi_mutex);
+ 		raw_spin_unlock_irqrestore(&pi_state->pi_mutex.wait_lock, flags);
+ 	}
+ 
+@@ -890,7 +913,7 @@ static void put_pi_state(struct futex_pi_state *pi_state)
+  * Kernel cleans up PI-state, but userspace is likely hosed.
+  * (Robust-futex cleanup is separate and might save the day for userspace.)
+  */
+-void exit_pi_state_list(struct task_struct *curr)
++static void exit_pi_state_list(struct task_struct *curr)
+ {
+ 	struct list_head *next, *head = &curr->pi_state_list;
+ 	struct futex_pi_state *pi_state;
+@@ -960,7 +983,8 @@ void exit_pi_state_list(struct task_struct *curr)
+ 	}
+ 	raw_spin_unlock_irq(&curr->pi_lock);
+ }
+-
++#else
++static inline void exit_pi_state_list(struct task_struct *curr) { }
+ #endif
+ 
+ /*
+@@ -1010,7 +1034,8 @@ void exit_pi_state_list(struct task_struct *curr)
+  *	FUTEX_OWNER_DIED bit. See [4]
+  *
+  * [10] There is no transient state which leaves owner and user space
+- *	TID out of sync.
++ *	TID out of sync. Except one error case where the kernel is denied
++ *	write access to the user address, see fixup_pi_state_owner().
+  *
+  *
+  * Serialization and lifetime rules:
+@@ -1169,16 +1194,47 @@ out_error:
+ 	return ret;
+ }
+ 
++/**
++ * wait_for_owner_exiting - Block until the owner has exited
++ * @exiting:	Pointer to the exiting task
++ *
++ * Caller must hold a refcount on @exiting.
++ */
++static void wait_for_owner_exiting(int ret, struct task_struct *exiting)
++{
++	if (ret != -EBUSY) {
++		WARN_ON_ONCE(exiting);
++		return;
++	}
++
++	if (WARN_ON_ONCE(ret == -EBUSY && !exiting))
++		return;
++
++	mutex_lock(&exiting->futex_exit_mutex);
++	/*
++	 * No point in doing state checking here. If the waiter got here
++	 * while the task was in exec()->exec_futex_release() then it can
++	 * have any FUTEX_STATE_* value when the waiter has acquired the
++	 * mutex. OK, if running, EXITING or DEAD if it reached exit()
++	 * already. Highly unlikely and not a problem. Just one more round
++	 * through the futex maze.
++	 */
++	mutex_unlock(&exiting->futex_exit_mutex);
++
++	put_task_struct(exiting);
++}
++
+ static int handle_exit_race(u32 __user *uaddr, u32 uval,
+ 			    struct task_struct *tsk)
+ {
+ 	u32 uval2;
+ 
+ 	/*
+-	 * If PF_EXITPIDONE is not yet set, then try again.
++	 * If the futex exit state is not yet FUTEX_STATE_DEAD, tell the
++	 * caller that the alleged owner is busy.
+ 	 */
+-	if (tsk && !(tsk->flags & PF_EXITPIDONE))
+-		return -EAGAIN;
++	if (tsk && tsk->futex_state != FUTEX_STATE_DEAD)
++		return -EBUSY;
+ 
+ 	/*
+ 	 * Reread the user space value to handle the following situation:
+@@ -1196,8 +1252,9 @@ static int handle_exit_race(u32 __user *uaddr, u32 uval,
+ 	 *    *uaddr = 0xC0000000;	     tsk = get_task(PID);
+ 	 *   }				     if (!tsk->flags & PF_EXITING) {
+ 	 *  ...				       attach();
+-	 *  tsk->flags |= PF_EXITPIDONE;     } else {
+-	 *				       if (!(tsk->flags & PF_EXITPIDONE))
++	 *  tsk->futex_state =               } else {
++	 *	FUTEX_STATE_DEAD;              if (tsk->futex_state !=
++	 *					  FUTEX_STATE_DEAD)
+ 	 *				         return -EAGAIN;
+ 	 *				       return -ESRCH; <--- FAIL
+ 	 *				     }
+@@ -1228,7 +1285,8 @@ static int handle_exit_race(u32 __user *uaddr, u32 uval,
+  * it after doing proper sanity checks.
+  */
+ static int attach_to_pi_owner(u32 __user *uaddr, u32 uval, union futex_key *key,
+-			      struct futex_pi_state **ps)
++			      struct futex_pi_state **ps,
++			      struct task_struct **exiting)
+ {
+ 	pid_t pid = uval & FUTEX_TID_MASK;
+ 	struct futex_pi_state *pi_state;
+@@ -1253,22 +1311,33 @@ static int attach_to_pi_owner(u32 __user *uaddr, u32 uval, union futex_key *key,
+ 	}
+ 
+ 	/*
+-	 * We need to look at the task state flags to figure out,
+-	 * whether the task is exiting. To protect against the do_exit
+-	 * change of the task flags, we do this protected by
+-	 * p->pi_lock:
++	 * We need to look at the task state to figure out, whether the
++	 * task is exiting. To protect against the change of the task state
++	 * in futex_exit_release(), we do this protected by p->pi_lock:
+ 	 */
+ 	raw_spin_lock_irq(&p->pi_lock);
+-	if (unlikely(p->flags & PF_EXITING)) {
++	if (unlikely(p->futex_state != FUTEX_STATE_OK)) {
+ 		/*
+-		 * The task is on the way out. When PF_EXITPIDONE is
+-		 * set, we know that the task has finished the
+-		 * cleanup:
++		 * The task is on the way out. When the futex state is
++		 * FUTEX_STATE_DEAD, we know that the task has finished
++		 * the cleanup:
+ 		 */
+ 		int ret = handle_exit_race(uaddr, uval, p);
+ 
+ 		raw_spin_unlock_irq(&p->pi_lock);
+-		put_task_struct(p);
++		/*
++		 * If the owner task is between FUTEX_STATE_EXITING and
++		 * FUTEX_STATE_DEAD then store the task pointer and keep
++		 * the reference on the task struct. The calling code will
++		 * drop all locks, wait for the task to reach
++		 * FUTEX_STATE_DEAD and then drop the refcount. This is
++		 * required to prevent a live lock when the current task
++		 * preempted the exiting task between the two states.
++		 */
++		if (ret == -EBUSY)
++			*exiting = p;
++		else
++			put_task_struct(p);
+ 		return ret;
+ 	}
+ 
+@@ -1307,7 +1376,8 @@ static int attach_to_pi_owner(u32 __user *uaddr, u32 uval, union futex_key *key,
+ 
+ static int lookup_pi_state(u32 __user *uaddr, u32 uval,
+ 			   struct futex_hash_bucket *hb,
+-			   union futex_key *key, struct futex_pi_state **ps)
++			   union futex_key *key, struct futex_pi_state **ps,
++			   struct task_struct **exiting)
+ {
+ 	struct futex_q *top_waiter = futex_top_waiter(hb, key);
+ 
+@@ -1322,7 +1392,7 @@ static int lookup_pi_state(u32 __user *uaddr, u32 uval,
+ 	 * We are the first waiter - try to look up the owner based on
+ 	 * @uval and attach to it.
+ 	 */
+-	return attach_to_pi_owner(uaddr, uval, key, ps);
++	return attach_to_pi_owner(uaddr, uval, key, ps, exiting);
+ }
+ 
+ static int lock_pi_update_atomic(u32 __user *uaddr, u32 uval, u32 newval)
+@@ -1350,6 +1420,8 @@ static int lock_pi_update_atomic(u32 __user *uaddr, u32 uval, u32 newval)
+  *			lookup
+  * @task:		the task to perform the atomic lock work for.  This will
+  *			be "current" except in the case of requeue pi.
++ * @exiting:		Pointer to store the task pointer of the owner task
++ *			which is in the middle of exiting
+  * @set_waiters:	force setting the FUTEX_WAITERS bit (1) or not (0)
+  *
+  * Return:
+@@ -1358,11 +1430,17 @@ static int lock_pi_update_atomic(u32 __user *uaddr, u32 uval, u32 newval)
+  *  - <0 - error
+  *
+  * The hb->lock and futex_key refs shall be held by the caller.
++ *
++ * @exiting is only set when the return value is -EBUSY. If so, this holds
++ * a refcount on the exiting task on return and the caller needs to drop it
++ * after waiting for the exit to complete.
+  */
+ static int futex_lock_pi_atomic(u32 __user *uaddr, struct futex_hash_bucket *hb,
+ 				union futex_key *key,
+ 				struct futex_pi_state **ps,
+-				struct task_struct *task, int set_waiters)
++				struct task_struct *task,
++				struct task_struct **exiting,
++				int set_waiters)
+ {
+ 	u32 uval, newval, vpid = task_pid_vnr(task);
+ 	struct futex_q *top_waiter;
+@@ -1432,7 +1510,7 @@ static int futex_lock_pi_atomic(u32 __user *uaddr, struct futex_hash_bucket *hb,
+ 	 * attach to the owner. If that fails, no harm done, we only
+ 	 * set the FUTEX_WAITERS bit in the user space variable.
+ 	 */
+-	return attach_to_pi_owner(uaddr, newval, key, ps);
++	return attach_to_pi_owner(uaddr, newval, key, ps, exiting);
+ }
+ 
+ /**
+@@ -1537,26 +1615,15 @@ static int wake_futex_pi(u32 __user *uaddr, u32 uval, struct futex_pi_state *pi_
+ 			ret = -EINVAL;
+ 	}
+ 
+-	if (ret)
+-		goto out_unlock;
+-
+-	/*
+-	 * This is a point of no return; once we modify the uval there is no
+-	 * going back and subsequent operations must not fail.
+-	 */
+-
+-	raw_spin_lock(&pi_state->owner->pi_lock);
+-	WARN_ON(list_empty(&pi_state->list));
+-	list_del_init(&pi_state->list);
+-	raw_spin_unlock(&pi_state->owner->pi_lock);
+-
+-	raw_spin_lock(&new_owner->pi_lock);
+-	WARN_ON(!list_empty(&pi_state->list));
+-	list_add(&pi_state->list, &new_owner->pi_state_list);
+-	pi_state->owner = new_owner;
+-	raw_spin_unlock(&new_owner->pi_lock);
+-
+-	postunlock = __rt_mutex_futex_unlock(&pi_state->pi_mutex, &wake_q);
++	if (!ret) {
++		/*
++		 * This is a point of no return; once we modified the uval
++		 * there is no going back and subsequent operations must
++		 * not fail.
++		 */
++		pi_state_update_owner(pi_state, new_owner);
++		postunlock = __rt_mutex_futex_unlock(&pi_state->pi_mutex, &wake_q);
++	}
+ 
+ out_unlock:
+ 	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+@@ -1853,6 +1920,8 @@ void requeue_pi_wake_futex(struct futex_q *q, union futex_key *key,
+  * @key1:		the from futex key
+  * @key2:		the to futex key
+  * @ps:			address to store the pi_state pointer
++ * @exiting:		Pointer to store the task pointer of the owner task
++ *			which is in the middle of exiting
+  * @set_waiters:	force setting the FUTEX_WAITERS bit (1) or not (0)
+  *
+  * Try and get the lock on behalf of the top waiter if we can do it atomically.
+@@ -1860,16 +1929,20 @@ void requeue_pi_wake_futex(struct futex_q *q, union futex_key *key,
+  * then direct futex_lock_pi_atomic() to force setting the FUTEX_WAITERS bit.
+  * hb1 and hb2 must be held by the caller.
+  *
++ * @exiting is only set when the return value is -EBUSY. If so, this holds
++ * a refcount on the exiting task on return and the caller needs to drop it
++ * after waiting for the exit to complete.
++ *
+  * Return:
+  *  -  0 - failed to acquire the lock atomically;
+  *  - >0 - acquired the lock, return value is vpid of the top_waiter
+  *  - <0 - error
+  */
+-static int futex_proxy_trylock_atomic(u32 __user *pifutex,
+-				 struct futex_hash_bucket *hb1,
+-				 struct futex_hash_bucket *hb2,
+-				 union futex_key *key1, union futex_key *key2,
+-				 struct futex_pi_state **ps, int set_waiters)
++static int
++futex_proxy_trylock_atomic(u32 __user *pifutex, struct futex_hash_bucket *hb1,
++			   struct futex_hash_bucket *hb2, union futex_key *key1,
++			   union futex_key *key2, struct futex_pi_state **ps,
++			   struct task_struct **exiting, int set_waiters)
+ {
+ 	struct futex_q *top_waiter = NULL;
+ 	u32 curval;
+@@ -1906,7 +1979,7 @@ static int futex_proxy_trylock_atomic(u32 __user *pifutex,
+ 	 */
+ 	vpid = task_pid_vnr(top_waiter->task);
+ 	ret = futex_lock_pi_atomic(pifutex, hb2, key2, ps, top_waiter->task,
+-				   set_waiters);
++				   exiting, set_waiters);
+ 	if (ret == 1) {
+ 		requeue_pi_wake_futex(top_waiter, key2, hb2);
+ 		return vpid;
+@@ -2035,6 +2108,8 @@ retry_private:
+ 	}
+ 
+ 	if (requeue_pi && (task_count - nr_wake < nr_requeue)) {
++		struct task_struct *exiting = NULL;
++
+ 		/*
+ 		 * Attempt to acquire uaddr2 and wake the top waiter. If we
+ 		 * intend to requeue waiters, force setting the FUTEX_WAITERS
+@@ -2042,7 +2117,8 @@ retry_private:
+ 		 * faults rather in the requeue loop below.
+ 		 */
+ 		ret = futex_proxy_trylock_atomic(uaddr2, hb1, hb2, &key1,
+-						 &key2, &pi_state, nr_requeue);
++						 &key2, &pi_state,
++						 &exiting, nr_requeue);
+ 
+ 		/*
+ 		 * At this point the top_waiter has either taken uaddr2 or is
+@@ -2069,7 +2145,8 @@ retry_private:
+ 			 * If that call succeeds then we have pi_state and an
+ 			 * initial refcount on it.
+ 			 */
+-			ret = lookup_pi_state(uaddr2, ret, hb2, &key2, &pi_state);
++			ret = lookup_pi_state(uaddr2, ret, hb2, &key2,
++					      &pi_state, &exiting);
+ 		}
+ 
+ 		switch (ret) {
+@@ -2087,17 +2164,24 @@ retry_private:
+ 			if (!ret)
+ 				goto retry;
+ 			goto out;
++		case -EBUSY:
+ 		case -EAGAIN:
+ 			/*
+ 			 * Two reasons for this:
+-			 * - Owner is exiting and we just wait for the
++			 * - EBUSY: Owner is exiting and we just wait for the
+ 			 *   exit to complete.
+-			 * - The user space value changed.
++			 * - EAGAIN: The user space value changed.
+ 			 */
+ 			double_unlock_hb(hb1, hb2);
+ 			hb_waiters_dec(hb2);
+ 			put_futex_key(&key2);
+ 			put_futex_key(&key1);
++			/*
++			 * Handle the case where the owner is in the middle of
++			 * exiting. Wait for the exit to complete otherwise
++			 * this task might loop forever, aka. live lock.
++			 */
++			wait_for_owner_exiting(ret, exiting);
+ 			cond_resched();
+ 			goto retry;
+ 		default:
+@@ -2362,18 +2446,13 @@ static void unqueue_me_pi(struct futex_q *q)
+ 	spin_unlock(q->lock_ptr);
+ }
+ 
+-static int fixup_pi_state_owner(u32 __user *uaddr, struct futex_q *q,
+-				struct task_struct *argowner)
++static int __fixup_pi_state_owner(u32 __user *uaddr, struct futex_q *q,
++				  struct task_struct *argowner)
+ {
++	u32 uval, uninitialized_var(curval), newval, newtid;
+ 	struct futex_pi_state *pi_state = q->pi_state;
+-	u32 uval, uninitialized_var(curval), newval;
+ 	struct task_struct *oldowner, *newowner;
+-	u32 newtid;
+-	int ret, err = 0;
+-
+-	lockdep_assert_held(q->lock_ptr);
+-
+-	raw_spin_lock_irq(&pi_state->pi_mutex.wait_lock);
++	int err = 0;
+ 
+ 	oldowner = pi_state->owner;
+ 
+@@ -2407,14 +2486,12 @@ retry:
+ 			 * We raced against a concurrent self; things are
+ 			 * already fixed up. Nothing to do.
+ 			 */
+-			ret = 0;
+-			goto out_unlock;
++			return 0;
+ 		}
+ 
+ 		if (__rt_mutex_futex_trylock(&pi_state->pi_mutex)) {
+-			/* We got the lock after all, nothing to fix. */
+-			ret = 0;
+-			goto out_unlock;
++			/* We got the lock. pi_state is correct. Tell caller. */
++			return 1;
+ 		}
+ 
+ 		/*
+@@ -2441,8 +2518,7 @@ retry:
+ 			 * We raced against a concurrent self; things are
+ 			 * already fixed up. Nothing to do.
+ 			 */
+-			ret = 0;
+-			goto out_unlock;
++			return 1;
+ 		}
+ 		newowner = argowner;
+ 	}
+@@ -2472,22 +2548,9 @@ retry:
+ 	 * We fixed up user space. Now we need to fix the pi_state
+ 	 * itself.
+ 	 */
+-	if (pi_state->owner != NULL) {
+-		raw_spin_lock(&pi_state->owner->pi_lock);
+-		WARN_ON(list_empty(&pi_state->list));
+-		list_del_init(&pi_state->list);
+-		raw_spin_unlock(&pi_state->owner->pi_lock);
+-	}
++	pi_state_update_owner(pi_state, newowner);
+ 
+-	pi_state->owner = newowner;
+-
+-	raw_spin_lock(&newowner->pi_lock);
+-	WARN_ON(!list_empty(&pi_state->list));
+-	list_add(&pi_state->list, &newowner->pi_state_list);
+-	raw_spin_unlock(&newowner->pi_lock);
+-	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+-
+-	return 0;
++	return argowner == current;
+ 
+ 	/*
+ 	 * In order to reschedule or handle a page fault, we need to drop the
+@@ -2508,17 +2571,16 @@ handle_err:
+ 
+ 	switch (err) {
+ 	case -EFAULT:
+-		ret = fault_in_user_writeable(uaddr);
++		err = fault_in_user_writeable(uaddr);
+ 		break;
+ 
+ 	case -EAGAIN:
+ 		cond_resched();
+-		ret = 0;
++		err = 0;
+ 		break;
+ 
+ 	default:
+ 		WARN_ON_ONCE(1);
+-		ret = err;
+ 		break;
+ 	}
+ 
+@@ -2528,17 +2590,44 @@ handle_err:
+ 	/*
+ 	 * Check if someone else fixed it for us:
+ 	 */
+-	if (pi_state->owner != oldowner) {
+-		ret = 0;
+-		goto out_unlock;
+-	}
++	if (pi_state->owner != oldowner)
++		return argowner == current;
+ 
+-	if (ret)
+-		goto out_unlock;
++	/* Retry if err was -EAGAIN or the fault in succeeded */
++	if (!err)
++		goto retry;
+ 
+-	goto retry;
++	/*
++	 * fault_in_user_writeable() failed so user state is immutable. At
++	 * best we can make the kernel state consistent but user state will
++	 * be most likely hosed and any subsequent unlock operation will be
++	 * rejected due to PI futex rule [10].
++	 *
++	 * Ensure that the rtmutex owner is also the pi_state owner despite
++	 * the user space value claiming something different. There is no
++	 * point in unlocking the rtmutex if current is the owner as it
++	 * would need to wait until the next waiter has taken the rtmutex
++	 * to guarantee consistent state. Keep it simple. Userspace asked
++	 * for this wreckaged state.
++	 *
++	 * The rtmutex has an owner - either current or some other
++	 * task. See the EAGAIN loop above.
++	 */
++	pi_state_update_owner(pi_state, rt_mutex_owner(&pi_state->pi_mutex));
+ 
+-out_unlock:
++	return err;
++}
++
++static int fixup_pi_state_owner(u32 __user *uaddr, struct futex_q *q,
++				struct task_struct *argowner)
++{
++	struct futex_pi_state *pi_state = q->pi_state;
++	int ret;
++
++	lockdep_assert_held(q->lock_ptr);
++
++	raw_spin_lock_irq(&pi_state->pi_mutex.wait_lock);
++	ret = __fixup_pi_state_owner(uaddr, q, argowner);
+ 	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+ 	return ret;
+ }
+@@ -2562,8 +2651,6 @@ static long futex_wait_restart(struct restart_block *restart);
+  */
+ static int fixup_owner(u32 __user *uaddr, struct futex_q *q, int locked)
+ {
+-	int ret = 0;
+-
+ 	if (locked) {
+ 		/*
+ 		 * Got the lock. We might not be the anticipated owner if we
+@@ -2574,8 +2661,8 @@ static int fixup_owner(u32 __user *uaddr, struct futex_q *q, int locked)
+ 		 * stable state, anything else needs more attention.
+ 		 */
+ 		if (q->pi_state->owner != current)
+-			ret = fixup_pi_state_owner(uaddr, q, current);
+-		goto out;
++			return fixup_pi_state_owner(uaddr, q, current);
++		return 1;
+ 	}
+ 
+ 	/*
+@@ -2586,24 +2673,17 @@ static int fixup_owner(u32 __user *uaddr, struct futex_q *q, int locked)
+ 	 * Another speculative read; pi_state->owner == current is unstable
+ 	 * but needs our attention.
+ 	 */
+-	if (q->pi_state->owner == current) {
+-		ret = fixup_pi_state_owner(uaddr, q, NULL);
+-		goto out;
+-	}
++	if (q->pi_state->owner == current)
++		return fixup_pi_state_owner(uaddr, q, NULL);
+ 
+ 	/*
+ 	 * Paranoia check. If we did not take the lock, then we should not be
+-	 * the owner of the rt_mutex.
++	 * the owner of the rt_mutex. Warn and establish consistent state.
+ 	 */
+-	if (rt_mutex_owner(&q->pi_state->pi_mutex) == current) {
+-		printk(KERN_ERR "fixup_owner: ret = %d pi-mutex: %p "
+-				"pi-state %p\n", ret,
+-				q->pi_state->pi_mutex.owner,
+-				q->pi_state->owner);
+-	}
++	if (WARN_ON_ONCE(rt_mutex_owner(&q->pi_state->pi_mutex) == current))
++		return fixup_pi_state_owner(uaddr, q, current);
+ 
+-out:
+-	return ret ? ret : locked;
++	return 0;
+ }
+ 
+ /**
+@@ -2824,7 +2904,7 @@ static int futex_lock_pi(u32 __user *uaddr, unsigned int flags,
+ 			 ktime_t *time, int trylock)
+ {
+ 	struct hrtimer_sleeper timeout, *to = NULL;
+-	struct futex_pi_state *pi_state = NULL;
++	struct task_struct *exiting = NULL;
+ 	struct rt_mutex_waiter rt_waiter;
+ 	struct futex_hash_bucket *hb;
+ 	struct futex_q q = futex_q_init;
+@@ -2852,7 +2932,8 @@ retry:
+ retry_private:
+ 	hb = queue_lock(&q);
+ 
+-	ret = futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current, 0);
++	ret = futex_lock_pi_atomic(uaddr, hb, &q.key, &q.pi_state, current,
++				   &exiting, 0);
+ 	if (unlikely(ret)) {
+ 		/*
+ 		 * Atomic work succeeded and we got the lock,
+@@ -2865,15 +2946,22 @@ retry_private:
+ 			goto out_unlock_put_key;
+ 		case -EFAULT:
+ 			goto uaddr_faulted;
++		case -EBUSY:
+ 		case -EAGAIN:
+ 			/*
+ 			 * Two reasons for this:
+-			 * - Task is exiting and we just wait for the
++			 * - EBUSY: Task is exiting and we just wait for the
+ 			 *   exit to complete.
+-			 * - The user space value changed.
++			 * - EAGAIN: The user space value changed.
+ 			 */
+ 			queue_unlock(hb);
+ 			put_futex_key(&q.key);
++			/*
++			 * Handle the case where the owner is in the middle of
++			 * exiting. Wait for the exit to complete otherwise
++			 * this task might loop forever, aka. live lock.
++			 */
++			wait_for_owner_exiting(ret, exiting);
+ 			cond_resched();
+ 			goto retry;
+ 		default:
+@@ -2958,23 +3046,9 @@ no_block:
+ 	if (res)
+ 		ret = (res < 0) ? res : 0;
+ 
+-	/*
+-	 * If fixup_owner() faulted and was unable to handle the fault, unlock
+-	 * it and return the fault to userspace.
+-	 */
+-	if (ret && (rt_mutex_owner(&q.pi_state->pi_mutex) == current)) {
+-		pi_state = q.pi_state;
+-		get_pi_state(pi_state);
+-	}
+-
+ 	/* Unqueue and drop the lock */
+ 	unqueue_me_pi(&q);
+ 
+-	if (pi_state) {
+-		rt_mutex_futex_unlock(&pi_state->pi_mutex);
+-		put_pi_state(pi_state);
+-	}
+-
+ 	goto out_put_key;
+ 
+ out_unlock_put_key:
+@@ -3240,7 +3314,6 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 				 u32 __user *uaddr2)
+ {
+ 	struct hrtimer_sleeper timeout, *to = NULL;
+-	struct futex_pi_state *pi_state = NULL;
+ 	struct rt_mutex_waiter rt_waiter;
+ 	struct futex_hash_bucket *hb;
+ 	union futex_key key2 = FUTEX_KEY_INIT;
+@@ -3325,16 +3398,17 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 		if (q.pi_state && (q.pi_state->owner != current)) {
+ 			spin_lock(q.lock_ptr);
+ 			ret = fixup_pi_state_owner(uaddr2, &q, current);
+-			if (ret && rt_mutex_owner(&q.pi_state->pi_mutex) == current) {
+-				pi_state = q.pi_state;
+-				get_pi_state(pi_state);
+-			}
+ 			/*
+ 			 * Drop the reference to the pi state which
+ 			 * the requeue_pi() code acquired for us.
+ 			 */
+ 			put_pi_state(q.pi_state);
+ 			spin_unlock(q.lock_ptr);
++			/*
++			 * Adjust the return value. It's either -EFAULT or
++			 * success (1) but the caller expects 0 for success.
++			 */
++			ret = ret < 0 ? ret : 0;
+ 		}
+ 	} else {
+ 		struct rt_mutex *pi_mutex;
+@@ -3365,25 +3439,10 @@ static int futex_wait_requeue_pi(u32 __user *uaddr, unsigned int flags,
+ 		if (res)
+ 			ret = (res < 0) ? res : 0;
+ 
+-		/*
+-		 * If fixup_pi_state_owner() faulted and was unable to handle
+-		 * the fault, unlock the rt_mutex and return the fault to
+-		 * userspace.
+-		 */
+-		if (ret && rt_mutex_owner(&q.pi_state->pi_mutex) == current) {
+-			pi_state = q.pi_state;
+-			get_pi_state(pi_state);
+-		}
+-
+ 		/* Unqueue and drop the lock. */
+ 		unqueue_me_pi(&q);
+ 	}
+ 
+-	if (pi_state) {
+-		rt_mutex_futex_unlock(&pi_state->pi_mutex);
+-		put_pi_state(pi_state);
+-	}
+-
+ 	if (ret == -EINTR) {
+ 		/*
+ 		 * We've already been requeued, but cannot restart by calling
+@@ -3625,7 +3684,7 @@ static inline int fetch_robust_entry(struct robust_list __user **entry,
+  *
+  * We silently return on any sign of list-walking problem.
+  */
+-void exit_robust_list(struct task_struct *curr)
++static void exit_robust_list(struct task_struct *curr)
+ {
+ 	struct robust_list_head __user *head = curr->robust_list;
+ 	struct robust_list __user *entry, *next_entry, *pending;
+@@ -3690,6 +3749,114 @@ void exit_robust_list(struct task_struct *curr)
+ 	}
+ }
+ 
++static void futex_cleanup(struct task_struct *tsk)
++{
++	if (unlikely(tsk->robust_list)) {
++		exit_robust_list(tsk);
++		tsk->robust_list = NULL;
++	}
++
++#ifdef CONFIG_COMPAT
++	if (unlikely(tsk->compat_robust_list)) {
++		compat_exit_robust_list(tsk);
++		tsk->compat_robust_list = NULL;
++	}
++#endif
++
++	if (unlikely(!list_empty(&tsk->pi_state_list)))
++		exit_pi_state_list(tsk);
++}
++
++/**
++ * futex_exit_recursive - Set the tasks futex state to FUTEX_STATE_DEAD
++ * @tsk:	task to set the state on
++ *
++ * Set the futex exit state of the task lockless. The futex waiter code
++ * observes that state when a task is exiting and loops until the task has
++ * actually finished the futex cleanup. The worst case for this is that the
++ * waiter runs through the wait loop until the state becomes visible.
++ *
++ * This is called from the recursive fault handling path in do_exit().
++ *
++ * This is best effort. Either the futex exit code has run already or
++ * not. If the OWNER_DIED bit has been set on the futex then the waiter can
++ * take it over. If not, the problem is pushed back to user space. If the
++ * futex exit code did not run yet, then an already queued waiter might
++ * block forever, but there is nothing which can be done about that.
++ */
++void futex_exit_recursive(struct task_struct *tsk)
++{
++	/* If the state is FUTEX_STATE_EXITING then futex_exit_mutex is held */
++	if (tsk->futex_state == FUTEX_STATE_EXITING)
++		mutex_unlock(&tsk->futex_exit_mutex);
++	tsk->futex_state = FUTEX_STATE_DEAD;
++}
++
++static void futex_cleanup_begin(struct task_struct *tsk)
++{
++	/*
++	 * Prevent various race issues against a concurrent incoming waiter
++	 * including live locks by forcing the waiter to block on
++	 * tsk->futex_exit_mutex when it observes FUTEX_STATE_EXITING in
++	 * attach_to_pi_owner().
++	 */
++	mutex_lock(&tsk->futex_exit_mutex);
++
++	/*
++	 * Switch the state to FUTEX_STATE_EXITING under tsk->pi_lock.
++	 *
++	 * This ensures that all subsequent checks of tsk->futex_state in
++	 * attach_to_pi_owner() must observe FUTEX_STATE_EXITING with
++	 * tsk->pi_lock held.
++	 *
++	 * It guarantees also that a pi_state which was queued right before
++	 * the state change under tsk->pi_lock by a concurrent waiter must
++	 * be observed in exit_pi_state_list().
++	 */
++	raw_spin_lock_irq(&tsk->pi_lock);
++	tsk->futex_state = FUTEX_STATE_EXITING;
++	raw_spin_unlock_irq(&tsk->pi_lock);
++}
++
++static void futex_cleanup_end(struct task_struct *tsk, int state)
++{
++	/*
++	 * Lockless store. The only side effect is that an observer might
++	 * take another loop until it becomes visible.
++	 */
++	tsk->futex_state = state;
++	/*
++	 * Drop the exit protection. This unblocks waiters which observed
++	 * FUTEX_STATE_EXITING to reevaluate the state.
++	 */
++	mutex_unlock(&tsk->futex_exit_mutex);
++}
++
++void futex_exec_release(struct task_struct *tsk)
++{
++	/*
++	 * The state handling is done for consistency, but in the case of
++	 * exec() there is no way to prevent futher damage as the PID stays
++	 * the same. But for the unlikely and arguably buggy case that a
++	 * futex is held on exec(), this provides at least as much state
++	 * consistency protection which is possible.
++	 */
++	futex_cleanup_begin(tsk);
++	futex_cleanup(tsk);
++	/*
++	 * Reset the state to FUTEX_STATE_OK. The task is alive and about
++	 * exec a new binary.
++	 */
++	futex_cleanup_end(tsk, FUTEX_STATE_OK);
++}
++
++void futex_exit_release(struct task_struct *tsk)
++{
++	futex_cleanup_begin(tsk);
++	futex_cleanup(tsk);
++	futex_cleanup_end(tsk, FUTEX_STATE_DEAD);
++}
++
+ long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+ 		u32 __user *uaddr2, u32 val2, u32 val3)
+ {
+@@ -3817,7 +3984,7 @@ static void __user *futex_uaddr(struct robust_list __user *entry,
+  *
+  * We silently return on any sign of list-walking problem.
+  */
+-void compat_exit_robust_list(struct task_struct *curr)
++static void compat_exit_robust_list(struct task_struct *curr)
+ {
+ 	struct compat_robust_list_head __user *head = curr->compat_robust_list;
+ 	struct robust_list __user *entry, *next_entry, *pending;
+diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
+index 9562aaa2afdce..a5ec4f68527e5 100644
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@ -1719,8 +1719,7 @@ void rt_mutex_init_proxy_locked(struct rt_mutex *lock,
+  * possible because it belongs to the pi_state which is about to be freed
+  * and it is not longer visible to other tasks.
+  */
+-void rt_mutex_proxy_unlock(struct rt_mutex *lock,
+-			   struct task_struct *proxy_owner)
++void rt_mutex_proxy_unlock(struct rt_mutex *lock)
+ {
+ 	debug_rt_mutex_proxy_unlock(lock);
+ 	rt_mutex_set_owner(lock, NULL);
+diff --git a/kernel/locking/rtmutex_common.h b/kernel/locking/rtmutex_common.h
+index d1d62f942be22..ca6fb489007b6 100644
+--- a/kernel/locking/rtmutex_common.h
++++ b/kernel/locking/rtmutex_common.h
+@@ -133,8 +133,7 @@ enum rtmutex_chainwalk {
+ extern struct task_struct *rt_mutex_next_owner(struct rt_mutex *lock);
+ extern void rt_mutex_init_proxy_locked(struct rt_mutex *lock,
+ 				       struct task_struct *proxy_owner);
+-extern void rt_mutex_proxy_unlock(struct rt_mutex *lock,
+-				  struct task_struct *proxy_owner);
++extern void rt_mutex_proxy_unlock(struct rt_mutex *lock);
+ extern void rt_mutex_init_waiter(struct rt_mutex_waiter *waiter);
+ extern int __rt_mutex_start_proxy_lock(struct rt_mutex *lock,
+ 				     struct rt_mutex_waiter *waiter,
+diff --git a/kernel/trace/ring_buffer.c b/kernel/trace/ring_buffer.c
+index 87ce9736043da..360129e475407 100644
+--- a/kernel/trace/ring_buffer.c
++++ b/kernel/trace/ring_buffer.c
+@@ -4393,6 +4393,8 @@ void ring_buffer_reset_cpu(struct ring_buffer *buffer, int cpu)
+ 
+ 	if (!cpumask_test_cpu(cpu, buffer->cpumask))
+ 		return;
++	/* prevent another thread from changing buffer sizes */
++	mutex_lock(&buffer->mutex);
+ 
+ 	atomic_inc(&buffer->resize_disabled);
+ 	atomic_inc(&cpu_buffer->record_disabled);
+@@ -4416,6 +4418,8 @@ void ring_buffer_reset_cpu(struct ring_buffer *buffer, int cpu)
+ 
+ 	atomic_dec(&cpu_buffer->record_disabled);
+ 	atomic_dec(&buffer->resize_disabled);
++
++	mutex_unlock(&buffer->mutex);
+ }
+ EXPORT_SYMBOL_GPL(ring_buffer_reset_cpu);
+ 
+diff --git a/mm/slub.c b/mm/slub.c
+index 02295fa61583c..eac80b0516fe8 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -5766,10 +5766,8 @@ static int sysfs_slab_add(struct kmem_cache *s)
+ 
+ 	s->kobj.kset = kset;
+ 	err = kobject_init_and_add(&s->kobj, &slab_ktype, NULL, "%s", name);
+-	if (err) {
+-		kobject_put(&s->kobj);
++	if (err)
+ 		goto out;
+-	}
+ 
+ 	err = sysfs_create_group(&s->kobj, &slab_attr_group);
+ 	if (err)
+diff --git a/tools/build/Makefile b/tools/build/Makefile
+index 727050c40f096..8a55378e8b7ce 100644
+--- a/tools/build/Makefile
++++ b/tools/build/Makefile
+@@ -15,10 +15,6 @@ endef
+ $(call allow-override,CC,$(CROSS_COMPILE)gcc)
+ $(call allow-override,LD,$(CROSS_COMPILE)ld)
+ 
+-HOSTCC ?= gcc
+-HOSTLD ?= ld
+-HOSTAR ?= ar
+-
+ export HOSTCC HOSTLD HOSTAR
+ 
+ ifeq ($(V),1)
+diff --git a/tools/objtool/Makefile b/tools/objtool/Makefile
+index baa92279c137e..15f32f67cf340 100644
+--- a/tools/objtool/Makefile
++++ b/tools/objtool/Makefile
+@@ -7,15 +7,6 @@ ARCH := x86
+ endif
+ 
+ # always use the host compiler
+-ifneq ($(LLVM),)
+-HOSTAR	?= llvm-ar
+-HOSTCC	?= clang
+-HOSTLD	?= ld.lld
+-else
+-HOSTAR	?= ar
+-HOSTCC	?= gcc
+-HOSTLD	?= ld
+-endif
+ AR	 = $(HOSTAR)
+ CC	 = $(HOSTCC)
+ LD	 = $(HOSTLD)
+diff --git a/tools/perf/Makefile.perf b/tools/perf/Makefile.perf
+index 0be4116953790..678aa7feb84d0 100644
+--- a/tools/perf/Makefile.perf
++++ b/tools/perf/Makefile.perf
+@@ -148,10 +148,6 @@ endef
+ 
+ LD += $(EXTRA_LDFLAGS)
+ 
+-HOSTCC  ?= gcc
+-HOSTLD  ?= ld
+-HOSTAR  ?= ar
+-
+ PKG_CONFIG = $(CROSS_COMPILE)pkg-config
+ LLVM_CONFIG ?= llvm-config
+ 
+diff --git a/tools/power/acpi/Makefile.config b/tools/power/acpi/Makefile.config
+index fc116c060b98d..32ff7baf39df4 100644
+--- a/tools/power/acpi/Makefile.config
++++ b/tools/power/acpi/Makefile.config
+@@ -57,7 +57,6 @@ INSTALL_SCRIPT = ${INSTALL_PROGRAM}
+ CROSS = #/usr/i386-linux-uclibc/usr/bin/i386-uclibc-
+ CROSS_COMPILE ?= $(CROSS)
+ LD = $(CC)
+-HOSTCC = gcc
+ 
+ # check if compiler option is supported
+ cc-supports = ${shell if $(CC) ${1} -S -o /dev/null -x c /dev/null > /dev/null 2>&1; then echo "$(1)"; fi;}
+diff --git a/tools/scripts/Makefile.include b/tools/scripts/Makefile.include
+index 8fc6b1ca47dca..42dbe05b18077 100644
+--- a/tools/scripts/Makefile.include
++++ b/tools/scripts/Makefile.include
+@@ -60,6 +60,16 @@ $(call allow-override,LD,$(CROSS_COMPILE)ld)
+ $(call allow-override,CXX,$(CROSS_COMPILE)g++)
+ $(call allow-override,STRIP,$(CROSS_COMPILE)strip)
+ 
++ifneq ($(LLVM),)
++HOSTAR  ?= llvm-ar
++HOSTCC  ?= clang
++HOSTLD  ?= ld.lld
++else
++HOSTAR  ?= ar
++HOSTCC  ?= gcc
++HOSTLD  ?= ld
++endif
++
+ ifeq ($(CC_NO_CLANG), 1)
+ EXTRA_WARNINGS += -Wstrict-aliasing=3
+ endif
