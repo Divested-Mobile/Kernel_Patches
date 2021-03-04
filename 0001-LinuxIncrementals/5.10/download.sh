@@ -13,3 +13,8 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.11-12.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.12-13.xz -O - | xz -d > 5.10.0012-0013.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.13-14.xz -O - | xz -d > 5.10.0013-0014.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.14-15.xz -O - | xz -d > 5.10.0014-0015.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.15-16.xz -O - | xz -d > 5.10.0015-0016.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.16-17.xz -O - | xz -d > 5.10.0016-0017.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.17-18.xz -O - | xz -d > 5.10.0017-0018.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.18-19.xz -O - | xz -d > 5.10.0018-0019.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.19-20.xz -O - | xz -d > 5.10.0019-0020.patch

@@ -1,0 +1,1470 @@
+diff --git a/Makefile b/Makefile
+index 8de8f9ac32795..abf7b5aa99bbf 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,6 +1,6 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+-SUBLEVEL = 257
++SUBLEVEL = 258
+ EXTRAVERSION =
+ NAME = Blurry Fish Butt
+ 
+@@ -760,6 +760,13 @@ ifdef CONFIG_FUNCTION_TRACER
+ ifndef CC_FLAGS_FTRACE
+ CC_FLAGS_FTRACE := -pg
+ endif
++ifdef CONFIG_FTRACE_MCOUNT_RECORD
++  # gcc 5 supports generating the mcount tables directly
++  ifeq ($(call cc-option-yn,-mrecord-mcount),y)
++    CC_FLAGS_FTRACE	+= -mrecord-mcount
++    export CC_USING_RECORD_MCOUNT := 1
++  endif
++endif
+ export CC_FLAGS_FTRACE
+ ifdef CONFIG_HAVE_FENTRY
+ CC_USING_FENTRY	:= $(call cc-option, -mfentry -DCC_USING_FENTRY)
+diff --git a/arch/arm/xen/p2m.c b/arch/arm/xen/p2m.c
+index 0ed01f2d5ee4b..02579e6569f0c 100644
+--- a/arch/arm/xen/p2m.c
++++ b/arch/arm/xen/p2m.c
+@@ -93,8 +93,10 @@ int set_foreign_p2m_mapping(struct gnttab_map_grant_ref *map_ops,
+ 	for (i = 0; i < count; i++) {
+ 		if (map_ops[i].status)
+ 			continue;
+-		set_phys_to_machine(map_ops[i].host_addr >> XEN_PAGE_SHIFT,
+-				    map_ops[i].dev_bus_addr >> XEN_PAGE_SHIFT);
++		if (unlikely(!set_phys_to_machine(map_ops[i].host_addr >> XEN_PAGE_SHIFT,
++				    map_ops[i].dev_bus_addr >> XEN_PAGE_SHIFT))) {
++			return -ENOMEM;
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/arch/h8300/kernel/asm-offsets.c b/arch/h8300/kernel/asm-offsets.c
+index dc2d16ce8a0d5..3e33a9844d99a 100644
+--- a/arch/h8300/kernel/asm-offsets.c
++++ b/arch/h8300/kernel/asm-offsets.c
+@@ -62,6 +62,9 @@ int main(void)
+ 	OFFSET(TI_FLAGS, thread_info, flags);
+ 	OFFSET(TI_CPU, thread_info, cpu);
+ 	OFFSET(TI_PRE, thread_info, preempt_count);
++#ifdef CONFIG_PREEMPTION
++	DEFINE(TI_PRE_COUNT, offsetof(struct thread_info, preempt_count));
++#endif
+ 
+ 	return 0;
+ }
+diff --git a/arch/x86/Makefile b/arch/x86/Makefile
+index e59dc138b24ea..5fece9334f12b 100644
+--- a/arch/x86/Makefile
++++ b/arch/x86/Makefile
+@@ -61,6 +61,9 @@ endif
+ KBUILD_CFLAGS += -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+ KBUILD_CFLAGS += $(call cc-option,-mno-avx,)
+ 
++# Intel CET isn't enabled in the kernel
++KBUILD_CFLAGS += $(call cc-option,-fcf-protection=none)
++
+ ifeq ($(CONFIG_X86_32),y)
+         BITS := 32
+         UTS_MACHINE := i386
+@@ -137,9 +140,6 @@ else
+         KBUILD_CFLAGS += -mno-red-zone
+         KBUILD_CFLAGS += -mcmodel=kernel
+ 
+-	# Intel CET isn't enabled in the kernel
+-	KBUILD_CFLAGS += $(call cc-option,-fcf-protection=none)
+-
+         # -funit-at-a-time shrinks the kernel .text considerably
+         # unfortunately it makes reading oopses harder.
+         KBUILD_CFLAGS += $(call cc-option,-funit-at-a-time)
+diff --git a/arch/x86/xen/p2m.c b/arch/x86/xen/p2m.c
+index cab9f766bb06b..8c7c5bb94257e 100644
+--- a/arch/x86/xen/p2m.c
++++ b/arch/x86/xen/p2m.c
+@@ -725,7 +725,8 @@ int set_foreign_p2m_mapping(struct gnttab_map_grant_ref *map_ops,
+ 		unsigned long mfn, pfn;
+ 
+ 		/* Do not add to override if the map failed. */
+-		if (map_ops[i].status)
++		if (map_ops[i].status != GNTST_okay ||
++		    (kmap_ops && kmap_ops[i].status != GNTST_okay))
+ 			continue;
+ 
+ 		if (map_ops[i].flags & GNTMAP_contains_pte) {
+@@ -763,17 +764,15 @@ int clear_foreign_p2m_mapping(struct gnttab_unmap_grant_ref *unmap_ops,
+ 		unsigned long mfn = __pfn_to_mfn(page_to_pfn(pages[i]));
+ 		unsigned long pfn = page_to_pfn(pages[i]);
+ 
+-		if (mfn == INVALID_P2M_ENTRY || !(mfn & FOREIGN_FRAME_BIT)) {
++		if (mfn != INVALID_P2M_ENTRY && (mfn & FOREIGN_FRAME_BIT))
++			set_phys_to_machine(pfn, INVALID_P2M_ENTRY);
++		else
+ 			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		set_phys_to_machine(pfn, INVALID_P2M_ENTRY);
+ 	}
+ 	if (kunmap_ops)
+ 		ret = HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref,
+-						kunmap_ops, count);
+-out:
++						kunmap_ops, count) ?: ret;
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(clear_foreign_p2m_mapping);
+diff --git a/drivers/block/xen-blkback/blkback.c b/drivers/block/xen-blkback/blkback.c
+index 8dbdd156e0d3e..f9dfcd8872af0 100644
+--- a/drivers/block/xen-blkback/blkback.c
++++ b/drivers/block/xen-blkback/blkback.c
+@@ -825,8 +825,11 @@ again:
+ 			pages[i]->page = persistent_gnt->page;
+ 			pages[i]->persistent_gnt = persistent_gnt;
+ 		} else {
+-			if (get_free_page(blkif, &pages[i]->page))
+-				goto out_of_memory;
++			if (get_free_page(blkif, &pages[i]->page)) {
++				put_free_pages(blkif, pages_to_gnt, segs_to_map);
++				ret = -ENOMEM;
++				goto out;
++			}
+ 			addr = vaddr(pages[i]->page);
+ 			pages_to_gnt[segs_to_map] = pages[i]->page;
+ 			pages[i]->persistent_gnt = NULL;
+@@ -842,10 +845,8 @@ again:
+ 			break;
+ 	}
+ 
+-	if (segs_to_map) {
++	if (segs_to_map)
+ 		ret = gnttab_map_refs(map, NULL, pages_to_gnt, segs_to_map);
+-		BUG_ON(ret);
+-	}
+ 
+ 	/*
+ 	 * Now swizzle the MFN in our domain with the MFN from the other domain
+@@ -860,7 +861,7 @@ again:
+ 				pr_debug("invalid buffer -- could not remap it\n");
+ 				put_free_pages(blkif, &pages[seg_idx]->page, 1);
+ 				pages[seg_idx]->handle = BLKBACK_INVALID_HANDLE;
+-				ret |= 1;
++				ret |= !ret;
+ 				goto next;
+ 			}
+ 			pages[seg_idx]->handle = map[new_map_idx].handle;
+@@ -912,15 +913,18 @@ next:
+ 	}
+ 	segs_to_map = 0;
+ 	last_map = map_until;
+-	if (map_until != num)
++	if (!ret && map_until != num)
+ 		goto again;
+ 
+-	return ret;
++out:
++	for (i = last_map; i < num; i++) {
++		/* Don't zap current batch's valid persistent grants. */
++		if(i >= last_map + segs_to_map)
++			pages[i]->persistent_gnt = NULL;
++		pages[i]->handle = BLKBACK_INVALID_HANDLE;
++	}
+ 
+-out_of_memory:
+-	pr_alert("%s: out of memory\n", __func__);
+-	put_free_pages(blkif, pages_to_gnt, segs_to_map);
+-	return -ENOMEM;
++	return ret;
+ }
+ 
+ static int xen_blkbk_map_seg(struct pending_req *pending_req)
+diff --git a/drivers/net/wireless/iwlwifi/mvm/ops.c b/drivers/net/wireless/iwlwifi/mvm/ops.c
+index 13c97f665ba88..bb81261de45fa 100644
+--- a/drivers/net/wireless/iwlwifi/mvm/ops.c
++++ b/drivers/net/wireless/iwlwifi/mvm/ops.c
+@@ -909,6 +909,7 @@ static void iwl_mvm_reprobe_wk(struct work_struct *wk)
+ 	reprobe = container_of(wk, struct iwl_mvm_reprobe, work);
+ 	if (device_reprobe(reprobe->dev))
+ 		dev_err(reprobe->dev, "reprobe failed!\n");
++	put_device(reprobe->dev);
+ 	kfree(reprobe);
+ 	module_put(THIS_MODULE);
+ }
+@@ -991,7 +992,7 @@ void iwl_mvm_nic_restart(struct iwl_mvm *mvm, bool fw_error)
+ 			module_put(THIS_MODULE);
+ 			return;
+ 		}
+-		reprobe->dev = mvm->trans->dev;
++		reprobe->dev = get_device(mvm->trans->dev);
+ 		INIT_WORK(&reprobe->work, iwl_mvm_reprobe_wk);
+ 		schedule_work(&reprobe->work);
+ 	} else if (mvm->cur_ucode == IWL_UCODE_REGULAR) {
+diff --git a/drivers/net/wireless/iwlwifi/pcie/tx.c b/drivers/net/wireless/iwlwifi/pcie/tx.c
+index 8dfe6b2bc7031..cb03c2855019b 100644
+--- a/drivers/net/wireless/iwlwifi/pcie/tx.c
++++ b/drivers/net/wireless/iwlwifi/pcie/tx.c
+@@ -585,6 +585,11 @@ static void iwl_pcie_txq_unmap(struct iwl_trans *trans, int txq_id)
+ 	struct iwl_txq *txq = &trans_pcie->txq[txq_id];
+ 	struct iwl_queue *q = &txq->q;
+ 
++	if (!txq) {
++		IWL_ERR(trans, "Trying to free a queue that wasn't allocated?\n");
++		return;
++	}
++
+ 	spin_lock_bh(&txq->lock);
+ 	while (q->write_ptr != q->read_ptr) {
+ 		IWL_DEBUG_TX_REPLY(trans, "Q %d Free %d\n",
+diff --git a/drivers/net/xen-netback/netback.c b/drivers/net/xen-netback/netback.c
+index ee7a800c16d54..9a988ea5d797b 100644
+--- a/drivers/net/xen-netback/netback.c
++++ b/drivers/net/xen-netback/netback.c
+@@ -1792,13 +1792,11 @@ int xenvif_tx_action(struct xenvif_queue *queue, int budget)
+ 		return 0;
+ 
+ 	gnttab_batch_copy(queue->tx_copy_ops, nr_cops);
+-	if (nr_mops != 0) {
++	if (nr_mops != 0)
+ 		ret = gnttab_map_refs(queue->tx_map_ops,
+ 				      NULL,
+ 				      queue->pages_to_map,
+ 				      nr_mops);
+-		BUG_ON(ret);
+-	}
+ 
+ 	work_done = xenvif_tx_submit(queue);
+ 
+diff --git a/drivers/scsi/qla2xxx/qla_tmpl.c b/drivers/scsi/qla2xxx/qla_tmpl.c
+index c3e6225246045..74372aaf209de 100644
+--- a/drivers/scsi/qla2xxx/qla_tmpl.c
++++ b/drivers/scsi/qla2xxx/qla_tmpl.c
+@@ -871,7 +871,8 @@ qla27xx_template_checksum(void *p, ulong size)
+ static inline int
+ qla27xx_verify_template_checksum(struct qla27xx_fwdt_template *tmp)
+ {
+-	return qla27xx_template_checksum(tmp, tmp->template_size) == 0;
++	return qla27xx_template_checksum(tmp,
++		le32_to_cpu(tmp->template_size)) == 0;
+ }
+ 
+ static inline int
+@@ -887,7 +888,7 @@ qla27xx_execute_fwdt_template(struct scsi_qla_host *vha)
+ 	ulong len;
+ 
+ 	if (qla27xx_fwdt_template_valid(tmp)) {
+-		len = tmp->template_size;
++		len = le32_to_cpu(tmp->template_size);
+ 		tmp = memcpy(vha->hw->fw_dump, tmp, len);
+ 		ql27xx_edit_template(vha, tmp);
+ 		qla27xx_walk_template(vha, tmp, tmp, &len);
+@@ -903,7 +904,7 @@ qla27xx_fwdt_calculate_dump_size(struct scsi_qla_host *vha)
+ 	ulong len = 0;
+ 
+ 	if (qla27xx_fwdt_template_valid(tmp)) {
+-		len = tmp->template_size;
++		len = le32_to_cpu(tmp->template_size);
+ 		qla27xx_walk_template(vha, tmp, NULL, &len);
+ 	}
+ 
+@@ -915,7 +916,7 @@ qla27xx_fwdt_template_size(void *p)
+ {
+ 	struct qla27xx_fwdt_template *tmp = p;
+ 
+-	return tmp->template_size;
++	return le32_to_cpu(tmp->template_size);
+ }
+ 
+ ulong
+diff --git a/drivers/scsi/qla2xxx/qla_tmpl.h b/drivers/scsi/qla2xxx/qla_tmpl.h
+index 141c1c5e73f42..2d3e1a8349b3b 100644
+--- a/drivers/scsi/qla2xxx/qla_tmpl.h
++++ b/drivers/scsi/qla2xxx/qla_tmpl.h
+@@ -13,7 +13,7 @@
+ struct __packed qla27xx_fwdt_template {
+ 	uint32_t template_type;
+ 	uint32_t entry_offset;
+-	uint32_t template_size;
++	__le32 template_size;
+ 	uint32_t reserved_1;
+ 
+ 	uint32_t entry_count;
+diff --git a/drivers/usb/dwc3/ulpi.c b/drivers/usb/dwc3/ulpi.c
+index ec004c6d76f23..44f1a496633ca 100644
+--- a/drivers/usb/dwc3/ulpi.c
++++ b/drivers/usb/dwc3/ulpi.c
+@@ -10,6 +10,8 @@
+  * published by the Free Software Foundation.
+  */
+ 
++#include <linux/delay.h>
++#include <linux/time64.h>
+ #include <linux/ulpi/regs.h>
+ 
+ #include "core.h"
+@@ -20,12 +22,22 @@
+ 		DWC3_GUSB2PHYACC_ADDR(ULPI_ACCESS_EXTENDED) | \
+ 		DWC3_GUSB2PHYACC_EXTEND_ADDR(a) : DWC3_GUSB2PHYACC_ADDR(a))
+ 
+-static int dwc3_ulpi_busyloop(struct dwc3 *dwc)
++#define DWC3_ULPI_BASE_DELAY	DIV_ROUND_UP(NSEC_PER_SEC, 60000000L)
++
++static int dwc3_ulpi_busyloop(struct dwc3 *dwc, u8 addr, bool read)
+ {
+-	unsigned count = 1000;
++	unsigned long ns = 5L * DWC3_ULPI_BASE_DELAY;
++	unsigned int count = 1000;
+ 	u32 reg;
+ 
++	if (addr >= ULPI_EXT_VENDOR_SPECIFIC)
++		ns += DWC3_ULPI_BASE_DELAY;
++
++	if (read)
++		ns += DWC3_ULPI_BASE_DELAY;
++
+ 	while (count--) {
++		ndelay(ns);
+ 		reg = dwc3_readl(dwc->regs, DWC3_GUSB2PHYACC(0));
+ 		if (!(reg & DWC3_GUSB2PHYACC_BUSY))
+ 			return 0;
+@@ -44,7 +56,7 @@ static int dwc3_ulpi_read(struct ulpi_ops *ops, u8 addr)
+ 	reg = DWC3_GUSB2PHYACC_NEWREGREQ | DWC3_ULPI_ADDR(addr);
+ 	dwc3_writel(dwc->regs, DWC3_GUSB2PHYACC(0), reg);
+ 
+-	ret = dwc3_ulpi_busyloop(dwc);
++	ret = dwc3_ulpi_busyloop(dwc, addr, true);
+ 	if (ret)
+ 		return ret;
+ 
+@@ -62,7 +74,7 @@ static int dwc3_ulpi_write(struct ulpi_ops *ops, u8 addr, u8 val)
+ 	reg |= DWC3_GUSB2PHYACC_WRITE | val;
+ 	dwc3_writel(dwc->regs, DWC3_GUSB2PHYACC(0), reg);
+ 
+-	return dwc3_ulpi_busyloop(dwc);
++	return dwc3_ulpi_busyloop(dwc, addr, false);
+ }
+ 
+ static struct ulpi_ops dwc3_ulpi_ops = {
+diff --git a/drivers/xen/gntdev.c b/drivers/xen/gntdev.c
+index 1865bcfa869bf..6f077ae0cf315 100644
+--- a/drivers/xen/gntdev.c
++++ b/drivers/xen/gntdev.c
+@@ -293,36 +293,47 @@ static int map_grant_pages(struct grant_map *map)
+ 		 * to the kernel linear addresses of the struct pages.
+ 		 * These ptes are completely different from the user ptes dealt
+ 		 * with find_grant_ptes.
++		 * Note that GNTMAP_device_map isn't needed here: The
++		 * dev_bus_addr output field gets consumed only from ->map_ops,
++		 * and by not requesting it when mapping we also avoid needing
++		 * to mirror dev_bus_addr into ->unmap_ops (and holding an extra
++		 * reference to the page in the hypervisor).
+ 		 */
++		unsigned int flags = (map->flags & ~GNTMAP_device_map) |
++				     GNTMAP_host_map;
++
+ 		for (i = 0; i < map->count; i++) {
+ 			unsigned long address = (unsigned long)
+ 				pfn_to_kaddr(page_to_pfn(map->pages[i]));
+ 			BUG_ON(PageHighMem(map->pages[i]));
+ 
+-			gnttab_set_map_op(&map->kmap_ops[i], address,
+-				map->flags | GNTMAP_host_map,
++			gnttab_set_map_op(&map->kmap_ops[i], address, flags,
+ 				map->grants[i].ref,
+ 				map->grants[i].domid);
+ 			gnttab_set_unmap_op(&map->kunmap_ops[i], address,
+-				map->flags | GNTMAP_host_map, -1);
++				flags, -1);
+ 		}
+ 	}
+ 
+ 	pr_debug("map %d+%d\n", map->index, map->count);
+ 	err = gnttab_map_refs(map->map_ops, use_ptemod ? map->kmap_ops : NULL,
+ 			map->pages, map->count);
+-	if (err)
+-		return err;
+ 
+ 	for (i = 0; i < map->count; i++) {
+-		if (map->map_ops[i].status) {
++		if (map->map_ops[i].status == GNTST_okay)
++			map->unmap_ops[i].handle = map->map_ops[i].handle;
++		else if (!err)
+ 			err = -EINVAL;
+-			continue;
+-		}
+ 
+-		map->unmap_ops[i].handle = map->map_ops[i].handle;
+-		if (use_ptemod)
+-			map->kunmap_ops[i].handle = map->kmap_ops[i].handle;
++		if (map->flags & GNTMAP_device_map)
++			map->unmap_ops[i].dev_bus_addr = map->map_ops[i].dev_bus_addr;
++
++		if (use_ptemod) {
++			if (map->kmap_ops[i].status == GNTST_okay)
++				map->kunmap_ops[i].handle = map->kmap_ops[i].handle;
++			else if (!err)
++				err = -EINVAL;
++		}
+ 	}
+ 	return err;
+ }
+diff --git a/drivers/xen/xen-scsiback.c b/drivers/xen/xen-scsiback.c
+index 29a1b8054a4dc..7fb5a2e7fa810 100644
+--- a/drivers/xen/xen-scsiback.c
++++ b/drivers/xen/xen-scsiback.c
+@@ -415,12 +415,12 @@ static int scsiback_gnttab_data_map_batch(struct gnttab_map_grant_ref *map,
+ 		return 0;
+ 
+ 	err = gnttab_map_refs(map, NULL, pg, cnt);
+-	BUG_ON(err);
+ 	for (i = 0; i < cnt; i++) {
+ 		if (unlikely(map[i].status != GNTST_okay)) {
+ 			pr_err("invalid buffer -- could not remap it\n");
+ 			map[i].handle = SCSIBACK_INVALID_HANDLE;
+-			err = -ENOMEM;
++			if (!err)
++				err = -ENOMEM;
+ 		} else {
+ 			get_page(pg[i]);
+ 		}
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index 66a9c9dab8316..7f068330edb67 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -1929,7 +1929,7 @@ void wb_workfn(struct work_struct *work)
+ 						struct bdi_writeback, dwork);
+ 	long pages_written;
+ 
+-	set_worker_desc("flush-%s", dev_name(wb->bdi->dev));
++	set_worker_desc("flush-%s", bdi_dev_name(wb->bdi));
+ 	current->flags |= PF_SWAPWRITE;
+ 
+ 	if (likely(!current_is_workqueue_rescuer() ||
+diff --git a/fs/squashfs/export.c b/fs/squashfs/export.c
+index 8073b6532cf04..d2a806416c3ab 100644
+--- a/fs/squashfs/export.c
++++ b/fs/squashfs/export.c
+@@ -54,12 +54,17 @@ static long long squashfs_inode_lookup(struct super_block *sb, int ino_num)
+ 	struct squashfs_sb_info *msblk = sb->s_fs_info;
+ 	int blk = SQUASHFS_LOOKUP_BLOCK(ino_num - 1);
+ 	int offset = SQUASHFS_LOOKUP_BLOCK_OFFSET(ino_num - 1);
+-	u64 start = le64_to_cpu(msblk->inode_lookup_table[blk]);
++	u64 start;
+ 	__le64 ino;
+ 	int err;
+ 
+ 	TRACE("Entered squashfs_inode_lookup, inode_number = %d\n", ino_num);
+ 
++	if (ino_num == 0 || (ino_num - 1) >= msblk->inodes)
++		return -EINVAL;
++
++	start = le64_to_cpu(msblk->inode_lookup_table[blk]);
++
+ 	err = squashfs_read_metadata(sb, &ino, &start, &offset, sizeof(ino));
+ 	if (err < 0)
+ 		return err;
+@@ -124,7 +129,10 @@ __le64 *squashfs_read_inode_lookup_table(struct super_block *sb,
+ 		u64 lookup_table_start, u64 next_table, unsigned int inodes)
+ {
+ 	unsigned int length = SQUASHFS_LOOKUP_BLOCK_BYTES(inodes);
++	unsigned int indexes = SQUASHFS_LOOKUP_BLOCKS(inodes);
++	int n;
+ 	__le64 *table;
++	u64 start, end;
+ 
+ 	TRACE("In read_inode_lookup_table, length %d\n", length);
+ 
+@@ -134,20 +142,37 @@ __le64 *squashfs_read_inode_lookup_table(struct super_block *sb,
+ 	if (inodes == 0)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	/* length bytes should not extend into the next table - this check
+-	 * also traps instances where lookup_table_start is incorrectly larger
+-	 * than the next table start
++	/*
++	 * The computed size of the lookup table (length bytes) should exactly
++	 * match the table start and end points
+ 	 */
+-	if (lookup_table_start + length > next_table)
++	if (length != (next_table - lookup_table_start))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	table = squashfs_read_table(sb, lookup_table_start, length);
++	if (IS_ERR(table))
++		return table;
+ 
+ 	/*
+-	 * table[0] points to the first inode lookup table metadata block,
+-	 * this should be less than lookup_table_start
++	 * table0], table[1], ... table[indexes - 1] store the locations
++	 * of the compressed inode lookup blocks.  Each entry should be
++	 * less than the next (i.e. table[0] < table[1]), and the difference
++	 * between them should be SQUASHFS_METADATA_SIZE or less.
++	 * table[indexes - 1] should  be less than lookup_table_start, and
++	 * again the difference should be SQUASHFS_METADATA_SIZE or less
+ 	 */
+-	if (!IS_ERR(table) && le64_to_cpu(table[0]) >= lookup_table_start) {
++	for (n = 0; n < (indexes - 1); n++) {
++		start = le64_to_cpu(table[n]);
++		end = le64_to_cpu(table[n + 1]);
++
++		if (start >= end || (end - start) > SQUASHFS_METADATA_SIZE) {
++			kfree(table);
++			return ERR_PTR(-EINVAL);
++		}
++	}
++
++	start = le64_to_cpu(table[indexes - 1]);
++	if (start >= lookup_table_start || (lookup_table_start - start) > SQUASHFS_METADATA_SIZE) {
+ 		kfree(table);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+diff --git a/fs/squashfs/id.c b/fs/squashfs/id.c
+index d38ea3dab9515..8ccc0e3f6ea5a 100644
+--- a/fs/squashfs/id.c
++++ b/fs/squashfs/id.c
+@@ -48,10 +48,15 @@ int squashfs_get_id(struct super_block *sb, unsigned int index,
+ 	struct squashfs_sb_info *msblk = sb->s_fs_info;
+ 	int block = SQUASHFS_ID_BLOCK(index);
+ 	int offset = SQUASHFS_ID_BLOCK_OFFSET(index);
+-	u64 start_block = le64_to_cpu(msblk->id_table[block]);
++	u64 start_block;
+ 	__le32 disk_id;
+ 	int err;
+ 
++	if (index >= msblk->ids)
++		return -EINVAL;
++
++	start_block = le64_to_cpu(msblk->id_table[block]);
++
+ 	err = squashfs_read_metadata(sb, &disk_id, &start_block, &offset,
+ 							sizeof(disk_id));
+ 	if (err < 0)
+@@ -69,7 +74,10 @@ __le64 *squashfs_read_id_index_table(struct super_block *sb,
+ 		u64 id_table_start, u64 next_table, unsigned short no_ids)
+ {
+ 	unsigned int length = SQUASHFS_ID_BLOCK_BYTES(no_ids);
++	unsigned int indexes = SQUASHFS_ID_BLOCKS(no_ids);
++	int n;
+ 	__le64 *table;
++	u64 start, end;
+ 
+ 	TRACE("In read_id_index_table, length %d\n", length);
+ 
+@@ -80,20 +88,36 @@ __le64 *squashfs_read_id_index_table(struct super_block *sb,
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	/*
+-	 * length bytes should not extend into the next table - this check
+-	 * also traps instances where id_table_start is incorrectly larger
+-	 * than the next table start
++	 * The computed size of the index table (length bytes) should exactly
++	 * match the table start and end points
+ 	 */
+-	if (id_table_start + length > next_table)
++	if (length != (next_table - id_table_start))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	table = squashfs_read_table(sb, id_table_start, length);
++	if (IS_ERR(table))
++		return table;
+ 
+ 	/*
+-	 * table[0] points to the first id lookup table metadata block, this
+-	 * should be less than id_table_start
++	 * table[0], table[1], ... table[indexes - 1] store the locations
++	 * of the compressed id blocks.   Each entry should be less than
++	 * the next (i.e. table[0] < table[1]), and the difference between them
++	 * should be SQUASHFS_METADATA_SIZE or less.  table[indexes - 1]
++	 * should be less than id_table_start, and again the difference
++	 * should be SQUASHFS_METADATA_SIZE or less
+ 	 */
+-	if (!IS_ERR(table) && le64_to_cpu(table[0]) >= id_table_start) {
++	for (n = 0; n < (indexes - 1); n++) {
++		start = le64_to_cpu(table[n]);
++		end = le64_to_cpu(table[n + 1]);
++
++		if (start >= end || (end - start) > SQUASHFS_METADATA_SIZE) {
++			kfree(table);
++			return ERR_PTR(-EINVAL);
++		}
++	}
++
++	start = le64_to_cpu(table[indexes - 1]);
++	if (start >= id_table_start || (id_table_start - start) > SQUASHFS_METADATA_SIZE) {
+ 		kfree(table);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+diff --git a/fs/squashfs/squashfs_fs_sb.h b/fs/squashfs/squashfs_fs_sb.h
+index ef69c31947bf8..5234c19a0eabc 100644
+--- a/fs/squashfs/squashfs_fs_sb.h
++++ b/fs/squashfs/squashfs_fs_sb.h
+@@ -77,5 +77,6 @@ struct squashfs_sb_info {
+ 	unsigned int				inodes;
+ 	unsigned int				fragments;
+ 	int					xattr_ids;
++	unsigned int				ids;
+ };
+ #endif
+diff --git a/fs/squashfs/super.c b/fs/squashfs/super.c
+index 93aa3e23c845b..44500dcf1805b 100644
+--- a/fs/squashfs/super.c
++++ b/fs/squashfs/super.c
+@@ -177,6 +177,7 @@ static int squashfs_fill_super(struct super_block *sb, void *data, int silent)
+ 	msblk->directory_table = le64_to_cpu(sblk->directory_table_start);
+ 	msblk->inodes = le32_to_cpu(sblk->inodes);
+ 	msblk->fragments = le32_to_cpu(sblk->fragments);
++	msblk->ids = le16_to_cpu(sblk->no_ids);
+ 	flags = le16_to_cpu(sblk->flags);
+ 
+ 	TRACE("Found valid superblock on %s\n", bdevname(sb->s_bdev, b));
+@@ -188,7 +189,7 @@ static int squashfs_fill_super(struct super_block *sb, void *data, int silent)
+ 	TRACE("Block size %d\n", msblk->block_size);
+ 	TRACE("Number of inodes %d\n", msblk->inodes);
+ 	TRACE("Number of fragments %d\n", msblk->fragments);
+-	TRACE("Number of ids %d\n", le16_to_cpu(sblk->no_ids));
++	TRACE("Number of ids %d\n", msblk->ids);
+ 	TRACE("sblk->inode_table_start %llx\n", msblk->inode_table);
+ 	TRACE("sblk->directory_table_start %llx\n", msblk->directory_table);
+ 	TRACE("sblk->fragment_table_start %llx\n",
+@@ -245,8 +246,7 @@ static int squashfs_fill_super(struct super_block *sb, void *data, int silent)
+ allocate_id_index_table:
+ 	/* Allocate and read id index table */
+ 	msblk->id_table = squashfs_read_id_index_table(sb,
+-		le64_to_cpu(sblk->id_table_start), next_table,
+-		le16_to_cpu(sblk->no_ids));
++		le64_to_cpu(sblk->id_table_start), next_table, msblk->ids);
+ 	if (IS_ERR(msblk->id_table)) {
+ 		ERROR("unable to read id index table\n");
+ 		err = PTR_ERR(msblk->id_table);
+diff --git a/fs/squashfs/xattr.h b/fs/squashfs/xattr.h
+index c83f5d9ec125c..30b3aaa08b628 100644
+--- a/fs/squashfs/xattr.h
++++ b/fs/squashfs/xattr.h
+@@ -30,8 +30,16 @@ extern int squashfs_xattr_lookup(struct super_block *, unsigned int, int *,
+ static inline __le64 *squashfs_read_xattr_id_table(struct super_block *sb,
+ 		u64 start, u64 *xattr_table_start, int *xattr_ids)
+ {
++	struct squashfs_xattr_id_table *id_table;
++
++	id_table = squashfs_read_table(sb, start, sizeof(*id_table));
++	if (IS_ERR(id_table))
++		return (__le64 *) id_table;
++
++	*xattr_table_start = le64_to_cpu(id_table->xattr_table_start);
++	kfree(id_table);
++
+ 	ERROR("Xattrs in filesystem, these will be ignored\n");
+-	*xattr_table_start = start;
+ 	return ERR_PTR(-ENOTSUPP);
+ }
+ 
+diff --git a/fs/squashfs/xattr_id.c b/fs/squashfs/xattr_id.c
+index c89607d690c48..3a655d879600c 100644
+--- a/fs/squashfs/xattr_id.c
++++ b/fs/squashfs/xattr_id.c
+@@ -44,10 +44,15 @@ int squashfs_xattr_lookup(struct super_block *sb, unsigned int index,
+ 	struct squashfs_sb_info *msblk = sb->s_fs_info;
+ 	int block = SQUASHFS_XATTR_BLOCK(index);
+ 	int offset = SQUASHFS_XATTR_BLOCK_OFFSET(index);
+-	u64 start_block = le64_to_cpu(msblk->xattr_id_table[block]);
++	u64 start_block;
+ 	struct squashfs_xattr_id id;
+ 	int err;
+ 
++	if (index >= msblk->xattr_ids)
++		return -EINVAL;
++
++	start_block = le64_to_cpu(msblk->xattr_id_table[block]);
++
+ 	err = squashfs_read_metadata(sb, &id, &start_block, &offset,
+ 							sizeof(id));
+ 	if (err < 0)
+@@ -63,13 +68,17 @@ int squashfs_xattr_lookup(struct super_block *sb, unsigned int index,
+ /*
+  * Read uncompressed xattr id lookup table indexes from disk into memory
+  */
+-__le64 *squashfs_read_xattr_id_table(struct super_block *sb, u64 start,
++__le64 *squashfs_read_xattr_id_table(struct super_block *sb, u64 table_start,
+ 		u64 *xattr_table_start, int *xattr_ids)
+ {
+-	unsigned int len;
++	struct squashfs_sb_info *msblk = sb->s_fs_info;
++	unsigned int len, indexes;
+ 	struct squashfs_xattr_id_table *id_table;
++	__le64 *table;
++	u64 start, end;
++	int n;
+ 
+-	id_table = squashfs_read_table(sb, start, sizeof(*id_table));
++	id_table = squashfs_read_table(sb, table_start, sizeof(*id_table));
+ 	if (IS_ERR(id_table))
+ 		return (__le64 *) id_table;
+ 
+@@ -83,13 +92,52 @@ __le64 *squashfs_read_xattr_id_table(struct super_block *sb, u64 start,
+ 	if (*xattr_ids == 0)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	/* xattr_table should be less than start */
+-	if (*xattr_table_start >= start)
++	len = SQUASHFS_XATTR_BLOCK_BYTES(*xattr_ids);
++	indexes = SQUASHFS_XATTR_BLOCKS(*xattr_ids);
++
++	/*
++	 * The computed size of the index table (len bytes) should exactly
++	 * match the table start and end points
++	 */
++	start = table_start + sizeof(*id_table);
++	end = msblk->bytes_used;
++
++	if (len != (end - start))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	len = SQUASHFS_XATTR_BLOCK_BYTES(*xattr_ids);
++	table = squashfs_read_table(sb, start, len);
++	if (IS_ERR(table))
++		return table;
++
++	/* table[0], table[1], ... table[indexes - 1] store the locations
++	 * of the compressed xattr id blocks.  Each entry should be less than
++	 * the next (i.e. table[0] < table[1]), and the difference between them
++	 * should be SQUASHFS_METADATA_SIZE or less.  table[indexes - 1]
++	 * should be less than table_start, and again the difference
++	 * shouls be SQUASHFS_METADATA_SIZE or less.
++	 *
++	 * Finally xattr_table_start should be less than table[0].
++	 */
++	for (n = 0; n < (indexes - 1); n++) {
++		start = le64_to_cpu(table[n]);
++		end = le64_to_cpu(table[n + 1]);
++
++		if (start >= end || (end - start) > SQUASHFS_METADATA_SIZE) {
++			kfree(table);
++			return ERR_PTR(-EINVAL);
++		}
++	}
++
++	start = le64_to_cpu(table[indexes - 1]);
++	if (start >= table_start || (table_start - start) > SQUASHFS_METADATA_SIZE) {
++		kfree(table);
++		return ERR_PTR(-EINVAL);
++	}
+ 
+-	TRACE("In read_xattr_index_table, length %d\n", len);
++	if (*xattr_table_start >= le64_to_cpu(table[0])) {
++		kfree(table);
++		return ERR_PTR(-EINVAL);
++	}
+ 
+-	return squashfs_read_table(sb, start + sizeof(*id_table), len);
++	return table;
+ }
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index 361274ce5815f..883ce03191e76 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -12,6 +12,7 @@
+ #include <linux/fs.h>
+ #include <linux/sched.h>
+ #include <linux/blkdev.h>
++#include <linux/device.h>
+ #include <linux/writeback.h>
+ #include <linux/blk-cgroup.h>
+ #include <linux/backing-dev-defs.h>
+@@ -518,4 +519,13 @@ static inline int bdi_rw_congested(struct backing_dev_info *bdi)
+ 				  (1 << WB_async_congested));
+ }
+ 
++extern const char *bdi_unknown_name;
++
++static inline const char *bdi_dev_name(struct backing_dev_info *bdi)
++{
++	if (!bdi || !bdi->dev)
++		return bdi_unknown_name;
++	return dev_name(bdi->dev);
++}
++
+ #endif	/* _LINUX_BACKING_DEV_H */
+diff --git a/include/linux/ftrace.h b/include/linux/ftrace.h
+index 60048c50404ee..0603b12180056 100644
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@ -747,7 +747,9 @@ typedef int (*trace_func_graph_ent_t)(struct ftrace_graph_ent *); /* entry */
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+ 
+ /* for init task */
+-#define INIT_FTRACE_GRAPH		.ret_stack = NULL,
++#define INIT_FTRACE_GRAPH				\
++	.ret_stack		= NULL,			\
++	.tracing_graph_pause	= ATOMIC_INIT(0),
+ 
+ /*
+  * Stack of return addresses for functions
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index c1a42027ee0ee..401a404b64b93 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3428,6 +3428,7 @@ static inline void netif_tx_disable(struct net_device *dev)
+ 
+ 	local_bh_disable();
+ 	cpu = smp_processor_id();
++	spin_lock(&dev->tx_global_lock);
+ 	for (i = 0; i < dev->num_tx_queues; i++) {
+ 		struct netdev_queue *txq = netdev_get_tx_queue(dev, i);
+ 
+@@ -3435,6 +3436,7 @@ static inline void netif_tx_disable(struct net_device *dev)
+ 		netif_tx_stop_queue(txq);
+ 		__netif_tx_unlock(txq);
+ 	}
++	spin_unlock(&dev->tx_global_lock);
+ 	local_bh_enable();
+ }
+ 
+diff --git a/include/linux/string.h b/include/linux/string.h
+index 870268d42ae7d..7da409760cf18 100644
+--- a/include/linux/string.h
++++ b/include/linux/string.h
+@@ -28,6 +28,10 @@ size_t strlcpy(char *, const char *, size_t);
+ #ifndef __HAVE_ARCH_STRSCPY
+ ssize_t strscpy(char *, const char *, size_t);
+ #endif
++
++/* Wraps calls to strscpy()/memset(), no arch specific code required */
++ssize_t strscpy_pad(char *dest, const char *src, size_t count);
++
+ #ifndef __HAVE_ARCH_STRCAT
+ extern char * strcat(char *, const char *);
+ #endif
+diff --git a/include/linux/sunrpc/xdr.h b/include/linux/sunrpc/xdr.h
+index 70c6b92e15a7c..8def5e0a491fa 100644
+--- a/include/linux/sunrpc/xdr.h
++++ b/include/linux/sunrpc/xdr.h
+@@ -23,8 +23,7 @@
+ #define XDR_QUADLEN(l)		(((l) + 3) >> 2)
+ 
+ /*
+- * Generic opaque `network object.' At the kernel level, this type
+- * is used only by lockd.
++ * Generic opaque `network object.'
+  */
+ #define XDR_MAX_NETOBJ		1024
+ struct xdr_netobj {
+diff --git a/include/trace/events/writeback.h b/include/trace/events/writeback.h
+index 2609b1c3549e2..d01217407d6d8 100644
+--- a/include/trace/events/writeback.h
++++ b/include/trace/events/writeback.h
+@@ -65,8 +65,9 @@ TRACE_EVENT(writeback_dirty_page,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-			mapping ? dev_name(inode_to_bdi(mapping->host)->dev) : "(unknown)", 32);
++		strscpy_pad(__entry->name,
++			    bdi_dev_name(mapping ? inode_to_bdi(mapping->host) :
++					 NULL), 32);
+ 		__entry->ino = mapping ? mapping->host->i_ino : 0;
+ 		__entry->index = page->index;
+ 	),
+@@ -95,8 +96,7 @@ DECLARE_EVENT_CLASS(writeback_dirty_inode_template,
+ 		struct backing_dev_info *bdi = inode_to_bdi(inode);
+ 
+ 		/* may be called for files on pseudo FSes w/ unregistered bdi */
+-		strncpy(__entry->name,
+-			bdi->dev ? dev_name(bdi->dev) : "(unknown)", 32);
++		strscpy_pad(__entry->name, bdi_dev_name(bdi), 32);
+ 		__entry->ino		= inode->i_ino;
+ 		__entry->state		= inode->i_state;
+ 		__entry->flags		= flags;
+@@ -205,8 +205,8 @@ DECLARE_EVENT_CLASS(writeback_write_inode_template,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-			dev_name(inode_to_bdi(inode)->dev), 32);
++		strscpy_pad(__entry->name,
++			    bdi_dev_name(inode_to_bdi(inode)), 32);
+ 		__entry->ino		= inode->i_ino;
+ 		__entry->sync_mode	= wbc->sync_mode;
+ 		__trace_wbc_assign_cgroup(__get_str(cgroup), wbc);
+@@ -249,8 +249,7 @@ DECLARE_EVENT_CLASS(writeback_work_class,
+ 		__dynamic_array(char, cgroup, __trace_wb_cgroup_size(wb))
+ 	),
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-			wb->bdi->dev ? dev_name(wb->bdi->dev) : "(unknown)", 32);
++		strscpy_pad(__entry->name, bdi_dev_name(wb->bdi), 32);
+ 		__entry->nr_pages = work->nr_pages;
+ 		__entry->sb_dev = work->sb ? work->sb->s_dev : 0;
+ 		__entry->sync_mode = work->sync_mode;
+@@ -303,7 +302,7 @@ DECLARE_EVENT_CLASS(writeback_class,
+ 		__dynamic_array(char, cgroup, __trace_wb_cgroup_size(wb))
+ 	),
+ 	TP_fast_assign(
+-		strncpy(__entry->name, dev_name(wb->bdi->dev), 32);
++		strscpy_pad(__entry->name, bdi_dev_name(wb->bdi), 32);
+ 		__trace_wb_assign_cgroup(__get_str(cgroup), wb);
+ 	),
+ 	TP_printk("bdi %s: cgroup=%s",
+@@ -326,7 +325,7 @@ TRACE_EVENT(writeback_bdi_register,
+ 		__array(char, name, 32)
+ 	),
+ 	TP_fast_assign(
+-		strncpy(__entry->name, dev_name(bdi->dev), 32);
++		strscpy_pad(__entry->name, bdi_dev_name(bdi), 32);
+ 	),
+ 	TP_printk("bdi %s",
+ 		__entry->name
+@@ -351,7 +350,7 @@ DECLARE_EVENT_CLASS(wbc_class,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name, dev_name(bdi->dev), 32);
++		strscpy_pad(__entry->name, bdi_dev_name(bdi), 32);
+ 		__entry->nr_to_write	= wbc->nr_to_write;
+ 		__entry->pages_skipped	= wbc->pages_skipped;
+ 		__entry->sync_mode	= wbc->sync_mode;
+@@ -402,7 +401,7 @@ TRACE_EVENT(writeback_queue_io,
+ 		__dynamic_array(char, cgroup, __trace_wb_cgroup_size(wb))
+ 	),
+ 	TP_fast_assign(
+-		strncpy(__entry->name, dev_name(wb->bdi->dev), 32);
++		strscpy_pad(__entry->name, bdi_dev_name(wb->bdi), 32);
+ 		__entry->older	= dirtied_before;
+ 		__entry->age	= (jiffies - dirtied_before) * 1000 / HZ;
+ 		__entry->moved	= moved;
+@@ -487,7 +486,7 @@ TRACE_EVENT(bdi_dirty_ratelimit,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strlcpy(__entry->bdi, dev_name(wb->bdi->dev), 32);
++		strscpy_pad(__entry->bdi, bdi_dev_name(wb->bdi), 32);
+ 		__entry->write_bw	= KBps(wb->write_bandwidth);
+ 		__entry->avg_write_bw	= KBps(wb->avg_write_bandwidth);
+ 		__entry->dirty_rate	= KBps(dirty_rate);
+@@ -552,7 +551,7 @@ TRACE_EVENT(balance_dirty_pages,
+ 
+ 	TP_fast_assign(
+ 		unsigned long freerun = (thresh + bg_thresh) / 2;
+-		strlcpy(__entry->bdi, dev_name(wb->bdi->dev), 32);
++		strscpy_pad(__entry->bdi, bdi_dev_name(wb->bdi), 32);
+ 
+ 		__entry->limit		= global_wb_domain.dirty_limit;
+ 		__entry->setpoint	= (global_wb_domain.dirty_limit +
+@@ -613,8 +612,8 @@ TRACE_EVENT(writeback_sb_inodes_requeue,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-		        dev_name(inode_to_bdi(inode)->dev), 32);
++		strscpy_pad(__entry->name,
++			    bdi_dev_name(inode_to_bdi(inode)), 32);
+ 		__entry->ino		= inode->i_ino;
+ 		__entry->state		= inode->i_state;
+ 		__entry->dirtied_when	= inode->dirtied_when;
+@@ -687,8 +686,8 @@ DECLARE_EVENT_CLASS(writeback_single_inode_template,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-			dev_name(inode_to_bdi(inode)->dev), 32);
++		strscpy_pad(__entry->name,
++			    bdi_dev_name(inode_to_bdi(inode)), 32);
+ 		__entry->ino		= inode->i_ino;
+ 		__entry->state		= inode->i_state;
+ 		__entry->dirtied_when	= inode->dirtied_when;
+diff --git a/include/xen/grant_table.h b/include/xen/grant_table.h
+index 34b1379f9777d..f9d8aac170fbc 100644
+--- a/include/xen/grant_table.h
++++ b/include/xen/grant_table.h
+@@ -157,6 +157,7 @@ gnttab_set_map_op(struct gnttab_map_grant_ref *map, phys_addr_t addr,
+ 	map->flags = flags;
+ 	map->ref = ref;
+ 	map->dom = domid;
++	map->status = 1; /* arbitrary positive value */
+ }
+ 
+ static inline void
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index 89ed01911a9a2..b56b1daa0a59a 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -5708,7 +5708,6 @@ static int alloc_retstack_tasklist(struct ftrace_ret_stack **ret_stack_list)
+ 		}
+ 
+ 		if (t->ret_stack == NULL) {
+-			atomic_set(&t->tracing_graph_pause, 0);
+ 			atomic_set(&t->trace_overrun, 0);
+ 			t->curr_ret_stack = -1;
+ 			/* Make sure the tasks see the -1 first: */
+@@ -5920,7 +5919,6 @@ static DEFINE_PER_CPU(struct ftrace_ret_stack *, idle_ret_stack);
+ static void
+ graph_init_task(struct task_struct *t, struct ftrace_ret_stack *ret_stack)
+ {
+-	atomic_set(&t->tracing_graph_pause, 0);
+ 	atomic_set(&t->trace_overrun, 0);
+ 	t->ftrace_timestamp = 0;
+ 	/* make curr_ret_stack visible before we add the ret_stack */
+diff --git a/kernel/trace/trace_events.c b/kernel/trace/trace_events.c
+index 9d6e755d17546..b89e00c748f18 100644
+--- a/kernel/trace/trace_events.c
++++ b/kernel/trace/trace_events.c
+@@ -1083,7 +1083,8 @@ system_enable_read(struct file *filp, char __user *ubuf, size_t cnt,
+ 	mutex_lock(&event_mutex);
+ 	list_for_each_entry(file, &tr->events, list) {
+ 		call = file->event_call;
+-		if (!trace_event_name(call) || !call->class || !call->class->reg)
++		if ((call->flags & TRACE_EVENT_FL_IGNORE_ENABLE) ||
++		    !trace_event_name(call) || !call->class || !call->class->reg)
+ 			continue;
+ 
+ 		if (system && strcmp(call->class->system, system->name) != 0)
+diff --git a/lib/string.c b/lib/string.c
+index 7f4baad6fb193..4351ec43cd6b8 100644
+--- a/lib/string.c
++++ b/lib/string.c
+@@ -157,11 +157,9 @@ EXPORT_SYMBOL(strlcpy);
+  * @src: Where to copy the string from
+  * @count: Size of destination buffer
+  *
+- * Copy the string, or as much of it as fits, into the dest buffer.
+- * The routine returns the number of characters copied (not including
+- * the trailing NUL) or -E2BIG if the destination buffer wasn't big enough.
+- * The behavior is undefined if the string buffers overlap.
+- * The destination buffer is always NUL terminated, unless it's zero-sized.
++ * Copy the string, or as much of it as fits, into the dest buffer.  The
++ * behavior is undefined if the string buffers overlap.  The destination
++ * buffer is always NUL terminated, unless it's zero-sized.
+  *
+  * Preferred to strlcpy() since the API doesn't require reading memory
+  * from the src string beyond the specified "count" bytes, and since
+@@ -171,8 +169,10 @@ EXPORT_SYMBOL(strlcpy);
+  *
+  * Preferred to strncpy() since it always returns a valid string, and
+  * doesn't unnecessarily force the tail of the destination buffer to be
+- * zeroed.  If the zeroing is desired, it's likely cleaner to use strscpy()
+- * with an overflow test, then just memset() the tail of the dest buffer.
++ * zeroed.  If zeroing is desired please use strscpy_pad().
++ *
++ * Return: The number of characters copied (not including the trailing
++ *         %NUL) or -E2BIG if the destination buffer wasn't big enough.
+  */
+ ssize_t strscpy(char *dest, const char *src, size_t count)
+ {
+@@ -259,6 +259,39 @@ char *stpcpy(char *__restrict__ dest, const char *__restrict__ src)
+ }
+ EXPORT_SYMBOL(stpcpy);
+ 
++/**
++ * strscpy_pad() - Copy a C-string into a sized buffer
++ * @dest: Where to copy the string to
++ * @src: Where to copy the string from
++ * @count: Size of destination buffer
++ *
++ * Copy the string, or as much of it as fits, into the dest buffer.  The
++ * behavior is undefined if the string buffers overlap.  The destination
++ * buffer is always %NUL terminated, unless it's zero-sized.
++ *
++ * If the source string is shorter than the destination buffer, zeros
++ * the tail of the destination buffer.
++ *
++ * For full explanation of why you may want to consider using the
++ * 'strscpy' functions please see the function docstring for strscpy().
++ *
++ * Return: The number of characters copied (not including the trailing
++ *         %NUL) or -E2BIG if the destination buffer wasn't big enough.
++ */
++ssize_t strscpy_pad(char *dest, const char *src, size_t count)
++{
++	ssize_t written;
++
++	written = strscpy(dest, src, count);
++	if (written < 0 || written == count - 1)
++		return written;
++
++	memset(dest + written + 1, 0, count - written - 1);
++
++	return written;
++}
++EXPORT_SYMBOL(strscpy_pad);
++
+ #ifndef __HAVE_ARCH_STRCAT
+ /**
+  * strcat - Append one %NUL-terminated string to another
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index 07e3b3b8e8469..f705c58b320b8 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -21,6 +21,7 @@ struct backing_dev_info noop_backing_dev_info = {
+ EXPORT_SYMBOL_GPL(noop_backing_dev_info);
+ 
+ static struct class *bdi_class;
++const char *bdi_unknown_name = "(unknown)";
+ 
+ /*
+  * bdi_lock protects updates to bdi_list. bdi_list has RCU reader side
+diff --git a/mm/memblock.c b/mm/memblock.c
+index f8fab45bfdb75..ff51a37eb86be 100644
+--- a/mm/memblock.c
++++ b/mm/memblock.c
+@@ -189,14 +189,6 @@ __memblock_find_range_top_down(phys_addr_t start, phys_addr_t end,
+  *
+  * Find @size free area aligned to @align in the specified range and node.
+  *
+- * When allocation direction is bottom-up, the @start should be greater
+- * than the end of the kernel image. Otherwise, it will be trimmed. The
+- * reason is that we want the bottom-up allocation just near the kernel
+- * image so it is highly likely that the allocated memory and the kernel
+- * will reside in the same node.
+- *
+- * If bottom-up allocation failed, will try to allocate memory top-down.
+- *
+  * RETURNS:
+  * Found address on success, 0 on failure.
+  */
+@@ -204,8 +196,6 @@ phys_addr_t __init_memblock memblock_find_in_range_node(phys_addr_t size,
+ 					phys_addr_t align, phys_addr_t start,
+ 					phys_addr_t end, int nid, ulong flags)
+ {
+-	phys_addr_t kernel_end, ret;
+-
+ 	/* pump up @end */
+ 	if (end == MEMBLOCK_ALLOC_ACCESSIBLE)
+ 		end = memblock.current_limit;
+@@ -213,40 +203,13 @@ phys_addr_t __init_memblock memblock_find_in_range_node(phys_addr_t size,
+ 	/* avoid allocating the first page */
+ 	start = max_t(phys_addr_t, start, PAGE_SIZE);
+ 	end = max(start, end);
+-	kernel_end = __pa_symbol(_end);
+-
+-	/*
+-	 * try bottom-up allocation only when bottom-up mode
+-	 * is set and @end is above the kernel image.
+-	 */
+-	if (memblock_bottom_up() && end > kernel_end) {
+-		phys_addr_t bottom_up_start;
+-
+-		/* make sure we will allocate above the kernel */
+-		bottom_up_start = max(start, kernel_end);
+ 
+-		/* ok, try bottom-up allocation first */
+-		ret = __memblock_find_range_bottom_up(bottom_up_start, end,
+-						      size, align, nid, flags);
+-		if (ret)
+-			return ret;
+-
+-		/*
+-		 * we always limit bottom-up allocation above the kernel,
+-		 * but top-down allocation doesn't have the limit, so
+-		 * retrying top-down allocation may succeed when bottom-up
+-		 * allocation failed.
+-		 *
+-		 * bottom-up allocation is expected to be fail very rarely,
+-		 * so we use WARN_ONCE() here to see the stack trace if
+-		 * fail happens.
+-		 */
+-		WARN_ONCE(1, "memblock: bottom-up allocation failed, "
+-			     "memory hotunplug may be affected\n");
+-	}
+-
+-	return __memblock_find_range_top_down(start, end, size, align, nid,
+-					      flags);
++	if (memblock_bottom_up())
++		return __memblock_find_range_bottom_up(start, end, size, align,
++						       nid, flags);
++	else
++		return __memblock_find_range_top_down(start, end, size, align,
++						      nid, flags);
+ }
+ 
+ /**
+diff --git a/net/key/af_key.c b/net/key/af_key.c
+index 76a008b1cbe5f..adc93329e6aac 100644
+--- a/net/key/af_key.c
++++ b/net/key/af_key.c
+@@ -2933,7 +2933,7 @@ static int count_ah_combs(const struct xfrm_tmpl *t)
+ 			break;
+ 		if (!aalg->pfkey_supported)
+ 			continue;
+-		if (aalg_tmpl_set(t, aalg) && aalg->available)
++		if (aalg_tmpl_set(t, aalg))
+ 			sz += sizeof(struct sadb_comb);
+ 	}
+ 	return sz + sizeof(struct sadb_prop);
+@@ -2951,7 +2951,7 @@ static int count_esp_combs(const struct xfrm_tmpl *t)
+ 		if (!ealg->pfkey_supported)
+ 			continue;
+ 
+-		if (!(ealg_tmpl_set(t, ealg) && ealg->available))
++		if (!(ealg_tmpl_set(t, ealg)))
+ 			continue;
+ 
+ 		for (k = 1; ; k++) {
+@@ -2962,7 +2962,7 @@ static int count_esp_combs(const struct xfrm_tmpl *t)
+ 			if (!aalg->pfkey_supported)
+ 				continue;
+ 
+-			if (aalg_tmpl_set(t, aalg) && aalg->available)
++			if (aalg_tmpl_set(t, aalg))
+ 				sz += sizeof(struct sadb_comb);
+ 		}
+ 	}
+diff --git a/net/netfilter/xt_recent.c b/net/netfilter/xt_recent.c
+index cd53b861a15c1..ffe673c6a2485 100644
+--- a/net/netfilter/xt_recent.c
++++ b/net/netfilter/xt_recent.c
+@@ -156,7 +156,8 @@ static void recent_entry_remove(struct recent_table *t, struct recent_entry *e)
+ /*
+  * Drop entries with timestamps older then 'time'.
+  */
+-static void recent_entry_reap(struct recent_table *t, unsigned long time)
++static void recent_entry_reap(struct recent_table *t, unsigned long time,
++			      struct recent_entry *working, bool update)
+ {
+ 	struct recent_entry *e;
+ 
+@@ -165,6 +166,12 @@ static void recent_entry_reap(struct recent_table *t, unsigned long time)
+ 	 */
+ 	e = list_entry(t->lru_list.next, struct recent_entry, lru_list);
+ 
++	/*
++	 * Do not reap the entry which are going to be updated.
++	 */
++	if (e == working && update)
++		return;
++
+ 	/*
+ 	 * The last time stamp is the most recent.
+ 	 */
+@@ -307,7 +314,8 @@ recent_mt(const struct sk_buff *skb, struct xt_action_param *par)
+ 
+ 		/* info->seconds must be non-zero */
+ 		if (info->check_set & XT_RECENT_REAP)
+-			recent_entry_reap(t, time);
++			recent_entry_reap(t, time, e,
++				info->check_set & XT_RECENT_UPDATE && ret);
+ 	}
+ 
+ 	if (info->check_set & XT_RECENT_SET ||
+diff --git a/net/sunrpc/auth_gss/auth_gss.c b/net/sunrpc/auth_gss/auth_gss.c
+index 62fca77bf3c70..7bde2976307ed 100644
+--- a/net/sunrpc/auth_gss/auth_gss.c
++++ b/net/sunrpc/auth_gss/auth_gss.c
+@@ -53,6 +53,7 @@
+ #include <asm/uaccess.h>
+ #include <linux/hashtable.h>
+ 
++#include "auth_gss_internal.h"
+ #include "../netns.h"
+ 
+ static const struct rpc_authops authgss_ops;
+@@ -147,35 +148,6 @@ gss_cred_set_ctx(struct rpc_cred *cred, struct gss_cl_ctx *ctx)
+ 	clear_bit(RPCAUTH_CRED_NEW, &cred->cr_flags);
+ }
+ 
+-static const void *
+-simple_get_bytes(const void *p, const void *end, void *res, size_t len)
+-{
+-	const void *q = (const void *)((const char *)p + len);
+-	if (unlikely(q > end || q < p))
+-		return ERR_PTR(-EFAULT);
+-	memcpy(res, p, len);
+-	return q;
+-}
+-
+-static inline const void *
+-simple_get_netobj(const void *p, const void *end, struct xdr_netobj *dest)
+-{
+-	const void *q;
+-	unsigned int len;
+-
+-	p = simple_get_bytes(p, end, &len, sizeof(len));
+-	if (IS_ERR(p))
+-		return p;
+-	q = (const void *)((const char *)p + len);
+-	if (unlikely(q > end || q < p))
+-		return ERR_PTR(-EFAULT);
+-	dest->data = kmemdup(p, len, GFP_NOFS);
+-	if (unlikely(dest->data == NULL))
+-		return ERR_PTR(-ENOMEM);
+-	dest->len = len;
+-	return q;
+-}
+-
+ static struct gss_cl_ctx *
+ gss_cred_get_ctx(struct rpc_cred *cred)
+ {
+diff --git a/net/sunrpc/auth_gss/auth_gss_internal.h b/net/sunrpc/auth_gss/auth_gss_internal.h
+new file mode 100644
+index 0000000000000..f6d9631bd9d00
+--- /dev/null
++++ b/net/sunrpc/auth_gss/auth_gss_internal.h
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * linux/net/sunrpc/auth_gss/auth_gss_internal.h
++ *
++ * Internal definitions for RPCSEC_GSS client authentication
++ *
++ * Copyright (c) 2000 The Regents of the University of Michigan.
++ * All rights reserved.
++ *
++ */
++#include <linux/err.h>
++#include <linux/string.h>
++#include <linux/sunrpc/xdr.h>
++
++static inline const void *
++simple_get_bytes(const void *p, const void *end, void *res, size_t len)
++{
++	const void *q = (const void *)((const char *)p + len);
++	if (unlikely(q > end || q < p))
++		return ERR_PTR(-EFAULT);
++	memcpy(res, p, len);
++	return q;
++}
++
++static inline const void *
++simple_get_netobj(const void *p, const void *end, struct xdr_netobj *dest)
++{
++	const void *q;
++	unsigned int len;
++
++	p = simple_get_bytes(p, end, &len, sizeof(len));
++	if (IS_ERR(p))
++		return p;
++	q = (const void *)((const char *)p + len);
++	if (unlikely(q > end || q < p))
++		return ERR_PTR(-EFAULT);
++	if (len) {
++		dest->data = kmemdup(p, len, GFP_NOFS);
++		if (unlikely(dest->data == NULL))
++			return ERR_PTR(-ENOMEM);
++	} else
++		dest->data = NULL;
++	dest->len = len;
++	return q;
++}
+diff --git a/net/sunrpc/auth_gss/gss_krb5_mech.c b/net/sunrpc/auth_gss/gss_krb5_mech.c
+index 28db442a0034a..89e616da161fd 100644
+--- a/net/sunrpc/auth_gss/gss_krb5_mech.c
++++ b/net/sunrpc/auth_gss/gss_krb5_mech.c
+@@ -45,6 +45,8 @@
+ #include <linux/crypto.h>
+ #include <linux/sunrpc/gss_krb5_enctypes.h>
+ 
++#include "auth_gss_internal.h"
++
+ #if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+ # define RPCDBG_FACILITY	RPCDBG_AUTH
+ #endif
+@@ -186,35 +188,6 @@ get_gss_krb5_enctype(int etype)
+ 	return NULL;
+ }
+ 
+-static const void *
+-simple_get_bytes(const void *p, const void *end, void *res, int len)
+-{
+-	const void *q = (const void *)((const char *)p + len);
+-	if (unlikely(q > end || q < p))
+-		return ERR_PTR(-EFAULT);
+-	memcpy(res, p, len);
+-	return q;
+-}
+-
+-static const void *
+-simple_get_netobj(const void *p, const void *end, struct xdr_netobj *res)
+-{
+-	const void *q;
+-	unsigned int len;
+-
+-	p = simple_get_bytes(p, end, &len, sizeof(len));
+-	if (IS_ERR(p))
+-		return p;
+-	q = (const void *)((const char *)p + len);
+-	if (unlikely(q > end || q < p))
+-		return ERR_PTR(-EFAULT);
+-	res->data = kmemdup(p, len, GFP_NOFS);
+-	if (unlikely(res->data == NULL))
+-		return ERR_PTR(-ENOMEM);
+-	res->len = len;
+-	return q;
+-}
+-
+ static inline const void *
+ get_key(const void *p, const void *end,
+ 	struct krb5_ctx *ctx, struct crypto_blkcipher **res)
+diff --git a/net/vmw_vsock/af_vsock.c b/net/vmw_vsock/af_vsock.c
+index 07b1a2775210b..cdd91a60b89aa 100644
+--- a/net/vmw_vsock/af_vsock.c
++++ b/net/vmw_vsock/af_vsock.c
+@@ -818,10 +818,12 @@ static int vsock_shutdown(struct socket *sock, int mode)
+ 	 */
+ 
+ 	sk = sock->sk;
++
++	lock_sock(sk);
+ 	if (sock->state == SS_UNCONNECTED) {
+ 		err = -ENOTCONN;
+ 		if (sk->sk_type == SOCK_STREAM)
+-			return err;
++			goto out;
+ 	} else {
+ 		sock->state = SS_DISCONNECTING;
+ 		err = 0;
+@@ -830,10 +832,8 @@ static int vsock_shutdown(struct socket *sock, int mode)
+ 	/* Receive and send shutdowns are treated alike. */
+ 	mode = mode & (RCV_SHUTDOWN | SEND_SHUTDOWN);
+ 	if (mode) {
+-		lock_sock(sk);
+ 		sk->sk_shutdown |= mode;
+ 		sk->sk_state_change(sk);
+-		release_sock(sk);
+ 
+ 		if (sk->sk_type == SOCK_STREAM) {
+ 			sock_reset_flag(sk, SOCK_DONE);
+@@ -841,6 +841,8 @@ static int vsock_shutdown(struct socket *sock, int mode)
+ 		}
+ 	}
+ 
++out:
++	release_sock(sk);
+ 	return err;
+ }
+ 
+diff --git a/scripts/Makefile.build b/scripts/Makefile.build
+index 42aef001dfdd7..6de137a28a127 100644
+--- a/scripts/Makefile.build
++++ b/scripts/Makefile.build
+@@ -221,6 +221,8 @@ cmd_modversions_c =								\
+ endif
+ 
+ ifdef CONFIG_FTRACE_MCOUNT_RECORD
++ifndef CC_USING_RECORD_MCOUNT
++# compiler will not generate __mcount_loc use recordmcount or recordmcount.pl
+ ifdef BUILD_C_RECORDMCOUNT
+ ifeq ("$(origin RECORDMCOUNT_WARN)", "command line")
+   RECORDMCOUNT_FLAGS = -w
+@@ -249,6 +251,7 @@ cmd_record_mcount =						\
+ 	     "$(CC_FLAGS_FTRACE)" ]; then			\
+ 		$(sub_cmd_record_mcount)			\
+ 	fi;
++endif # CC_USING_RECORD_MCOUNT
+ endif
+ 
+ define rule_cc_o_c
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index ba8e8840b94b2..b0326734a980b 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -346,9 +346,8 @@ static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ 	 */
+ 	kvm->mmu_notifier_count++;
+ 	need_tlb_flush = kvm_unmap_hva_range(kvm, start, end);
+-	need_tlb_flush |= kvm->tlbs_dirty;
+ 	/* we've to flush the tlb before the pages can be freed */
+-	if (need_tlb_flush)
++	if (need_tlb_flush || kvm->tlbs_dirty)
+ 		kvm_flush_remote_tlbs(kvm);
+ 
+ 	spin_unlock(&kvm->mmu_lock);

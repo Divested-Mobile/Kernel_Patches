@@ -1,0 +1,1359 @@
+diff --git a/Makefile b/Makefile
+index db37b39fae693..6bebe3b22b452 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 19
+-SUBLEVEL = 175
++SUBLEVEL = 176
+ EXTRAVERSION =
+ NAME = "People's Front"
+ 
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index f1e86051aa5f3..b34d11f22213f 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -1832,6 +1832,8 @@ static struct page **sev_pin_memory(struct kvm *kvm, unsigned long uaddr,
+ 	struct page **pages;
+ 	unsigned long first, last;
+ 
++	lockdep_assert_held(&kvm->lock);
++
+ 	if (ulen == 0 || uaddr + ulen < uaddr)
+ 		return NULL;
+ 
+@@ -7084,12 +7086,21 @@ static int svm_register_enc_region(struct kvm *kvm,
+ 	if (!region)
+ 		return -ENOMEM;
+ 
++	mutex_lock(&kvm->lock);
+ 	region->pages = sev_pin_memory(kvm, range->addr, range->size, &region->npages, 1);
+ 	if (!region->pages) {
+ 		ret = -ENOMEM;
++		mutex_unlock(&kvm->lock);
+ 		goto e_free;
+ 	}
+ 
++	region->uaddr = range->addr;
++	region->size = range->size;
++
++	mutex_lock(&kvm->lock);
++	list_add_tail(&region->list, &sev->regions_list);
++	mutex_unlock(&kvm->lock);
++
+ 	/*
+ 	 * The guest may change the memory encryption attribute from C=0 -> C=1
+ 	 * or vice versa for this memory range. Lets make sure caches are
+@@ -7098,13 +7109,6 @@ static int svm_register_enc_region(struct kvm *kvm,
+ 	 */
+ 	sev_clflush_pages(region->pages, region->npages);
+ 
+-	region->uaddr = range->addr;
+-	region->size = range->size;
+-
+-	mutex_lock(&kvm->lock);
+-	list_add_tail(&region->list, &sev->regions_list);
+-	mutex_unlock(&kvm->lock);
+-
+ 	return ret;
+ 
+ e_free:
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 0df43515ff949..195526b93895e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2324,11 +2324,6 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+ 	struct blk_mq_ctx *ctx;
+ 	struct blk_mq_tag_set *set = q->tag_set;
+ 
+-	/*
+-	 * Avoid others reading imcomplete hctx->cpumask through sysfs
+-	 */
+-	mutex_lock(&q->sysfs_lock);
+-
+ 	queue_for_each_hw_ctx(q, hctx, i) {
+ 		cpumask_clear(hctx->cpumask);
+ 		hctx->nr_ctx = 0;
+@@ -2362,8 +2357,6 @@ static void blk_mq_map_swqueue(struct request_queue *q)
+ 		hctx->ctxs[hctx->nr_ctx++] = ctx;
+ 	}
+ 
+-	mutex_unlock(&q->sysfs_lock);
+-
+ 	queue_for_each_hw_ctx(q, hctx, i) {
+ 		/*
+ 		 * If no software queues are mapped to this hardware queue,
+diff --git a/block/elevator.c b/block/elevator.c
+index fae58b2f906fc..ddbcd36616a8d 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -980,23 +980,19 @@ int elevator_init_mq(struct request_queue *q)
+ 	if (q->nr_hw_queues != 1)
+ 		return 0;
+ 
+-	/*
+-	 * q->sysfs_lock must be held to provide mutual exclusion between
+-	 * elevator_switch() and here.
+-	 */
+-	mutex_lock(&q->sysfs_lock);
++	WARN_ON_ONCE(test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags));
++
+ 	if (unlikely(q->elevator))
+-		goto out_unlock;
++		goto out;
+ 
+ 	e = elevator_get(q, "mq-deadline", false);
+ 	if (!e)
+-		goto out_unlock;
++		goto out;
+ 
+ 	err = blk_mq_init_sched(q, e);
+ 	if (err)
+ 		elevator_put(e);
+-out_unlock:
+-	mutex_unlock(&q->sysfs_lock);
++out:
+ 	return err;
+ }
+ 
+diff --git a/block/genhd.c b/block/genhd.c
+index 2b536ab570ac1..6965dde963736 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -652,10 +652,12 @@ exit:
+ 		kobject_uevent(&part_to_dev(part)->kobj, KOBJ_ADD);
+ 	disk_part_iter_exit(&piter);
+ 
+-	err = sysfs_create_link(&ddev->kobj,
+-				&disk->queue->backing_dev_info->dev->kobj,
+-				"bdi");
+-	WARN_ON(err);
++	if (disk->queue->backing_dev_info->dev) {
++		err = sysfs_create_link(&ddev->kobj,
++			  &disk->queue->backing_dev_info->dev->kobj,
++			  "bdi");
++		WARN_ON(err);
++	}
+ }
+ 
+ /**
+diff --git a/drivers/crypto/chelsio/chtls/chtls_cm.c b/drivers/crypto/chelsio/chtls/chtls_cm.c
+index fd3092a4378e4..08ed3ff8b255f 100644
+--- a/drivers/crypto/chelsio/chtls/chtls_cm.c
++++ b/drivers/crypto/chelsio/chtls/chtls_cm.c
+@@ -1051,11 +1051,9 @@ static struct sock *chtls_recv_sock(struct sock *lsk,
+ 	tcph = (struct tcphdr *)(iph + 1);
+ 	n = dst_neigh_lookup(dst, &iph->saddr);
+ 	if (!n || !n->dev)
+-		goto free_sk;
++		goto free_dst;
+ 
+ 	ndev = n->dev;
+-	if (!ndev)
+-		goto free_dst;
+ 	if (is_vlan_dev(ndev))
+ 		ndev = vlan_dev_real_dev(ndev);
+ 
+@@ -1117,7 +1115,8 @@ static struct sock *chtls_recv_sock(struct sock *lsk,
+ free_csk:
+ 	chtls_sock_release(&csk->kref);
+ free_dst:
+-	neigh_release(n);
++	if (n)
++		neigh_release(n);
+ 	dst_release(dst);
+ free_sk:
+ 	inet_csk_prepare_forced_close(newsk);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/debugfs-vif.c b/drivers/net/wireless/intel/iwlwifi/mvm/debugfs-vif.c
+index 798605c4f1227..5287f21d7ba63 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/debugfs-vif.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/debugfs-vif.c
+@@ -520,7 +520,10 @@ static ssize_t iwl_dbgfs_os_device_timediff_read(struct file *file,
+ 	const size_t bufsz = sizeof(buf);
+ 	int pos = 0;
+ 
++	mutex_lock(&mvm->mutex);
+ 	iwl_mvm_get_sync_time(mvm, &curr_gp2, &curr_os);
++	mutex_unlock(&mvm->mutex);
++
+ 	do_div(curr_os, NSEC_PER_USEC);
+ 	diff = curr_os - curr_gp2;
+ 	pos += scnprintf(buf + pos, bufsz - pos, "diff=%lld\n", diff);
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+index 0e26619fb330b..d932171617e6a 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/ops.c
+@@ -1192,6 +1192,7 @@ static void iwl_mvm_reprobe_wk(struct work_struct *wk)
+ 	reprobe = container_of(wk, struct iwl_mvm_reprobe, work);
+ 	if (device_reprobe(reprobe->dev))
+ 		dev_err(reprobe->dev, "reprobe failed!\n");
++	put_device(reprobe->dev);
+ 	kfree(reprobe);
+ 	module_put(THIS_MODULE);
+ }
+@@ -1242,7 +1243,7 @@ void iwl_mvm_nic_restart(struct iwl_mvm *mvm, bool fw_error)
+ 			module_put(THIS_MODULE);
+ 			return;
+ 		}
+-		reprobe->dev = mvm->trans->dev;
++		reprobe->dev = get_device(mvm->trans->dev);
+ 		INIT_WORK(&reprobe->work, iwl_mvm_reprobe_wk);
+ 		schedule_work(&reprobe->work);
+ 	} else if (mvm->fwrt.cur_fw_img == IWL_UCODE_REGULAR &&
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c b/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
+index 6783b20d9681b..a1cecf4a0e820 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/ctxt-info-gen3.c
+@@ -159,8 +159,10 @@ int iwl_pcie_ctxt_info_gen3_init(struct iwl_trans *trans,
+ 	/* Allocate IML */
+ 	iml_img = dma_alloc_coherent(trans->dev, trans->iml_len,
+ 				     &trans_pcie->iml_dma_addr, GFP_KERNEL);
+-	if (!iml_img)
+-		return -ENOMEM;
++	if (!iml_img) {
++		ret = -ENOMEM;
++		goto err_free_ctxt_info;
++	}
+ 
+ 	memcpy(iml_img, trans->iml, trans->iml_len);
+ 
+@@ -177,6 +179,11 @@ int iwl_pcie_ctxt_info_gen3_init(struct iwl_trans *trans,
+ 
+ 	return 0;
+ 
++err_free_ctxt_info:
++	dma_free_coherent(trans->dev, sizeof(*trans_pcie->ctxt_info_gen3),
++			  trans_pcie->ctxt_info_gen3,
++			  trans_pcie->ctxt_info_dma_addr);
++	trans_pcie->ctxt_info_gen3 = NULL;
+ err_free_prph_info:
+ 	dma_free_coherent(trans->dev,
+ 			  sizeof(*prph_info),
+diff --git a/drivers/net/wireless/intel/iwlwifi/pcie/tx.c b/drivers/net/wireless/intel/iwlwifi/pcie/tx.c
+index b73582ec03a08..b1a71539ca3e5 100644
+--- a/drivers/net/wireless/intel/iwlwifi/pcie/tx.c
++++ b/drivers/net/wireless/intel/iwlwifi/pcie/tx.c
+@@ -631,6 +631,11 @@ static void iwl_pcie_txq_unmap(struct iwl_trans *trans, int txq_id)
+ 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
+ 	struct iwl_txq *txq = trans_pcie->txq[txq_id];
+ 
++	if (!txq) {
++		IWL_ERR(trans, "Trying to free a queue that wasn't allocated?\n");
++		return;
++	}
++
+ 	spin_lock_bh(&txq->lock);
+ 	while (txq->write_ptr != txq->read_ptr) {
+ 		IWL_DEBUG_TX_REPLY(trans, "Q %d Free %d\n",
+diff --git a/drivers/regulator/core.c b/drivers/regulator/core.c
+index 8a6ca06d9c160..65e1cde13d59e 100644
+--- a/drivers/regulator/core.c
++++ b/drivers/regulator/core.c
+@@ -1142,17 +1142,6 @@ static int set_machine_constraints(struct regulator_dev *rdev)
+ 		}
+ 	}
+ 
+-	/* If the constraints say the regulator should be on at this point
+-	 * and we have control then make sure it is enabled.
+-	 */
+-	if (rdev->constraints->always_on || rdev->constraints->boot_on) {
+-		ret = _regulator_do_enable(rdev);
+-		if (ret < 0 && ret != -EINVAL) {
+-			rdev_err(rdev, "failed to enable\n");
+-			return ret;
+-		}
+-	}
+-
+ 	if ((rdev->constraints->ramp_delay || rdev->constraints->ramp_disable)
+ 		&& ops->set_ramp_delay) {
+ 		ret = ops->set_ramp_delay(rdev, rdev->constraints->ramp_delay);
+@@ -1198,6 +1187,27 @@ static int set_machine_constraints(struct regulator_dev *rdev)
+ 		}
+ 	}
+ 
++	/* If the constraints say the regulator should be on at this point
++	 * and we have control then make sure it is enabled.
++	 */
++	if (rdev->constraints->always_on || rdev->constraints->boot_on) {
++		if (rdev->supply) {
++			ret = regulator_enable(rdev->supply);
++			if (ret < 0) {
++				_regulator_put(rdev->supply);
++				rdev->supply = NULL;
++				return ret;
++			}
++		}
++
++		ret = _regulator_do_enable(rdev);
++		if (ret < 0 && ret != -EINVAL) {
++			rdev_err(rdev, "failed to enable\n");
++			return ret;
++		}
++		rdev->use_count++;
++	}
++
+ 	print_constraints(rdev);
+ 	return 0;
+ }
+@@ -1567,13 +1577,13 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
+ {
+ 	struct regulator_dev *r;
+ 	struct device *dev = rdev->dev.parent;
+-	int ret;
++	int ret = 0;
+ 
+ 	/* No supply to resovle? */
+ 	if (!rdev->supply_name)
+ 		return 0;
+ 
+-	/* Supply already resolved? */
++	/* Supply already resolved? (fast-path without locking contention) */
+ 	if (rdev->supply)
+ 		return 0;
+ 
+@@ -1583,7 +1593,7 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
+ 
+ 		/* Did the lookup explicitly defer for us? */
+ 		if (ret == -EPROBE_DEFER)
+-			return ret;
++			goto out;
+ 
+ 		if (have_full_constraints()) {
+ 			r = dummy_regulator_rdev;
+@@ -1591,15 +1601,18 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
+ 		} else {
+ 			dev_err(dev, "Failed to resolve %s-supply for %s\n",
+ 				rdev->supply_name, rdev->desc->name);
+-			return -EPROBE_DEFER;
++			ret = -EPROBE_DEFER;
++			goto out;
+ 		}
+ 	}
+ 
+ 	if (r == rdev) {
+ 		dev_err(dev, "Supply for %s (%s) resolved to itself\n",
+ 			rdev->desc->name, rdev->supply_name);
+-		if (!have_full_constraints())
+-			return -EINVAL;
++		if (!have_full_constraints()) {
++			ret = -EINVAL;
++			goto out;
++		}
+ 		r = dummy_regulator_rdev;
+ 		get_device(&r->dev);
+ 	}
+@@ -1613,7 +1626,8 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
+ 	if (r->dev.parent && r->dev.parent != rdev->dev.parent) {
+ 		if (!device_is_bound(r->dev.parent)) {
+ 			put_device(&r->dev);
+-			return -EPROBE_DEFER;
++			ret = -EPROBE_DEFER;
++			goto out;
+ 		}
+ 	}
+ 
+@@ -1621,26 +1635,48 @@ static int regulator_resolve_supply(struct regulator_dev *rdev)
+ 	ret = regulator_resolve_supply(r);
+ 	if (ret < 0) {
+ 		put_device(&r->dev);
+-		return ret;
++		goto out;
++	}
++
++	/*
++	 * Recheck rdev->supply with rdev->mutex lock held to avoid a race
++	 * between rdev->supply null check and setting rdev->supply in
++	 * set_supply() from concurrent tasks.
++	 */
++	regulator_lock(rdev);
++
++	/* Supply just resolved by a concurrent task? */
++	if (rdev->supply) {
++		regulator_unlock(rdev);
++		put_device(&r->dev);
++		goto out;
+ 	}
+ 
+ 	ret = set_supply(rdev, r);
+ 	if (ret < 0) {
++		regulator_unlock(rdev);
+ 		put_device(&r->dev);
+-		return ret;
++		goto out;
+ 	}
+ 
+-	/* Cascade always-on state to supply */
+-	if (_regulator_is_enabled(rdev)) {
++	regulator_unlock(rdev);
++
++	/*
++	 * In set_machine_constraints() we may have turned this regulator on
++	 * but we couldn't propagate to the supply if it hadn't been resolved
++	 * yet.  Do it now.
++	 */
++	if (rdev->use_count) {
+ 		ret = regulator_enable(rdev->supply);
+ 		if (ret < 0) {
+ 			_regulator_put(rdev->supply);
+ 			rdev->supply = NULL;
+-			return ret;
++			goto out;
+ 		}
+ 	}
+ 
+-	return 0;
++out:
++	return ret;
+ }
+ 
+ /* Internal regulator request function */
+diff --git a/drivers/remoteproc/qcom_q6v5_pil.c b/drivers/remoteproc/qcom_q6v5_pil.c
+index cc475dcbf27f3..604828c04ddfb 100644
+--- a/drivers/remoteproc/qcom_q6v5_pil.c
++++ b/drivers/remoteproc/qcom_q6v5_pil.c
+@@ -340,6 +340,12 @@ static int q6v5_load(struct rproc *rproc, const struct firmware *fw)
+ {
+ 	struct q6v5 *qproc = rproc->priv;
+ 
++	/* MBA is restricted to a maximum size of 1M */
++	if (fw->size > qproc->mba_size || fw->size > SZ_1M) {
++		dev_err(qproc->dev, "MBA firmware load failed\n");
++		return -EINVAL;
++	}
++
+ 	memcpy(qproc->mba_region, fw->data, fw->size);
+ 
+ 	return 0;
+@@ -739,14 +745,13 @@ static int q6v5_mpss_load(struct q6v5 *qproc)
+ 
+ 		if (phdr->p_filesz) {
+ 			snprintf(seg_name, sizeof(seg_name), "modem.b%02d", i);
+-			ret = request_firmware(&seg_fw, seg_name, qproc->dev);
++			ret = request_firmware_into_buf(&seg_fw, seg_name, qproc->dev,
++							ptr, phdr->p_filesz);
+ 			if (ret) {
+ 				dev_err(qproc->dev, "failed to load %s\n", seg_name);
+ 				goto release_firmware;
+ 			}
+ 
+-			memcpy(ptr, seg_fw->data, seg_fw->size);
+-
+ 			release_firmware(seg_fw);
+ 		}
+ 
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index f2d0c4acb3cbb..a247cb4b00e2d 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -1986,7 +1986,7 @@ void wb_workfn(struct work_struct *work)
+ 						struct bdi_writeback, dwork);
+ 	long pages_written;
+ 
+-	set_worker_desc("flush-%s", dev_name(wb->bdi->dev));
++	set_worker_desc("flush-%s", bdi_dev_name(wb->bdi));
+ 	current->flags |= PF_SWAPWRITE;
+ 
+ 	if (likely(!current_is_workqueue_rescuer() ||
+diff --git a/fs/nfs/pnfs.c b/fs/nfs/pnfs.c
+index 4b165aa5a2561..55965e8e9a2ed 100644
+--- a/fs/nfs/pnfs.c
++++ b/fs/nfs/pnfs.c
+@@ -2301,7 +2301,13 @@ pnfs_layout_process(struct nfs4_layoutget *lgp)
+ 		 * We got an entirely new state ID.  Mark all segments for the
+ 		 * inode invalid, and retry the layoutget
+ 		 */
+-		pnfs_mark_layout_stateid_invalid(lo, &free_me);
++		struct pnfs_layout_range range = {
++			.iomode = IOMODE_ANY,
++			.length = NFS4_MAX_UINT64,
++		};
++		pnfs_set_plh_return_info(lo, IOMODE_ANY, 0);
++		pnfs_mark_matching_lsegs_return(lo, &lo->plh_return_segs,
++						&range, 0);
+ 		goto out_forget;
+ 	}
+ 
+diff --git a/fs/squashfs/export.c b/fs/squashfs/export.c
+index 8073b6532cf04..d2a806416c3ab 100644
+--- a/fs/squashfs/export.c
++++ b/fs/squashfs/export.c
+@@ -54,12 +54,17 @@ static long long squashfs_inode_lookup(struct super_block *sb, int ino_num)
+ 	struct squashfs_sb_info *msblk = sb->s_fs_info;
+ 	int blk = SQUASHFS_LOOKUP_BLOCK(ino_num - 1);
+ 	int offset = SQUASHFS_LOOKUP_BLOCK_OFFSET(ino_num - 1);
+-	u64 start = le64_to_cpu(msblk->inode_lookup_table[blk]);
++	u64 start;
+ 	__le64 ino;
+ 	int err;
+ 
+ 	TRACE("Entered squashfs_inode_lookup, inode_number = %d\n", ino_num);
+ 
++	if (ino_num == 0 || (ino_num - 1) >= msblk->inodes)
++		return -EINVAL;
++
++	start = le64_to_cpu(msblk->inode_lookup_table[blk]);
++
+ 	err = squashfs_read_metadata(sb, &ino, &start, &offset, sizeof(ino));
+ 	if (err < 0)
+ 		return err;
+@@ -124,7 +129,10 @@ __le64 *squashfs_read_inode_lookup_table(struct super_block *sb,
+ 		u64 lookup_table_start, u64 next_table, unsigned int inodes)
+ {
+ 	unsigned int length = SQUASHFS_LOOKUP_BLOCK_BYTES(inodes);
++	unsigned int indexes = SQUASHFS_LOOKUP_BLOCKS(inodes);
++	int n;
+ 	__le64 *table;
++	u64 start, end;
+ 
+ 	TRACE("In read_inode_lookup_table, length %d\n", length);
+ 
+@@ -134,20 +142,37 @@ __le64 *squashfs_read_inode_lookup_table(struct super_block *sb,
+ 	if (inodes == 0)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	/* length bytes should not extend into the next table - this check
+-	 * also traps instances where lookup_table_start is incorrectly larger
+-	 * than the next table start
++	/*
++	 * The computed size of the lookup table (length bytes) should exactly
++	 * match the table start and end points
+ 	 */
+-	if (lookup_table_start + length > next_table)
++	if (length != (next_table - lookup_table_start))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	table = squashfs_read_table(sb, lookup_table_start, length);
++	if (IS_ERR(table))
++		return table;
+ 
+ 	/*
+-	 * table[0] points to the first inode lookup table metadata block,
+-	 * this should be less than lookup_table_start
++	 * table0], table[1], ... table[indexes - 1] store the locations
++	 * of the compressed inode lookup blocks.  Each entry should be
++	 * less than the next (i.e. table[0] < table[1]), and the difference
++	 * between them should be SQUASHFS_METADATA_SIZE or less.
++	 * table[indexes - 1] should  be less than lookup_table_start, and
++	 * again the difference should be SQUASHFS_METADATA_SIZE or less
+ 	 */
+-	if (!IS_ERR(table) && le64_to_cpu(table[0]) >= lookup_table_start) {
++	for (n = 0; n < (indexes - 1); n++) {
++		start = le64_to_cpu(table[n]);
++		end = le64_to_cpu(table[n + 1]);
++
++		if (start >= end || (end - start) > SQUASHFS_METADATA_SIZE) {
++			kfree(table);
++			return ERR_PTR(-EINVAL);
++		}
++	}
++
++	start = le64_to_cpu(table[indexes - 1]);
++	if (start >= lookup_table_start || (lookup_table_start - start) > SQUASHFS_METADATA_SIZE) {
+ 		kfree(table);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+diff --git a/fs/squashfs/id.c b/fs/squashfs/id.c
+index d38ea3dab9515..8ccc0e3f6ea5a 100644
+--- a/fs/squashfs/id.c
++++ b/fs/squashfs/id.c
+@@ -48,10 +48,15 @@ int squashfs_get_id(struct super_block *sb, unsigned int index,
+ 	struct squashfs_sb_info *msblk = sb->s_fs_info;
+ 	int block = SQUASHFS_ID_BLOCK(index);
+ 	int offset = SQUASHFS_ID_BLOCK_OFFSET(index);
+-	u64 start_block = le64_to_cpu(msblk->id_table[block]);
++	u64 start_block;
+ 	__le32 disk_id;
+ 	int err;
+ 
++	if (index >= msblk->ids)
++		return -EINVAL;
++
++	start_block = le64_to_cpu(msblk->id_table[block]);
++
+ 	err = squashfs_read_metadata(sb, &disk_id, &start_block, &offset,
+ 							sizeof(disk_id));
+ 	if (err < 0)
+@@ -69,7 +74,10 @@ __le64 *squashfs_read_id_index_table(struct super_block *sb,
+ 		u64 id_table_start, u64 next_table, unsigned short no_ids)
+ {
+ 	unsigned int length = SQUASHFS_ID_BLOCK_BYTES(no_ids);
++	unsigned int indexes = SQUASHFS_ID_BLOCKS(no_ids);
++	int n;
+ 	__le64 *table;
++	u64 start, end;
+ 
+ 	TRACE("In read_id_index_table, length %d\n", length);
+ 
+@@ -80,20 +88,36 @@ __le64 *squashfs_read_id_index_table(struct super_block *sb,
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	/*
+-	 * length bytes should not extend into the next table - this check
+-	 * also traps instances where id_table_start is incorrectly larger
+-	 * than the next table start
++	 * The computed size of the index table (length bytes) should exactly
++	 * match the table start and end points
+ 	 */
+-	if (id_table_start + length > next_table)
++	if (length != (next_table - id_table_start))
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	table = squashfs_read_table(sb, id_table_start, length);
++	if (IS_ERR(table))
++		return table;
+ 
+ 	/*
+-	 * table[0] points to the first id lookup table metadata block, this
+-	 * should be less than id_table_start
++	 * table[0], table[1], ... table[indexes - 1] store the locations
++	 * of the compressed id blocks.   Each entry should be less than
++	 * the next (i.e. table[0] < table[1]), and the difference between them
++	 * should be SQUASHFS_METADATA_SIZE or less.  table[indexes - 1]
++	 * should be less than id_table_start, and again the difference
++	 * should be SQUASHFS_METADATA_SIZE or less
+ 	 */
+-	if (!IS_ERR(table) && le64_to_cpu(table[0]) >= id_table_start) {
++	for (n = 0; n < (indexes - 1); n++) {
++		start = le64_to_cpu(table[n]);
++		end = le64_to_cpu(table[n + 1]);
++
++		if (start >= end || (end - start) > SQUASHFS_METADATA_SIZE) {
++			kfree(table);
++			return ERR_PTR(-EINVAL);
++		}
++	}
++
++	start = le64_to_cpu(table[indexes - 1]);
++	if (start >= id_table_start || (id_table_start - start) > SQUASHFS_METADATA_SIZE) {
+ 		kfree(table);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+diff --git a/fs/squashfs/squashfs_fs_sb.h b/fs/squashfs/squashfs_fs_sb.h
+index ef69c31947bf8..5234c19a0eabc 100644
+--- a/fs/squashfs/squashfs_fs_sb.h
++++ b/fs/squashfs/squashfs_fs_sb.h
+@@ -77,5 +77,6 @@ struct squashfs_sb_info {
+ 	unsigned int				inodes;
+ 	unsigned int				fragments;
+ 	int					xattr_ids;
++	unsigned int				ids;
+ };
+ #endif
+diff --git a/fs/squashfs/super.c b/fs/squashfs/super.c
+index 40e657386fa52..728b2d72f3f07 100644
+--- a/fs/squashfs/super.c
++++ b/fs/squashfs/super.c
+@@ -176,6 +176,7 @@ static int squashfs_fill_super(struct super_block *sb, void *data, int silent)
+ 	msblk->directory_table = le64_to_cpu(sblk->directory_table_start);
+ 	msblk->inodes = le32_to_cpu(sblk->inodes);
+ 	msblk->fragments = le32_to_cpu(sblk->fragments);
++	msblk->ids = le16_to_cpu(sblk->no_ids);
+ 	flags = le16_to_cpu(sblk->flags);
+ 
+ 	TRACE("Found valid superblock on %pg\n", sb->s_bdev);
+@@ -187,7 +188,7 @@ static int squashfs_fill_super(struct super_block *sb, void *data, int silent)
+ 	TRACE("Block size %d\n", msblk->block_size);
+ 	TRACE("Number of inodes %d\n", msblk->inodes);
+ 	TRACE("Number of fragments %d\n", msblk->fragments);
+-	TRACE("Number of ids %d\n", le16_to_cpu(sblk->no_ids));
++	TRACE("Number of ids %d\n", msblk->ids);
+ 	TRACE("sblk->inode_table_start %llx\n", msblk->inode_table);
+ 	TRACE("sblk->directory_table_start %llx\n", msblk->directory_table);
+ 	TRACE("sblk->fragment_table_start %llx\n",
+@@ -244,8 +245,7 @@ static int squashfs_fill_super(struct super_block *sb, void *data, int silent)
+ allocate_id_index_table:
+ 	/* Allocate and read id index table */
+ 	msblk->id_table = squashfs_read_id_index_table(sb,
+-		le64_to_cpu(sblk->id_table_start), next_table,
+-		le16_to_cpu(sblk->no_ids));
++		le64_to_cpu(sblk->id_table_start), next_table, msblk->ids);
+ 	if (IS_ERR(msblk->id_table)) {
+ 		ERROR("unable to read id index table\n");
+ 		err = PTR_ERR(msblk->id_table);
+diff --git a/fs/squashfs/xattr.h b/fs/squashfs/xattr.h
+index afe70f815e3de..86b0a0073e51f 100644
+--- a/fs/squashfs/xattr.h
++++ b/fs/squashfs/xattr.h
+@@ -30,8 +30,16 @@ extern int squashfs_xattr_lookup(struct super_block *, unsigned int, int *,
+ static inline __le64 *squashfs_read_xattr_id_table(struct super_block *sb,
+ 		u64 start, u64 *xattr_table_start, int *xattr_ids)
+ {
++	struct squashfs_xattr_id_table *id_table;
++
++	id_table = squashfs_read_table(sb, start, sizeof(*id_table));
++	if (IS_ERR(id_table))
++		return (__le64 *) id_table;
++
++	*xattr_table_start = le64_to_cpu(id_table->xattr_table_start);
++	kfree(id_table);
++
+ 	ERROR("Xattrs in filesystem, these will be ignored\n");
+-	*xattr_table_start = start;
+ 	return ERR_PTR(-ENOTSUPP);
+ }
+ 
+diff --git a/fs/squashfs/xattr_id.c b/fs/squashfs/xattr_id.c
+index c89607d690c48..3a655d879600c 100644
+--- a/fs/squashfs/xattr_id.c
++++ b/fs/squashfs/xattr_id.c
+@@ -44,10 +44,15 @@ int squashfs_xattr_lookup(struct super_block *sb, unsigned int index,
+ 	struct squashfs_sb_info *msblk = sb->s_fs_info;
+ 	int block = SQUASHFS_XATTR_BLOCK(index);
+ 	int offset = SQUASHFS_XATTR_BLOCK_OFFSET(index);
+-	u64 start_block = le64_to_cpu(msblk->xattr_id_table[block]);
++	u64 start_block;
+ 	struct squashfs_xattr_id id;
+ 	int err;
+ 
++	if (index >= msblk->xattr_ids)
++		return -EINVAL;
++
++	start_block = le64_to_cpu(msblk->xattr_id_table[block]);
++
+ 	err = squashfs_read_metadata(sb, &id, &start_block, &offset,
+ 							sizeof(id));
+ 	if (err < 0)
+@@ -63,13 +68,17 @@ int squashfs_xattr_lookup(struct super_block *sb, unsigned int index,
+ /*
+  * Read uncompressed xattr id lookup table indexes from disk into memory
+  */
+-__le64 *squashfs_read_xattr_id_table(struct super_block *sb, u64 start,
++__le64 *squashfs_read_xattr_id_table(struct super_block *sb, u64 table_start,
+ 		u64 *xattr_table_start, int *xattr_ids)
+ {
+-	unsigned int len;
++	struct squashfs_sb_info *msblk = sb->s_fs_info;
++	unsigned int len, indexes;
+ 	struct squashfs_xattr_id_table *id_table;
++	__le64 *table;
++	u64 start, end;
++	int n;
+ 
+-	id_table = squashfs_read_table(sb, start, sizeof(*id_table));
++	id_table = squashfs_read_table(sb, table_start, sizeof(*id_table));
+ 	if (IS_ERR(id_table))
+ 		return (__le64 *) id_table;
+ 
+@@ -83,13 +92,52 @@ __le64 *squashfs_read_xattr_id_table(struct super_block *sb, u64 start,
+ 	if (*xattr_ids == 0)
+ 		return ERR_PTR(-EINVAL);
+ 
+-	/* xattr_table should be less than start */
+-	if (*xattr_table_start >= start)
++	len = SQUASHFS_XATTR_BLOCK_BYTES(*xattr_ids);
++	indexes = SQUASHFS_XATTR_BLOCKS(*xattr_ids);
++
++	/*
++	 * The computed size of the index table (len bytes) should exactly
++	 * match the table start and end points
++	 */
++	start = table_start + sizeof(*id_table);
++	end = msblk->bytes_used;
++
++	if (len != (end - start))
+ 		return ERR_PTR(-EINVAL);
+ 
+-	len = SQUASHFS_XATTR_BLOCK_BYTES(*xattr_ids);
++	table = squashfs_read_table(sb, start, len);
++	if (IS_ERR(table))
++		return table;
++
++	/* table[0], table[1], ... table[indexes - 1] store the locations
++	 * of the compressed xattr id blocks.  Each entry should be less than
++	 * the next (i.e. table[0] < table[1]), and the difference between them
++	 * should be SQUASHFS_METADATA_SIZE or less.  table[indexes - 1]
++	 * should be less than table_start, and again the difference
++	 * shouls be SQUASHFS_METADATA_SIZE or less.
++	 *
++	 * Finally xattr_table_start should be less than table[0].
++	 */
++	for (n = 0; n < (indexes - 1); n++) {
++		start = le64_to_cpu(table[n]);
++		end = le64_to_cpu(table[n + 1]);
++
++		if (start >= end || (end - start) > SQUASHFS_METADATA_SIZE) {
++			kfree(table);
++			return ERR_PTR(-EINVAL);
++		}
++	}
++
++	start = le64_to_cpu(table[indexes - 1]);
++	if (start >= table_start || (table_start - start) > SQUASHFS_METADATA_SIZE) {
++		kfree(table);
++		return ERR_PTR(-EINVAL);
++	}
+ 
+-	TRACE("In read_xattr_index_table, length %d\n", len);
++	if (*xattr_table_start >= le64_to_cpu(table[0])) {
++		kfree(table);
++		return ERR_PTR(-EINVAL);
++	}
+ 
+-	return squashfs_read_table(sb, start + sizeof(*id_table), len);
++	return table;
+ }
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index c28a47cbe355e..1ef4aca7b953f 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -13,6 +13,7 @@
+ #include <linux/fs.h>
+ #include <linux/sched.h>
+ #include <linux/blkdev.h>
++#include <linux/device.h>
+ #include <linux/writeback.h>
+ #include <linux/blk-cgroup.h>
+ #include <linux/backing-dev-defs.h>
+@@ -498,4 +499,13 @@ static inline int bdi_rw_congested(struct backing_dev_info *bdi)
+ 				  (1 << WB_async_congested));
+ }
+ 
++extern const char *bdi_unknown_name;
++
++static inline const char *bdi_dev_name(struct backing_dev_info *bdi)
++{
++	if (!bdi || !bdi->dev)
++		return bdi_unknown_name;
++	return dev_name(bdi->dev);
++}
++
+ #endif	/* _LINUX_BACKING_DEV_H */
+diff --git a/include/linux/kprobes.h b/include/linux/kprobes.h
+index 9f22652d69bb0..c28204e22b544 100644
+--- a/include/linux/kprobes.h
++++ b/include/linux/kprobes.h
+@@ -245,7 +245,7 @@ extern void kprobes_inc_nmissed_count(struct kprobe *p);
+ extern bool arch_within_kprobe_blacklist(unsigned long addr);
+ extern int arch_populate_kprobe_blacklist(void);
+ extern bool arch_kprobe_on_func_entry(unsigned long offset);
+-extern bool kprobe_on_func_entry(kprobe_opcode_t *addr, const char *sym, unsigned long offset);
++extern int kprobe_on_func_entry(kprobe_opcode_t *addr, const char *sym, unsigned long offset);
+ 
+ extern bool within_kprobe_blacklist(unsigned long addr);
+ extern int kprobe_add_ksym_blacklist(unsigned long entry);
+diff --git a/include/linux/string.h b/include/linux/string.h
+index 4db285b83f44e..1e0c442b941e2 100644
+--- a/include/linux/string.h
++++ b/include/linux/string.h
+@@ -31,6 +31,10 @@ size_t strlcpy(char *, const char *, size_t);
+ #ifndef __HAVE_ARCH_STRSCPY
+ ssize_t strscpy(char *, const char *, size_t);
+ #endif
++
++/* Wraps calls to strscpy()/memset(), no arch specific code required */
++ssize_t strscpy_pad(char *dest, const char *src, size_t count);
++
+ #ifndef __HAVE_ARCH_STRCAT
+ extern char * strcat(char *, const char *);
+ #endif
+diff --git a/include/linux/sunrpc/xdr.h b/include/linux/sunrpc/xdr.h
+index 2bd68177a442e..33580cc72a43d 100644
+--- a/include/linux/sunrpc/xdr.h
++++ b/include/linux/sunrpc/xdr.h
+@@ -26,8 +26,7 @@ struct rpc_rqst;
+ #define XDR_QUADLEN(l)		(((l) + 3) >> 2)
+ 
+ /*
+- * Generic opaque `network object.' At the kernel level, this type
+- * is used only by lockd.
++ * Generic opaque `network object.'
+  */
+ #define XDR_MAX_NETOBJ		1024
+ struct xdr_netobj {
+diff --git a/include/trace/events/writeback.h b/include/trace/events/writeback.h
+index 146e7b3faa856..300afa559f467 100644
+--- a/include/trace/events/writeback.h
++++ b/include/trace/events/writeback.h
+@@ -65,8 +65,9 @@ TRACE_EVENT(writeback_dirty_page,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-			mapping ? dev_name(inode_to_bdi(mapping->host)->dev) : "(unknown)", 32);
++		strscpy_pad(__entry->name,
++			    bdi_dev_name(mapping ? inode_to_bdi(mapping->host) :
++					 NULL), 32);
+ 		__entry->ino = mapping ? mapping->host->i_ino : 0;
+ 		__entry->index = page->index;
+ 	),
+@@ -95,8 +96,7 @@ DECLARE_EVENT_CLASS(writeback_dirty_inode_template,
+ 		struct backing_dev_info *bdi = inode_to_bdi(inode);
+ 
+ 		/* may be called for files on pseudo FSes w/ unregistered bdi */
+-		strncpy(__entry->name,
+-			bdi->dev ? dev_name(bdi->dev) : "(unknown)", 32);
++		strscpy_pad(__entry->name, bdi_dev_name(bdi), 32);
+ 		__entry->ino		= inode->i_ino;
+ 		__entry->state		= inode->i_state;
+ 		__entry->flags		= flags;
+@@ -175,8 +175,8 @@ DECLARE_EVENT_CLASS(writeback_write_inode_template,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-			dev_name(inode_to_bdi(inode)->dev), 32);
++		strscpy_pad(__entry->name,
++			    bdi_dev_name(inode_to_bdi(inode)), 32);
+ 		__entry->ino		= inode->i_ino;
+ 		__entry->sync_mode	= wbc->sync_mode;
+ 		__entry->cgroup_ino	= __trace_wbc_assign_cgroup(wbc);
+@@ -219,8 +219,7 @@ DECLARE_EVENT_CLASS(writeback_work_class,
+ 		__field(unsigned int, cgroup_ino)
+ 	),
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-			wb->bdi->dev ? dev_name(wb->bdi->dev) : "(unknown)", 32);
++		strscpy_pad(__entry->name, bdi_dev_name(wb->bdi), 32);
+ 		__entry->nr_pages = work->nr_pages;
+ 		__entry->sb_dev = work->sb ? work->sb->s_dev : 0;
+ 		__entry->sync_mode = work->sync_mode;
+@@ -273,7 +272,7 @@ DECLARE_EVENT_CLASS(writeback_class,
+ 		__field(unsigned int, cgroup_ino)
+ 	),
+ 	TP_fast_assign(
+-		strncpy(__entry->name, dev_name(wb->bdi->dev), 32);
++		strscpy_pad(__entry->name, bdi_dev_name(wb->bdi), 32);
+ 		__entry->cgroup_ino = __trace_wb_assign_cgroup(wb);
+ 	),
+ 	TP_printk("bdi %s: cgroup_ino=%u",
+@@ -295,7 +294,7 @@ TRACE_EVENT(writeback_bdi_register,
+ 		__array(char, name, 32)
+ 	),
+ 	TP_fast_assign(
+-		strncpy(__entry->name, dev_name(bdi->dev), 32);
++		strscpy_pad(__entry->name, bdi_dev_name(bdi), 32);
+ 	),
+ 	TP_printk("bdi %s",
+ 		__entry->name
+@@ -320,7 +319,7 @@ DECLARE_EVENT_CLASS(wbc_class,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name, dev_name(bdi->dev), 32);
++		strscpy_pad(__entry->name, bdi_dev_name(bdi), 32);
+ 		__entry->nr_to_write	= wbc->nr_to_write;
+ 		__entry->pages_skipped	= wbc->pages_skipped;
+ 		__entry->sync_mode	= wbc->sync_mode;
+@@ -371,7 +370,7 @@ TRACE_EVENT(writeback_queue_io,
+ 		__field(unsigned int,	cgroup_ino)
+ 	),
+ 	TP_fast_assign(
+-		strncpy(__entry->name, dev_name(wb->bdi->dev), 32);
++		strscpy_pad(__entry->name, bdi_dev_name(wb->bdi), 32);
+ 		__entry->older	= dirtied_before;
+ 		__entry->age	= (jiffies - dirtied_before) * 1000 / HZ;
+ 		__entry->moved	= moved;
+@@ -456,7 +455,7 @@ TRACE_EVENT(bdi_dirty_ratelimit,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strlcpy(__entry->bdi, dev_name(wb->bdi->dev), 32);
++		strscpy_pad(__entry->bdi, bdi_dev_name(wb->bdi), 32);
+ 		__entry->write_bw	= KBps(wb->write_bandwidth);
+ 		__entry->avg_write_bw	= KBps(wb->avg_write_bandwidth);
+ 		__entry->dirty_rate	= KBps(dirty_rate);
+@@ -521,7 +520,7 @@ TRACE_EVENT(balance_dirty_pages,
+ 
+ 	TP_fast_assign(
+ 		unsigned long freerun = (thresh + bg_thresh) / 2;
+-		strlcpy(__entry->bdi, dev_name(wb->bdi->dev), 32);
++		strscpy_pad(__entry->bdi, bdi_dev_name(wb->bdi), 32);
+ 
+ 		__entry->limit		= global_wb_domain.dirty_limit;
+ 		__entry->setpoint	= (global_wb_domain.dirty_limit +
+@@ -581,8 +580,8 @@ TRACE_EVENT(writeback_sb_inodes_requeue,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-		        dev_name(inode_to_bdi(inode)->dev), 32);
++		strscpy_pad(__entry->name,
++			    bdi_dev_name(inode_to_bdi(inode)), 32);
+ 		__entry->ino		= inode->i_ino;
+ 		__entry->state		= inode->i_state;
+ 		__entry->dirtied_when	= inode->dirtied_when;
+@@ -655,8 +654,8 @@ DECLARE_EVENT_CLASS(writeback_single_inode_template,
+ 	),
+ 
+ 	TP_fast_assign(
+-		strncpy(__entry->name,
+-			dev_name(inode_to_bdi(inode)->dev), 32);
++		strscpy_pad(__entry->name,
++			    bdi_dev_name(inode_to_bdi(inode)), 32);
+ 		__entry->ino		= inode->i_ino;
+ 		__entry->state		= inode->i_state;
+ 		__entry->dirtied_when	= inode->dirtied_when;
+diff --git a/init/init_task.c b/init/init_task.c
+index 5aebe3be4d7cd..994ffe0181208 100644
+--- a/init/init_task.c
++++ b/init/init_task.c
+@@ -168,7 +168,8 @@ struct task_struct init_task
+ 	.lockdep_recursion = 0,
+ #endif
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+-	.ret_stack	= NULL,
++	.ret_stack		= NULL,
++	.tracing_graph_pause	= ATOMIC_INIT(0),
+ #endif
+ #if defined(CONFIG_TRACING) && defined(CONFIG_PREEMPT)
+ 	.trace_recursion = 0,
+diff --git a/kernel/kprobes.c b/kernel/kprobes.c
+index 6d02b78fde01e..d4435fd6fc8bc 100644
+--- a/kernel/kprobes.c
++++ b/kernel/kprobes.c
+@@ -1921,29 +1921,45 @@ bool __weak arch_kprobe_on_func_entry(unsigned long offset)
+ 	return !offset;
+ }
+ 
+-bool kprobe_on_func_entry(kprobe_opcode_t *addr, const char *sym, unsigned long offset)
++/**
++ * kprobe_on_func_entry() -- check whether given address is function entry
++ * @addr: Target address
++ * @sym:  Target symbol name
++ * @offset: The offset from the symbol or the address
++ *
++ * This checks whether the given @addr+@offset or @sym+@offset is on the
++ * function entry address or not.
++ * This returns 0 if it is the function entry, or -EINVAL if it is not.
++ * And also it returns -ENOENT if it fails the symbol or address lookup.
++ * Caller must pass @addr or @sym (either one must be NULL), or this
++ * returns -EINVAL.
++ */
++int kprobe_on_func_entry(kprobe_opcode_t *addr, const char *sym, unsigned long offset)
+ {
+ 	kprobe_opcode_t *kp_addr = _kprobe_addr(addr, sym, offset);
+ 
+ 	if (IS_ERR(kp_addr))
+-		return false;
++		return PTR_ERR(kp_addr);
+ 
+-	if (!kallsyms_lookup_size_offset((unsigned long)kp_addr, NULL, &offset) ||
+-						!arch_kprobe_on_func_entry(offset))
+-		return false;
++	if (!kallsyms_lookup_size_offset((unsigned long)kp_addr, NULL, &offset))
++		return -ENOENT;
+ 
+-	return true;
++	if (!arch_kprobe_on_func_entry(offset))
++		return -EINVAL;
++
++	return 0;
+ }
+ 
+ int register_kretprobe(struct kretprobe *rp)
+ {
+-	int ret = 0;
++	int ret;
+ 	struct kretprobe_instance *inst;
+ 	int i;
+ 	void *addr;
+ 
+-	if (!kprobe_on_func_entry(rp->kp.addr, rp->kp.symbol_name, rp->kp.offset))
+-		return -EINVAL;
++	ret = kprobe_on_func_entry(rp->kp.addr, rp->kp.symbol_name, rp->kp.offset);
++	if (ret)
++		return ret;
+ 
+ 	/* If only rp->kp.addr is specified, check reregistering kprobes */
+ 	if (rp->kp.addr && check_kprobe_rereg(&rp->kp))
+diff --git a/kernel/trace/ftrace.c b/kernel/trace/ftrace.c
+index cce526755471f..3492202762c73 100644
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@ -6875,7 +6875,6 @@ static int alloc_retstack_tasklist(struct ftrace_ret_stack **ret_stack_list)
+ 		}
+ 
+ 		if (t->ret_stack == NULL) {
+-			atomic_set(&t->tracing_graph_pause, 0);
+ 			atomic_set(&t->trace_overrun, 0);
+ 			t->curr_ret_stack = -1;
+ 			t->curr_ret_depth = -1;
+@@ -7088,7 +7087,6 @@ static DEFINE_PER_CPU(struct ftrace_ret_stack *, idle_ret_stack);
+ static void
+ graph_init_task(struct task_struct *t, struct ftrace_ret_stack *ret_stack)
+ {
+-	atomic_set(&t->tracing_graph_pause, 0);
+ 	atomic_set(&t->trace_overrun, 0);
+ 	t->ftrace_timestamp = 0;
+ 	/* make curr_ret_stack visible before we add the ret_stack */
+diff --git a/kernel/trace/trace_kprobe.c b/kernel/trace/trace_kprobe.c
+index 5c17f70c7f2d2..61eff45653f57 100644
+--- a/kernel/trace/trace_kprobe.c
++++ b/kernel/trace/trace_kprobe.c
+@@ -112,9 +112,9 @@ bool trace_kprobe_on_func_entry(struct trace_event_call *call)
+ {
+ 	struct trace_kprobe *tk = (struct trace_kprobe *)call->data;
+ 
+-	return kprobe_on_func_entry(tk->rp.kp.addr,
++	return (kprobe_on_func_entry(tk->rp.kp.addr,
+ 			tk->rp.kp.addr ? NULL : tk->rp.kp.symbol_name,
+-			tk->rp.kp.addr ? 0 : tk->rp.kp.offset);
++			tk->rp.kp.addr ? 0 : tk->rp.kp.offset) == 0);
+ }
+ 
+ bool trace_kprobe_error_injectable(struct trace_event_call *call)
+diff --git a/lib/string.c b/lib/string.c
+index edf4907ec946f..f7f7770444bf5 100644
+--- a/lib/string.c
++++ b/lib/string.c
+@@ -158,11 +158,9 @@ EXPORT_SYMBOL(strlcpy);
+  * @src: Where to copy the string from
+  * @count: Size of destination buffer
+  *
+- * Copy the string, or as much of it as fits, into the dest buffer.
+- * The routine returns the number of characters copied (not including
+- * the trailing NUL) or -E2BIG if the destination buffer wasn't big enough.
+- * The behavior is undefined if the string buffers overlap.
+- * The destination buffer is always NUL terminated, unless it's zero-sized.
++ * Copy the string, or as much of it as fits, into the dest buffer.  The
++ * behavior is undefined if the string buffers overlap.  The destination
++ * buffer is always NUL terminated, unless it's zero-sized.
+  *
+  * Preferred to strlcpy() since the API doesn't require reading memory
+  * from the src string beyond the specified "count" bytes, and since
+@@ -172,8 +170,10 @@ EXPORT_SYMBOL(strlcpy);
+  *
+  * Preferred to strncpy() since it always returns a valid string, and
+  * doesn't unnecessarily force the tail of the destination buffer to be
+- * zeroed.  If the zeroing is desired, it's likely cleaner to use strscpy()
+- * with an overflow test, then just memset() the tail of the dest buffer.
++ * zeroed.  If zeroing is desired please use strscpy_pad().
++ *
++ * Return: The number of characters copied (not including the trailing
++ *         %NUL) or -E2BIG if the destination buffer wasn't big enough.
+  */
+ ssize_t strscpy(char *dest, const char *src, size_t count)
+ {
+@@ -260,6 +260,39 @@ char *stpcpy(char *__restrict__ dest, const char *__restrict__ src)
+ }
+ EXPORT_SYMBOL(stpcpy);
+ 
++/**
++ * strscpy_pad() - Copy a C-string into a sized buffer
++ * @dest: Where to copy the string to
++ * @src: Where to copy the string from
++ * @count: Size of destination buffer
++ *
++ * Copy the string, or as much of it as fits, into the dest buffer.  The
++ * behavior is undefined if the string buffers overlap.  The destination
++ * buffer is always %NUL terminated, unless it's zero-sized.
++ *
++ * If the source string is shorter than the destination buffer, zeros
++ * the tail of the destination buffer.
++ *
++ * For full explanation of why you may want to consider using the
++ * 'strscpy' functions please see the function docstring for strscpy().
++ *
++ * Return: The number of characters copied (not including the trailing
++ *         %NUL) or -E2BIG if the destination buffer wasn't big enough.
++ */
++ssize_t strscpy_pad(char *dest, const char *src, size_t count)
++{
++	ssize_t written;
++
++	written = strscpy(dest, src, count);
++	if (written < 0 || written == count - 1)
++		return written;
++
++	memset(dest + written + 1, 0, count - written - 1);
++
++	return written;
++}
++EXPORT_SYMBOL(strscpy_pad);
++
+ #ifndef __HAVE_ARCH_STRCAT
+ /**
+  * strcat - Append one %NUL-terminated string to another
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index 72e6d0c55cfad..0a970be24a28d 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -19,6 +19,7 @@ struct backing_dev_info noop_backing_dev_info = {
+ EXPORT_SYMBOL_GPL(noop_backing_dev_info);
+ 
+ static struct class *bdi_class;
++const char *bdi_unknown_name = "(unknown)";
+ 
+ /*
+  * bdi_lock protects updates to bdi_list. bdi_list has RCU reader side
+diff --git a/net/key/af_key.c b/net/key/af_key.c
+index e340e97224c3a..c7d5a6015389b 100644
+--- a/net/key/af_key.c
++++ b/net/key/af_key.c
+@@ -2908,7 +2908,7 @@ static int count_ah_combs(const struct xfrm_tmpl *t)
+ 			break;
+ 		if (!aalg->pfkey_supported)
+ 			continue;
+-		if (aalg_tmpl_set(t, aalg) && aalg->available)
++		if (aalg_tmpl_set(t, aalg))
+ 			sz += sizeof(struct sadb_comb);
+ 	}
+ 	return sz + sizeof(struct sadb_prop);
+@@ -2926,7 +2926,7 @@ static int count_esp_combs(const struct xfrm_tmpl *t)
+ 		if (!ealg->pfkey_supported)
+ 			continue;
+ 
+-		if (!(ealg_tmpl_set(t, ealg) && ealg->available))
++		if (!(ealg_tmpl_set(t, ealg)))
+ 			continue;
+ 
+ 		for (k = 1; ; k++) {
+@@ -2937,7 +2937,7 @@ static int count_esp_combs(const struct xfrm_tmpl *t)
+ 			if (!aalg->pfkey_supported)
+ 				continue;
+ 
+-			if (aalg_tmpl_set(t, aalg) && aalg->available)
++			if (aalg_tmpl_set(t, aalg))
+ 				sz += sizeof(struct sadb_comb);
+ 		}
+ 	}
+diff --git a/net/sunrpc/auth_gss/auth_gss.c b/net/sunrpc/auth_gss/auth_gss.c
+index 8cb7d812ccb82..e61c48c1b37d6 100644
+--- a/net/sunrpc/auth_gss/auth_gss.c
++++ b/net/sunrpc/auth_gss/auth_gss.c
+@@ -53,6 +53,7 @@
+ #include <linux/uaccess.h>
+ #include <linux/hashtable.h>
+ 
++#include "auth_gss_internal.h"
+ #include "../netns.h"
+ 
+ static const struct rpc_authops authgss_ops;
+@@ -147,35 +148,6 @@ gss_cred_set_ctx(struct rpc_cred *cred, struct gss_cl_ctx *ctx)
+ 	clear_bit(RPCAUTH_CRED_NEW, &cred->cr_flags);
+ }
+ 
+-static const void *
+-simple_get_bytes(const void *p, const void *end, void *res, size_t len)
+-{
+-	const void *q = (const void *)((const char *)p + len);
+-	if (unlikely(q > end || q < p))
+-		return ERR_PTR(-EFAULT);
+-	memcpy(res, p, len);
+-	return q;
+-}
+-
+-static inline const void *
+-simple_get_netobj(const void *p, const void *end, struct xdr_netobj *dest)
+-{
+-	const void *q;
+-	unsigned int len;
+-
+-	p = simple_get_bytes(p, end, &len, sizeof(len));
+-	if (IS_ERR(p))
+-		return p;
+-	q = (const void *)((const char *)p + len);
+-	if (unlikely(q > end || q < p))
+-		return ERR_PTR(-EFAULT);
+-	dest->data = kmemdup(p, len, GFP_NOFS);
+-	if (unlikely(dest->data == NULL))
+-		return ERR_PTR(-ENOMEM);
+-	dest->len = len;
+-	return q;
+-}
+-
+ static struct gss_cl_ctx *
+ gss_cred_get_ctx(struct rpc_cred *cred)
+ {
+diff --git a/net/sunrpc/auth_gss/auth_gss_internal.h b/net/sunrpc/auth_gss/auth_gss_internal.h
+new file mode 100644
+index 0000000000000..f6d9631bd9d00
+--- /dev/null
++++ b/net/sunrpc/auth_gss/auth_gss_internal.h
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: BSD-3-Clause
++/*
++ * linux/net/sunrpc/auth_gss/auth_gss_internal.h
++ *
++ * Internal definitions for RPCSEC_GSS client authentication
++ *
++ * Copyright (c) 2000 The Regents of the University of Michigan.
++ * All rights reserved.
++ *
++ */
++#include <linux/err.h>
++#include <linux/string.h>
++#include <linux/sunrpc/xdr.h>
++
++static inline const void *
++simple_get_bytes(const void *p, const void *end, void *res, size_t len)
++{
++	const void *q = (const void *)((const char *)p + len);
++	if (unlikely(q > end || q < p))
++		return ERR_PTR(-EFAULT);
++	memcpy(res, p, len);
++	return q;
++}
++
++static inline const void *
++simple_get_netobj(const void *p, const void *end, struct xdr_netobj *dest)
++{
++	const void *q;
++	unsigned int len;
++
++	p = simple_get_bytes(p, end, &len, sizeof(len));
++	if (IS_ERR(p))
++		return p;
++	q = (const void *)((const char *)p + len);
++	if (unlikely(q > end || q < p))
++		return ERR_PTR(-EFAULT);
++	if (len) {
++		dest->data = kmemdup(p, len, GFP_NOFS);
++		if (unlikely(dest->data == NULL))
++			return ERR_PTR(-ENOMEM);
++	} else
++		dest->data = NULL;
++	dest->len = len;
++	return q;
++}
+diff --git a/net/sunrpc/auth_gss/gss_krb5_mech.c b/net/sunrpc/auth_gss/gss_krb5_mech.c
+index 7bb2514aadd9d..14f2823ad6c20 100644
+--- a/net/sunrpc/auth_gss/gss_krb5_mech.c
++++ b/net/sunrpc/auth_gss/gss_krb5_mech.c
+@@ -46,6 +46,8 @@
+ #include <linux/sunrpc/xdr.h>
+ #include <linux/sunrpc/gss_krb5_enctypes.h>
+ 
++#include "auth_gss_internal.h"
++
+ #if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+ # define RPCDBG_FACILITY	RPCDBG_AUTH
+ #endif
+@@ -187,35 +189,6 @@ get_gss_krb5_enctype(int etype)
+ 	return NULL;
+ }
+ 
+-static const void *
+-simple_get_bytes(const void *p, const void *end, void *res, int len)
+-{
+-	const void *q = (const void *)((const char *)p + len);
+-	if (unlikely(q > end || q < p))
+-		return ERR_PTR(-EFAULT);
+-	memcpy(res, p, len);
+-	return q;
+-}
+-
+-static const void *
+-simple_get_netobj(const void *p, const void *end, struct xdr_netobj *res)
+-{
+-	const void *q;
+-	unsigned int len;
+-
+-	p = simple_get_bytes(p, end, &len, sizeof(len));
+-	if (IS_ERR(p))
+-		return p;
+-	q = (const void *)((const char *)p + len);
+-	if (unlikely(q > end || q < p))
+-		return ERR_PTR(-EFAULT);
+-	res->data = kmemdup(p, len, GFP_NOFS);
+-	if (unlikely(res->data == NULL))
+-		return ERR_PTR(-ENOMEM);
+-	res->len = len;
+-	return q;
+-}
+-
+ static inline const void *
+ get_key(const void *p, const void *end,
+ 	struct krb5_ctx *ctx, struct crypto_skcipher **res)

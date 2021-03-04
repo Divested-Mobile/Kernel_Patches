@@ -1,0 +1,1145 @@
+diff --git a/Makefile b/Makefile
+index b740f9c933cb7..822a8e10d4325 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 5
+ PATCHLEVEL = 10
+-SUBLEVEL = 17
++SUBLEVEL = 18
+ EXTRAVERSION =
+ NAME = Kleptomaniac Octopus
+ 
+diff --git a/arch/arm/xen/p2m.c b/arch/arm/xen/p2m.c
+index e52950a43f2ed..fd6e3aafe2724 100644
+--- a/arch/arm/xen/p2m.c
++++ b/arch/arm/xen/p2m.c
+@@ -95,8 +95,10 @@ int set_foreign_p2m_mapping(struct gnttab_map_grant_ref *map_ops,
+ 	for (i = 0; i < count; i++) {
+ 		if (map_ops[i].status)
+ 			continue;
+-		set_phys_to_machine(map_ops[i].host_addr >> XEN_PAGE_SHIFT,
+-				    map_ops[i].dev_bus_addr >> XEN_PAGE_SHIFT);
++		if (unlikely(!set_phys_to_machine(map_ops[i].host_addr >> XEN_PAGE_SHIFT,
++				    map_ops[i].dev_bus_addr >> XEN_PAGE_SHIFT))) {
++			return -ENOMEM;
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/arch/x86/xen/p2m.c b/arch/x86/xen/p2m.c
+index be4151f42611f..d71942a3c65af 100644
+--- a/arch/x86/xen/p2m.c
++++ b/arch/x86/xen/p2m.c
+@@ -712,7 +712,8 @@ int set_foreign_p2m_mapping(struct gnttab_map_grant_ref *map_ops,
+ 		unsigned long mfn, pfn;
+ 
+ 		/* Do not add to override if the map failed. */
+-		if (map_ops[i].status)
++		if (map_ops[i].status != GNTST_okay ||
++		    (kmap_ops && kmap_ops[i].status != GNTST_okay))
+ 			continue;
+ 
+ 		if (map_ops[i].flags & GNTMAP_contains_pte) {
+@@ -750,17 +751,15 @@ int clear_foreign_p2m_mapping(struct gnttab_unmap_grant_ref *unmap_ops,
+ 		unsigned long mfn = __pfn_to_mfn(page_to_pfn(pages[i]));
+ 		unsigned long pfn = page_to_pfn(pages[i]);
+ 
+-		if (mfn == INVALID_P2M_ENTRY || !(mfn & FOREIGN_FRAME_BIT)) {
++		if (mfn != INVALID_P2M_ENTRY && (mfn & FOREIGN_FRAME_BIT))
++			set_phys_to_machine(pfn, INVALID_P2M_ENTRY);
++		else
+ 			ret = -EINVAL;
+-			goto out;
+-		}
+-
+-		set_phys_to_machine(pfn, INVALID_P2M_ENTRY);
+ 	}
+ 	if (kunmap_ops)
+ 		ret = HYPERVISOR_grant_table_op(GNTTABOP_unmap_grant_ref,
+-						kunmap_ops, count);
+-out:
++						kunmap_ops, count) ?: ret;
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(clear_foreign_p2m_mapping);
+diff --git a/drivers/block/xen-blkback/blkback.c b/drivers/block/xen-blkback/blkback.c
+index 9ebf53903d7bf..da16121140cab 100644
+--- a/drivers/block/xen-blkback/blkback.c
++++ b/drivers/block/xen-blkback/blkback.c
+@@ -794,8 +794,13 @@ again:
+ 			pages[i]->persistent_gnt = persistent_gnt;
+ 		} else {
+ 			if (gnttab_page_cache_get(&ring->free_pages,
+-						  &pages[i]->page))
+-				goto out_of_memory;
++						  &pages[i]->page)) {
++				gnttab_page_cache_put(&ring->free_pages,
++						      pages_to_gnt,
++						      segs_to_map);
++				ret = -ENOMEM;
++				goto out;
++			}
+ 			addr = vaddr(pages[i]->page);
+ 			pages_to_gnt[segs_to_map] = pages[i]->page;
+ 			pages[i]->persistent_gnt = NULL;
+@@ -811,10 +816,8 @@ again:
+ 			break;
+ 	}
+ 
+-	if (segs_to_map) {
++	if (segs_to_map)
+ 		ret = gnttab_map_refs(map, NULL, pages_to_gnt, segs_to_map);
+-		BUG_ON(ret);
+-	}
+ 
+ 	/*
+ 	 * Now swizzle the MFN in our domain with the MFN from the other domain
+@@ -830,7 +833,7 @@ again:
+ 				gnttab_page_cache_put(&ring->free_pages,
+ 						      &pages[seg_idx]->page, 1);
+ 				pages[seg_idx]->handle = BLKBACK_INVALID_HANDLE;
+-				ret |= 1;
++				ret |= !ret;
+ 				goto next;
+ 			}
+ 			pages[seg_idx]->handle = map[new_map_idx].handle;
+@@ -882,17 +885,18 @@ next:
+ 	}
+ 	segs_to_map = 0;
+ 	last_map = map_until;
+-	if (map_until != num)
++	if (!ret && map_until != num)
+ 		goto again;
+ 
+-	return ret;
+-
+-out_of_memory:
+-	pr_alert("%s: out of memory\n", __func__);
+-	gnttab_page_cache_put(&ring->free_pages, pages_to_gnt, segs_to_map);
+-	for (i = last_map; i < num; i++)
++out:
++	for (i = last_map; i < num; i++) {
++		/* Don't zap current batch's valid persistent grants. */
++		if(i >= last_map + segs_to_map)
++			pages[i]->persistent_gnt = NULL;
+ 		pages[i]->handle = BLKBACK_INVALID_HANDLE;
+-	return -ENOMEM;
++	}
++
++	return ret;
+ }
+ 
+ static int xen_blkbk_map_seg(struct pending_req *pending_req)
+diff --git a/drivers/bluetooth/btusb.c b/drivers/bluetooth/btusb.c
+index 80468745d5c5e..9f958699141e2 100644
+--- a/drivers/bluetooth/btusb.c
++++ b/drivers/bluetooth/btusb.c
+@@ -480,7 +480,6 @@ static const struct dmi_system_id btusb_needs_reset_resume_table[] = {
+ #define BTUSB_HW_RESET_ACTIVE	12
+ #define BTUSB_TX_WAIT_VND_EVT	13
+ #define BTUSB_WAKEUP_DISABLE	14
+-#define BTUSB_USE_ALT1_FOR_WBS	15
+ 
+ struct btusb_data {
+ 	struct hci_dev       *hdev;
+@@ -1710,15 +1709,12 @@ static void btusb_work(struct work_struct *work)
+ 				new_alts = data->sco_num;
+ 			}
+ 		} else if (data->air_mode == HCI_NOTIFY_ENABLE_SCO_TRANSP) {
+-			/* Check if Alt 6 is supported for Transparent audio */
+-			if (btusb_find_altsetting(data, 6)) {
+-				data->usb_alt6_packet_flow = true;
+-				new_alts = 6;
+-			} else if (test_bit(BTUSB_USE_ALT1_FOR_WBS, &data->flags)) {
+-				new_alts = 1;
+-			} else {
+-				bt_dev_err(hdev, "Device does not support ALT setting 6");
+-			}
++			/* Bluetooth USB spec recommends alt 6 (63 bytes), but
++			 * many adapters do not support it.  Alt 1 appears to
++			 * work for all adapters that do not have alt 6, and
++			 * which work with WBS at all.
++			 */
++			new_alts = btusb_find_altsetting(data, 6) ? 6 : 1;
+ 		}
+ 
+ 		if (btusb_switch_alt_setting(hdev, new_alts) < 0)
+@@ -4149,10 +4145,6 @@ static int btusb_probe(struct usb_interface *intf,
+ 		 * (DEVICE_REMOTE_WAKEUP)
+ 		 */
+ 		set_bit(BTUSB_WAKEUP_DISABLE, &data->flags);
+-		if (btusb_find_altsetting(data, 1))
+-			set_bit(BTUSB_USE_ALT1_FOR_WBS, &data->flags);
+-		else
+-			bt_dev_err(hdev, "Device does not support ALT setting 1");
+ 	}
+ 
+ 	if (!reset)
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.c b/drivers/infiniband/ulp/isert/ib_isert.c
+index 436e17f1d0e53..bd478947b93a5 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -28,6 +28,18 @@ static int isert_debug_level;
+ module_param_named(debug_level, isert_debug_level, int, 0644);
+ MODULE_PARM_DESC(debug_level, "Enable debug tracing if > 0 (default:0)");
+ 
++static int isert_sg_tablesize_set(const char *val,
++				  const struct kernel_param *kp);
++static const struct kernel_param_ops sg_tablesize_ops = {
++	.set = isert_sg_tablesize_set,
++	.get = param_get_int,
++};
++
++static int isert_sg_tablesize = ISCSI_ISER_DEF_SG_TABLESIZE;
++module_param_cb(sg_tablesize, &sg_tablesize_ops, &isert_sg_tablesize, 0644);
++MODULE_PARM_DESC(sg_tablesize,
++		 "Number of gather/scatter entries in a single scsi command, should >= 128 (default: 256, max: 4096)");
++
+ static DEFINE_MUTEX(device_list_mutex);
+ static LIST_HEAD(device_list);
+ static struct workqueue_struct *isert_comp_wq;
+@@ -47,6 +59,19 @@ static void isert_send_done(struct ib_cq *cq, struct ib_wc *wc);
+ static void isert_login_recv_done(struct ib_cq *cq, struct ib_wc *wc);
+ static void isert_login_send_done(struct ib_cq *cq, struct ib_wc *wc);
+ 
++static int isert_sg_tablesize_set(const char *val, const struct kernel_param *kp)
++{
++	int n = 0, ret;
++
++	ret = kstrtoint(val, 10, &n);
++	if (ret != 0 || n < ISCSI_ISER_MIN_SG_TABLESIZE ||
++	    n > ISCSI_ISER_MAX_SG_TABLESIZE)
++		return -EINVAL;
++
++	return param_set_int(val, kp);
++}
++
++
+ static inline bool
+ isert_prot_cmd(struct isert_conn *conn, struct se_cmd *cmd)
+ {
+@@ -101,7 +126,7 @@ isert_create_qp(struct isert_conn *isert_conn,
+ 	attr.cap.max_send_wr = ISERT_QP_MAX_REQ_DTOS + 1;
+ 	attr.cap.max_recv_wr = ISERT_QP_MAX_RECV_DTOS + 1;
+ 	factor = rdma_rw_mr_factor(device->ib_device, cma_id->port_num,
+-				   ISCSI_ISER_MAX_SG_TABLESIZE);
++				   isert_sg_tablesize);
+ 	attr.cap.max_rdma_ctxs = ISCSI_DEF_XMIT_CMDS_MAX * factor;
+ 	attr.cap.max_send_sge = device->ib_device->attrs.max_send_sge;
+ 	attr.cap.max_recv_sge = 1;
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.h b/drivers/infiniband/ulp/isert/ib_isert.h
+index 7fee4a65e181a..6c5af13db4e0d 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.h
++++ b/drivers/infiniband/ulp/isert/ib_isert.h
+@@ -65,6 +65,12 @@
+  */
+ #define ISER_RX_SIZE		(ISCSI_DEF_MAX_RECV_SEG_LEN + 1024)
+ 
++/* Default I/O size is 1MB */
++#define ISCSI_ISER_DEF_SG_TABLESIZE 256
++
++/* Minimum I/O size is 512KB */
++#define ISCSI_ISER_MIN_SG_TABLESIZE 128
++
+ /* Maximum support is 16MB I/O size */
+ #define ISCSI_ISER_MAX_SG_TABLESIZE	4096
+ 
+diff --git a/drivers/media/usb/pwc/pwc-if.c b/drivers/media/usb/pwc/pwc-if.c
+index 61869636ec613..5e3339cc31c07 100644
+--- a/drivers/media/usb/pwc/pwc-if.c
++++ b/drivers/media/usb/pwc/pwc-if.c
+@@ -155,16 +155,17 @@ static const struct video_device pwc_template = {
+ /***************************************************************************/
+ /* Private functions */
+ 
+-static void *pwc_alloc_urb_buffer(struct device *dev,
++static void *pwc_alloc_urb_buffer(struct usb_device *dev,
+ 				  size_t size, dma_addr_t *dma_handle)
+ {
++	struct device *dmadev = dev->bus->sysdev;
+ 	void *buffer = kmalloc(size, GFP_KERNEL);
+ 
+ 	if (!buffer)
+ 		return NULL;
+ 
+-	*dma_handle = dma_map_single(dev, buffer, size, DMA_FROM_DEVICE);
+-	if (dma_mapping_error(dev, *dma_handle)) {
++	*dma_handle = dma_map_single(dmadev, buffer, size, DMA_FROM_DEVICE);
++	if (dma_mapping_error(dmadev, *dma_handle)) {
+ 		kfree(buffer);
+ 		return NULL;
+ 	}
+@@ -172,12 +173,14 @@ static void *pwc_alloc_urb_buffer(struct device *dev,
+ 	return buffer;
+ }
+ 
+-static void pwc_free_urb_buffer(struct device *dev,
++static void pwc_free_urb_buffer(struct usb_device *dev,
+ 				size_t size,
+ 				void *buffer,
+ 				dma_addr_t dma_handle)
+ {
+-	dma_unmap_single(dev, dma_handle, size, DMA_FROM_DEVICE);
++	struct device *dmadev = dev->bus->sysdev;
++
++	dma_unmap_single(dmadev, dma_handle, size, DMA_FROM_DEVICE);
+ 	kfree(buffer);
+ }
+ 
+@@ -282,6 +285,7 @@ static void pwc_frame_complete(struct pwc_device *pdev)
+ static void pwc_isoc_handler(struct urb *urb)
+ {
+ 	struct pwc_device *pdev = (struct pwc_device *)urb->context;
++	struct device *dmadev = urb->dev->bus->sysdev;
+ 	int i, fst, flen;
+ 	unsigned char *iso_buf = NULL;
+ 
+@@ -328,7 +332,7 @@ static void pwc_isoc_handler(struct urb *urb)
+ 	/* Reset ISOC error counter. We did get here, after all. */
+ 	pdev->visoc_errors = 0;
+ 
+-	dma_sync_single_for_cpu(&urb->dev->dev,
++	dma_sync_single_for_cpu(dmadev,
+ 				urb->transfer_dma,
+ 				urb->transfer_buffer_length,
+ 				DMA_FROM_DEVICE);
+@@ -379,7 +383,7 @@ static void pwc_isoc_handler(struct urb *urb)
+ 		pdev->vlast_packet_size = flen;
+ 	}
+ 
+-	dma_sync_single_for_device(&urb->dev->dev,
++	dma_sync_single_for_device(dmadev,
+ 				   urb->transfer_dma,
+ 				   urb->transfer_buffer_length,
+ 				   DMA_FROM_DEVICE);
+@@ -461,7 +465,7 @@ retry:
+ 		urb->pipe = usb_rcvisocpipe(udev, pdev->vendpoint);
+ 		urb->transfer_flags = URB_ISO_ASAP | URB_NO_TRANSFER_DMA_MAP;
+ 		urb->transfer_buffer_length = ISO_BUFFER_SIZE;
+-		urb->transfer_buffer = pwc_alloc_urb_buffer(&udev->dev,
++		urb->transfer_buffer = pwc_alloc_urb_buffer(udev,
+ 							    urb->transfer_buffer_length,
+ 							    &urb->transfer_dma);
+ 		if (urb->transfer_buffer == NULL) {
+@@ -524,7 +528,7 @@ static void pwc_iso_free(struct pwc_device *pdev)
+ 		if (urb) {
+ 			PWC_DEBUG_MEMORY("Freeing URB\n");
+ 			if (urb->transfer_buffer)
+-				pwc_free_urb_buffer(&urb->dev->dev,
++				pwc_free_urb_buffer(urb->dev,
+ 						    urb->transfer_buffer_length,
+ 						    urb->transfer_buffer,
+ 						    urb->transfer_dma);
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+index 31b40fb83f6c1..c31036f57aef8 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7615/mcu.c
+@@ -2718,11 +2718,11 @@ int mt7615_mcu_rdd_cmd(struct mt7615_dev *dev,
+ int mt7615_mcu_set_fcc5_lpn(struct mt7615_dev *dev, int val)
+ {
+ 	struct {
+-		u16 tag;
+-		u16 min_lpn;
++		__le16 tag;
++		__le16 min_lpn;
+ 	} req = {
+-		.tag = 0x1,
+-		.min_lpn = val,
++		.tag = cpu_to_le16(0x1),
++		.min_lpn = cpu_to_le16(val),
+ 	};
+ 
+ 	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
+@@ -2733,14 +2733,27 @@ int mt7615_mcu_set_pulse_th(struct mt7615_dev *dev,
+ 			    const struct mt7615_dfs_pulse *pulse)
+ {
+ 	struct {
+-		u16 tag;
+-		struct mt7615_dfs_pulse pulse;
++		__le16 tag;
++		__le32 max_width;	/* us */
++		__le32 max_pwr;		/* dbm */
++		__le32 min_pwr;		/* dbm */
++		__le32 min_stgr_pri;	/* us */
++		__le32 max_stgr_pri;	/* us */
++		__le32 min_cr_pri;	/* us */
++		__le32 max_cr_pri;	/* us */
+ 	} req = {
+-		.tag = 0x3,
++		.tag = cpu_to_le16(0x3),
++#define __req_field(field) .field = cpu_to_le32(pulse->field)
++		__req_field(max_width),
++		__req_field(max_pwr),
++		__req_field(min_pwr),
++		__req_field(min_stgr_pri),
++		__req_field(max_stgr_pri),
++		__req_field(min_cr_pri),
++		__req_field(max_cr_pri),
++#undef  __req_field
+ 	};
+ 
+-	memcpy(&req.pulse, pulse, sizeof(*pulse));
+-
+ 	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
+ 				   &req, sizeof(req), true);
+ }
+@@ -2749,16 +2762,45 @@ int mt7615_mcu_set_radar_th(struct mt7615_dev *dev, int index,
+ 			    const struct mt7615_dfs_pattern *pattern)
+ {
+ 	struct {
+-		u16 tag;
+-		u16 radar_type;
+-		struct mt7615_dfs_pattern pattern;
++		__le16 tag;
++		__le16 radar_type;
++		u8 enb;
++		u8 stgr;
++		u8 min_crpn;
++		u8 max_crpn;
++		u8 min_crpr;
++		u8 min_pw;
++		u8 max_pw;
++		__le32 min_pri;
++		__le32 max_pri;
++		u8 min_crbn;
++		u8 max_crbn;
++		u8 min_stgpn;
++		u8 max_stgpn;
++		u8 min_stgpr;
+ 	} req = {
+-		.tag = 0x2,
+-		.radar_type = index,
++		.tag = cpu_to_le16(0x2),
++		.radar_type = cpu_to_le16(index),
++#define __req_field_u8(field) .field = pattern->field
++#define __req_field_u32(field) .field = cpu_to_le32(pattern->field)
++		__req_field_u8(enb),
++		__req_field_u8(stgr),
++		__req_field_u8(min_crpn),
++		__req_field_u8(max_crpn),
++		__req_field_u8(min_crpr),
++		__req_field_u8(min_pw),
++		__req_field_u8(max_pw),
++		__req_field_u32(min_pri),
++		__req_field_u32(max_pri),
++		__req_field_u8(min_crbn),
++		__req_field_u8(max_crbn),
++		__req_field_u8(min_stgpn),
++		__req_field_u8(max_stgpn),
++		__req_field_u8(min_stgpr),
++#undef __req_field_u8
++#undef __req_field_u32
+ 	};
+ 
+-	memcpy(&req.pattern, pattern, sizeof(*pattern));
+-
+ 	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
+ 				   &req, sizeof(req), true);
+ }
+@@ -2769,9 +2811,9 @@ int mt7615_mcu_rdd_send_pattern(struct mt7615_dev *dev)
+ 		u8 pulse_num;
+ 		u8 rsv[3];
+ 		struct {
+-			u32 start_time;
+-			u16 width;
+-			s16 power;
++			__le32 start_time;
++			__le16 width;
++			__le16 power;
+ 		} pattern[32];
+ 	} req = {
+ 		.pulse_num = dev->radar_pattern.n_pulses,
+@@ -2784,10 +2826,11 @@ int mt7615_mcu_rdd_send_pattern(struct mt7615_dev *dev)
+ 
+ 	/* TODO: add some noise here */
+ 	for (i = 0; i < dev->radar_pattern.n_pulses; i++) {
+-		req.pattern[i].width = dev->radar_pattern.width;
+-		req.pattern[i].power = dev->radar_pattern.power;
+-		req.pattern[i].start_time = start_time +
+-					    i * dev->radar_pattern.period;
++		u32 ts = start_time + i * dev->radar_pattern.period;
++
++		req.pattern[i].width = cpu_to_le16(dev->radar_pattern.width);
++		req.pattern[i].power = cpu_to_le16(dev->radar_pattern.power);
++		req.pattern[i].start_time = cpu_to_le32(ts);
+ 	}
+ 
+ 	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_PATTERN,
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7915/mcu.c b/drivers/net/wireless/mediatek/mt76/mt7915/mcu.c
+index a3ccc17856615..ea71409751519 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7915/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7915/mcu.c
+@@ -2835,7 +2835,7 @@ int mt7915_mcu_fw_dbg_ctrl(struct mt7915_dev *dev, u32 module, u8 level)
+ 	struct {
+ 		u8 ver;
+ 		u8 pad;
+-		u16 len;
++		__le16 len;
+ 		u8 level;
+ 		u8 rsv[3];
+ 		__le32 module_idx;
+@@ -3070,12 +3070,12 @@ int mt7915_mcu_rdd_cmd(struct mt7915_dev *dev,
+ int mt7915_mcu_set_fcc5_lpn(struct mt7915_dev *dev, int val)
+ {
+ 	struct {
+-		u32 tag;
+-		u16 min_lpn;
++		__le32 tag;
++		__le16 min_lpn;
+ 		u8 rsv[2];
+ 	} __packed req = {
+-		.tag = 0x1,
+-		.min_lpn = val,
++		.tag = cpu_to_le32(0x1),
++		.min_lpn = cpu_to_le16(val),
+ 	};
+ 
+ 	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
+@@ -3086,14 +3086,29 @@ int mt7915_mcu_set_pulse_th(struct mt7915_dev *dev,
+ 			    const struct mt7915_dfs_pulse *pulse)
+ {
+ 	struct {
+-		u32 tag;
+-		struct mt7915_dfs_pulse pulse;
++		__le32 tag;
++
++		__le32 max_width;		/* us */
++		__le32 max_pwr;			/* dbm */
++		__le32 min_pwr;			/* dbm */
++		__le32 min_stgr_pri;		/* us */
++		__le32 max_stgr_pri;		/* us */
++		__le32 min_cr_pri;		/* us */
++		__le32 max_cr_pri;		/* us */
+ 	} __packed req = {
+-		.tag = 0x3,
++		.tag = cpu_to_le32(0x3),
++
++#define __req_field(field) .field = cpu_to_le32(pulse->field)
++		__req_field(max_width),
++		__req_field(max_pwr),
++		__req_field(min_pwr),
++		__req_field(min_stgr_pri),
++		__req_field(max_stgr_pri),
++		__req_field(min_cr_pri),
++		__req_field(max_cr_pri),
++#undef __req_field
+ 	};
+ 
+-	memcpy(&req.pulse, pulse, sizeof(*pulse));
+-
+ 	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
+ 				   &req, sizeof(req), true);
+ }
+@@ -3102,16 +3117,50 @@ int mt7915_mcu_set_radar_th(struct mt7915_dev *dev, int index,
+ 			    const struct mt7915_dfs_pattern *pattern)
+ {
+ 	struct {
+-		u32 tag;
+-		u16 radar_type;
+-		struct mt7915_dfs_pattern pattern;
++		__le32 tag;
++		__le16 radar_type;
++
++		u8 enb;
++		u8 stgr;
++		u8 min_crpn;
++		u8 max_crpn;
++		u8 min_crpr;
++		u8 min_pw;
++		u32 min_pri;
++		u32 max_pri;
++		u8 max_pw;
++		u8 min_crbn;
++		u8 max_crbn;
++		u8 min_stgpn;
++		u8 max_stgpn;
++		u8 min_stgpr;
++		u8 rsv[2];
++		u32 min_stgpr_diff;
+ 	} __packed req = {
+-		.tag = 0x2,
+-		.radar_type = index,
++		.tag = cpu_to_le32(0x2),
++		.radar_type = cpu_to_le16(index),
++
++#define __req_field_u8(field) .field = pattern->field
++#define __req_field_u32(field) .field = cpu_to_le32(pattern->field)
++		__req_field_u8(enb),
++		__req_field_u8(stgr),
++		__req_field_u8(min_crpn),
++		__req_field_u8(max_crpn),
++		__req_field_u8(min_crpr),
++		__req_field_u8(min_pw),
++		__req_field_u32(min_pri),
++		__req_field_u32(max_pri),
++		__req_field_u8(max_pw),
++		__req_field_u8(min_crbn),
++		__req_field_u8(max_crbn),
++		__req_field_u8(min_stgpn),
++		__req_field_u8(max_stgpn),
++		__req_field_u8(min_stgpr),
++		__req_field_u32(min_stgpr_diff),
++#undef __req_field_u8
++#undef __req_field_u32
+ 	};
+ 
+-	memcpy(&req.pattern, pattern, sizeof(*pattern));
+-
+ 	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
+ 				   &req, sizeof(req), true);
+ }
+@@ -3342,12 +3391,12 @@ int mt7915_mcu_add_obss_spr(struct mt7915_dev *dev, struct ieee80211_vif *vif,
+ 		u8 drop_tx_idx;
+ 		u8 sta_idx;	/* 256 sta */
+ 		u8 rsv[2];
+-		u32 val;
++		__le32 val;
+ 	} __packed req = {
+ 		.action = MT_SPR_ENABLE,
+ 		.arg_num = 1,
+ 		.band_idx = mvif->band_idx,
+-		.val = enable,
++		.val = cpu_to_le32(enable),
+ 	};
+ 
+ 	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_SPR,
+diff --git a/drivers/net/xen-netback/netback.c b/drivers/net/xen-netback/netback.c
+index bc3421d145768..423667b837510 100644
+--- a/drivers/net/xen-netback/netback.c
++++ b/drivers/net/xen-netback/netback.c
+@@ -1342,13 +1342,11 @@ int xenvif_tx_action(struct xenvif_queue *queue, int budget)
+ 		return 0;
+ 
+ 	gnttab_batch_copy(queue->tx_copy_ops, nr_cops);
+-	if (nr_mops != 0) {
++	if (nr_mops != 0)
+ 		ret = gnttab_map_refs(queue->tx_map_ops,
+ 				      NULL,
+ 				      queue->pages_to_map,
+ 				      nr_mops);
+-		BUG_ON(ret);
+-	}
+ 
+ 	work_done = xenvif_tx_submit(queue);
+ 
+diff --git a/drivers/tty/tty_io.c b/drivers/tty/tty_io.c
+index ff87cb51747d8..21cd5ac6ca8b5 100644
+--- a/drivers/tty/tty_io.c
++++ b/drivers/tty/tty_io.c
+@@ -963,11 +963,14 @@ static inline ssize_t do_tty_write(
+ 		if (ret <= 0)
+ 			break;
+ 
++		written += ret;
++		if (ret > size)
++			break;
++
+ 		/* FIXME! Have Al check this! */
+ 		if (ret != size)
+ 			iov_iter_revert(from, size-ret);
+ 
+-		written += ret;
+ 		count -= ret;
+ 		if (!count)
+ 			break;
+diff --git a/drivers/vdpa/vdpa_sim/vdpa_sim.c b/drivers/vdpa/vdpa_sim/vdpa_sim.c
+index 6a90fdb9cbfc6..f2ad450db5478 100644
+--- a/drivers/vdpa/vdpa_sim/vdpa_sim.c
++++ b/drivers/vdpa/vdpa_sim/vdpa_sim.c
+@@ -42,6 +42,8 @@ static char *macaddr;
+ module_param(macaddr, charp, 0);
+ MODULE_PARM_DESC(macaddr, "Ethernet MAC address");
+ 
++u8 macaddr_buf[ETH_ALEN];
++
+ struct vdpasim_virtqueue {
+ 	struct vringh vring;
+ 	struct vringh_kiov iov;
+@@ -67,14 +69,24 @@ static u64 vdpasim_features = (1ULL << VIRTIO_F_ANY_LAYOUT) |
+ 			      (1ULL << VIRTIO_F_ACCESS_PLATFORM) |
+ 			      (1ULL << VIRTIO_NET_F_MAC);
+ 
++struct vdpasim;
++
++struct vdpasim_dev_attr {
++	size_t config_size;
++	int nvqs;
++	void (*get_config)(struct vdpasim *vdpasim, void *config);
++};
++
+ /* State of each vdpasim device */
+ struct vdpasim {
+ 	struct vdpa_device vdpa;
+-	struct vdpasim_virtqueue vqs[VDPASIM_VQ_NUM];
++	struct vdpasim_virtqueue *vqs;
+ 	struct work_struct work;
++	struct vdpasim_dev_attr dev_attr;
+ 	/* spinlock to synchronize virtqueue state */
+ 	spinlock_t lock;
+-	struct virtio_net_config config;
++	/* virtio config according to device type */
++	void *config;
+ 	struct vhost_iotlb *iommu;
+ 	void *buffer;
+ 	u32 status;
+@@ -144,7 +156,7 @@ static void vdpasim_reset(struct vdpasim *vdpasim)
+ {
+ 	int i;
+ 
+-	for (i = 0; i < VDPASIM_VQ_NUM; i++)
++	for (i = 0; i < vdpasim->dev_attr.nvqs; i++)
+ 		vdpasim_vq_reset(&vdpasim->vqs[i]);
+ 
+ 	spin_lock(&vdpasim->iommu_lock);
+@@ -345,22 +357,24 @@ static const struct dma_map_ops vdpasim_dma_ops = {
+ static const struct vdpa_config_ops vdpasim_net_config_ops;
+ static const struct vdpa_config_ops vdpasim_net_batch_config_ops;
+ 
+-static struct vdpasim *vdpasim_create(void)
++static struct vdpasim *vdpasim_create(struct vdpasim_dev_attr *dev_attr)
+ {
+ 	const struct vdpa_config_ops *ops;
+ 	struct vdpasim *vdpasim;
+ 	struct device *dev;
+-	int ret = -ENOMEM;
++	int i, ret = -ENOMEM;
+ 
+ 	if (batch_mapping)
+ 		ops = &vdpasim_net_batch_config_ops;
+ 	else
+ 		ops = &vdpasim_net_config_ops;
+ 
+-	vdpasim = vdpa_alloc_device(struct vdpasim, vdpa, NULL, ops, VDPASIM_VQ_NUM);
++	vdpasim = vdpa_alloc_device(struct vdpasim, vdpa, NULL, ops,
++				    dev_attr->nvqs);
+ 	if (!vdpasim)
+ 		goto err_alloc;
+ 
++	vdpasim->dev_attr = *dev_attr;
+ 	INIT_WORK(&vdpasim->work, vdpasim_work);
+ 	spin_lock_init(&vdpasim->lock);
+ 	spin_lock_init(&vdpasim->iommu_lock);
+@@ -371,6 +385,15 @@ static struct vdpasim *vdpasim_create(void)
+ 		goto err_iommu;
+ 	set_dma_ops(dev, &vdpasim_dma_ops);
+ 
++	vdpasim->config = kzalloc(dev_attr->config_size, GFP_KERNEL);
++	if (!vdpasim->config)
++		goto err_iommu;
++
++	vdpasim->vqs = kcalloc(dev_attr->nvqs, sizeof(struct vdpasim_virtqueue),
++			       GFP_KERNEL);
++	if (!vdpasim->vqs)
++		goto err_iommu;
++
+ 	vdpasim->iommu = vhost_iotlb_alloc(2048, 0);
+ 	if (!vdpasim->iommu)
+ 		goto err_iommu;
+@@ -380,17 +403,17 @@ static struct vdpasim *vdpasim_create(void)
+ 		goto err_iommu;
+ 
+ 	if (macaddr) {
+-		mac_pton(macaddr, vdpasim->config.mac);
+-		if (!is_valid_ether_addr(vdpasim->config.mac)) {
++		mac_pton(macaddr, macaddr_buf);
++		if (!is_valid_ether_addr(macaddr_buf)) {
+ 			ret = -EADDRNOTAVAIL;
+ 			goto err_iommu;
+ 		}
+ 	} else {
+-		eth_random_addr(vdpasim->config.mac);
++		eth_random_addr(macaddr_buf);
+ 	}
+ 
+-	vringh_set_iotlb(&vdpasim->vqs[0].vring, vdpasim->iommu);
+-	vringh_set_iotlb(&vdpasim->vqs[1].vring, vdpasim->iommu);
++	for (i = 0; i < dev_attr->nvqs; i++)
++		vringh_set_iotlb(&vdpasim->vqs[i].vring, vdpasim->iommu);
+ 
+ 	vdpasim->vdpa.dma_dev = dev;
+ 	ret = vdpa_register_device(&vdpasim->vdpa);
+@@ -504,7 +527,6 @@ static u64 vdpasim_get_features(struct vdpa_device *vdpa)
+ static int vdpasim_set_features(struct vdpa_device *vdpa, u64 features)
+ {
+ 	struct vdpasim *vdpasim = vdpa_to_sim(vdpa);
+-	struct virtio_net_config *config = &vdpasim->config;
+ 
+ 	/* DMA mapping must be done by driver */
+ 	if (!(features & (1ULL << VIRTIO_F_ACCESS_PLATFORM)))
+@@ -512,14 +534,6 @@ static int vdpasim_set_features(struct vdpa_device *vdpa, u64 features)
+ 
+ 	vdpasim->features = features & vdpasim_features;
+ 
+-	/* We generally only know whether guest is using the legacy interface
+-	 * here, so generally that's the earliest we can set config fields.
+-	 * Note: We actually require VIRTIO_F_ACCESS_PLATFORM above which
+-	 * implies VIRTIO_F_VERSION_1, but let's not try to be clever here.
+-	 */
+-
+-	config->mtu = cpu_to_vdpasim16(vdpasim, 1500);
+-	config->status = cpu_to_vdpasim16(vdpasim, VIRTIO_NET_S_LINK_UP);
+ 	return 0;
+ }
+ 
+@@ -572,8 +586,13 @@ static void vdpasim_get_config(struct vdpa_device *vdpa, unsigned int offset,
+ {
+ 	struct vdpasim *vdpasim = vdpa_to_sim(vdpa);
+ 
+-	if (offset + len < sizeof(struct virtio_net_config))
+-		memcpy(buf, (u8 *)&vdpasim->config + offset, len);
++	if (offset + len > vdpasim->dev_attr.config_size)
++		return;
++
++	if (vdpasim->dev_attr.get_config)
++		vdpasim->dev_attr.get_config(vdpasim, vdpasim->config);
++
++	memcpy(buf, vdpasim->config + offset, len);
+ }
+ 
+ static void vdpasim_set_config(struct vdpa_device *vdpa, unsigned int offset,
+@@ -659,6 +678,8 @@ static void vdpasim_free(struct vdpa_device *vdpa)
+ 	kfree(vdpasim->buffer);
+ 	if (vdpasim->iommu)
+ 		vhost_iotlb_free(vdpasim->iommu);
++	kfree(vdpasim->vqs);
++	kfree(vdpasim->config);
+ }
+ 
+ static const struct vdpa_config_ops vdpasim_net_config_ops = {
+@@ -714,9 +735,25 @@ static const struct vdpa_config_ops vdpasim_net_batch_config_ops = {
+ 	.free                   = vdpasim_free,
+ };
+ 
++static void vdpasim_net_get_config(struct vdpasim *vdpasim, void *config)
++{
++	struct virtio_net_config *net_config =
++		(struct virtio_net_config *)config;
++
++	net_config->mtu = cpu_to_vdpasim16(vdpasim, 1500);
++	net_config->status = cpu_to_vdpasim16(vdpasim, VIRTIO_NET_S_LINK_UP);
++	memcpy(net_config->mac, macaddr_buf, ETH_ALEN);
++}
++
+ static int __init vdpasim_dev_init(void)
+ {
+-	vdpasim_dev = vdpasim_create();
++	struct vdpasim_dev_attr dev_attr = {};
++
++	dev_attr.nvqs = VDPASIM_VQ_NUM;
++	dev_attr.config_size = sizeof(struct virtio_net_config);
++	dev_attr.get_config = vdpasim_net_get_config;
++
++	vdpasim_dev = vdpasim_create(&dev_attr);
+ 
+ 	if (!IS_ERR(vdpasim_dev))
+ 		return 0;
+diff --git a/drivers/xen/gntdev.c b/drivers/xen/gntdev.c
+index a36b71286bcf8..5447c5156b2e6 100644
+--- a/drivers/xen/gntdev.c
++++ b/drivers/xen/gntdev.c
+@@ -309,44 +309,47 @@ int gntdev_map_grant_pages(struct gntdev_grant_map *map)
+ 		 * to the kernel linear addresses of the struct pages.
+ 		 * These ptes are completely different from the user ptes dealt
+ 		 * with find_grant_ptes.
++		 * Note that GNTMAP_device_map isn't needed here: The
++		 * dev_bus_addr output field gets consumed only from ->map_ops,
++		 * and by not requesting it when mapping we also avoid needing
++		 * to mirror dev_bus_addr into ->unmap_ops (and holding an extra
++		 * reference to the page in the hypervisor).
+ 		 */
++		unsigned int flags = (map->flags & ~GNTMAP_device_map) |
++				     GNTMAP_host_map;
++
+ 		for (i = 0; i < map->count; i++) {
+ 			unsigned long address = (unsigned long)
+ 				pfn_to_kaddr(page_to_pfn(map->pages[i]));
+ 			BUG_ON(PageHighMem(map->pages[i]));
+ 
+-			gnttab_set_map_op(&map->kmap_ops[i], address,
+-				map->flags | GNTMAP_host_map,
++			gnttab_set_map_op(&map->kmap_ops[i], address, flags,
+ 				map->grants[i].ref,
+ 				map->grants[i].domid);
+ 			gnttab_set_unmap_op(&map->kunmap_ops[i], address,
+-				map->flags | GNTMAP_host_map, -1);
++				flags, -1);
+ 		}
+ 	}
+ 
+ 	pr_debug("map %d+%d\n", map->index, map->count);
+ 	err = gnttab_map_refs(map->map_ops, use_ptemod ? map->kmap_ops : NULL,
+ 			map->pages, map->count);
+-	if (err)
+-		return err;
+ 
+ 	for (i = 0; i < map->count; i++) {
+-		if (map->map_ops[i].status) {
++		if (map->map_ops[i].status == GNTST_okay)
++			map->unmap_ops[i].handle = map->map_ops[i].handle;
++		else if (!err)
+ 			err = -EINVAL;
+-			continue;
+-		}
+ 
+-		map->unmap_ops[i].handle = map->map_ops[i].handle;
+-		if (use_ptemod)
+-			map->kunmap_ops[i].handle = map->kmap_ops[i].handle;
+-#ifdef CONFIG_XEN_GRANT_DMA_ALLOC
+-		else if (map->dma_vaddr) {
+-			unsigned long bfn;
++		if (map->flags & GNTMAP_device_map)
++			map->unmap_ops[i].dev_bus_addr = map->map_ops[i].dev_bus_addr;
+ 
+-			bfn = pfn_to_bfn(page_to_pfn(map->pages[i]));
+-			map->unmap_ops[i].dev_bus_addr = __pfn_to_phys(bfn);
++		if (use_ptemod) {
++			if (map->kmap_ops[i].status == GNTST_okay)
++				map->kunmap_ops[i].handle = map->kmap_ops[i].handle;
++			else if (!err)
++				err = -EINVAL;
+ 		}
+-#endif
+ 	}
+ 	return err;
+ }
+diff --git a/drivers/xen/xen-scsiback.c b/drivers/xen/xen-scsiback.c
+index 862162dca33cf..9cd4fe8ce6803 100644
+--- a/drivers/xen/xen-scsiback.c
++++ b/drivers/xen/xen-scsiback.c
+@@ -386,12 +386,12 @@ static int scsiback_gnttab_data_map_batch(struct gnttab_map_grant_ref *map,
+ 		return 0;
+ 
+ 	err = gnttab_map_refs(map, NULL, pg, cnt);
+-	BUG_ON(err);
+ 	for (i = 0; i < cnt; i++) {
+ 		if (unlikely(map[i].status != GNTST_okay)) {
+ 			pr_err("invalid buffer -- could not remap it\n");
+ 			map[i].handle = SCSIBACK_INVALID_HANDLE;
+-			err = -ENOMEM;
++			if (!err)
++				err = -ENOMEM;
+ 		} else {
+ 			get_page(pg[i]);
+ 		}
+diff --git a/fs/btrfs/ctree.h b/fs/btrfs/ctree.h
+index 30ea9780725ff..b6884eda9ff67 100644
+--- a/fs/btrfs/ctree.h
++++ b/fs/btrfs/ctree.h
+@@ -146,9 +146,6 @@ enum {
+ 	BTRFS_FS_STATE_DEV_REPLACING,
+ 	/* The btrfs_fs_info created for self-tests */
+ 	BTRFS_FS_STATE_DUMMY_FS_INFO,
+-
+-	/* Indicate that we can't trust the free space tree for caching yet */
+-	BTRFS_FS_FREE_SPACE_TREE_UNTRUSTED,
+ };
+ 
+ #define BTRFS_BACKREF_REV_MAX		256
+@@ -562,6 +559,9 @@ enum {
+ 
+ 	/* Indicate that the discard workqueue can service discards. */
+ 	BTRFS_FS_DISCARD_RUNNING,
++
++	/* Indicate that we can't trust the free space tree for caching yet */
++	BTRFS_FS_FREE_SPACE_TREE_UNTRUSTED,
+ };
+ 
+ /*
+diff --git a/fs/btrfs/inode.c b/fs/btrfs/inode.c
+index acc47e2ffb46b..b536d21541a9f 100644
+--- a/fs/btrfs/inode.c
++++ b/fs/btrfs/inode.c
+@@ -8026,8 +8026,12 @@ ssize_t btrfs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
+ 	bool relock = false;
+ 	ssize_t ret;
+ 
+-	if (check_direct_IO(fs_info, iter, offset))
++	if (check_direct_IO(fs_info, iter, offset)) {
++		ASSERT(current->journal_info == NULL ||
++		       current->journal_info == BTRFS_DIO_SYNC_STUB);
++		current->journal_info = NULL;
+ 		return 0;
++	}
+ 
+ 	count = iov_iter_count(iter);
+ 	if (iov_iter_rw(iter) == WRITE) {
+diff --git a/include/xen/grant_table.h b/include/xen/grant_table.h
+index b9c937b3a1499..0b1182a3cf412 100644
+--- a/include/xen/grant_table.h
++++ b/include/xen/grant_table.h
+@@ -157,6 +157,7 @@ gnttab_set_map_op(struct gnttab_map_grant_ref *map, phys_addr_t addr,
+ 	map->flags = flags;
+ 	map->ref = ref;
+ 	map->dom = domid;
++	map->status = 1; /* arbitrary positive value */
+ }
+ 
+ static inline void
+diff --git a/net/bridge/br.c b/net/bridge/br.c
+index 401eeb9142eb6..1b169f8e74919 100644
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@ -43,7 +43,10 @@ static int br_device_event(struct notifier_block *unused, unsigned long event, v
+ 
+ 		if (event == NETDEV_REGISTER) {
+ 			/* register of bridge completed, add sysfs entries */
+-			br_sysfs_addbr(dev);
++			err = br_sysfs_addbr(dev);
++			if (err)
++				return notifier_from_errno(err);
++
+ 			return NOTIFY_DONE;
+ 		}
+ 	}
+diff --git a/net/core/dev.c b/net/core/dev.c
+index da85cb9398693..210d0fce58e17 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3867,6 +3867,7 @@ sch_handle_egress(struct sk_buff *skb, int *ret, struct net_device *dev)
+ 		return skb;
+ 
+ 	/* qdisc_skb_cb(skb)->pkt_len was already set by the caller. */
++	qdisc_skb_cb(skb)->mru = 0;
+ 	mini_qdisc_bstats_cpu_update(miniq, skb);
+ 
+ 	switch (tcf_classify(skb, miniq->filter_list, &cl_res, false)) {
+@@ -4950,6 +4951,7 @@ sch_handle_ingress(struct sk_buff *skb, struct packet_type **pt_prev, int *ret,
+ 	}
+ 
+ 	qdisc_skb_cb(skb)->pkt_len = skb->len;
++	qdisc_skb_cb(skb)->mru = 0;
+ 	skb->tc_at_ingress = 1;
+ 	mini_qdisc_bstats_cpu_update(miniq, skb);
+ 
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 967ce9ccfc0da..f56b2e331bb6b 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1648,8 +1648,11 @@ static struct sock *mptcp_subflow_get_retrans(const struct mptcp_sock *msk)
+ 			continue;
+ 
+ 		/* still data outstanding at TCP level?  Don't retransmit. */
+-		if (!tcp_write_queue_empty(ssk))
++		if (!tcp_write_queue_empty(ssk)) {
++			if (inet_csk(ssk)->icsk_ca_state >= TCP_CA_Loss)
++				continue;
+ 			return NULL;
++		}
+ 
+ 		if (subflow->backup) {
+ 			if (!backup)
+diff --git a/net/openvswitch/actions.c b/net/openvswitch/actions.c
+index c3a664871cb5a..e8902a7e60f24 100644
+--- a/net/openvswitch/actions.c
++++ b/net/openvswitch/actions.c
+@@ -959,16 +959,13 @@ static int dec_ttl_exception_handler(struct datapath *dp, struct sk_buff *skb,
+ 				     struct sw_flow_key *key,
+ 				     const struct nlattr *attr, bool last)
+ {
+-	/* The first action is always 'OVS_DEC_TTL_ATTR_ARG'. */
+-	struct nlattr *dec_ttl_arg = nla_data(attr);
++	/* The first attribute is always 'OVS_DEC_TTL_ATTR_ACTION'. */
++	struct nlattr *actions = nla_data(attr);
+ 
+-	if (nla_len(dec_ttl_arg)) {
+-		struct nlattr *actions = nla_data(dec_ttl_arg);
++	if (nla_len(actions))
++		return clone_execute(dp, skb, key, 0, nla_data(actions),
++				     nla_len(actions), last, false);
+ 
+-		if (actions)
+-			return clone_execute(dp, skb, key, 0, nla_data(actions),
+-					     nla_len(actions), last, false);
+-	}
+ 	consume_skb(skb);
+ 	return 0;
+ }
+@@ -1212,7 +1209,7 @@ static int execute_dec_ttl(struct sk_buff *skb, struct sw_flow_key *key)
+ 			return -EHOSTUNREACH;
+ 
+ 		key->ip.ttl = --nh->hop_limit;
+-	} else {
++	} else if (skb->protocol == htons(ETH_P_IP)) {
+ 		struct iphdr *nh;
+ 		u8 old_ttl;
+ 
+diff --git a/net/packet/af_packet.c b/net/packet/af_packet.c
+index 7a18ffff85514..a0121e7c98b14 100644
+--- a/net/packet/af_packet.c
++++ b/net/packet/af_packet.c
+@@ -4615,9 +4615,11 @@ static int __net_init packet_net_init(struct net *net)
+ 	mutex_init(&net->packet.sklist_lock);
+ 	INIT_HLIST_HEAD(&net->packet.sklist);
+ 
++#ifdef CONFIG_PROC_FS
+ 	if (!proc_create_net("packet", 0, net->proc_net, &packet_seq_ops,
+ 			sizeof(struct seq_net_private)))
+ 		return -ENOMEM;
++#endif /* CONFIG_PROC_FS */
+ 
+ 	return 0;
+ }
+diff --git a/net/qrtr/qrtr.c b/net/qrtr/qrtr.c
+index 957aa9263ba4c..d7134c558993c 100644
+--- a/net/qrtr/qrtr.c
++++ b/net/qrtr/qrtr.c
+@@ -347,7 +347,7 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
+ 	hdr->src_port_id = cpu_to_le32(from->sq_port);
+ 	if (to->sq_port == QRTR_PORT_CTRL) {
+ 		hdr->dst_node_id = cpu_to_le32(node->nid);
+-		hdr->dst_port_id = cpu_to_le32(QRTR_NODE_BCAST);
++		hdr->dst_port_id = cpu_to_le32(QRTR_PORT_CTRL);
+ 	} else {
+ 		hdr->dst_node_id = cpu_to_le32(to->sq_node);
+ 		hdr->dst_port_id = cpu_to_le32(to->sq_port);
+diff --git a/net/sched/Kconfig b/net/sched/Kconfig
+index a3b37d88800eb..d762e89ab74f7 100644
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -813,7 +813,7 @@ config NET_ACT_SAMPLE
+ 
+ config NET_ACT_IPT
+ 	tristate "IPtables targets"
+-	depends on NET_CLS_ACT && NETFILTER && IP_NF_IPTABLES
++	depends on NET_CLS_ACT && NETFILTER && NETFILTER_XTABLES
+ 	help
+ 	  Say Y here to be able to invoke iptables targets after successful
+ 	  classification.
+@@ -912,7 +912,7 @@ config NET_ACT_BPF
+ 
+ config NET_ACT_CONNMARK
+ 	tristate "Netfilter Connection Mark Retriever"
+-	depends on NET_CLS_ACT && NETFILTER && IP_NF_IPTABLES
++	depends on NET_CLS_ACT && NETFILTER
+ 	depends on NF_CONNTRACK && NF_CONNTRACK_MARK
+ 	help
+ 	  Say Y here to allow retrieving of conn mark
+@@ -924,7 +924,7 @@ config NET_ACT_CONNMARK
+ 
+ config NET_ACT_CTINFO
+ 	tristate "Netfilter Connection Mark Actions"
+-	depends on NET_CLS_ACT && NETFILTER && IP_NF_IPTABLES
++	depends on NET_CLS_ACT && NETFILTER
+ 	depends on NF_CONNTRACK && NF_CONNTRACK_MARK
+ 	help
+ 	  Say Y here to allow transfer of a connmark stored information.
+diff --git a/net/tls/tls_proc.c b/net/tls/tls_proc.c
+index 3a5dd1e072332..feeceb0e4cb48 100644
+--- a/net/tls/tls_proc.c
++++ b/net/tls/tls_proc.c
+@@ -37,9 +37,12 @@ static int tls_statistics_seq_show(struct seq_file *seq, void *v)
+ 
+ int __net_init tls_proc_init(struct net *net)
+ {
++#ifdef CONFIG_PROC_FS
+ 	if (!proc_create_net_single("tls_stat", 0444, net->proc_net,
+ 				    tls_statistics_seq_show, NULL))
+ 		return -ENOMEM;
++#endif /* CONFIG_PROC_FS */
++
+ 	return 0;
+ }
+ 
