@@ -1,0 +1,1080 @@
+diff --git a/Makefile b/Makefile
+index eda72c1ca13a4..6941aa5bd1865 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ VERSION = 4
+ PATCHLEVEL = 14
+-SUBLEVEL = 224
++SUBLEVEL = 225
+ EXTRAVERSION =
+ NAME = Petit Gorille
+ 
+diff --git a/drivers/base/power/runtime.c b/drivers/base/power/runtime.c
+index b2b1eece0db1b..1547f8209e788 100644
+--- a/drivers/base/power/runtime.c
++++ b/drivers/base/power/runtime.c
+@@ -306,22 +306,22 @@ static void rpm_put_suppliers(struct device *dev)
+ static int __rpm_callback(int (*cb)(struct device *), struct device *dev)
+ 	__releases(&dev->power.lock) __acquires(&dev->power.lock)
+ {
+-	int retval, idx;
+ 	bool use_links = dev->power.links_count > 0;
++	bool get = false;
++	int retval, idx;
++	bool put;
+ 
+ 	if (dev->power.irq_safe) {
+ 		spin_unlock(&dev->power.lock);
++	} else if (!use_links) {
++		spin_unlock_irq(&dev->power.lock);
+ 	} else {
++		get = dev->power.runtime_status == RPM_RESUMING;
++
+ 		spin_unlock_irq(&dev->power.lock);
+ 
+-		/*
+-		 * Resume suppliers if necessary.
+-		 *
+-		 * The device's runtime PM status cannot change until this
+-		 * routine returns, so it is safe to read the status outside of
+-		 * the lock.
+-		 */
+-		if (use_links && dev->power.runtime_status == RPM_RESUMING) {
++		/* Resume suppliers if necessary. */
++		if (get) {
+ 			idx = device_links_read_lock();
+ 
+ 			retval = rpm_get_suppliers(dev);
+@@ -336,24 +336,36 @@ static int __rpm_callback(int (*cb)(struct device *), struct device *dev)
+ 
+ 	if (dev->power.irq_safe) {
+ 		spin_lock(&dev->power.lock);
+-	} else {
+-		/*
+-		 * If the device is suspending and the callback has returned
+-		 * success, drop the usage counters of the suppliers that have
+-		 * been reference counted on its resume.
+-		 *
+-		 * Do that if resume fails too.
+-		 */
+-		if (use_links
+-		    && ((dev->power.runtime_status == RPM_SUSPENDING && !retval)
+-		    || (dev->power.runtime_status == RPM_RESUMING && retval))) {
+-			idx = device_links_read_lock();
++		return retval;
++	}
+ 
+- fail:
+-			rpm_put_suppliers(dev);
++	spin_lock_irq(&dev->power.lock);
+ 
+-			device_links_read_unlock(idx);
+-		}
++	if (!use_links)
++		return retval;
++
++	/*
++	 * If the device is suspending and the callback has returned success,
++	 * drop the usage counters of the suppliers that have been reference
++	 * counted on its resume.
++	 *
++	 * Do that if the resume fails too.
++	 */
++	put = dev->power.runtime_status == RPM_SUSPENDING && !retval;
++	if (put)
++		__update_runtime_status(dev, RPM_SUSPENDED);
++	else
++		put = get && retval;
++
++	if (put) {
++		spin_unlock_irq(&dev->power.lock);
++
++		idx = device_links_read_lock();
++
++fail:
++		rpm_put_suppliers(dev);
++
++		device_links_read_unlock(idx);
+ 
+ 		spin_lock_irq(&dev->power.lock);
+ 	}
+diff --git a/drivers/block/rsxx/core.c b/drivers/block/rsxx/core.c
+index 6beafaa335c71..97b678c0ea136 100644
+--- a/drivers/block/rsxx/core.c
++++ b/drivers/block/rsxx/core.c
+@@ -180,15 +180,17 @@ static ssize_t rsxx_cram_read(struct file *fp, char __user *ubuf,
+ {
+ 	struct rsxx_cardinfo *card = file_inode(fp)->i_private;
+ 	char *buf;
+-	ssize_t st;
++	int st;
+ 
+ 	buf = kzalloc(cnt, GFP_KERNEL);
+ 	if (!buf)
+ 		return -ENOMEM;
+ 
+ 	st = rsxx_creg_read(card, CREG_ADD_CRAM + (u32)*ppos, cnt, buf, 1);
+-	if (!st)
+-		st = copy_to_user(ubuf, buf, cnt);
++	if (!st) {
++		if (copy_to_user(ubuf, buf, cnt))
++			st = -EFAULT;
++	}
+ 	kfree(buf);
+ 	if (st)
+ 		return st;
+diff --git a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+index f1aaa76cc2e4e..92e767f3cc16f 100644
+--- a/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/a5xx_gpu.c
+@@ -472,8 +472,6 @@ static int a5xx_hw_init(struct msm_gpu *gpu)
+ 	if (adreno_gpu->info->quirks & ADRENO_QUIRK_TWO_PASS_USE_WFI)
+ 		gpu_rmw(gpu, REG_A5XX_PC_DBG_ECO_CNTL, 0, (1 << 8));
+ 
+-	gpu_write(gpu, REG_A5XX_PC_DBG_ECO_CNTL, 0xc0200100);
+-
+ 	/* Enable USE_RETENTION_FLOPS */
+ 	gpu_write(gpu, REG_A5XX_CP_CHICKEN_DBG, 0x02000000);
+ 
+diff --git a/drivers/iommu/amd_iommu.c b/drivers/iommu/amd_iommu.c
+index 494caaa265af0..8195ff219b48c 100644
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@ -1347,24 +1347,26 @@ static void increase_address_space(struct protection_domain *domain,
+ 	unsigned long flags;
+ 	u64 *pte;
+ 
++	pte = (void *)get_zeroed_page(gfp);
++	if (!pte)
++		return;
++
+ 	spin_lock_irqsave(&domain->lock, flags);
+ 
+ 	if (WARN_ON_ONCE(domain->mode == PAGE_MODE_6_LEVEL))
+ 		/* address space already 64 bit large */
+ 		goto out;
+ 
+-	pte = (void *)get_zeroed_page(gfp);
+-	if (!pte)
+-		goto out;
+-
+ 	*pte             = PM_LEVEL_PDE(domain->mode,
+ 					iommu_virt_to_phys(domain->pt_root));
+ 	domain->pt_root  = pte;
+ 	domain->mode    += 1;
+ 	domain->updated  = true;
++	pte              = NULL;
+ 
+ out:
+ 	spin_unlock_irqrestore(&domain->lock, flags);
++	free_page((unsigned long)pte);
+ 
+ 	return;
+ }
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index c855ab2feb181..3b2a880eed687 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -889,10 +889,10 @@ void dm_table_set_type(struct dm_table *t, enum dm_queue_mode type)
+ }
+ EXPORT_SYMBOL_GPL(dm_table_set_type);
+ 
+-static int device_supports_dax(struct dm_target *ti, struct dm_dev *dev,
++static int device_not_dax_capable(struct dm_target *ti, struct dm_dev *dev,
+ 			       sector_t start, sector_t len, void *data)
+ {
+-	return bdev_dax_supported(dev->bdev, PAGE_SIZE);
++	return !bdev_dax_supported(dev->bdev, PAGE_SIZE);
+ }
+ 
+ static bool dm_table_supports_dax(struct dm_table *t)
+@@ -908,7 +908,7 @@ static bool dm_table_supports_dax(struct dm_table *t)
+ 			return false;
+ 
+ 		if (!ti->type->iterate_devices ||
+-		    !ti->type->iterate_devices(ti, device_supports_dax, NULL))
++		    ti->type->iterate_devices(ti, device_not_dax_capable, NULL))
+ 			return false;
+ 	}
+ 
+@@ -1351,6 +1351,46 @@ struct dm_target *dm_table_find_target(struct dm_table *t, sector_t sector)
+ 	return &t->targets[(KEYS_PER_NODE * n) + k];
+ }
+ 
++/*
++ * type->iterate_devices() should be called when the sanity check needs to
++ * iterate and check all underlying data devices. iterate_devices() will
++ * iterate all underlying data devices until it encounters a non-zero return
++ * code, returned by whether the input iterate_devices_callout_fn, or
++ * iterate_devices() itself internally.
++ *
++ * For some target type (e.g. dm-stripe), one call of iterate_devices() may
++ * iterate multiple underlying devices internally, in which case a non-zero
++ * return code returned by iterate_devices_callout_fn will stop the iteration
++ * in advance.
++ *
++ * Cases requiring _any_ underlying device supporting some kind of attribute,
++ * should use the iteration structure like dm_table_any_dev_attr(), or call
++ * it directly. @func should handle semantics of positive examples, e.g.
++ * capable of something.
++ *
++ * Cases requiring _all_ underlying devices supporting some kind of attribute,
++ * should use the iteration structure like dm_table_supports_nowait() or
++ * dm_table_supports_discards(). Or introduce dm_table_all_devs_attr() that
++ * uses an @anti_func that handle semantics of counter examples, e.g. not
++ * capable of something. So: return !dm_table_any_dev_attr(t, anti_func, data);
++ */
++static bool dm_table_any_dev_attr(struct dm_table *t,
++				  iterate_devices_callout_fn func, void *data)
++{
++	struct dm_target *ti;
++	unsigned int i;
++
++	for (i = 0; i < dm_table_get_num_targets(t); i++) {
++		ti = dm_table_get_target(t, i);
++
++		if (ti->type->iterate_devices &&
++		    ti->type->iterate_devices(ti, func, data))
++			return true;
++        }
++
++	return false;
++}
++
+ static int count_device(struct dm_target *ti, struct dm_dev *dev,
+ 			sector_t start, sector_t len, void *data)
+ {
+@@ -1387,13 +1427,13 @@ bool dm_table_has_no_data_devices(struct dm_table *table)
+ 	return true;
+ }
+ 
+-static int device_is_zoned_model(struct dm_target *ti, struct dm_dev *dev,
+-				 sector_t start, sector_t len, void *data)
++static int device_not_zoned_model(struct dm_target *ti, struct dm_dev *dev,
++				  sector_t start, sector_t len, void *data)
+ {
+ 	struct request_queue *q = bdev_get_queue(dev->bdev);
+ 	enum blk_zoned_model *zoned_model = data;
+ 
+-	return q && blk_queue_zoned_model(q) == *zoned_model;
++	return !q || blk_queue_zoned_model(q) != *zoned_model;
+ }
+ 
+ static bool dm_table_supports_zoned_model(struct dm_table *t,
+@@ -1410,37 +1450,20 @@ static bool dm_table_supports_zoned_model(struct dm_table *t,
+ 			return false;
+ 
+ 		if (!ti->type->iterate_devices ||
+-		    !ti->type->iterate_devices(ti, device_is_zoned_model, &zoned_model))
++		    ti->type->iterate_devices(ti, device_not_zoned_model, &zoned_model))
+ 			return false;
+ 	}
+ 
+ 	return true;
+ }
+ 
+-static int device_matches_zone_sectors(struct dm_target *ti, struct dm_dev *dev,
+-				       sector_t start, sector_t len, void *data)
++static int device_not_matches_zone_sectors(struct dm_target *ti, struct dm_dev *dev,
++					   sector_t start, sector_t len, void *data)
+ {
+ 	struct request_queue *q = bdev_get_queue(dev->bdev);
+ 	unsigned int *zone_sectors = data;
+ 
+-	return q && blk_queue_zone_sectors(q) == *zone_sectors;
+-}
+-
+-static bool dm_table_matches_zone_sectors(struct dm_table *t,
+-					  unsigned int zone_sectors)
+-{
+-	struct dm_target *ti;
+-	unsigned i;
+-
+-	for (i = 0; i < dm_table_get_num_targets(t); i++) {
+-		ti = dm_table_get_target(t, i);
+-
+-		if (!ti->type->iterate_devices ||
+-		    !ti->type->iterate_devices(ti, device_matches_zone_sectors, &zone_sectors))
+-			return false;
+-	}
+-
+-	return true;
++	return !q || blk_queue_zone_sectors(q) != *zone_sectors;
+ }
+ 
+ static int validate_hardware_zoned_model(struct dm_table *table,
+@@ -1460,7 +1483,7 @@ static int validate_hardware_zoned_model(struct dm_table *table,
+ 	if (!zone_sectors || !is_power_of_2(zone_sectors))
+ 		return -EINVAL;
+ 
+-	if (!dm_table_matches_zone_sectors(table, zone_sectors)) {
++	if (dm_table_any_dev_attr(table, device_not_matches_zone_sectors, &zone_sectors)) {
+ 		DMERR("%s: zone sectors is not consistent across all devices",
+ 		      dm_device_name(table->md));
+ 		return -EINVAL;
+@@ -1650,29 +1673,12 @@ static int device_dax_write_cache_enabled(struct dm_target *ti,
+ 	return false;
+ }
+ 
+-static int dm_table_supports_dax_write_cache(struct dm_table *t)
+-{
+-	struct dm_target *ti;
+-	unsigned i;
+-
+-	for (i = 0; i < dm_table_get_num_targets(t); i++) {
+-		ti = dm_table_get_target(t, i);
+-
+-		if (ti->type->iterate_devices &&
+-		    ti->type->iterate_devices(ti,
+-				device_dax_write_cache_enabled, NULL))
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+-static int device_is_nonrot(struct dm_target *ti, struct dm_dev *dev,
+-			    sector_t start, sector_t len, void *data)
++static int device_is_rotational(struct dm_target *ti, struct dm_dev *dev,
++				sector_t start, sector_t len, void *data)
+ {
+ 	struct request_queue *q = bdev_get_queue(dev->bdev);
+ 
+-	return q && blk_queue_nonrot(q);
++	return q && !blk_queue_nonrot(q);
+ }
+ 
+ static int device_is_not_random(struct dm_target *ti, struct dm_dev *dev,
+@@ -1683,29 +1689,12 @@ static int device_is_not_random(struct dm_target *ti, struct dm_dev *dev,
+ 	return q && !blk_queue_add_random(q);
+ }
+ 
+-static int queue_supports_sg_merge(struct dm_target *ti, struct dm_dev *dev,
+-				   sector_t start, sector_t len, void *data)
++static int queue_no_sg_merge(struct dm_target *ti, struct dm_dev *dev,
++			     sector_t start, sector_t len, void *data)
+ {
+ 	struct request_queue *q = bdev_get_queue(dev->bdev);
+ 
+-	return q && !test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
+-}
+-
+-static bool dm_table_all_devices_attribute(struct dm_table *t,
+-					   iterate_devices_callout_fn func)
+-{
+-	struct dm_target *ti;
+-	unsigned i;
+-
+-	for (i = 0; i < dm_table_get_num_targets(t); i++) {
+-		ti = dm_table_get_target(t, i);
+-
+-		if (!ti->type->iterate_devices ||
+-		    !ti->type->iterate_devices(ti, func, NULL))
+-			return false;
+-	}
+-
+-	return true;
++	return q && test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
+ }
+ 
+ static int device_not_write_same_capable(struct dm_target *ti, struct dm_dev *dev,
+@@ -1804,27 +1793,6 @@ static int device_requires_stable_pages(struct dm_target *ti,
+ 	return q && bdi_cap_stable_pages_required(q->backing_dev_info);
+ }
+ 
+-/*
+- * If any underlying device requires stable pages, a table must require
+- * them as well.  Only targets that support iterate_devices are considered:
+- * don't want error, zero, etc to require stable pages.
+- */
+-static bool dm_table_requires_stable_pages(struct dm_table *t)
+-{
+-	struct dm_target *ti;
+-	unsigned i;
+-
+-	for (i = 0; i < dm_table_get_num_targets(t); i++) {
+-		ti = dm_table_get_target(t, i);
+-
+-		if (ti->type->iterate_devices &&
+-		    ti->type->iterate_devices(ti, device_requires_stable_pages, NULL))
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 			       struct queue_limits *limits)
+ {
+@@ -1852,32 +1820,35 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 	else
+ 		queue_flag_clear_unlocked(QUEUE_FLAG_DAX, q);
+ 
+-	if (dm_table_supports_dax_write_cache(t))
++	if (dm_table_any_dev_attr(t, device_dax_write_cache_enabled, NULL))
+ 		dax_write_cache(t->md->dax_dev, true);
+ 
+ 	/* Ensure that all underlying devices are non-rotational. */
+-	if (dm_table_all_devices_attribute(t, device_is_nonrot))
+-		queue_flag_set_unlocked(QUEUE_FLAG_NONROT, q);
+-	else
++	if (dm_table_any_dev_attr(t, device_is_rotational, NULL))
+ 		queue_flag_clear_unlocked(QUEUE_FLAG_NONROT, q);
++	else
++		queue_flag_set_unlocked(QUEUE_FLAG_NONROT, q);
+ 
+ 	if (!dm_table_supports_write_same(t))
+ 		q->limits.max_write_same_sectors = 0;
+ 	if (!dm_table_supports_write_zeroes(t))
+ 		q->limits.max_write_zeroes_sectors = 0;
+ 
+-	if (dm_table_all_devices_attribute(t, queue_supports_sg_merge))
+-		queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
+-	else
++	if (dm_table_any_dev_attr(t, queue_no_sg_merge, NULL))
+ 		queue_flag_set_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
++	else
++		queue_flag_clear_unlocked(QUEUE_FLAG_NO_SG_MERGE, q);
+ 
+ 	dm_table_verify_integrity(t);
+ 
+ 	/*
+ 	 * Some devices don't use blk_integrity but still want stable pages
+ 	 * because they do their own checksumming.
++	 * If any underlying device requires stable pages, a table must require
++	 * them as well.  Only targets that support iterate_devices are considered:
++	 * don't want error, zero, etc to require stable pages.
+ 	 */
+-	if (dm_table_requires_stable_pages(t))
++	if (dm_table_any_dev_attr(t, device_requires_stable_pages, NULL))
+ 		q->backing_dev_info->capabilities |= BDI_CAP_STABLE_WRITES;
+ 	else
+ 		q->backing_dev_info->capabilities &= ~BDI_CAP_STABLE_WRITES;
+@@ -1888,7 +1859,8 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 	 * Clear QUEUE_FLAG_ADD_RANDOM if any underlying device does not
+ 	 * have it set.
+ 	 */
+-	if (blk_queue_add_random(q) && dm_table_all_devices_attribute(t, device_is_not_random))
++	if (blk_queue_add_random(q) &&
++	    dm_table_any_dev_attr(t, device_is_not_random, NULL))
+ 		queue_flag_clear_unlocked(QUEUE_FLAG_ADD_RANDOM, q);
+ 
+ 	/*
+diff --git a/drivers/misc/eeprom/eeprom_93xx46.c b/drivers/misc/eeprom/eeprom_93xx46.c
+index a3248ebd28c62..182feab6da25b 100644
+--- a/drivers/misc/eeprom/eeprom_93xx46.c
++++ b/drivers/misc/eeprom/eeprom_93xx46.c
+@@ -38,6 +38,10 @@ static const struct eeprom_93xx46_devtype_data atmel_at93c46d_data = {
+ 		  EEPROM_93XX46_QUIRK_INSTRUCTION_LENGTH,
+ };
+ 
++static const struct eeprom_93xx46_devtype_data microchip_93lc46b_data = {
++	.quirks = EEPROM_93XX46_QUIRK_EXTRA_READ_CYCLE,
++};
++
+ struct eeprom_93xx46_dev {
+ 	struct spi_device *spi;
+ 	struct eeprom_93xx46_platform_data *pdata;
+@@ -58,6 +62,11 @@ static inline bool has_quirk_instruction_length(struct eeprom_93xx46_dev *edev)
+ 	return edev->pdata->quirks & EEPROM_93XX46_QUIRK_INSTRUCTION_LENGTH;
+ }
+ 
++static inline bool has_quirk_extra_read_cycle(struct eeprom_93xx46_dev *edev)
++{
++	return edev->pdata->quirks & EEPROM_93XX46_QUIRK_EXTRA_READ_CYCLE;
++}
++
+ static int eeprom_93xx46_read(void *priv, unsigned int off,
+ 			      void *val, size_t count)
+ {
+@@ -99,6 +108,11 @@ static int eeprom_93xx46_read(void *priv, unsigned int off,
+ 		dev_dbg(&edev->spi->dev, "read cmd 0x%x, %d Hz\n",
+ 			cmd_addr, edev->spi->max_speed_hz);
+ 
++		if (has_quirk_extra_read_cycle(edev)) {
++			cmd_addr <<= 1;
++			bits += 1;
++		}
++
+ 		spi_message_init(&m);
+ 
+ 		t[0].tx_buf = (char *)&cmd_addr;
+@@ -366,6 +380,7 @@ static void select_deassert(void *context)
+ static const struct of_device_id eeprom_93xx46_of_table[] = {
+ 	{ .compatible = "eeprom-93xx46", },
+ 	{ .compatible = "atmel,at93c46d", .data = &atmel_at93c46d_data, },
++	{ .compatible = "microchip,93lc46b", .data = &microchip_93lc46b_data, },
+ 	{}
+ };
+ MODULE_DEVICE_TABLE(of, eeprom_93xx46_of_table);
+diff --git a/drivers/net/wireless/marvell/mwifiex/pcie.c b/drivers/net/wireless/marvell/mwifiex/pcie.c
+index 8ee9609ef9749..7f615ad98acaa 100644
+--- a/drivers/net/wireless/marvell/mwifiex/pcie.c
++++ b/drivers/net/wireless/marvell/mwifiex/pcie.c
+@@ -368,6 +368,8 @@ static void mwifiex_pcie_reset_prepare(struct pci_dev *pdev)
+ 	clear_bit(MWIFIEX_IFACE_WORK_DEVICE_DUMP, &card->work_flags);
+ 	clear_bit(MWIFIEX_IFACE_WORK_CARD_RESET, &card->work_flags);
+ 	mwifiex_dbg(adapter, INFO, "%s, successful\n", __func__);
++
++	card->pci_reset_ongoing = true;
+ }
+ 
+ /*
+@@ -396,6 +398,8 @@ static void mwifiex_pcie_reset_done(struct pci_dev *pdev)
+ 		dev_err(&pdev->dev, "reinit failed: %d\n", ret);
+ 	else
+ 		mwifiex_dbg(adapter, INFO, "%s, successful\n", __func__);
++
++	card->pci_reset_ongoing = false;
+ }
+ 
+ static const struct pci_error_handlers mwifiex_pcie_err_handler = {
+@@ -2980,7 +2984,19 @@ static void mwifiex_cleanup_pcie(struct mwifiex_adapter *adapter)
+ 	int ret;
+ 	u32 fw_status;
+ 
+-	cancel_work_sync(&card->work);
++	/* Perform the cancel_work_sync() only when we're not resetting
++	 * the card. It's because that function never returns if we're
++	 * in reset path. If we're here when resetting the card, it means
++	 * that we failed to reset the card (reset failure path).
++	 */
++	if (!card->pci_reset_ongoing) {
++		mwifiex_dbg(adapter, MSG, "performing cancel_work_sync()...\n");
++		cancel_work_sync(&card->work);
++		mwifiex_dbg(adapter, MSG, "cancel_work_sync() done\n");
++	} else {
++		mwifiex_dbg(adapter, MSG,
++			    "skipped cancel_work_sync() because we're in card reset failure path\n");
++	}
+ 
+ 	ret = mwifiex_read_reg(adapter, reg->fw_status, &fw_status);
+ 	if (fw_status == FIRMWARE_READY_PCIE) {
+diff --git a/drivers/net/wireless/marvell/mwifiex/pcie.h b/drivers/net/wireless/marvell/mwifiex/pcie.h
+index f7ce9b6db6b41..72d0c01ff3592 100644
+--- a/drivers/net/wireless/marvell/mwifiex/pcie.h
++++ b/drivers/net/wireless/marvell/mwifiex/pcie.h
+@@ -391,6 +391,8 @@ struct pcie_service_card {
+ 	struct mwifiex_msix_context share_irq_ctx;
+ 	struct work_struct work;
+ 	unsigned long work_flags;
++
++	bool pci_reset_ongoing;
+ };
+ 
+ static inline int
+diff --git a/drivers/pci/quirks.c b/drivers/pci/quirks.c
+index da790f26d2950..510cb05aa96ff 100644
+--- a/drivers/pci/quirks.c
++++ b/drivers/pci/quirks.c
+@@ -3934,6 +3934,9 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_MARVELL_EXT, 0x9182,
+ /* https://bugzilla.kernel.org/show_bug.cgi?id=42679#c46 */
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_MARVELL_EXT, 0x91a0,
+ 			 quirk_dma_func1_alias);
++/* https://bugzilla.kernel.org/show_bug.cgi?id=42679#c135 */
++DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_MARVELL_EXT, 0x9215,
++			 quirk_dma_func1_alias);
+ /* https://bugzilla.kernel.org/show_bug.cgi?id=42679#c127 */
+ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_MARVELL_EXT, 0x9220,
+ 			 quirk_dma_func1_alias);
+diff --git a/drivers/platform/x86/acer-wmi.c b/drivers/platform/x86/acer-wmi.c
+index 29f6f2bbb5fff..5ddc359135a85 100644
+--- a/drivers/platform/x86/acer-wmi.c
++++ b/drivers/platform/x86/acer-wmi.c
+@@ -43,6 +43,7 @@
+ #include <linux/input/sparse-keymap.h>
+ #include <acpi/video.h>
+ 
++ACPI_MODULE_NAME(KBUILD_MODNAME);
+ MODULE_AUTHOR("Carlos Corbacho");
+ MODULE_DESCRIPTION("Acer Laptop WMI Extras Driver");
+ MODULE_LICENSE("GPL");
+@@ -93,7 +94,7 @@ MODULE_ALIAS("wmi:676AA15E-6A47-4D9F-A2CC-1E6D18D14026");
+ 
+ enum acer_wmi_event_ids {
+ 	WMID_HOTKEY_EVENT = 0x1,
+-	WMID_ACCEL_EVENT = 0x5,
++	WMID_ACCEL_OR_KBD_DOCK_EVENT = 0x5,
+ };
+ 
+ static const struct key_entry acer_wmi_keymap[] __initconst = {
+@@ -140,7 +141,9 @@ struct event_return_value {
+ 	u8 function;
+ 	u8 key_num;
+ 	u16 device_state;
+-	u32 reserved;
++	u16 reserved1;
++	u8 kbd_dock_state;
++	u8 reserved2;
+ } __attribute__((packed));
+ 
+ /*
+@@ -218,14 +221,13 @@ struct hotkey_function_type_aa {
+ /*
+  * Interface capability flags
+  */
+-#define ACER_CAP_MAILLED		(1<<0)
+-#define ACER_CAP_WIRELESS		(1<<1)
+-#define ACER_CAP_BLUETOOTH		(1<<2)
+-#define ACER_CAP_BRIGHTNESS		(1<<3)
+-#define ACER_CAP_THREEG			(1<<4)
+-#define ACER_CAP_ACCEL			(1<<5)
+-#define ACER_CAP_RFBTN			(1<<6)
+-#define ACER_CAP_ANY			(0xFFFFFFFF)
++#define ACER_CAP_MAILLED		BIT(0)
++#define ACER_CAP_WIRELESS		BIT(1)
++#define ACER_CAP_BLUETOOTH		BIT(2)
++#define ACER_CAP_BRIGHTNESS		BIT(3)
++#define ACER_CAP_THREEG			BIT(4)
++#define ACER_CAP_SET_FUNCTION_MODE	BIT(5)
++#define ACER_CAP_KBD_DOCK		BIT(6)
+ 
+ /*
+  * Interface type flags
+@@ -248,6 +250,7 @@ static int mailled = -1;
+ static int brightness = -1;
+ static int threeg = -1;
+ static int force_series;
++static int force_caps = -1;
+ static bool ec_raw_mode;
+ static bool has_type_aa;
+ static u16 commun_func_bitmap;
+@@ -257,11 +260,13 @@ module_param(mailled, int, 0444);
+ module_param(brightness, int, 0444);
+ module_param(threeg, int, 0444);
+ module_param(force_series, int, 0444);
++module_param(force_caps, int, 0444);
+ module_param(ec_raw_mode, bool, 0444);
+ MODULE_PARM_DESC(mailled, "Set initial state of Mail LED");
+ MODULE_PARM_DESC(brightness, "Set initial LCD backlight brightness");
+ MODULE_PARM_DESC(threeg, "Set initial state of 3G hardware");
+ MODULE_PARM_DESC(force_series, "Force a different laptop series");
++MODULE_PARM_DESC(force_caps, "Force the capability bitmask to this value");
+ MODULE_PARM_DESC(ec_raw_mode, "Enable EC raw mode");
+ 
+ struct acer_data {
+@@ -332,6 +337,15 @@ static int __init dmi_matched(const struct dmi_system_id *dmi)
+ 	return 1;
+ }
+ 
++static int __init set_force_caps(const struct dmi_system_id *dmi)
++{
++	if (force_caps == -1) {
++		force_caps = (uintptr_t)dmi->driver_data;
++		pr_info("Found %s, set force_caps to 0x%x\n", dmi->ident, force_caps);
++	}
++	return 1;
++}
++
+ static struct quirk_entry quirk_unknown = {
+ };
+ 
+@@ -510,6 +524,33 @@ static const struct dmi_system_id acer_quirks[] __initconst = {
+ 		},
+ 		.driver_data = &quirk_acer_travelmate_2490,
+ 	},
++	{
++		.callback = set_force_caps,
++		.ident = "Acer Aspire Switch 10E SW3-016",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire SW3-016"),
++		},
++		.driver_data = (void *)ACER_CAP_KBD_DOCK,
++	},
++	{
++		.callback = set_force_caps,
++		.ident = "Acer Aspire Switch 10 SW5-012",
++		.matches = {
++			DMI_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_MATCH(DMI_PRODUCT_NAME, "Aspire SW5-012"),
++		},
++		.driver_data = (void *)ACER_CAP_KBD_DOCK,
++	},
++	{
++		.callback = set_force_caps,
++		.ident = "Acer One 10 (S1003)",
++		.matches = {
++			DMI_EXACT_MATCH(DMI_SYS_VENDOR, "Acer"),
++			DMI_EXACT_MATCH(DMI_PRODUCT_NAME, "One S1003"),
++		},
++		.driver_data = (void *)ACER_CAP_KBD_DOCK,
++	},
+ 	{}
+ };
+ 
+@@ -1268,10 +1309,8 @@ static void __init type_aa_dmi_decode(const struct dmi_header *header, void *d)
+ 		interface->capability |= ACER_CAP_THREEG;
+ 	if (type_aa->commun_func_bitmap & ACER_WMID3_GDS_BLUETOOTH)
+ 		interface->capability |= ACER_CAP_BLUETOOTH;
+-	if (type_aa->commun_func_bitmap & ACER_WMID3_GDS_RFBTN) {
+-		interface->capability |= ACER_CAP_RFBTN;
++	if (type_aa->commun_func_bitmap & ACER_WMID3_GDS_RFBTN)
+ 		commun_func_bitmap &= ~ACER_WMID3_GDS_RFBTN;
+-	}
+ 
+ 	commun_fn_key_number = type_aa->commun_fn_key_number;
+ }
+@@ -1532,7 +1571,7 @@ static int acer_gsensor_event(void)
+ 	struct acpi_buffer output;
+ 	union acpi_object out_obj[5];
+ 
+-	if (!has_cap(ACER_CAP_ACCEL))
++	if (!acer_wmi_accel_dev)
+ 		return -1;
+ 
+ 	output.length = sizeof(out_obj);
+@@ -1555,6 +1594,71 @@ static int acer_gsensor_event(void)
+ 	return 0;
+ }
+ 
++/*
++ * Switch series keyboard dock status
++ */
++static int acer_kbd_dock_state_to_sw_tablet_mode(u8 kbd_dock_state)
++{
++	switch (kbd_dock_state) {
++	case 0x01: /* Docked, traditional clamshell laptop mode */
++		return 0;
++	case 0x04: /* Stand-alone tablet */
++	case 0x40: /* Docked, tent mode, keyboard not usable */
++		return 1;
++	default:
++		pr_warn("Unknown kbd_dock_state 0x%02x\n", kbd_dock_state);
++	}
++
++	return 0;
++}
++
++static void acer_kbd_dock_get_initial_state(void)
++{
++	u8 *output, input[8] = { 0x05, 0x00, };
++	struct acpi_buffer input_buf = { sizeof(input), input };
++	struct acpi_buffer output_buf = { ACPI_ALLOCATE_BUFFER, NULL };
++	union acpi_object *obj;
++	acpi_status status;
++	int sw_tablet_mode;
++
++	status = wmi_evaluate_method(WMID_GUID3, 0, 0x2, &input_buf, &output_buf);
++	if (ACPI_FAILURE(status)) {
++		ACPI_EXCEPTION((AE_INFO, status, "Error getting keyboard-dock initial status"));
++		return;
++	}
++
++	obj = output_buf.pointer;
++	if (!obj || obj->type != ACPI_TYPE_BUFFER || obj->buffer.length != 8) {
++		pr_err("Unexpected output format getting keyboard-dock initial status\n");
++		goto out_free_obj;
++	}
++
++	output = obj->buffer.pointer;
++	if (output[0] != 0x00 || (output[3] != 0x05 && output[3] != 0x45)) {
++		pr_err("Unexpected output [0]=0x%02x [3]=0x%02x getting keyboard-dock initial status\n",
++		       output[0], output[3]);
++		goto out_free_obj;
++	}
++
++	sw_tablet_mode = acer_kbd_dock_state_to_sw_tablet_mode(output[4]);
++	input_report_switch(acer_wmi_input_dev, SW_TABLET_MODE, sw_tablet_mode);
++
++out_free_obj:
++	kfree(obj);
++}
++
++static void acer_kbd_dock_event(const struct event_return_value *event)
++{
++	int sw_tablet_mode;
++
++	if (!has_cap(ACER_CAP_KBD_DOCK))
++		return;
++
++	sw_tablet_mode = acer_kbd_dock_state_to_sw_tablet_mode(event->kbd_dock_state);
++	input_report_switch(acer_wmi_input_dev, SW_TABLET_MODE, sw_tablet_mode);
++	input_sync(acer_wmi_input_dev);
++}
++
+ /*
+  * Rfkill devices
+  */
+@@ -1782,8 +1886,9 @@ static void acer_wmi_notify(u32 value, void *context)
+ 			sparse_keymap_report_event(acer_wmi_input_dev, scancode, 1, true);
+ 		}
+ 		break;
+-	case WMID_ACCEL_EVENT:
++	case WMID_ACCEL_OR_KBD_DOCK_EVENT:
+ 		acer_gsensor_event();
++		acer_kbd_dock_event(&return_value);
+ 		break;
+ 	default:
+ 		pr_warn("Unknown function number - %d - %d\n",
+@@ -1941,8 +2046,6 @@ static int __init acer_wmi_accel_setup(void)
+ 	if (err)
+ 		return err;
+ 
+-	interface->capability |= ACER_CAP_ACCEL;
+-
+ 	acer_wmi_accel_dev = input_allocate_device();
+ 	if (!acer_wmi_accel_dev)
+ 		return -ENOMEM;
+@@ -1968,11 +2071,6 @@ err_free_dev:
+ 	return err;
+ }
+ 
+-static void acer_wmi_accel_destroy(void)
+-{
+-	input_unregister_device(acer_wmi_accel_dev);
+-}
+-
+ static int __init acer_wmi_input_setup(void)
+ {
+ 	acpi_status status;
+@@ -1990,6 +2088,9 @@ static int __init acer_wmi_input_setup(void)
+ 	if (err)
+ 		goto err_free_dev;
+ 
++	if (has_cap(ACER_CAP_KBD_DOCK))
++		input_set_capability(acer_wmi_input_dev, EV_SW, SW_TABLET_MODE);
++
+ 	status = wmi_install_notify_handler(ACERWMID_EVENT_GUID,
+ 						acer_wmi_notify, NULL);
+ 	if (ACPI_FAILURE(status)) {
+@@ -1997,6 +2098,9 @@ static int __init acer_wmi_input_setup(void)
+ 		goto err_free_dev;
+ 	}
+ 
++	if (has_cap(ACER_CAP_KBD_DOCK))
++		acer_kbd_dock_get_initial_state();
++
+ 	err = input_register_device(acer_wmi_input_dev);
+ 	if (err)
+ 		goto err_uninstall_notifier;
+@@ -2127,7 +2231,7 @@ static int acer_resume(struct device *dev)
+ 	if (has_cap(ACER_CAP_BRIGHTNESS))
+ 		set_u32(data->brightness, ACER_CAP_BRIGHTNESS);
+ 
+-	if (has_cap(ACER_CAP_ACCEL))
++	if (acer_wmi_accel_dev)
+ 		acer_gsensor_init();
+ 
+ 	return 0;
+@@ -2242,7 +2346,7 @@ static int __init acer_wmi_init(void)
+ 		}
+ 		/* WMID always provides brightness methods */
+ 		interface->capability |= ACER_CAP_BRIGHTNESS;
+-	} else if (!wmi_has_guid(WMID_GUID2) && interface && !has_type_aa) {
++	} else if (!wmi_has_guid(WMID_GUID2) && interface && !has_type_aa && force_caps == -1) {
+ 		pr_err("No WMID device detection method found\n");
+ 		return -ENODEV;
+ 	}
+@@ -2272,7 +2376,14 @@ static int __init acer_wmi_init(void)
+ 	if (acpi_video_get_backlight_type() != acpi_backlight_vendor)
+ 		interface->capability &= ~ACER_CAP_BRIGHTNESS;
+ 
+-	if (wmi_has_guid(WMID_GUID3)) {
++	if (wmi_has_guid(WMID_GUID3))
++		interface->capability |= ACER_CAP_SET_FUNCTION_MODE;
++
++	if (force_caps != -1)
++		interface->capability = force_caps;
++
++	if (wmi_has_guid(WMID_GUID3) &&
++	    (interface->capability & ACER_CAP_SET_FUNCTION_MODE)) {
+ 		if (ACPI_FAILURE(acer_wmi_enable_rf_button()))
+ 			pr_warn("Cannot enable RF Button Driver\n");
+ 
+@@ -2335,8 +2446,8 @@ error_device_alloc:
+ error_platform_register:
+ 	if (wmi_has_guid(ACERWMID_EVENT_GUID))
+ 		acer_wmi_input_destroy();
+-	if (has_cap(ACER_CAP_ACCEL))
+-		acer_wmi_accel_destroy();
++	if (acer_wmi_accel_dev)
++		input_unregister_device(acer_wmi_accel_dev);
+ 
+ 	return err;
+ }
+@@ -2346,8 +2457,8 @@ static void __exit acer_wmi_exit(void)
+ 	if (wmi_has_guid(ACERWMID_EVENT_GUID))
+ 		acer_wmi_input_destroy();
+ 
+-	if (has_cap(ACER_CAP_ACCEL))
+-		acer_wmi_accel_destroy();
++	if (acer_wmi_accel_dev)
++		input_unregister_device(acer_wmi_accel_dev);
+ 
+ 	remove_debugfs();
+ 	platform_device_unregister(acer_platform_device);
+diff --git a/fs/btrfs/raid56.c b/fs/btrfs/raid56.c
+index 1e35a2327478d..5873d4f1094f6 100644
+--- a/fs/btrfs/raid56.c
++++ b/fs/btrfs/raid56.c
+@@ -1190,22 +1190,19 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
+ 	int nr_data = rbio->nr_data;
+ 	int stripe;
+ 	int pagenr;
+-	int p_stripe = -1;
+-	int q_stripe = -1;
++	bool has_qstripe;
+ 	struct bio_list bio_list;
+ 	struct bio *bio;
+ 	int ret;
+ 
+ 	bio_list_init(&bio_list);
+ 
+-	if (rbio->real_stripes - rbio->nr_data == 1) {
+-		p_stripe = rbio->real_stripes - 1;
+-	} else if (rbio->real_stripes - rbio->nr_data == 2) {
+-		p_stripe = rbio->real_stripes - 2;
+-		q_stripe = rbio->real_stripes - 1;
+-	} else {
++	if (rbio->real_stripes - rbio->nr_data == 1)
++		has_qstripe = false;
++	else if (rbio->real_stripes - rbio->nr_data == 2)
++		has_qstripe = true;
++	else
+ 		BUG();
+-	}
+ 
+ 	/* at this point we either have a full stripe,
+ 	 * or we've read the full stripe from the drive.
+@@ -1249,7 +1246,7 @@ static noinline void finish_rmw(struct btrfs_raid_bio *rbio)
+ 		SetPageUptodate(p);
+ 		pointers[stripe++] = kmap(p);
+ 
+-		if (q_stripe != -1) {
++		if (has_qstripe) {
+ 
+ 			/*
+ 			 * raid6, add the qstripe and call the
+@@ -2325,8 +2322,7 @@ static noinline void finish_parity_scrub(struct btrfs_raid_bio *rbio,
+ 	int nr_data = rbio->nr_data;
+ 	int stripe;
+ 	int pagenr;
+-	int p_stripe = -1;
+-	int q_stripe = -1;
++	bool has_qstripe;
+ 	struct page *p_page = NULL;
+ 	struct page *q_page = NULL;
+ 	struct bio_list bio_list;
+@@ -2336,14 +2332,12 @@ static noinline void finish_parity_scrub(struct btrfs_raid_bio *rbio,
+ 
+ 	bio_list_init(&bio_list);
+ 
+-	if (rbio->real_stripes - rbio->nr_data == 1) {
+-		p_stripe = rbio->real_stripes - 1;
+-	} else if (rbio->real_stripes - rbio->nr_data == 2) {
+-		p_stripe = rbio->real_stripes - 2;
+-		q_stripe = rbio->real_stripes - 1;
+-	} else {
++	if (rbio->real_stripes - rbio->nr_data == 1)
++		has_qstripe = false;
++	else if (rbio->real_stripes - rbio->nr_data == 2)
++		has_qstripe = true;
++	else
+ 		BUG();
+-	}
+ 
+ 	if (bbio->num_tgtdevs && bbio->tgtdev_map[rbio->scrubp]) {
+ 		is_replace = 1;
+@@ -2365,17 +2359,22 @@ static noinline void finish_parity_scrub(struct btrfs_raid_bio *rbio,
+ 		goto cleanup;
+ 	SetPageUptodate(p_page);
+ 
+-	if (q_stripe != -1) {
++	if (has_qstripe) {
++		/* RAID6, allocate and map temp space for the Q stripe */
+ 		q_page = alloc_page(GFP_NOFS | __GFP_HIGHMEM);
+ 		if (!q_page) {
+ 			__free_page(p_page);
+ 			goto cleanup;
+ 		}
+ 		SetPageUptodate(q_page);
++		pointers[rbio->real_stripes - 1] = kmap(q_page);
+ 	}
+ 
+ 	atomic_set(&rbio->error, 0);
+ 
++	/* Map the parity stripe just once */
++	pointers[nr_data] = kmap(p_page);
++
+ 	for_each_set_bit(pagenr, rbio->dbitmap, rbio->stripe_npages) {
+ 		struct page *p;
+ 		void *parity;
+@@ -2385,17 +2384,8 @@ static noinline void finish_parity_scrub(struct btrfs_raid_bio *rbio,
+ 			pointers[stripe] = kmap(p);
+ 		}
+ 
+-		/* then add the parity stripe */
+-		pointers[stripe++] = kmap(p_page);
+-
+-		if (q_stripe != -1) {
+-
+-			/*
+-			 * raid6, add the qstripe and call the
+-			 * library function to fill in our p/q
+-			 */
+-			pointers[stripe++] = kmap(q_page);
+-
++		if (has_qstripe) {
++			/* RAID6, call the library function to fill in our P/Q */
+ 			raid6_call.gen_syndrome(rbio->real_stripes, PAGE_SIZE,
+ 						pointers);
+ 		} else {
+@@ -2416,12 +2406,14 @@ static noinline void finish_parity_scrub(struct btrfs_raid_bio *rbio,
+ 
+ 		for (stripe = 0; stripe < nr_data; stripe++)
+ 			kunmap(page_in_rbio(rbio, stripe, pagenr, 0));
+-		kunmap(p_page);
+ 	}
+ 
++	kunmap(p_page);
+ 	__free_page(p_page);
+-	if (q_page)
++	if (q_page) {
++		kunmap(q_page);
+ 		__free_page(q_page);
++	}
+ 
+ writeback:
+ 	/*
+diff --git a/include/linux/eeprom_93xx46.h b/include/linux/eeprom_93xx46.h
+index eec7928ff8fe0..99580c22f91a4 100644
+--- a/include/linux/eeprom_93xx46.h
++++ b/include/linux/eeprom_93xx46.h
+@@ -16,6 +16,8 @@ struct eeprom_93xx46_platform_data {
+ #define EEPROM_93XX46_QUIRK_SINGLE_WORD_READ		(1 << 0)
+ /* Instructions such as EWEN are (addrlen + 2) in length. */
+ #define EEPROM_93XX46_QUIRK_INSTRUCTION_LENGTH		(1 << 1)
++/* Add extra cycle after address during a read */
++#define EEPROM_93XX46_QUIRK_EXTRA_READ_CYCLE		BIT(2)
+ 
+ 	/*
+ 	 * optional hooks to control additional logic
+diff --git a/sound/pci/ctxfi/cthw20k2.c b/sound/pci/ctxfi/cthw20k2.c
+index b866d6b2c9236..e603db4d5ef3c 100644
+--- a/sound/pci/ctxfi/cthw20k2.c
++++ b/sound/pci/ctxfi/cthw20k2.c
+@@ -995,7 +995,7 @@ static int daio_mgr_dao_init(void *blk, unsigned int idx, unsigned int conf)
+ 
+ 	if (idx < 4) {
+ 		/* S/PDIF output */
+-		switch ((conf & 0x7)) {
++		switch ((conf & 0xf)) {
+ 		case 1:
+ 			set_field(&ctl->txctl[idx], ATXCTL_NUC, 0);
+ 			break;
+diff --git a/tools/usb/usbip/libsrc/usbip_host_common.c b/tools/usb/usbip/libsrc/usbip_host_common.c
+index 4bb905925b0e4..99c26a175beb1 100644
+--- a/tools/usb/usbip/libsrc/usbip_host_common.c
++++ b/tools/usb/usbip/libsrc/usbip_host_common.c
+@@ -35,7 +35,7 @@
+ #include "list.h"
+ #include "sysfs_utils.h"
+ 
+-struct udev *udev_context;
++extern struct udev *udev_context;
+ 
+ static int32_t read_attr_usbip_status(struct usbip_usb_device *udev)
+ {
