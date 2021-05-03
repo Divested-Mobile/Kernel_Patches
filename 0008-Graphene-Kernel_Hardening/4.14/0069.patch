@@ -1,49 +1,238 @@
-From 23bf108bf025aef32a8233b8f4e4ca591fc2c0ba Mon Sep 17 00:00:00 2001
+From 4656098edde5857e4cede6a7ba43dd1c4c284e02 Mon Sep 17 00:00:00 2001
 From: Daniel Micay <danielmicay@gmail.com>
-Date: Mon, 22 May 2017 05:06:20 -0400
-Subject: [PATCH] arm64: determine stack entropy based on mmap entropy
+Date: Thu, 10 Sep 2020 04:59:39 -0400
+Subject: [PATCH] slub: add multi-purpose random canaries
 
-Stack mapping entropy is currently hard-wired to 11 bits of entropy on
-32-bit and 18 bits of entropy on 64-bit. The stack itself gains an extra
-8 bits of entropy from lower bit randomization within 16 byte alignment
-constraints. The argument block could have all lower bits randomized but
-it currently only gets the mapping randomization.
-
-Rather than hard-wiring values this switches to using the mmap entropy
-configuration like the mmap base and executable base, resulting in a
-range of 8 to 16 bits on 32-bit and 18 to 24 bits on 64-bit (with 4k
-pages and 3 level page tables) depending on kernel configuration and
-overridable via the sysctl entries.
-
-It's worth noting that since these kernel configuration options default
-to the minimum supported entropy value, the entropy on 32-bit will drop
-from 11 to 8 bits for builds using the defaults. However, following the
-configuration seems like the right thing to do regardless. At the very
-least, changing the defaults for COMPAT (32-bit processes on 64-bit)
-should be considered due to the larger address space compared to real
-32-bit.
-
-Signed-off-by: Daniel Micay <danielmicay@gmail.com>
 Signed-off-by: anupritaisno1 <www.anuprita804@gmail.com>
 ---
- arch/arm64/include/asm/elf.h | 6 +++---
- 1 file changed, 3 insertions(+), 3 deletions(-)
+ include/linux/slub_def.h |  5 +++
+ init/Kconfig             | 17 +++++++++++
+ mm/slab.h                |  2 +-
+ mm/slub.c                | 66 +++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 88 insertions(+), 2 deletions(-)
 
-diff --git a/arch/arm64/include/asm/elf.h b/arch/arm64/include/asm/elf.h
-index 675fa096d4a4..7d8ec21b46fa 100644
---- a/arch/arm64/include/asm/elf.h
-+++ b/arch/arm64/include/asm/elf.h
-@@ -159,10 +159,10 @@ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
- /* 1GB of VA */
- #ifdef CONFIG_COMPAT
- #define STACK_RND_MASK			(test_thread_flag(TIF_32BIT) ? \
--						0x7ff >> (PAGE_SHIFT - 12) : \
--						0x3ffff >> (PAGE_SHIFT - 12))
-+						((1UL << mmap_rnd_compat_bits) - 1) >> (PAGE_SHIFT - 12) : \
-+						((1UL << mmap_rnd_bits) - 1) >> (PAGE_SHIFT - 12))
- #else
--#define STACK_RND_MASK			(0x3ffff >> (PAGE_SHIFT - 12))
-+#define STACK_RND_MASK			(((1UL << mmap_rnd_bits) - 1) >> (PAGE_SHIFT - 12))
+diff --git a/include/linux/slub_def.h b/include/linux/slub_def.h
+index f8ced87a2efe..cd61c8d2aa6e 100644
+--- a/include/linux/slub_def.h
++++ b/include/linux/slub_def.h
+@@ -121,6 +121,11 @@ struct kmem_cache {
+ 	unsigned long random;
  #endif
  
- #ifdef __AARCH64EB__
++#ifdef CONFIG_SLAB_CANARY
++	unsigned long random_active;
++	unsigned long random_inactive;
++#endif
++
+ #ifdef CONFIG_NUMA
+ 	/*
+ 	 * Defragmentation by allocating from a remote node.
+diff --git a/init/Kconfig b/init/Kconfig
+index cdb2c473f65c..42554cc2cf34 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1757,6 +1757,23 @@ config SLAB_HARDENED
+           Make minor performance sacrifices to harden the kernel slab
+           allocator.
+ 
++config SLAB_CANARY
++	depends on SLUB
++	depends on !SLAB_MERGE_DEFAULT
++	bool "SLAB canaries"
++	default y
++	help
++	  Place canaries at the end of kernel slab allocations, sacrificing
++	  some performance and memory usage for security.
++
++	  Canaries can detect some forms of heap corruption when allocations
++	  are freed and as part of the HARDENED_USERCOPY feature. It provides
++	  basic use-after-free detection for HARDENED_USERCOPY.
++
++	  Canaries absorb small overflows (rendering them harmless), mitigate
++	  non-NUL terminated C string overflows on 64-bit via a guaranteed zero
++	  byte and provide basic double-free detection.
++
+ config SLUB_CPU_PARTIAL
+ 	default y
+ 	depends on SLUB && SMP
+diff --git a/mm/slab.h b/mm/slab.h
+index 3699ca7cfe63..f298dff7b800 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -412,7 +412,7 @@ static inline size_t slab_ksize(const struct kmem_cache *s)
+ 	 * back there or track user information then we can
+ 	 * only use the space before that information.
+ 	 */
+-	if (s->flags & (SLAB_TYPESAFE_BY_RCU | SLAB_STORE_USER))
++	if ((s->flags & (SLAB_TYPESAFE_BY_RCU | SLAB_STORE_USER)) || IS_ENABLED(CONFIG_SLAB_CANARY))
+ 		return s->inuse;
+ 	/*
+ 	 * Else we can use all the padding etc for the allocation
+diff --git a/mm/slub.c b/mm/slub.c
+index d18b50799491..b9e09cafb8f8 100644
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@ -313,6 +313,35 @@ static inline void set_freepointer(struct kmem_cache *s, void *object, void *fp)
+ 	*(void **)freeptr_addr = freelist_ptr(s, fp, freeptr_addr);
+ }
+ 
++#ifdef CONFIG_SLAB_CANARY
++static inline unsigned long *get_canary(struct kmem_cache *s, void *object)
++{
++	if (s->offset)
++		return object + s->offset + sizeof(void *);
++	return object + s->inuse;
++}
++
++static inline unsigned long get_canary_value(const void *canary, unsigned long value)
++{
++	return (value ^ (unsigned long)canary) & CANARY_MASK;
++}
++
++static inline void set_canary(struct kmem_cache *s, void *object, unsigned long value)
++{
++	unsigned long *canary = get_canary(s, object);
++	*canary = get_canary_value(canary, value);
++}
++
++static inline void check_canary(struct kmem_cache *s, void *object, unsigned long value)
++{
++	unsigned long *canary = get_canary(s, object);
++	BUG_ON(*canary != get_canary_value(canary, value));
++}
++#else
++#define set_canary(s, object, value)
++#define check_canary(s, object, value)
++#endif
++
+ /* Loop over all objects in a slab */
+ #define for_each_object(__p, __s, __addr, __objects) \
+ 	for (__p = fixup_red_left(__s, __addr); \
+@@ -562,6 +591,9 @@ static struct track *get_track(struct kmem_cache *s, void *object,
+ 	else
+ 		p = object + s->inuse;
+ 
++	if (IS_ENABLED(CONFIG_SLAB_CANARY))
++		p = (void *)p + sizeof(void *);
++
+ 	return p + alloc;
+ }
+ 
+@@ -714,6 +746,9 @@ static void print_trailer(struct kmem_cache *s, struct page *page, u8 *p)
+ 	else
+ 		off = s->inuse;
+ 
++	if (IS_ENABLED(CONFIG_SLAB_CANARY))
++		off += sizeof(void *);
++
+ 	if (s->flags & SLAB_STORE_USER)
+ 		off += 2 * sizeof(struct track);
+ 
+@@ -855,6 +890,9 @@ static int check_pad_bytes(struct kmem_cache *s, struct page *page, u8 *p)
+ 		/* Freepointer is placed after the object. */
+ 		off += sizeof(void *);
+ 
++	if (IS_ENABLED(CONFIG_SLAB_CANARY))
++		off += sizeof(void *);
++
+ 	if (s->flags & SLAB_STORE_USER)
+ 		/* We also have user information there */
+ 		off += 2 * sizeof(struct track);
+@@ -1460,6 +1498,8 @@ static inline bool slab_free_freelist_hook(struct kmem_cache *s,
+ 		object = next;
+ 		next = get_freepointer(s, object);
+ 
++		check_canary(s, object, s->random_active);
++
+ 		if (slab_want_init_on_free(s)) {
+ 			/*
+ 			 * Clear the object and the metadata, but don't touch
+@@ -1473,6 +1513,9 @@ static inline bool slab_free_freelist_hook(struct kmem_cache *s,
+ 			if (!IS_ENABLED(CONFIG_SLAB_SANITIZE_VERIFY) && s->ctor)
+ 				s->ctor(object);
+ 		}
++
++		set_canary(s, object, s->random_inactive);
++
+ 		/* If object's reuse doesn't have to be delayed */
+ 		if (!slab_free_hook(s, object)) {
+ 			/* Move object to the new freelist */
+@@ -1504,6 +1547,7 @@ static void *setup_object(struct kmem_cache *s, struct page *page,
+ 				void *object)
+ {
+ 	setup_object_debug(s, page, object);
++	set_canary(s, object, s->random_inactive);
+ 	object = kasan_init_slab_obj(s, object);
+ 	if (unlikely(s->ctor) && !has_sanitize_verify(s)) {
+ 		kasan_unpoison_object_data(s, object);
+@@ -2878,6 +2922,11 @@ static __always_inline void *slab_alloc_node(struct kmem_cache *s,
+ 		}
+ 	}
+ 
++	if (object) {
++		check_canary(s, object, s->random_inactive);
++		set_canary(s, object, s->random_active);
++	}
++
+ 	slab_post_alloc_hook(s, gfpflags, 1, &object);
+ 
+ 	return object;
+@@ -3262,7 +3311,7 @@ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
+ 			  void **p)
+ {
+ 	struct kmem_cache_cpu *c;
+-	int i;
++	int i, k;
+ 
+ 	/* memcg and kmem_cache debug support */
+ 	s = slab_pre_alloc_hook(s, flags);
+@@ -3337,6 +3386,11 @@ int kmem_cache_alloc_bulk(struct kmem_cache *s, gfp_t flags, size_t size,
+ 		}
+ 	}
+ 
++	for (k = 0; k < i; k++) {
++		check_canary(s, p[k], s->random_inactive);
++		set_canary(s, p[k], s->random_active);
++	}
++
+ 	/* memcg and kmem_cache debug support */
+ 	slab_post_alloc_hook(s, flags, size, p);
+ 	return i;
+@@ -3536,6 +3590,7 @@ static void early_kmem_cache_node_alloc(int node)
+ 	init_object(kmem_cache_node, n, SLUB_RED_ACTIVE);
+ 	init_tracking(kmem_cache_node, n);
+ #endif
++	set_canary(kmem_cache_node, n, kmem_cache_node->random_active);
+ 	n = kasan_kmalloc(kmem_cache_node, n, sizeof(struct kmem_cache_node),
+ 		      GFP_KERNEL);
+ 	page->freelist = get_freepointer(kmem_cache_node, n);
+@@ -3696,6 +3751,9 @@ static int calculate_sizes(struct kmem_cache *s, int forced_order)
+ 		size += sizeof(void *);
+ 	}
+ 
++	if (IS_ENABLED(CONFIG_SLAB_CANARY))
++		size += sizeof(void *);
++
+ #ifdef CONFIG_SLUB_DEBUG
+ 	if (flags & SLAB_STORE_USER)
+ 		/*
+@@ -3766,6 +3824,10 @@ static int kmem_cache_open(struct kmem_cache *s, unsigned long flags)
+ #ifdef CONFIG_SLAB_FREELIST_HARDENED
+ 	s->random = get_random_long();
+ #endif
++#ifdef CONFIG_SLAB_CANARY
++	s->random_active = get_random_long();
++	s->random_inactive = get_random_long();
++#endif
+ 
+ 	if (need_reserve_slab_rcu && (s->flags & SLAB_TYPESAFE_BY_RCU))
+ 		s->reserved = sizeof(struct rcu_head);
+@@ -4042,6 +4104,8 @@ const char *__check_heap_object(const void *ptr, unsigned long n,
+ 		offset -= s->red_left_pad;
+ 	}
+ 
++	check_canary(s, (void *)ptr - offset, s->random_active);
++
+ 	/* Allow address range falling entirely within object size. */
+ 	if (offset <= object_size && n <= object_size - offset)
+ 		return NULL;
