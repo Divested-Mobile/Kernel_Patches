@@ -114,3 +114,7 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.112-113.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.113-114.xz -O - | xz -d > 5.4.0113-0114.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.114-115.xz -O - | xz -d > 5.4.0114-0115.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.115-116.xz -O - | xz -d > 5.4.0115-0116.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.116-117.xz -O - | xz -d > 5.4.0116-0117.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.117-118.xz -O - | xz -d > 5.4.0117-0118.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.118-119.xz -O - | xz -d > 5.4.0118-0119.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.119-120.xz -O - | xz -d > 5.4.0119-0120.patch
