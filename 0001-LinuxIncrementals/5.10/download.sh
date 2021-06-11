@@ -40,3 +40,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.38-39.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.39-40.xz -O - | xz -d > 5.10.0039-0040.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.40-41.xz -O - | xz -d > 5.10.0040-0041.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.41-42.xz -O - | xz -d > 5.10.0041-0042.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.42-43.xz -O - | xz -d > 5.10.0042-0043.patch

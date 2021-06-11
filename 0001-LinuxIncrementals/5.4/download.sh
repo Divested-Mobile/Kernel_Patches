@@ -122,3 +122,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.120-121.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.121-122.xz -O - | xz -d > 5.4.0121-0122.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.122-123.xz -O - | xz -d > 5.4.0122-0123.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.123-124.xz -O - | xz -d > 5.4.0123-0124.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.124-125.xz -O - | xz -d > 5.4.0124-0125.patch
