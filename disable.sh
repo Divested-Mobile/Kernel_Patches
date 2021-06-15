@@ -10,4 +10,4 @@ mv CVE-2019-2324/3.10/0001.patch CVE-2019-2324/3.10/0001.patch.disabled;
 mv CVE-2020-0305/^5.5/0002.patch CVE-2020-0305/^5.5/0002.patch.disabled;
 mv CVE-2020-0305/3.18/0001.patch CVE-2020-0305/3.18/0001.patch.disabled;
 mv CVE-2021-3428/3.18/0002.patch CVE-2021-3428/3.18/0002.patch.disabled;
-mv CVE-2020-36386/^5.7/0002.patch CVE-2020-36386/^5.7/0002.patch.disabled;
+rename CVE-2020-36386/*/*.patch patch patch.disabled;
