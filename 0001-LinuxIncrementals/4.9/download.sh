@@ -274,3 +274,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.272-273.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.273-274.xz -O - | xz -d > 4.9.0273-0274.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.274-275.xz -O - | xz -d > 4.9.0274-0275.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.275-276.xz -O - | xz -d > 4.9.0275-0276.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.276-277.xz -O - | xz -d > 4.9.0276-0277.patch
