@@ -15,3 +15,4 @@ rename CVE-2020-36386/*/*.patch patch patch.disabled;
 mv CVE-2017-0576/3.4/0002.patch CVE-2017-0576/3.4/0002.patch.disabled;
 mv CVE-2016-3935/3.4/0002.patch CVE-2016-3935/3.4/0002.patch.disabled;
 mv CVE-2015-8940/3.4/0002.patch CVE-2015-8940/3.4/0002.patch.disabled;
+mv CVE-2018-11878/prima/0001.patch CVE-2018-11878/prima/0001.patch.disabled;
