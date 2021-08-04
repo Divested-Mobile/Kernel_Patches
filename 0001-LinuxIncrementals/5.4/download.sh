@@ -135,3 +135,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.133-134.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.134-135.xz -O - | xz -d > 5.4.0134-0135.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.135-136.xz -O - | xz -d > 5.4.0135-0136.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.136-137.xz -O - | xz -d > 5.4.0136-0137.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.137-138.xz -O - | xz -d > 5.4.0137-0138.patch
