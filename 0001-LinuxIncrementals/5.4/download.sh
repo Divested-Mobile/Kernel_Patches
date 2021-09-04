@@ -141,3 +141,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.139-140.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.140-141.xz -O - | xz -d > 5.4.0140-0141.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.141-142.xz -O - | xz -d > 5.4.0141-0142.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.142-143.xz -O - | xz -d > 5.4.0142-0143.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.143-144.xz -O - | xz -d > 5.4.0143-0144.patch
