@@ -60,3 +60,8 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.58-59.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.59-60.xz -O - | xz -d > 5.10.0059-0060.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.60-61.xz -O - | xz -d > 5.10.0060-0061.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.61-62.xz -O - | xz -d > 5.10.0061-0062.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.62-63.xz -O - | xz -d > 5.10.0062-0063.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.63-64.xz -O - | xz -d > 5.10.0063-0064.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.64-65.xz -O - | xz -d > 5.10.0064-0065.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.65-66.xz -O - | xz -d > 5.10.0065-0066.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.66-67.xz -O - | xz -d > 5.10.0066-0067.patch
