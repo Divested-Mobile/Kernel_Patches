@@ -22,4 +22,3 @@ mv CVE-2019-2214/3.4/0004.patch CVE-2019-2214/3.4/0004.patch.disabled;
 mv CVE-2021-20317/^5.3/0001.patch CVE-2021-20317/^5.3/0001.patch.disabled; #breaks qcom event timer
 mv CVE-2019-19449/^5.9/0001.patch CVE-2019-19449/^5.9/0001.patch.disabled;
 rename patch patch.disabled CVE-2021-42008/*/*.patch; #applies again and again
-mv CVE-2021-Misc2/3.4/0066.patch CVE-2021-Misc2/3.4/0066.patch.disabled;
