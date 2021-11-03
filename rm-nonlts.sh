@@ -8,7 +8,10 @@ rmVersion() {
 }
 
 rmVersions() {
-	rmVersion 5\.15;
+	rmVersion 5\.18;
+	rmVersion 5\.17;
+	rmVersion 5\.16;
+	#5.15 LTS
 	rmVersion 5\.14;
 	rmVersion 5\.13;
 	rmVersion 5\.12;
