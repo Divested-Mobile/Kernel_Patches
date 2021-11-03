@@ -74,3 +74,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.72-73.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.73-74.xz -O - | xz -d > 5.10.0073-0074.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.74-75.xz -O - | xz -d > 5.10.0074-0075.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.75-76.xz -O - | xz -d > 5.10.0075-0076.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.76-77.xz -O - | xz -d > 5.10.0076-0077.patch
