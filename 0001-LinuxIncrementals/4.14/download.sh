@@ -262,3 +262,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.260-261.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.261-262.xz -O - | xz -d > 4.14.0261-0262.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.262-263.xz -O - | xz -d > 4.14.0262-0263.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.263-264.xz -O - | xz -d > 4.14.0263-0264.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.264-265.xz -O - | xz -d > 4.14.0264-0265.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.265-266.xz -O - | xz -d > 4.14.0265-0266.patch
