@@ -299,3 +299,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.297-298.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.298-299.xz -O - | xz -d > 4.9.0298-0299.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.299-300.xz -O - | xz -d > 4.9.0299-0300.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.300-301.xz -O - | xz -d > 4.9.0300-0301.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.301-302.xz -O - | xz -d > 4.9.0301-0302.patch

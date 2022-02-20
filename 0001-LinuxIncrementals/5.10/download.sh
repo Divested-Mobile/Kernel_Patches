@@ -98,3 +98,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.96-97.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.97-98.xz -O - | xz -d > 5.10.0097-0098.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.98-99.xz -O - | xz -d > 5.10.0098-0099.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.99-100.xz -O - | xz -d > 5.10.0099-0100.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.100-101.xz -O - | xz -d > 5.10.0100-0101.patch

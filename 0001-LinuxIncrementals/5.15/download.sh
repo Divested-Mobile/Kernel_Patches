@@ -21,3 +21,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.19-20.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.20-21.xz -O - | xz -d > 5.15.0020-0021.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.21-22.xz -O - | xz -d > 5.15.0021-0022.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.22-23.xz -O - | xz -d > 5.15.0022-0023.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.23-24.xz -O - | xz -d > 5.15.0023-0024.patch
