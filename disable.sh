@@ -25,3 +25,5 @@ rename patch patch.disabled CVE-2021-20317/*/*.patch; #breaks qcom event timer
 mv CVE-2021-0961/4.11-^5.4/0001.patch CVE-2021-0961/4.11-^5.4/0001.patch.disabled #major breakage
 rename patch patch.disabled CVE-2021-4203/*/*.patch; #potential breakage
 rename patch patch.disabled CVE-2015-0571/*/*.patch; #consistently doesn't apply correctly
+rename patch patch.disabled CVE-2016-6693/ANY/0001.patch; #replaced with merged patch of CVE-2016-6696
+rename patch patch.disabled CVE-2016-6696/ANY/0001.patch;
