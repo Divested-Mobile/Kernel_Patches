@@ -27,3 +27,4 @@ rename patch patch.disabled CVE-2021-4203/*/*.patch; #potential breakage
 rename patch patch.disabled CVE-2015-0571/*/*.patch; #consistently doesn't apply correctly
 rename patch patch.disabled CVE-2016-6693/ANY/0001.patch; #replaced with merged patch of CVE-2016-6696
 rename patch patch.disabled CVE-2016-6696/ANY/0001.patch;
+rename patch patch.disabled CVE-2016-2188/^4.5/0002.patch; #conflicts with never version
