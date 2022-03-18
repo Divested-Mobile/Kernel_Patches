@@ -230,3 +230,6 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.228-229.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.229-230.xz -O - | xz -d > 4.19.0229-0230.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.230-231.xz -O - | xz -d > 4.19.0230-0231.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.231-232.xz -O - | xz -d > 4.19.0231-0232.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.232-233.xz -O - | xz -d > 4.19.0232-0233.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.233-234.xz -O - | xz -d > 4.19.0233-0234.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.234-235.xz -O - | xz -d > 4.19.0234-0235.patch
