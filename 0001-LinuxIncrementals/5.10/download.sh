@@ -104,3 +104,6 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.102-103.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.103-104.xz -O - | xz -d > 5.10.0103-0104.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.104-105.xz -O - | xz -d > 5.10.0104-0105.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.105-106.xz -O - | xz -d > 5.10.0105-0106.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.106-107.xz -O - | xz -d > 5.10.0106-0107.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.107-108.xz -O - | xz -d > 5.10.0107-0108.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.108-109.xz -O - | xz -d > 5.10.0108-0109.patch
