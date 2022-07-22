@@ -202,3 +202,6 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.200-201.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.201-202.xz -O - | xz -d > 5.4.0201-0202.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.202-203.xz -O - | xz -d > 5.4.0202-0203.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.203-204.xz -O - | xz -d > 5.4.0203-0204.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.204-205.xz -O - | xz -d > 5.4.0204-0205.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.205-206.xz -O - | xz -d > 5.4.0205-0206.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.206-207.xz -O - | xz -d > 5.4.0206-0207.patch
