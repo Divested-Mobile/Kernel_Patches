@@ -251,3 +251,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.249-250.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.250-251.xz -O - | xz -d > 4.19.0250-0251.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.251-252.xz -O - | xz -d > 4.19.0251-0252.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.252-253.xz -O - | xz -d > 4.19.0252-0253.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.253-254.xz -O - | xz -d > 4.19.0253-0254.patch

@@ -54,3 +54,6 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.52-53.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.53-54.xz -O - | xz -d > 5.15.0053-0054.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.54-55.xz -O - | xz -d > 5.15.0054-0055.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.55-56.xz -O - | xz -d > 5.15.0055-0056.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.56-57.xz -O - | xz -d > 5.15.0056-0057.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.57-58.xz -O - | xz -d > 5.15.0057-0058.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.58-59.xz -O - | xz -d > 5.15.0058-0059.patch
