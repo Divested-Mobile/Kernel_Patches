@@ -28,6 +28,7 @@ rename patch patch.disabled CVE-2015-0571/*/*.patch; #consistently doesn't apply
 rename patch patch.disabled CVE-2016-6693/ANY/0001.patch; #replaced with merged patch of CVE-2016-6696
 rename patch patch.disabled CVE-2016-6696/ANY/0001.patch;
 rename patch patch.disabled CVE-2016-2188/^4.5/0002.patch; #conflicts with never version
+rename patch patch.disabled CVE-2019-14070/3.4/0008.patch;
 rename patch patch.disabled 0006-AndroidHardening-Kernel_Hardening/3.18/0045.patch; #breaks some programs
 rename patch patch.disabled CVE-2021-39713/ANY/0011.patch; #requires CONFIG_MODULES
 rename patch patch.disabled CVE-2022-1462/*/*.patch; #requires tty_flip_buffer_commit backport
