@@ -289,3 +289,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.287-288.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.288-289.xz -O - | xz -d > 4.14.0288-0289.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.289-290.xz -O - | xz -d > 4.14.0289-0290.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.290-291.xz -O - | xz -d > 4.14.0290-0291.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.291-292.xz -O - | xz -d > 4.14.0291-0292.patch
