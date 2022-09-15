@@ -255,3 +255,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.253-254.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.254-255.xz -O - | xz -d > 4.19.0254-0255.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.255-256.xz -O - | xz -d > 4.19.0255-0256.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.256-257.xz -O - | xz -d > 4.19.0256-0257.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.257-258.xz -O - | xz -d > 4.19.0257-0258.patch
