@@ -331,3 +331,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.329-330.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.330-331.xz -O - | xz -d > 4.9.0330-0331.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.331-332.xz -O - | xz -d > 4.9.0331-0332.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.332-333.xz -O - | xz -d > 4.9.0332-0333.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.9.333-334.xz -O - | xz -d > 4.9.0333-0334.patch
