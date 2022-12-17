@@ -265,3 +265,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.263-264.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.264-265.xz -O - | xz -d > 4.19.0264-0265.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.265-266.xz -O - | xz -d > 4.19.0265-0266.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.266-267.xz -O - | xz -d > 4.19.0266-0267.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.267-268.xz -O - | xz -d > 4.19.0267-0268.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.268-269.xz -O - | xz -d > 4.19.0268-0269.patch
