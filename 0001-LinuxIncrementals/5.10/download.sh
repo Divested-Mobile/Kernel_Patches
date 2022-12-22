@@ -157,3 +157,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.155-156.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.156-157.xz -O - | xz -d > 5.10.0156-0157.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.157-158.xz -O - | xz -d > 5.10.0157-0158.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.158-159.xz -O - | xz -d > 5.10.0158-0159.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.159-160.xz -O - | xz -d > 5.10.0159-0160.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.160-161.xz -O - | xz -d > 5.10.0160-0161.patch
