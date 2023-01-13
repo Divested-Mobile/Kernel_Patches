@@ -84,3 +84,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.82-83.xz -O - 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.83-84.xz -O - | xz -d > 5.15.0083-0084.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.84-85.xz -O - | xz -d > 5.15.0084-0085.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.85-86.xz -O - | xz -d > 5.15.0085-0086.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.15.86-87.xz -O - | xz -d > 5.15.0086-0087.patch
