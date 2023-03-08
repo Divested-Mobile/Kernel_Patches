@@ -34,3 +34,4 @@ rename patch patch.disabled CVE-2021-39713/ANY/0011.patch; #requires CONFIG_MODU
 rename patch patch.disabled CVE-2022-1462/*/*.patch; #requires tty_flip_buffer_commit backport
 rename patch patch.disabled CVE-2022-3640/*/*.patch; #requires torvalds/d0be8347c623
 rename patch patch.disabled CVE-2022-25721/ANY/0001.patch; #breaks video playback on sm8150
+rename patch patch.disabled CVE-2022-33243/*/*.patch; #requires blob updates?
