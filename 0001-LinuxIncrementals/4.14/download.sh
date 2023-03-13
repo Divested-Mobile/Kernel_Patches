@@ -305,3 +305,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.303-304.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.304-305.xz -O - | xz -d > 4.14.0304-0305.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.305-306.xz -O - | xz -d > 4.14.0305-0306.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.306-307.xz -O - | xz -d > 4.14.0306-0307.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.307-308.xz -O - | xz -d > 4.14.0307-0308.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.308-309.xz -O - | xz -d > 4.14.0308-0309.patch

@@ -13,3 +13,7 @@ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.11-12.xz -O - |
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.12-13.xz -O - | xz -d > 6.1.0012-0013.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.13-14.xz -O - | xz -d > 6.1.0013-0014.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.14-15.xz -O - | xz -d > 6.1.0014-0015.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.15-16.xz -O - | xz -d > 6.1.0015-0016.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.16-17.xz -O - | xz -d > 6.1.0016-0017.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.17-18.xz -O - | xz -d > 6.1.0017-0018.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.18-19.xz -O - | xz -d > 6.1.0018-0019.patch
