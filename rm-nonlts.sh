@@ -8,9 +8,10 @@ rmVersion() {
 }
 
 rmVersions() {
+	rmVersion 6\.4;
 	rmVersion 6\.3;
 	rmVersion 6\.2;
-	rmVersion 6\.1; #TODO: 6.1 IS LTS
+	#6.1 LTS
 	rmVersion 6\.0;
 	rmVersion 5\.19;
 	rmVersion 5\.18;
