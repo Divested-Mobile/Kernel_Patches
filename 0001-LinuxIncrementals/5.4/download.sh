@@ -239,3 +239,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.237-238.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.238-239.xz -O - | xz -d > 5.4.0238-0239.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.239-240.xz -O - | xz -d > 5.4.0239-0240.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.240-241.xz -O - | xz -d > 5.4.0240-0241.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.241-242.xz -O - | xz -d > 5.4.0241-0242.patch
