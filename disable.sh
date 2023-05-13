@@ -36,3 +36,4 @@ rename patch patch.disabled CVE-2022-3640/*/*.patch; #requires torvalds/d0be8347
 rename patch patch.disabled CVE-2022-25721/ANY/0001.patch; #breaks video playback on sm8150
 rename patch patch.disabled CVE-2022-33243/*/*.patch; #requires blob updates?
 rename patch patch.disabled CVE-2023-1076/*/*.patch; #requires backport
+rename patch patch.disabled CVE-2023-2513/*/*.patch; #requires backport
