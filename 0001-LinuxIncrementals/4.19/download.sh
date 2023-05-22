@@ -280,3 +280,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.278-279.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.279-280.xz -O - | xz -d > 4.19.0279-0280.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.280-281.xz -O - | xz -d > 4.19.0280-0281.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.281-282.xz -O - | xz -d > 4.19.0281-0282.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.282-283.xz -O - | xz -d > 4.19.0282-0283.patch
