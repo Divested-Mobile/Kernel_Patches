@@ -189,3 +189,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.187-188.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.188-189.xz -O - | xz -d > 5.10.0188-0189.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.189-190.xz -O - | xz -d > 5.10.0189-0190.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.190-191.xz -O - | xz -d > 5.10.0190-0191.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.191-192.xz -O - | xz -d > 5.10.0191-0192.patch
