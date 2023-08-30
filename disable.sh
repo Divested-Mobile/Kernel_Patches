@@ -38,3 +38,4 @@ rename patch patch.disabled CVE-2022-33243/*/*.patch; #requires blob updates?
 rename patch patch.disabled CVE-2023-1076/*/*.patch; #requires backport
 rename patch patch.disabled CVE-2023-2513/*/*.patch; #requires backport
 rename patch patch.disabled CVE-2023-3611/*/*.patch;
+rename patch patch.disabled CVE-2023-3773/*/*.patch;
