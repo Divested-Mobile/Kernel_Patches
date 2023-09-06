@@ -8,6 +8,7 @@ rmVersion() {
 }
 
 rmVersions() {
+	rmVersion 6\.7;
 	rmVersion 6\.6;
 	rmVersion 6\.5;
 	rmVersion 6\.4;
