@@ -47,3 +47,7 @@ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.45-46.xz -O - |
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.46-47.xz -O - | xz -d > 6.1.0046-0047.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.47-48.xz -O - | xz -d > 6.1.0047-0048.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.48-49.xz -O - | xz -d > 6.1.0048-0049.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.49-50.xz -O - | xz -d > 6.1.0049-0050.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.50-51.xz -O - | xz -d > 6.1.0050-0051.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.51-52.xz -O - | xz -d > 6.1.0051-0052.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.52-53.xz -O - | xz -d > 6.1.0052-0053.patch
