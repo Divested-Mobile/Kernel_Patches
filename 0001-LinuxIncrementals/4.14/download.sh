@@ -325,3 +325,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.323-324.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.324-325.xz -O - | xz -d > 4.14.0324-0325.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.325-326.xz -O - | xz -d > 4.14.0325-0326.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.326-327.xz -O - | xz -d > 4.14.0326-0327.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.14.327-328.xz -O - | xz -d > 4.14.0327-0328.patch
