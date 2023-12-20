@@ -63,3 +63,7 @@ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.61-62.xz -O - |
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.62-63.xz -O - | xz -d > 6.1.0062-0063.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.63-64.xz -O - | xz -d > 6.1.0063-0064.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.64-65.xz -O - | xz -d > 6.1.0064-0065.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.65-66.xz -O - | xz -d > 6.1.0065-0066.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.66-67.xz -O - | xz -d > 6.1.0066-0067.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.67-68.xz -O - | xz -d > 6.1.0067-0068.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.68-69.xz -O - | xz -d > 6.1.0068-0069.patch

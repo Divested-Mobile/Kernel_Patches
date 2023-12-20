@@ -260,3 +260,6 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.258-259.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.259-260.xz -O - | xz -d > 5.4.0259-0260.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.260-261.xz -O - | xz -d > 5.4.0260-0261.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.261-262.xz -O - | xz -d > 5.4.0261-0262.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.262-263.xz -O - | xz -d > 5.4.0262-0263.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.263-264.xz -O - | xz -d > 5.4.0263-0264.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.4.264-265.xz -O - | xz -d > 5.4.0264-0265.patch

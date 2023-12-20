@@ -200,3 +200,6 @@ wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.198-199.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.199-200.xz -O - | xz -d > 5.10.0199-0200.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.200-201.xz -O - | xz -d > 5.10.0200-0201.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.201-202.xz -O - | xz -d > 5.10.0201-0202.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.202-203.xz -O - | xz -d > 5.10.0202-0203.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.203-204.xz -O - | xz -d > 5.10.0203-0204.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v5.x/incr/patch-5.10.204-205.xz -O - | xz -d > 5.10.0204-0205.patch
