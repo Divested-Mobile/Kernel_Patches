@@ -76,3 +76,4 @@ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.74-75.xz -O - |
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.75-76.xz -O - | xz -d > 6.1.0075-0076.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.76-77.xz -O - | xz -d > 6.1.0076-0077.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.77-78.xz -O - | xz -d > 6.1.0077-0078.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.78-79.xz -O - | xz -d > 6.1.0078-0079.patch
