@@ -40,3 +40,4 @@ rename patch patch.disabled CVE-2023-2513/*/*.patch; #requires backport
 rename patch patch.disabled CVE-2023-3611/*/*.patch;
 rename patch patch.disabled CVE-2023-3773/*/*.patch;
 rename patch patch.disabled CVE-2023-42753/*/*.patch;
+rename patch patch.disabled CVE-2023-52462/^6.7/0001.patch;
