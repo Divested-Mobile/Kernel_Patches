@@ -49,3 +49,4 @@ rename patch patch.disabled CVE-2023-52578/*/*.patch; #depends on torvalds/6c1c5
 rename patch patch.disabled CVE-2021-47096/*/*.patch; #depends on torvalds/09d23174402d
 rename patch patch.disabled CVE-2021-46921/^5.12/0001.patch;
 rename patch patch.disabled CVE-2023-52435/^6.7/0001.patch;
+rename patch patch.disabled CVE-2024-26659/*/*.patch;
