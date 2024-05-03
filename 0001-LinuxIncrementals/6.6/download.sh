@@ -25,3 +25,6 @@ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.6.23-24.xz -O - |
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.6.24-25.xz -O - | xz -d > 6.6.0024-0025.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.6.25-26.xz -O - | xz -d > 6.6.0025-0026.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.6.26-27.xz -O - | xz -d > 6.6.0026-0027.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.6.27-28.xz -O - | xz -d > 6.6.0027-0028.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.6.28-29.xz -O - | xz -d > 6.6.0028-0029.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.6.29-30.xz -O - | xz -d > 6.6.0029-0030.patch
