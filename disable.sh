@@ -51,3 +51,7 @@ rename patch patch.disabled CVE-2021-46921/^5.12/0001.patch;
 rename patch patch.disabled CVE-2023-52435/^6.7/0001.patch;
 rename patch patch.disabled CVE-2024-26659/*/*.patch;
 rename patch patch.disabled CVE-2022-48671/^6.0/*.patch;
+rename patch patch.disabled CVE-2024-26857/5.4/*.patch;
+rename patch patch.disabled CVE-2024-26857/4.19/*.patch;
+rename patch patch.disabled CVE-2024-26882/*/*.patch;
+rename patch patch.disabled CVE-2022-48639/*/*.patch;
