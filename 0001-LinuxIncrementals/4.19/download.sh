@@ -311,3 +311,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.309-310.xz -O 
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.310-311.xz -O - | xz -d > 4.19.0310-0311.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.311-312.xz -O - | xz -d > 4.19.0311-0312.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.312-313.xz -O - | xz -d > 4.19.0312-0313.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.313-314.xz -O - | xz -d > 4.19.0313-0314.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v4.x/incr/patch-4.19.314-315.xz -O - | xz -d > 4.19.0314-0315.patch
