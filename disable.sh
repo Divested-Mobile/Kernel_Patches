@@ -59,3 +59,4 @@ rename patch patch.disabled CVE-2024-36013/^6.9/0001.patch;
 rename patch patch.disabled CVE-2023-52700/^6.2/0001.patch;
 rename patch patch.disabled CVE-2023-52758/^6.6/0001.patch;
 rename patch patch.disabled CVE-2023-52784/^6.6/0001.patch;
+rename patch patch.disabled CVE-2024-36908/^6.9/0001.patch;
