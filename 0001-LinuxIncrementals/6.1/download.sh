@@ -90,3 +90,5 @@ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.88-89.xz -O - |
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.89-90.xz -O - | xz -d > 6.1.0089-0090.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.90-91.xz -O - | xz -d > 6.1.0090-0091.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.91-92.xz -O - | xz -d > 6.1.0091-0092.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.92-93.xz -O - | xz -d > 6.1.0092-0093.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.93-94.xz -O - | xz -d > 6.1.0093-0094.patch
