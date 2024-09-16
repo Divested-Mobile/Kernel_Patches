@@ -64,3 +64,4 @@ rename patch patch.disabled CVE-2024-38596/^6.9/0001.patch;
 rename patch patch.disabled CVE-2024-40911/^6.10/0001.patch;
 rename patch patch.disabled CVE-2024-41023/^6.10/0001.patch;
 rename patch patch.disabled 0002-Misc_Fixes-2024/4.9/0001.patch;
+rename patch patch.disabled CVE-2024-45025/*/*.patch; #needs bitmap_size() backport
