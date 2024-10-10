@@ -1,0 +1,161 @@
+From 0e27b6c7d2bd8d0453e4465ac2ca49a8f8c440e2 Mon Sep 17 00:00:00 2001
+From: quic_anane <quic_anane@quicinc.com>
+Date: Thu, 27 Jun 2024 12:30:41 +0530
+Subject: [PATCH] dsp-kernel: Handle UAF scenario in put_args
+
+Currently, the DSP updates header buffers with unused DMA handle fds.
+In the put_args section, if any DMA handle FDs are present in the
+header buffer, the corresponding map is freed. However, since the
+header buffer is exposed to users in unsigned PD, users can update
+invalid FDs. If this invalid FD matches with any FD that is already
+in use, it could lead to a use-after-free (UAF) vulnerability.
+As a solution,add DMA handle references for DMA FDs, and the map for
+the FD will be freed only when a reference is found.
+
+Change-Id: Ie4d19dc0ef0ebdda5ed2fe6f7b64598ef661a63f
+Signed-off-by: quic_anane <quic_anane@quicinc.com>
+---
+ dsp/adsprpc.c        | 64 +++++++++++++++++++++++++++++++-------------
+ dsp/adsprpc_shared.h |  2 ++
+ 2 files changed, 48 insertions(+), 18 deletions(-)
+
+diff --git a/dsp/adsprpc.c b/dsp/adsprpc.c
+index 6ec8544..8cfb8e6 100644
+--- a/dsp/adsprpc.c
++++ b/dsp/adsprpc.c
+@@ -955,6 +955,8 @@ static int fastrpc_mmap_remove(struct fastrpc_file *fl, int fd, uintptr_t va,
+ 			map->refs == 1 &&
+ 			/* Remove map only if it isn't being used in any pending RPC calls */
+ 			!map->ctx_refs &&
++			/* Remove map only if it isn't being used by DSP */
++			!map->dma_handle_refs &&
+ 			/* Skip unmap if it is fastrpc shell memory */
+ 			!map->is_filemap) {
+ 			match = map;
+@@ -994,8 +996,9 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
+ 	if (map->flags == ADSP_MMAP_HEAP_ADDR ||
+ 				map->flags == ADSP_MMAP_REMOTE_HEAP_ADDR) {
+ 		spin_lock_irqsave(&me->hlock, irq_flags);
+-		map->refs--;
+-		if (!map->refs && !map->is_persistent && !map->ctx_refs)
++		if (map->refs)
++			map->refs--;
++		if (!map->refs && !map->is_persistent)
+ 			hlist_del_init(&map->hn);
+ 		if (map->refs > 0) {
+ 			ADSPRPC_WARN(
+@@ -1008,10 +1011,14 @@ static void fastrpc_mmap_free(struct fastrpc_mmap *map, uint32_t flags)
+ 			map->in_use = false;
+ 		spin_unlock_irqrestore(&me->hlock, irq_flags);
+ 	} else {
+-		map->refs--;
+-		if (!map->refs && !map->ctx_refs)
++		if (map->refs)
++			map->refs--;
++		/* flags is passed as 1 during fastrpc_file_free (ie process exit),
++		 * so that maps will be cleared even though references are present.
++		 */
++		if (flags || (!map->refs && !map->ctx_refs && !map->dma_handle_refs))
+ 			hlist_del_init(&map->hn);
+-		if (map->refs > 0 && !flags)
++		else
+ 			return;
+ 	}
+ 	if (map->flags == ADSP_MMAP_HEAP_ADDR ||
+@@ -2501,21 +2508,22 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
+ 		if (err) {
+ 			for (j = bufs; j < i; j++) {
+ 				/*
+-				 * Due to error decrement ctx refs count before mmap free
++				 * Due to error decrement  refs count before mmap free
+ 				 * for each in/out handle, if map created
+ 				 */
+-				if (ctx->maps[j] && ctx->maps[j]->ctx_refs)
+-					ctx->maps[j]->ctx_refs--;
+-				fastrpc_mmap_free(ctx->maps[j], 0);
++				if (ctx->maps[j] && ctx->maps[j]->dma_handle_refs) {
++					ctx->maps[j]->dma_handle_refs--;
++					fastrpc_mmap_free(ctx->maps[j], 0);
++				}
+ 			}
+ 			mutex_unlock(&ctx->fl->map_mutex);
+ 			goto bail;
+ 		} else if (ctx->maps[i]) {
+ 			/*
+-			 * Increment ctx refs count for in/out handle if map created
++			 * Increment  refs count for in/out handle if map created
+ 			 * and no error, indicate map under use in remote call
+ 			 */
+-			ctx->maps[i]->ctx_refs++;
++			ctx->maps[i]->dma_handle_refs++;
+ 		}
+ 		ipage += 1;
+ 	}
+@@ -2667,14 +2675,33 @@ static int get_args(uint32_t kernel, struct smq_invoke_ctx *ctx)
+ 		rpra[i].buf.pv = buf;
+ 	}
+ 	PERF_END);
++	/* Since we are not holidng map_mutex during get args whole time
++	 * it is possible that dma handle map may be removed by some invalid
++	 * fd passed by DSP. Inside the lock check if the map present or not
++	 */
++	mutex_lock(&ctx->fl->map_mutex);
+ 	for (i = bufs; i < bufs + handles; ++i) {
+-		struct fastrpc_mmap *map = ctx->maps[i];
++		struct fastrpc_mmap *mmap = NULL;
++		/* check if map  was created */
++		if (ctx->maps[i]) {
++			/* check if map still exist */
++			if (!fastrpc_mmap_find(ctx->fl, ctx->fds[i], NULL, 0, 0,
++				0, 0, &mmap)) {
++				if (mmap) {
++					pages[i].addr = mmap->phys;
++					pages[i].size = mmap->size;
++				}
+ 
+-		if (map) {
+-			pages[i].addr = map->phys;
+-			pages[i].size = map->size;
++			} else {
++				/* map already freed by some other call */
++				mutex_unlock(&ctx->fl->map_mutex);
++				ADSPRPC_ERR("could not find map associated with dma hadle fd %d \n",
++					ctx->fds[i]);
++				goto bail;
++			}
+ 		}
+ 	}
++	mutex_unlock(&ctx->fl->map_mutex);
+ 	fdlist = (uint64_t *)&pages[bufs + handles];
+ 	crclist = (uint32_t *)&fdlist[M_FDLIST];
+ 	/* reset fds, crc and early wakeup hint memory */
+@@ -2883,9 +2910,10 @@ static int put_args(uint32_t kernel, struct smq_invoke_ctx *ctx,
+ 			 * Decrement ctx refs count before mmap free,
+ 			 * indicate remote call no longer using it
+ 			 */
+-			if (mmap && mmap->ctx_refs)
+-				mmap->ctx_refs--;
+-			fastrpc_mmap_free(mmap, 0);
++			if (mmap && mmap->dma_handle_refs) {
++				mmap->dma_handle_refs = 0;
++				fastrpc_mmap_free(mmap, 0);
++			}
+ 		}
+ 	}
+ 	mutex_unlock(&ctx->fl->map_mutex);
+diff --git a/dsp/adsprpc_shared.h b/dsp/adsprpc_shared.h
+index cd8ed47..0b773fd 100644
+--- a/dsp/adsprpc_shared.h
++++ b/dsp/adsprpc_shared.h
+@@ -794,6 +794,8 @@ struct fastrpc_mmap {
+ 	char *servloc_name;			/* Indicate which daemon mapped this */
+ 	/* Indicates map is being used by a pending RPC call */
+ 	unsigned int ctx_refs;
++	/* Map in use for dma handle */
++	unsigned int dma_handle_refs;
+ };
+ 
+ enum fastrpc_perfkeys {
+-- 
+GitLab
+
