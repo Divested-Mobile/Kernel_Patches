@@ -111,3 +111,9 @@ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.109-110.xz -O -
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.110-111.xz -O - | xz -d > 6.1.0110-0111.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.111-112.xz -O - | xz -d > 6.1.0111-0112.patch
 wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.112-113.xz -O - | xz -d > 6.1.0112-0113.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.113-114.xz -O - | xz -d > 6.1.0113-0114.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.114-115.xz -O - | xz -d > 6.1.0114-0115.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.115-116.xz -O - | xz -d > 6.1.0115-0116.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.116-117.xz -O - | xz -d > 6.1.0116-0117.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.117-118.xz -O - | xz -d > 6.1.0117-0118.patch
+wget https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.118-119.xz -O - | xz -d > 6.1.0118-0119.patch
